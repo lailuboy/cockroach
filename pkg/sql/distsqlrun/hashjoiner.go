@@ -11,60 +11,69 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
 import (
-	"sync"
-	"unsafe"
+	"context"
+	"fmt"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/mon"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
 )
 
-// bucket contains the set of rows for a given group key (comprised of
-// columns specified by the join constraints).
-type bucket struct {
-	// rows holds indices of rows into the hashJoiner's rows container.
-	rows []int
-	// seen is only used for outer joins; there is an entry for each row in `rows`
-	// indicating if that row had at least a matching row in the opposite stream
-	// ("matching" meaning that the ON condition passed).
-	seen []bool
-}
-
 // hashJoinerInitialBufferSize controls the size of the initial buffering phase
-// (see hashJoiner).
+// (see hashJoiner). This only applies when falling back to disk is disabled.
 const hashJoinerInitialBufferSize = 4 * 1024 * 1024
 
-const sizeOfBucket = int64(unsafe.Sizeof(bucket{}))
-const sizeOfRowIdx = int64(unsafe.Sizeof(int(0)))
+// hashJoinerState represents the state of the processor.
+type hashJoinerState int
 
-// HashJoiner performs a hash join.
-//
-// It has two input streams and one output. It works in three phases:
-//
-//  1. Initial buffering: we read and store rows from both streams, up to a
-//     certain amount of memory. If we find the end of a stream, this is the
-//     stream we will build the buckets from in the next phase. If not, we
-//     choose the right stream and read it and buffer it until the end.
-//
-//  2. Build phase: in this phase we build the buckets from the rows stored
-//     in the first phase.
-//
-//  3. Probe phase: in this phase we process all the rows from the other stream
-//     and look for matching rows from the stored stream using the map.
-//
-// There is no guarantee on the output ordering.
+const (
+	hjStateUnknown hashJoinerState = iota
+	// hjBuilding represents the state the hashJoiner is in when it is trying to
+	// determine which side to store (i.e. which side is smallest).
+	// At most hashJoinerInitialBufferSize is used to buffer rows from either
+	// side. The first input to be finished within this limit is the smallest
+	// side. If both inputs still have rows, the hashJoiner will default to
+	// storing the right side. When a side is stored, a hash map is also
+	// constructed from the equality columns to the rows.
+	hjBuilding
+	// hjConsumingStoredSide represents the state the hashJoiner is in if a small
+	// side was not found. In this case, the hashJoiner will fully consume the
+	// right side. This state is skipped if the hashJoiner determined the smallest
+	// side, since it must have fully consumed that side.
+	hjConsumingStoredSide
+	// hjReadingProbeSide represents the state the hashJoiner is in when it reads
+	// rows from the input that wasn't chosen to be stored.
+	hjReadingProbeSide
+	// hjProbingRow represents the state the hashJoiner is in when it uses a row
+	// read in hjReadingProbeSide to probe the stored hash map with.
+	hjProbingRow
+	// hjEmittingUnmatched represents the state the hashJoiner is in when it is
+	// emitting unmatched rows from its stored side after having consumed the
+	// other side. This only happens when executing a FULL OUTER, LEFT/RIGHT
+	// OUTER and ANTI joins (depending on which side we store).
+	hjEmittingUnmatched
+)
+
+// hashJoiner performs a hash join. There is no guarantee on the output
+// ordering.
 type hashJoiner struct {
 	joinerBase
+
+	runningState hashJoinerState
+
+	diskMonitor *mon.BytesMonitor
+
+	leftSource, rightSource RowSource
 
 	// initialBufferSize is the maximum amount of data we buffer from each stream
 	// as part of the initial buffering phase. Normally
@@ -74,151 +83,608 @@ type hashJoiner struct {
 	// We read a portion of both streams, in the hope that one is small. One of
 	// the containers will contain the entire "stored" stream, the other just the
 	// start of the other stream.
-	rows [2]memRowContainer
+	rows [2]rowcontainer.MemRowContainer
 
-	// storedSide is set by the initial buffering phase and indicates which stream
-	// we store fully and build the hashtable from.
+	// storedSide is set by the initial buffering phase and indicates which
+	// stream we store fully and build the hashRowContainer from.
 	storedSide joinSide
 
-	// bucketsAcc is the memory account for the buckets. The datums themselves are
-	// all in the rows container.
-	bucketsAcc mon.BoundAccount
+	// nullEquality indicates that NULL = NULL should be considered true. Used for
+	// INTERSECT and EXCEPT.
+	nullEquality bool
 
-	scratch []byte
+	useTempStorage bool
+	storedRows     rowcontainer.HashRowContainer
 
-	buckets    map[string]bucket
-	datumAlloc sqlbase.DatumAlloc
+	// Used by tests to force a storedSide.
+	forcedStoredSide *joinSide
+
+	// probingRowState is state used when hjProbingRow.
+	probingRowState struct {
+		// row is the row being probed with.
+		row sqlbase.EncDatumRow
+		// iter is an iterator over the bucket that matches row on the equality
+		// columns.
+		iter rowcontainer.RowMarkerIterator
+		// matched represents whether any row that matches row on equality columns
+		// has also passed the ON condition.
+		matched bool
+	}
+
+	// emittingUnmatchedState is used when hjEmittingUnmatched.
+	emittingUnmatchedState struct {
+		iter rowcontainer.RowIterator
+	}
+
+	// testingKnobMemFailPoint specifies a state in which the hashJoiner will
+	// fail at a random point during this phase.
+	testingKnobMemFailPoint hashJoinerState
+
+	// Context cancellation checker.
+	cancelChecker *sqlbase.CancelChecker
 }
 
-var _ processor = &hashJoiner{}
+var _ Processor = &hashJoiner{}
+var _ RowSource = &hashJoiner{}
+
+const hashJoinerProcName = "hash joiner"
 
 func newHashJoiner(
 	flowCtx *FlowCtx,
-	spec *HashJoinerSpec,
+	processorID int32,
+	spec *distsqlpb.HashJoinerSpec,
 	leftSource RowSource,
 	rightSource RowSource,
-	post *PostProcessSpec,
+	post *distsqlpb.PostProcessSpec,
 	output RowReceiver,
 ) (*hashJoiner, error) {
 	h := &hashJoiner{
 		initialBufferSize: hashJoinerInitialBufferSize,
-		buckets:           make(map[string]bucket),
-		bucketsAcc:        flowCtx.evalCtx.Mon.MakeBoundAccount(),
+		leftSource:        leftSource,
+		rightSource:       rightSource,
 	}
-	h.rows[leftSide] = makeRowContainer(nil /* ordering */, leftSource.Types(), &flowCtx.evalCtx)
-	h.rows[rightSide] = makeRowContainer(nil /* ordering */, rightSource.Types(), &flowCtx.evalCtx)
 
 	numMergedColumns := 0
 	if spec.MergedColumns {
 		numMergedColumns = len(spec.LeftEqColumns)
 	}
 	if err := h.joinerBase.init(
-		flowCtx, leftSource, rightSource, spec.Type, spec.OnExpr, spec.LeftEqColumns, spec.RightEqColumns, uint32(numMergedColumns), post, output,
+		h,
+		flowCtx,
+		processorID,
+		leftSource.OutputTypes(),
+		rightSource.OutputTypes(),
+		spec.Type,
+		spec.OnExpr,
+		spec.LeftEqColumns,
+		spec.RightEqColumns,
+		uint32(numMergedColumns),
+		post,
+		output,
+		ProcStateOpts{
+			InputsToDrain: []RowSource{h.leftSource, h.rightSource},
+			TrailingMetaCallback: func(context.Context) []ProducerMetadata {
+				h.close()
+				return nil
+			},
+		},
 	); err != nil {
 		return nil, err
+	}
+
+	st := h.flowCtx.Settings
+	ctx := h.flowCtx.EvalCtx.Ctx()
+	h.useTempStorage = settingUseTempStorageJoins.Get(&st.SV) ||
+		h.flowCtx.testingKnobs.MemoryLimitBytes > 0 ||
+		h.testingKnobMemFailPoint != hjStateUnknown
+	if h.useTempStorage {
+		// Limit the memory use by creating a child monitor with a hard limit.
+		// The hashJoiner will overflow to disk if this limit is not enough.
+		limit := h.flowCtx.testingKnobs.MemoryLimitBytes
+		if limit <= 0 {
+			limit = settingWorkMemBytes.Get(&st.SV)
+		}
+		limitedMon := mon.MakeMonitorInheritWithLimit("hashjoiner-limited", limit, flowCtx.EvalCtx.Mon)
+		limitedMon.Start(ctx, flowCtx.EvalCtx.Mon, mon.BoundAccount{})
+		h.MemMonitor = &limitedMon
+		h.diskMonitor = NewMonitor(ctx, flowCtx.diskMonitor, "hashjoiner-disk")
+		// Override initialBufferSize to be half of this processor's memory
+		// limit. We consume up to h.initialBufferSize bytes from each input
+		// stream.
+		h.initialBufferSize = limit / 2
+	} else {
+		h.MemMonitor = NewMonitor(ctx, flowCtx.EvalCtx.Mon, "hashjoiner-mem")
+	}
+
+	// If the trace is recording, instrument the hashJoiner to collect stats.
+	if sp := opentracing.SpanFromContext(ctx); sp != nil && tracing.IsRecording(sp) {
+		h.leftSource = NewInputStatCollector(h.leftSource)
+		h.rightSource = NewInputStatCollector(h.rightSource)
+		h.finishTrace = h.outputStatsToTrace
+	}
+
+	h.rows[leftSide].InitWithMon(
+		nil /* ordering */, h.leftSource.OutputTypes(), h.evalCtx, h.MemMonitor, 0, /* rowCapacity */
+	)
+	h.rows[rightSide].InitWithMon(
+		nil /* ordering */, h.rightSource.OutputTypes(), h.evalCtx, h.MemMonitor, 0, /* rowCapacity */
+	)
+
+	if h.joinType == sqlbase.IntersectAllJoin || h.joinType == sqlbase.ExceptAllJoin {
+		h.nullEquality = true
 	}
 
 	return h, nil
 }
 
-const sizeOfBoolSlice = unsafe.Sizeof([]bool{})
-const sizeOfBool = unsafe.Sizeof(true)
+// Start is part of the RowSource interface.
+func (h *hashJoiner) Start(ctx context.Context) context.Context {
+	h.leftSource.Start(ctx)
+	h.rightSource.Start(ctx)
+	ctx = h.StartInternal(ctx, hashJoinerProcName)
+	h.cancelChecker = sqlbase.NewCancelChecker(ctx)
+	h.runningState = hjBuilding
+	return ctx
+}
 
-// Run is part of the processor interface.
-func (h *hashJoiner) Run(ctx context.Context, wg *sync.WaitGroup) {
-	if wg != nil {
-		defer wg.Done()
-	}
-
-	ctx = log.WithLogTag(ctx, "HashJoiner", nil)
-	ctx, span := processorSpan(ctx, "hash joiner")
-	defer tracing.FinishSpan(span)
-
-	if log.V(2) {
-		log.Infof(ctx, "starting hash joiner run")
-		defer log.Infof(ctx, "exiting hash joiner run")
-	}
-
-	defer h.rows[leftSide].Close(ctx)
-	defer h.rows[rightSide].Close(ctx)
-	defer h.bucketsAcc.Close(ctx)
-
-	if earlyExit, err := h.bufferPhase(ctx); earlyExit || err != nil {
-		if err != nil {
-			// We got an error. We still want to drain. Any error encountered while
-			// draining will be swallowed, and the original error will be forwarded to
-			// the consumer.
-			log.Infof(ctx, "initial buffering phase error %s", err)
+// Next is part of the RowSource interface.
+func (h *hashJoiner) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+	for h.State == StateRunning {
+		var row sqlbase.EncDatumRow
+		var meta *ProducerMetadata
+		switch h.runningState {
+		case hjBuilding:
+			h.runningState, row, meta = h.build()
+		case hjConsumingStoredSide:
+			h.runningState, row, meta = h.consumeStoredSide()
+		case hjReadingProbeSide:
+			h.runningState, row, meta = h.readProbeSide()
+		case hjProbingRow:
+			h.runningState, row, meta = h.probeRow()
+		case hjEmittingUnmatched:
+			h.runningState, row, meta = h.emitUnmatched()
+		default:
+			log.Fatalf(h.Ctx, "unsupported state: %d", h.runningState)
 		}
-		DrainAndClose(ctx, h.out.output, err /* cause */, h.leftSource, h.rightSource)
-		return
+
+		if row == nil && meta == nil {
+			continue
+		}
+		if meta != nil {
+			return nil, meta
+		}
+		if outRow := h.ProcessRowHelper(row); outRow != nil {
+			return outRow, nil
+		}
+	}
+	return nil, h.DrainHelper()
+}
+
+// ConsumerClosed is part of the RowSource interface.
+func (h *hashJoiner) ConsumerClosed() {
+	h.close()
+}
+
+func (h *hashJoiner) build() (hashJoinerState, sqlbase.EncDatumRow, *ProducerMetadata) {
+	// setStoredSideTransition is a helper function that sets storedSide on the
+	// hashJoiner and performs initialization before a transition to
+	// hjConsumingStoredSide.
+	setStoredSideTransition := func(
+		side joinSide,
+	) (hashJoinerState, sqlbase.EncDatumRow, *ProducerMetadata) {
+		h.storedSide = side
+		if err := h.initStoredRows(); err != nil {
+			h.MoveToDraining(err)
+			return hjStateUnknown, nil, h.DrainHelper()
+		}
+		return hjConsumingStoredSide, nil, nil
 	}
 
-	// From this point, we are done with the source for h.storedSide.
-	srcToClose := h.leftSource
-	if h.storedSide == leftSide {
-		srcToClose = h.rightSource
+	if h.forcedStoredSide != nil {
+		return setStoredSideTransition(*h.forcedStoredSide)
 	}
 
-	if err := h.buildPhase(ctx); err != nil {
-		log.Infof(ctx, "build phase error %s", err)
-		DrainAndClose(ctx, h.out.output, err /* cause */, srcToClose)
-		return
-	}
+	for {
+		leftUsage := h.rows[leftSide].MemUsage()
+		rightUsage := h.rows[rightSide].MemUsage()
 
-	// Allocate seen slices to produce results for unmatched stored rows,
-	// for FULL OUTER AND LEFT/RIGHT OUTER (depending on which stream we store).
-	if shouldEmitUnmatchedRow(h.storedSide, h.joinType) {
-		for k, bucket := range h.buckets {
-			if err := h.bucketsAcc.Grow(
-				ctx, int64(sizeOfBoolSlice+uintptr(len(bucket.rows))*sizeOfBool),
-			); err != nil {
-				DrainAndClose(ctx, h.out.output, err, srcToClose)
-				return
+		if leftUsage >= h.initialBufferSize && rightUsage >= h.initialBufferSize {
+			// Both sides have reached the buffer size limit. Move on to storing and
+			// fully consuming the right side.
+			log.VEventf(h.Ctx, 1, "buffer phase found no short stream with buffer size %d", h.initialBufferSize)
+			return setStoredSideTransition(rightSide)
+		}
+
+		side := rightSide
+		if leftUsage < rightUsage {
+			side = leftSide
+		}
+
+		row, meta, emitDirectly, err := h.receiveNext(side)
+		if err != nil {
+			h.MoveToDraining(err)
+			return hjStateUnknown, nil, h.DrainHelper()
+		} else if meta != nil {
+			if meta.Err != nil {
+				h.MoveToDraining(nil /* err */)
+				return hjStateUnknown, nil, meta
 			}
-			bucket.seen = make([]bool, len(bucket.rows))
-			h.buckets[k] = bucket
+			return hjBuilding, nil, meta
+		} else if emitDirectly {
+			return hjBuilding, row, nil
 		}
-	}
-	log.VEventf(ctx, 1, "build phase complete")
-	if earlyExit, err := h.probePhase(ctx); earlyExit || err != nil {
-		if err != nil {
-			// We got an error. We still want to drain. Any error encountered while
-			// draining will be swallowed, and the original error will be forwarded to
-			// the consumer. Note that rightSource has already been drained at this
-			// point.
-			log.Infof(ctx, "probe phase error %s", err)
+
+		if row == nil {
+			// This side has been fully consumed, it is the shortest side.
+			// If storedSide is empty, we might be able to short-circuit.
+			if h.rows[side].Len() == 0 &&
+				(h.joinType == sqlbase.InnerJoin ||
+					(h.joinType == sqlbase.LeftOuterJoin && side == leftSide) ||
+					(h.joinType == sqlbase.RightOuterJoin && side == rightSide)) {
+				h.MoveToDraining(nil /* err */)
+				return hjStateUnknown, nil, h.DrainHelper()
+			}
+			// We could skip hjConsumingStoredSide and move straight to
+			// hjReadingProbeSide apart from the fact that hjConsumingStoredSide
+			// pre-reserves mark memory. To keep the code simple and avoid
+			// duplication, we move to hjConsumingStoredSide.
+			return setStoredSideTransition(side)
 		}
-		DrainAndClose(ctx, h.out.output, err /* cause */, srcToClose)
+
+		// Add the row to the correct container.
+		if err := h.rows[side].AddRow(h.Ctx, row); err != nil {
+			// If this error is a memory limit error, move to hjConsumingStoredSide.
+			h.storedSide = side
+			if sqlbase.IsOutOfMemoryError(err) {
+				if !h.useTempStorage {
+					err = errors.Wrap(err, "error while attempting hashJoiner disk spill: temp storage disabled")
+				} else {
+					if err := h.initStoredRows(); err != nil {
+						h.MoveToDraining(err)
+						return hjStateUnknown, nil, h.DrainHelper()
+					}
+					addErr := h.storedRows.AddRow(h.Ctx, row)
+					if addErr == nil {
+						return hjConsumingStoredSide, nil, nil
+					}
+					err = errors.Wrap(err, addErr.Error())
+				}
+			}
+			h.MoveToDraining(err)
+			return hjStateUnknown, nil, h.DrainHelper()
+		}
 	}
 }
 
-// receiveRow receives a row from either the left or right stream.
-// It takes care of forwarding any metadata, and processes any rows that have
-// NULL on an equality column - these rows will not match anything, they are
-// routed directly to the output if appropriate (depending on the type of join)
-// and then discarded.
-// If earlyExit is set, the output doesn't need more rows.
-func (h *hashJoiner) receiveRow(
-	ctx context.Context, src RowSource, side joinSide,
-) (_ sqlbase.EncDatumRow, earlyExit bool, _ error) {
+// consumeStoredSide fully consumes the stored side and adds the rows to
+// h.storedRows. It assumes that h.storedRows has been initialized through
+// h.initStoredRows().
+func (h *hashJoiner) consumeStoredSide() (hashJoinerState, sqlbase.EncDatumRow, *ProducerMetadata) {
+	side := h.storedSide
 	for {
-		row, meta := src.Next()
-		if row == nil {
-			if meta.Empty() {
-				// Done.
-				return nil, false, nil
-			}
+		row, meta, emitDirectly, err := h.receiveNext(side)
+		if err != nil {
+			h.MoveToDraining(err)
+			return hjStateUnknown, nil, h.DrainHelper()
+		} else if meta != nil {
 			if meta.Err != nil {
-				return nil, false, meta.Err
+				h.MoveToDraining(nil /* err */)
+				return hjStateUnknown, nil, meta
 			}
-			if h.out.output.Push(nil /* row */, meta) != NeedMoreRows {
-				return nil, true, nil
-			}
-			continue
+			return hjConsumingStoredSide, nil, meta
+		} else if emitDirectly {
+			return hjConsumingStoredSide, row, nil
 		}
 
-		// See if we have NULLs on equality columns.
+		if row == nil {
+			// The stored side has been fully consumed, move on to hjReadingProbeSide.
+			// If storedRows is in-memory, pre-reserve the memory needed to mark.
+			if rc, ok := h.storedRows.(*rowcontainer.HashMemRowContainer); ok {
+				// h.storedRows is hashMemRowContainer and not a disk backed one, so
+				// h.useTempStorage is false and we cannot spill to disk, so we simply
+				// will return an error if it occurs.
+				err = rc.ReserveMarkMemoryMaybe(h.Ctx)
+			} else if hdbrc, ok := h.storedRows.(*rowcontainer.HashDiskBackedRowContainer); ok {
+				err = hdbrc.ReserveMarkMemoryMaybe(h.Ctx)
+			} else {
+				panic("unexpected type of storedRows in hashJoiner")
+			}
+			if err != nil {
+				h.MoveToDraining(err)
+				return hjStateUnknown, nil, h.DrainHelper()
+			}
+			return hjReadingProbeSide, nil, nil
+		}
+
+		err = h.storedRows.AddRow(h.Ctx, row)
+		// Regardless of the underlying row container (disk backed or in-memory
+		// only), we cannot do anything about an error if it occurs.
+		if err != nil {
+			h.MoveToDraining(err)
+			return hjStateUnknown, nil, h.DrainHelper()
+		}
+	}
+}
+
+func (h *hashJoiner) readProbeSide() (hashJoinerState, sqlbase.EncDatumRow, *ProducerMetadata) {
+	side := otherSide(h.storedSide)
+
+	var row sqlbase.EncDatumRow
+	// First process the rows that were already buffered.
+	if h.rows[side].Len() > 0 {
+		row = h.rows[side].EncRow(0)
+		h.rows[side].PopFirst()
+	} else {
+		var meta *ProducerMetadata
+		var emitDirectly bool
+		var err error
+		row, meta, emitDirectly, err = h.receiveNext(side)
+		if err != nil {
+			h.MoveToDraining(err)
+			return hjStateUnknown, nil, h.DrainHelper()
+		} else if meta != nil {
+			if meta.Err != nil {
+				h.MoveToDraining(nil /* err */)
+				return hjStateUnknown, nil, meta
+			}
+			return hjReadingProbeSide, nil, meta
+		} else if emitDirectly {
+			return hjReadingProbeSide, row, nil
+		}
+
+		if row == nil {
+			// The probe side has been fully consumed. Move on to hjEmittingUnmatched
+			// if unmatched rows on the stored side need to be emitted, otherwise
+			// finish.
+			if shouldEmitUnmatchedRow(h.storedSide, h.joinType) {
+				i := h.storedRows.NewUnmarkedIterator(h.Ctx)
+				i.Rewind()
+				h.emittingUnmatchedState.iter = i
+				return hjEmittingUnmatched, nil, nil
+			}
+			h.MoveToDraining(nil /* err */)
+			return hjStateUnknown, nil, h.DrainHelper()
+		}
+	}
+
+	// Probe with this row. Get the iterator over the matching bucket ready for
+	// hjProbingRow.
+	h.probingRowState.row = row
+	h.probingRowState.matched = false
+	if h.probingRowState.iter == nil {
+		i, err := h.storedRows.NewBucketIterator(h.Ctx, row, h.eqCols[side])
+		if err != nil {
+			h.MoveToDraining(err)
+			return hjStateUnknown, nil, h.DrainHelper()
+		}
+		h.probingRowState.iter = i
+	} else {
+		if err := h.probingRowState.iter.Reset(h.Ctx, row); err != nil {
+			h.MoveToDraining(err)
+			return hjStateUnknown, nil, h.DrainHelper()
+		}
+	}
+	h.probingRowState.iter.Rewind()
+	return hjProbingRow, nil, nil
+}
+
+func (h *hashJoiner) probeRow() (hashJoinerState, sqlbase.EncDatumRow, *ProducerMetadata) {
+	i := h.probingRowState.iter
+	if ok, err := i.Valid(); err != nil {
+		h.MoveToDraining(err)
+		return hjStateUnknown, nil, h.DrainHelper()
+	} else if !ok {
+		// In this case we have reached the end of the matching bucket. Check if any
+		// rows passed the ON condition. If they did, move back to
+		// hjReadingProbeSide to get the next probe row.
+		if h.probingRowState.matched {
+			return hjReadingProbeSide, nil, nil
+		}
+		// If not, this probe row is unmatched. Check if it needs to be emitted.
+		if renderedRow, shouldEmit := h.shouldEmitUnmatched(
+			h.probingRowState.row, otherSide(h.storedSide),
+		); shouldEmit {
+			return hjReadingProbeSide, renderedRow, nil
+		}
+		return hjReadingProbeSide, nil, nil
+	}
+
+	if err := h.cancelChecker.Check(); err != nil {
+		h.MoveToDraining(err)
+		return hjStateUnknown, nil, h.DrainHelper()
+	}
+
+	row := h.probingRowState.row
+	otherRow, err := i.Row()
+	if err != nil {
+		h.MoveToDraining(err)
+		return hjStateUnknown, nil, h.DrainHelper()
+	}
+	defer i.Next()
+
+	var renderedRow sqlbase.EncDatumRow
+	if h.storedSide == rightSide {
+		renderedRow, err = h.render(row, otherRow)
+	} else {
+		renderedRow, err = h.render(otherRow, row)
+	}
+	if err != nil {
+		h.MoveToDraining(err)
+		return hjStateUnknown, nil, h.DrainHelper()
+	}
+
+	// If the ON condition failed, renderedRow is nil.
+	if renderedRow == nil {
+		return hjProbingRow, nil, nil
+	}
+
+	h.probingRowState.matched = true
+	shouldEmit := h.joinType != sqlbase.LeftAntiJoin && h.joinType != sqlbase.ExceptAllJoin
+	if shouldMark(h.storedSide, h.joinType) {
+		// Matched rows are marked on the stored side for 2 reasons.
+		// 1: For outer joins, anti joins, and EXCEPT ALL to iterate through
+		// the unmarked rows.
+		// 2: For semi-joins and INTERSECT ALL where the left-side is stored,
+		// multiple rows from the right may match to the same row on the left.
+		// The rows on the left should only be emitted the first time
+		// a right row matches it, then marked to not be emitted again.
+		// (Note: an alternative is to remove the entry from the stored
+		// side, but our containers do not support that today).
+		// TODO(peter): figure out a way to reduce this special casing below.
+		if i.IsMarked(h.Ctx) {
+			switch h.joinType {
+			case sqlbase.LeftSemiJoin:
+				shouldEmit = false
+			case sqlbase.IntersectAllJoin:
+				shouldEmit = false
+			case sqlbase.ExceptAllJoin:
+				// We want to mark a stored row if possible, so move on to the next
+				// match. Reset h.probingRowState.matched in case we don't find any more
+				// matches and want to emit this row.
+				h.probingRowState.matched = false
+				return hjProbingRow, nil, nil
+			}
+		} else if err := i.Mark(h.Ctx, true); err != nil {
+			h.MoveToDraining(err)
+			return hjStateUnknown, nil, h.DrainHelper()
+		}
+	}
+	nextState := hjProbingRow
+	if shouldShortCircuit(h.storedSide, h.joinType) {
+		nextState = hjReadingProbeSide
+	}
+	if shouldEmit {
+		if h.joinType == sqlbase.IntersectAllJoin {
+			// We found a match, so we are done with this row.
+			return hjReadingProbeSide, renderedRow, nil
+		}
+		return nextState, renderedRow, nil
+	}
+
+	return nextState, nil, nil
+}
+
+func (h *hashJoiner) emitUnmatched() (hashJoinerState, sqlbase.EncDatumRow, *ProducerMetadata) {
+	i := h.emittingUnmatchedState.iter
+	if ok, err := i.Valid(); err != nil {
+		h.MoveToDraining(err)
+		return hjStateUnknown, nil, h.DrainHelper()
+	} else if !ok {
+		// Done.
+		h.MoveToDraining(nil /* err */)
+		return hjStateUnknown, nil, h.DrainHelper()
+	}
+
+	if err := h.cancelChecker.Check(); err != nil {
+		h.MoveToDraining(err)
+		return hjStateUnknown, nil, h.DrainHelper()
+	}
+
+	row, err := i.Row()
+	if err != nil {
+		h.MoveToDraining(err)
+		return hjStateUnknown, nil, h.DrainHelper()
+	}
+	defer i.Next()
+
+	return hjEmittingUnmatched, h.renderUnmatchedRow(row, h.storedSide), nil
+}
+
+func (h *hashJoiner) close() {
+	if h.InternalClose() {
+		// We need to close only memRowContainer of the probe side because the
+		// stored side container will be closed by closing h.storedRows.
+		if h.storedSide == rightSide {
+			h.rows[leftSide].Close(h.Ctx)
+		} else {
+			h.rows[rightSide].Close(h.Ctx)
+		}
+		if h.storedRows != nil {
+			h.storedRows.Close(h.Ctx)
+		} else {
+			// h.storedRows has not been initialized, so we need to close the stored
+			// side container explicitly.
+			h.rows[h.storedSide].Close(h.Ctx)
+		}
+		if h.probingRowState.iter != nil {
+			h.probingRowState.iter.Close()
+		}
+		if h.emittingUnmatchedState.iter != nil {
+			h.emittingUnmatchedState.iter.Close()
+		}
+		h.MemMonitor.Stop(h.Ctx)
+		if h.diskMonitor != nil {
+			h.diskMonitor.Stop(h.Ctx)
+		}
+	}
+}
+
+// receiveNext reads from the source specified by side and returns the next row
+// or metadata to be processed by the hashJoiner. Unless h.nullEquality is true,
+// rows with NULLs in their equality columns are only returned if the joinType
+// specifies that unmatched rows should be returned for the given side. In this
+// case, a rendered row and true is returned, notifying the caller that the
+// returned row may be emitted directly.
+func (h *hashJoiner) receiveNext(
+	side joinSide,
+) (sqlbase.EncDatumRow, *ProducerMetadata, bool, error) {
+	source := h.leftSource
+	if side == rightSide {
+		source = h.rightSource
+	}
+	for {
+		if err := h.cancelChecker.Check(); err != nil {
+			return nil, nil, false, err
+		}
+		row, meta := source.Next()
+		if meta != nil {
+			return nil, meta, false, nil
+		} else if row == nil {
+			return nil, nil, false, nil
+		}
+		// We make the explicit check for whether or not the row contained a NULL value
+		// on an equality column. The reasoning here is because of the way we expect
+		// NULL equality checks to behave (i.e. NULL != NULL) and the fact that we
+		// use the encoding of any given row as key into our bucket. Thus if we
+		// encountered a NULL row when building the hashmap we have to store in
+		// order to use it for RIGHT OUTER joins but if we encounter another
+		// NULL row when going through the left stream (probing phase), matching
+		// this with the first NULL row would be incorrect.
+		//
+		// If we have have the following:
+		// CREATE TABLE t(x INT); INSERT INTO t(x) VALUES (NULL);
+		//    |  x   |
+		//     ------
+		//    | NULL |
+		//
+		// For the following query:
+		// SELECT * FROM t AS a FULL OUTER JOIN t AS b USING(x);
+		//
+		// We expect:
+		//    |  x   |
+		//     ------
+		//    | NULL |
+		//    | NULL |
+		//
+		// The following examples illustrates the behavior when joining on two
+		// or more columns, and only one of them contains NULL.
+		// If we have have the following:
+		// CREATE TABLE t(x INT, y INT);
+		// INSERT INTO t(x, y) VALUES (44,51), (NULL,52);
+		//    |  x   |  y   |
+		//     ------
+		//    |  44  |  51  |
+		//    | NULL |  52  |
+		//
+		// For the following query:
+		// SELECT * FROM t AS a FULL OUTER JOIN t AS b USING(x, y);
+		//
+		// We expect:
+		//    |  x   |  y   |
+		//     ------
+		//    |  44  |  51  |
+		//    | NULL |  52  |
+		//    | NULL |  52  |
 		hasNull := false
 		for _, c := range h.eqCols[side] {
 			if row[c].IsNull() {
@@ -226,251 +692,141 @@ func (h *hashJoiner) receiveRow(
 				break
 			}
 		}
-		if !hasNull {
-			// Normal path.
-			return row, false, nil
+		// row has no NULLs in its equality columns (or we are considering NULLs to
+		// be equal), so it might match a row from the other side.
+		if !hasNull || h.nullEquality {
+			return row, nil, false, nil
 		}
 
-		if !h.maybeEmitUnmatchedRow(ctx, row, side) {
-			return nil, true, nil
+		if renderedRow, shouldEmit := h.shouldEmitUnmatched(row, side); shouldEmit {
+			return renderedRow, nil, true, nil
 		}
+
+		// If this point is reached, row had NULLs in its equality columns but
+		// should not be emitted. Throw it away and get the next row.
 	}
 }
 
-// bufferPhase is an initial phase where we read a portion of both streams,
-// in the hope that one of them is small.
-//
-// Rows that contain NULLs on equality columns go straight to the output if it's
-// an outer join; otherwise they are discarded.
-//
-// A successful initial buffering phase sets h.storedSide.
-//
-// If earlyExit is set, the output doesn't need more rows.
-func (h *hashJoiner) bufferPhase(ctx context.Context) (earlyExit bool, _ error) {
-	srcs := [2]RowSource{h.leftSource, h.rightSource}
-	for {
-		leftUsage := h.rows[leftSide].MemUsage()
-		rightUsage := h.rows[rightSide].MemUsage()
-		if leftUsage >= h.initialBufferSize && rightUsage >= h.initialBufferSize {
-			break
-		}
-		side := rightSide
-		if leftUsage < rightUsage {
-			side = leftSide
-		}
-
-		row, earlyExit, err := h.receiveRow(ctx, srcs[side], side)
-		if row == nil {
-			if err != nil {
-				return false, err
-			}
-			if earlyExit {
-				return true, nil
-			}
-
-			// This stream is done, great! We will build the hashtable using this
-			// stream.
-			h.storedSide = side
-			return false, nil
-		}
-		// Add the row to the correct container.
-		if err := h.rows[side].AddRow(ctx, row); err != nil {
-			return false, err
-		}
+// shouldEmitUnmatched returns whether this row should be emitted if it doesn't
+// match. If this is the case, a rendered row ready for emitting is returned as
+// well.
+func (h *hashJoiner) shouldEmitUnmatched(
+	row sqlbase.EncDatumRow, side joinSide,
+) (sqlbase.EncDatumRow, bool) {
+	if !shouldEmitUnmatchedRow(side, h.joinType) {
+		return nil, false
 	}
-
-	// We did not find a short stream. Stop reading for both streams, just
-	// choose the right stream and consume it.
-	h.storedSide = rightSide
-
-	for {
-		row, earlyExit, err := h.receiveRow(ctx, h.rightSource, rightSide)
-		if row == nil {
-			if err != nil {
-				return false, err
-			}
-			return earlyExit, nil
-		}
-		if err := h.rows[rightSide].AddRow(ctx, row); err != nil {
-			return false, err
-		}
-	}
+	return h.renderUnmatchedRow(row, side), true
 }
 
-// buildPhase constructs our internal hash map of rows seen. This is done
-// entirely from one stream (chosen during initial buffering) with the
-// encoding/group key generated using the equality columns. If a row is found to
-// have a NULL in an equality column (and thus will not match anything), it
-// might be routed directly to the output (for outer joins). In such cases it is
-// possible that the buildPhase will fully satisfy the consumer.
-func (h *hashJoiner) buildPhase(ctx context.Context) error {
-	storedRows := &h.rows[h.storedSide]
-
-	for rowIdx := 0; rowIdx < storedRows.Len(); rowIdx++ {
-		row := storedRows.EncRow(rowIdx)
-
-		encoded, hasNull, err := encodeColumnsOfRow(
-			&h.datumAlloc, h.scratch, row, h.eqCols[h.storedSide], false, /* encodeNull */
+// initStoredRows initializes a hashRowContainer and sets h.storedRows.
+func (h *hashJoiner) initStoredRows() error {
+	if h.useTempStorage {
+		hrc := rowcontainer.MakeHashDiskBackedRowContainer(
+			&h.rows[h.storedSide],
+			h.evalCtx,
+			h.MemMonitor,
+			h.diskMonitor,
+			h.flowCtx.TempStorage,
 		)
-		if err != nil {
-			return err
-		}
-
-		h.scratch = encoded[:0]
-
-		if hasNull {
-			panic("NULLs not detected during receive")
-		}
-
-		b, bucketExists := h.buckets[string(encoded)]
-
-		// Acount for the memory usage of rowIdx, map key, and bucket.
-		usage := sizeOfRowIdx
-		if !bucketExists {
-			usage += int64(len(encoded))
-			usage += sizeOfBucket
-		}
-
-		if err := h.bucketsAcc.Grow(ctx, usage); err != nil {
-			return err
-		}
-
-		b.rows = append(b.rows, rowIdx)
-		h.buckets[string(encoded)] = b
+		h.storedRows = &hrc
+	} else {
+		hrc := rowcontainer.MakeHashMemRowContainer(&h.rows[h.storedSide])
+		h.storedRows = &hrc
 	}
-	return nil
-}
-
-func (h *hashJoiner) probeRow(
-	ctx context.Context, row sqlbase.EncDatumRow,
-) (earlyExit bool, _ error) {
-	side := otherSide(h.storedSide)
-	encoded, hasNull, err := encodeColumnsOfRow(
-		&h.datumAlloc, h.scratch, row, h.eqCols[side], false, /* encodeNull */
+	return h.storedRows.Init(
+		h.Ctx,
+		shouldMark(h.storedSide, h.joinType),
+		h.rows[h.storedSide].Types(),
+		h.eqCols[h.storedSide],
+		h.nullEquality,
 	)
-	if err != nil {
-		return false, err
-	}
-	h.scratch = encoded[:0]
-
-	if hasNull {
-		panic("NULLs not detected during receive")
-	}
-
-	matched := false
-	if b, ok := h.buckets[string(encoded)]; ok {
-		for i, otherRowIdx := range b.rows {
-			otherRow := h.rows[h.storedSide].EncRow(otherRowIdx)
-
-			var renderedRow sqlbase.EncDatumRow
-			var err error
-			if h.storedSide == rightSide {
-				renderedRow, err = h.render(row, otherRow)
-			} else {
-				renderedRow, err = h.render(otherRow, row)
-			}
-
-			if err != nil {
-				return false, err
-			}
-			// If the ON condition failed, renderedRow is nil.
-			if renderedRow != nil {
-				matched = true
-				if b.seen != nil {
-					// Mark the right row as matched (for right/full outer join).
-					b.seen[i] = true
-				}
-				consumerStatus, err := h.out.emitRow(ctx, renderedRow)
-				if err != nil || consumerStatus != NeedMoreRows {
-					return true, nil
-				}
-			}
-		}
-	}
-
-	if !matched && !h.maybeEmitUnmatchedRow(ctx, row, otherSide(h.storedSide)) {
-		return true, nil
-	}
-	return false, nil
 }
 
-// probePhase uses our constructed hash map of rows seen from the right stream,
-// we probe the map for each row retrieved from the left stream outputting the
-// merging of the two rows if matched. Behaviour for outer joins is as expected,
-// i.e. for RIGHT OUTER joins if no corresponding left row is seen an empty
-// DNull row is emitted instead.
-//
-// In error or earlyExit cases it is the caller's responsibility to drain the
-// input stream and close the output stream.
-func (h *hashJoiner) probePhase(ctx context.Context) (earlyExit bool, _ error) {
-	side := otherSide(h.storedSide)
+var _ distsqlpb.DistSQLSpanStats = &HashJoinerStats{}
 
-	src := h.leftSource
-	if side == rightSide {
-		src = h.rightSource
-	}
-	bufferedRows := &h.rows[side]
-	// First process the rows that were already buffered.
-	for i := 0; i < bufferedRows.Len(); i++ {
-		row := bufferedRows.EncRow(i)
-		earlyExit, err := h.probeRow(ctx, row)
-		if earlyExit || err != nil {
-			return earlyExit, err
-		}
-	}
-	bufferedRows.Clear(ctx)
+const hashJoinerTagPrefix = "hashjoiner."
 
-	for {
-		row, earlyExit, err := h.receiveRow(ctx, src, side)
-		if row == nil {
-			if earlyExit || err != nil {
-				return earlyExit, err
-			}
-			break
-		}
-		if earlyExit, err := h.probeRow(ctx, row); earlyExit || err != nil {
-			return earlyExit, err
-		}
+// Stats implements the SpanStats interface.
+func (hjs *HashJoinerStats) Stats() map[string]string {
+	// statsMap starts off as the left input stats map.
+	statsMap := hjs.LeftInputStats.Stats(hashJoinerTagPrefix + "left.")
+	rightInputStatsMap := hjs.RightInputStats.Stats(hashJoinerTagPrefix + "right.")
+	// Merge the two input maps.
+	for k, v := range rightInputStatsMap {
+		statsMap[k] = v
 	}
-
-	if shouldEmitUnmatchedRow(h.storedSide, h.joinType) {
-		// Produce results for unmatched rows, for FULL OUTER AND LEFT/RIGHT OUTER
-		// (depending on which stream we use).
-		storedRows := &h.rows[h.storedSide]
-		for _, b := range h.buckets {
-			for i, seen := range b.seen {
-				if !seen && !h.maybeEmitUnmatchedRow(ctx, storedRows.EncRow(b.rows[i]), h.storedSide) {
-					return true, nil
-				}
-			}
-		}
-	}
-
-	sendTraceData(ctx, h.out.output)
-	h.out.close()
-	return false, nil
+	statsMap[hashJoinerTagPrefix+"stored_side"] = hjs.StoredSide
+	statsMap[hashJoinerTagPrefix+maxMemoryTagSuffix] = humanizeutil.IBytes(hjs.MaxAllocatedMem)
+	statsMap[hashJoinerTagPrefix+maxDiskTagSuffix] = humanizeutil.IBytes(hjs.MaxAllocatedDisk)
+	return statsMap
 }
 
-// encodeColumnsOfRow returns the encoding for the grouping columns. This is
-// then used as our group key to determine which bucket to add to.
-// If the row contains any NULLs and encodeNull is false, hasNull is true and
-// no encoding is returned. If encodeNull is true, hasNull is never set.
-func encodeColumnsOfRow(
-	da *sqlbase.DatumAlloc, appendTo []byte, row sqlbase.EncDatumRow, cols columns, encodeNull bool,
-) (encoding []byte, hasNull bool, err error) {
-	for _, colIdx := range cols {
-		if row[colIdx].IsNull() && !encodeNull {
-			return nil, true, nil
-		}
-		// Note: we cannot compare VALUE encodings because they contain column IDs
-		// which can vary.
-		// TODO(radu): we should figure out what encoding is readily available and
-		// use that (though it needs to be consistent across all rows). We could add
-		// functionality to compare VALUE encodings ignoring the column ID.
-		appendTo, err = row[colIdx].Encode(da, sqlbase.DatumEncoding_ASCENDING_KEY, appendTo)
-		if err != nil {
-			return appendTo, false, err
-		}
+// StatsForQueryPlan implements the DistSQLSpanStats interface.
+func (hjs *HashJoinerStats) StatsForQueryPlan() []string {
+	leftInputStats := hjs.LeftInputStats.StatsForQueryPlan("left ")
+	leftInputStats = append(leftInputStats, hjs.RightInputStats.StatsForQueryPlan("right ")...)
+	return append(
+		leftInputStats,
+		fmt.Sprintf("stored side: %s", hjs.StoredSide),
+		fmt.Sprintf("%s: %s", maxMemoryQueryPlanSuffix, humanizeutil.IBytes(hjs.MaxAllocatedMem)),
+		fmt.Sprintf("%s: %s", maxDiskQueryPlanSuffix, humanizeutil.IBytes(hjs.MaxAllocatedDisk)),
+	)
+}
+
+// outputStatsToTrace outputs the collected hashJoiner stats to the trace. Will
+// fail silently if the hashJoiner is not collecting stats.
+func (h *hashJoiner) outputStatsToTrace() {
+	lis, ok := getInputStats(h.flowCtx, h.leftSource)
+	if !ok {
+		return
 	}
-	return appendTo, false, nil
+	ris, ok := getInputStats(h.flowCtx, h.rightSource)
+	if !ok {
+		return
+	}
+	if sp := opentracing.SpanFromContext(h.Ctx); sp != nil {
+		tracing.SetSpanStats(
+			sp,
+			&HashJoinerStats{
+				LeftInputStats:   lis,
+				RightInputStats:  ris,
+				StoredSide:       h.storedSide.String(),
+				MaxAllocatedMem:  h.MemMonitor.MaximumBytes(),
+				MaxAllocatedDisk: h.diskMonitor.MaximumBytes(),
+			},
+		)
+	}
+}
+
+// Some types of joins need to mark rows that matched.
+func shouldMark(storedSide joinSide, joinType sqlbase.JoinType) bool {
+	switch {
+	case joinType == sqlbase.LeftSemiJoin && storedSide == leftSide:
+		return true
+	case joinType == sqlbase.LeftAntiJoin && storedSide == leftSide:
+		return true
+	case joinType == sqlbase.ExceptAllJoin:
+		return true
+	case joinType == sqlbase.IntersectAllJoin:
+		return true
+	case shouldEmitUnmatchedRow(storedSide, joinType):
+		return true
+	default:
+		return false
+	}
+}
+
+// Some types of joins only need to know of the existence of a matching row in
+// the storedSide, depending on the storedSide, and don't need to know all the
+// rows. These can 'short circuit' to avoid iterating through them all.
+func shouldShortCircuit(storedSide joinSide, joinType sqlbase.JoinType) bool {
+	switch joinType {
+	case sqlbase.LeftSemiJoin:
+		return storedSide == rightSide
+	case sqlbase.ExceptAllJoin:
+		return true
+	default:
+		return false
+	}
 }

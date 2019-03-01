@@ -11,23 +11,25 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Kenji Kaneda (kenji.kaneda@gmail.com)
 
 package storage_test
 
 import (
+	"context"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/pkg/errors"
 )
 
 // TestReplicaGCQueueDropReplica verifies that a removed replica is
@@ -38,6 +40,24 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 	const numStores = 3
 	rangeID := roachpb.RangeID(1)
 
+	// Use actual engines (not in memory) because the in-mem ones don't write
+	// to disk. The test would still pass if we didn't do this except it
+	// would probably look at an empty sideloaded directory and fail.
+	tempDir, cleanup := testutils.TempDir(t)
+	defer cleanup()
+	cache := engine.NewRocksDBCache(1 << 20)
+	defer cache.Release()
+	for i := 0; i < 3; i++ {
+		eng, err := engine.NewRocksDB(engine.RocksDBConfig{
+			Dir: filepath.Join(tempDir, strconv.Itoa(i)),
+		}, cache)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer eng.Close()
+		mtc.engines = append(mtc.engines, eng)
+	}
+
 	// In this test, the Replica on the second Node is removed, and the test
 	// verifies that that Node adds this Replica to its RangeGCQueue. However,
 	// the queue does a consistent lookup which will usually be read from
@@ -47,7 +67,7 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 	// waits for the first.
 	cfg := storage.TestStoreConfig(nil)
 	mtc.storeConfig = &cfg
-	mtc.storeConfig.TestingKnobs.TestingEvalFilter =
+	mtc.storeConfig.TestingKnobs.EvalKnobs.TestingEvalFilter =
 		func(filterArgs storagebase.FilterArgs) *roachpb.Error {
 			et, ok := filterArgs.Req.(*roachpb.EndTransactionRequest)
 			if !ok || filterArgs.Sid != 2 {
@@ -80,21 +100,32 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Put some bogus data on the replica which we're about to remove. Then,
-		// at the end of the test, check that that sideloaded storage is now
-		// empty (in other words, GC'ing the Replica took care of cleanup).
-		repl1.PutBogusSideloadedData()
-		if !repl1.HasBogusSideloadedData() {
-			t.Fatal("sideloaded storage ate our data")
+
+		// Put some bogus sideloaded data on the replica which we're about to
+		// remove. Then, at the end of the test, check that that sideloaded
+		// storage is now empty (in other words, GC'ing the Replica took care of
+		// cleanup).
+		dir := repl1.SideloadedDir()
+		if dir == "" {
+			t.Fatal("no sideloaded directory")
+		}
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := ioutil.WriteFile(filepath.Join(dir, "i1000000.t100000"), []byte("foo"), 0644); err != nil {
+			t.Fatal(err)
 		}
 
 		defer func() {
 			if !t.Failed() {
 				testutils.SucceedsSoon(t, func() error {
-					if repl1.HasBogusSideloadedData() {
-						return errors.Errorf("first replica still has sideloaded files despite GC")
+					// Verify that the whole directory for the replica is gone.
+					dir := repl1.SideloadedDir()
+					_, err := os.Stat(dir)
+					if os.IsNotExist(err) {
+						return nil
 					}
-					return nil
+					return errors.Errorf("replica still has sideloaded files despite GC: %v", err)
 				})
 			}
 		}()
@@ -143,7 +174,7 @@ func TestReplicaGCQueueDropReplicaGCOnScan(t *testing.T) {
 	// Make sure the range is removed from the store.
 	testutils.SucceedsSoon(t, func() error {
 		store := mtc.stores[1]
-		store.ForceReplicaGCScanAndProcess()
+		store.MustForceReplicaGCScanAndProcess()
 		if _, err := store.GetReplica(rangeID); !testutils.IsError(err, "r[0-9]+ was not found") {
 			return errors.Errorf("expected range removal: %v", err) // NB: errors.Wrapf(nil, ...) returns nil.
 		}

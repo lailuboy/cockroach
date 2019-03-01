@@ -14,26 +14,31 @@
 
 package settings
 
-import (
-	"sync/atomic"
-
-	"github.com/pkg/errors"
-)
+import "github.com/pkg/errors"
 
 // StringSetting is the interface of a setting variable that will be
 // updated automatically when the corresponding cluster-wide setting
 // of type "string" is updated.
 type StringSetting struct {
 	defaultValue string
-	v            atomic.Value
-	validateFn   func(string) error
+	validateFn   func(*Values, string) error
 	common
 }
 
 var _ Setting = &StringSetting{}
 
-func (s *StringSetting) String() string {
-	return s.Get()
+func (s *StringSetting) String(sv *Values) string {
+	return s.Get(sv)
+}
+
+// Encoded returns the encoded value of the current value of the setting.
+func (s *StringSetting) Encoded(sv *Values) string {
+	return s.String(sv)
+}
+
+// EncodedDefault returns the encoded value of the default value of the setting.
+func (s *StringSetting) EncodedDefault() string {
+	return s.defaultValue
 }
 
 // Typ returns the short (1 char) string denoting the type of setting.
@@ -42,8 +47,8 @@ func (*StringSetting) Typ() string {
 }
 
 // Get retrieves the string value in the setting.
-func (s *StringSetting) Get() string {
-	loaded := s.v.Load()
+func (s *StringSetting) Get(sv *Values) string {
+	loaded := sv.getGeneric(s.slotIdx)
 	if loaded == nil {
 		return ""
 	}
@@ -51,29 +56,27 @@ func (s *StringSetting) Get() string {
 }
 
 // Validate that a value conforms with the validation function.
-func (s *StringSetting) Validate(v string) error {
+func (s *StringSetting) Validate(sv *Values, v string) error {
 	if s.validateFn != nil {
-		if err := s.validateFn(v); err != nil {
+		if err := s.validateFn(sv, v); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *StringSetting) set(v string) error {
-	if err := s.Validate(v); err != nil {
+func (s *StringSetting) set(sv *Values, v string) error {
+	if err := s.Validate(sv, v); err != nil {
 		return err
 	}
-	if s.Get() == v {
-		return nil
+	if s.Get(sv) != v {
+		sv.setGeneric(s.slotIdx, v)
 	}
-	s.v.Store(v)
-	s.changed()
 	return nil
 }
 
-func (s *StringSetting) setToDefault() {
-	if err := s.set(s.defaultValue); err != nil {
+func (s *StringSetting) setToDefault(sv *Values) {
+	if err := s.set(sv, s.defaultValue); err != nil {
 		panic(err)
 	}
 }
@@ -86,10 +89,10 @@ func RegisterStringSetting(key, desc string, defaultValue string) *StringSetting
 // RegisterValidatedStringSetting defines a new setting with type string with a
 // validation function.
 func RegisterValidatedStringSetting(
-	key, desc string, defaultValue string, validateFn func(string) error,
+	key, desc string, defaultValue string, validateFn func(*Values, string) error,
 ) *StringSetting {
 	if validateFn != nil {
-		if err := validateFn(defaultValue); err != nil {
+		if err := validateFn(nil, defaultValue); err != nil {
 			panic(errors.Wrap(err, "invalid default"))
 		}
 	}
@@ -99,25 +102,4 @@ func RegisterValidatedStringSetting(
 	}
 	register(key, desc, setting)
 	return setting
-}
-
-// TestingSetString returns a mock, unregistered string setting for testing. See
-// TestingSetBool for more details.
-func TestingSetString(s **StringSetting, v string) func() {
-	saved := *s
-	tmp := &StringSetting{}
-	if err := tmp.set(v); err != nil {
-		panic(err)
-	}
-	*s = tmp
-	return func() {
-		*s = saved
-	}
-}
-
-// OnChange registers a callback to be called when the setting changes.
-// This overrides the `common`` impl to return the concrete impl type.
-func (s *StringSetting) OnChange(fn func()) *StringSetting {
-	s.setOnChange(fn)
-	return s
 }

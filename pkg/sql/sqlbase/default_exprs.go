@@ -16,14 +16,19 @@ package sqlbase
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 // MakeDefaultExprs returns a slice of the default expressions for the slice
 // of input column descriptors, or nil if none of the input column descriptors
 // have default expressions.
+// The length of the result slice matches the length of the input column descriptors.
+// For every column that has no default expression, a NULL expression is reported
+// as default.
 func MakeDefaultExprs(
-	cols []ColumnDescriptor, parse *parser.Parser, evalCtx *parser.EvalContext,
-) ([]parser.TypedExpr, error) {
+	cols []ColumnDescriptor, txCtx *transform.ExprTransformContext, evalCtx *tree.EvalContext,
+) ([]tree.TypedExpr, error) {
 	// Check to see if any of the columns have DEFAULT expressions. If there
 	// are no DEFAULT expressions, we don't bother with constructing the
 	// defaults map as the defaults are all NULL.
@@ -39,7 +44,7 @@ func MakeDefaultExprs(
 	}
 
 	// Build the default expressions map from the parsed SELECT statement.
-	defaultExprs := make([]parser.TypedExpr, 0, len(cols))
+	defaultExprs := make([]tree.TypedExpr, 0, len(cols))
 	exprStrings := make([]string, 0, len(cols))
 	for _, col := range cols {
 		if col.DefaultExpr != nil {
@@ -54,15 +59,15 @@ func MakeDefaultExprs(
 	defExprIdx := 0
 	for _, col := range cols {
 		if col.DefaultExpr == nil {
-			defaultExprs = append(defaultExprs, parser.DNull)
+			defaultExprs = append(defaultExprs, tree.DNull)
 			continue
 		}
 		expr := exprs[defExprIdx]
-		typedExpr, err := parser.TypeCheck(expr, nil, col.Type.ToDatumType())
+		typedExpr, err := tree.TypeCheck(expr, nil, col.Type.ToDatumType())
 		if err != nil {
 			return nil, err
 		}
-		if typedExpr, err = parse.NormalizeExpr(evalCtx, typedExpr); err != nil {
+		if typedExpr, err = txCtx.NormalizeExpr(evalCtx, typedExpr); err != nil {
 			return nil, err
 		}
 		defaultExprs = append(defaultExprs, typedExpr)
@@ -75,38 +80,34 @@ func MakeDefaultExprs(
 // and returns the defaultExprs for cols.
 func ProcessDefaultColumns(
 	cols []ColumnDescriptor,
-	tableDesc *TableDescriptor,
-	parse *parser.Parser,
-	evalCtx *parser.EvalContext,
-) ([]ColumnDescriptor, []parser.TypedExpr, error) {
+	tableDesc *ImmutableTableDescriptor,
+	txCtx *transform.ExprTransformContext,
+	evalCtx *tree.EvalContext,
+) ([]ColumnDescriptor, []tree.TypedExpr, error) {
+	cols = processColumnSet(cols, tableDesc, func(col ColumnDescriptor) bool {
+		return col.DefaultExpr != nil
+	})
+	defaultExprs, err := MakeDefaultExprs(cols, txCtx, evalCtx)
+	return cols, defaultExprs, err
+}
+
+func processColumnSet(
+	cols []ColumnDescriptor, tableDesc *ImmutableTableDescriptor, inSet func(ColumnDescriptor) bool,
+) []ColumnDescriptor {
 	colIDSet := make(map[ColumnID]struct{}, len(cols))
 	for _, col := range cols {
 		colIDSet[col.ID] = struct{}{}
 	}
 
-	// Add the column if it has a DEFAULT expression.
-	addIfDefault := func(col ColumnDescriptor) {
-		if col.DefaultExpr != nil {
+	// Add all public or columns in DELETE_AND_WRITE_ONLY state
+	// that satisfy the condition.
+	for _, col := range tableDesc.WritableColumns() {
+		if inSet(col) {
 			if _, ok := colIDSet[col.ID]; !ok {
 				colIDSet[col.ID] = struct{}{}
 				cols = append(cols, col)
 			}
 		}
 	}
-
-	// Add any column that has a DEFAULT expression.
-	for _, col := range tableDesc.Columns {
-		addIfDefault(col)
-	}
-	// Also add any column in a mutation that is DELETE_AND_WRITE_ONLY and has
-	// a DEFAULT expression.
-	for _, m := range tableDesc.Mutations {
-		if col := m.GetColumn(); col != nil &&
-			m.State == DescriptorMutation_DELETE_AND_WRITE_ONLY {
-			addIfDefault(*col)
-		}
-	}
-
-	defaultExprs, err := MakeDefaultExprs(cols, parse, evalCtx)
-	return cols, defaultExprs, err
+	return cols
 }

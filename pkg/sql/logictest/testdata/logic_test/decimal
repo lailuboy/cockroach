@@ -1,4 +1,4 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata fakedist-disk
 
 # The following tests have results equivalent to Postgres (differences
 # in string representation and number of decimals returned, but otherwise
@@ -67,14 +67,15 @@ statement ok
 CREATE TABLE t (d decimal, v decimal(3, 1))
 
 statement ok
-INSERT INTO t VALUES (1.00::decimal, 1.00::decimal), (2.0::decimal, 2.0::decimal), (3::decimal, 3::decimal)
+INSERT INTO t VALUES (0.000::decimal, 0.00::decimal), (1.00::decimal, 1.00::decimal), (2.0::decimal, 2.0::decimal), (3::decimal, 3::decimal)
 
 query RR
 SELECT * FROM t ORDER BY d
 ----
-1.00 1.0
-2.0  2.0
-3    3.0
+0.000  0.0
+1.00   1.0
+2.0    2.0
+3      3.0
 
 # Ensure trailing zeros are kept in an index.
 
@@ -96,7 +97,7 @@ SELECT * FROM t2 ORDER BY d
 ----
 NaN        NaN
 -Infinity  -Infinity
--0.0000    -0.0
+0.0000     0.0
 1.00       1.0
 2.0        2.0
 3          3.0
@@ -117,10 +118,25 @@ SELECT 'NaN'::decimal, '-NaN'::decimal, 'sNaN'::decimal, '-sNaN'::decimal
 ----
 NaN NaN NaN NaN
 
+query RR
+SELECT * FROM t2 WHERE d IS NaN and v IS NaN
+----
+NaN NaN
+
+query RR
+SELECT * FROM t2 WHERE d = 'Infinity' and v = 'Infinity'
+----
+Infinity Infinity
+
+query RR
+SELECT * FROM t2 WHERE d = '-Infinity' and v = '-Infinity'
+----
+-Infinity -Infinity
+
 # Ensure special values are handled correctly.
 
 statement ok
-CREATE TABLE s (d decimal null)
+CREATE TABLE s (d decimal null, index (d))
 
 statement ok
 INSERT INTO s VALUES
@@ -132,30 +148,6 @@ INSERT INTO s VALUES
   ('0'::decimal),
   (1),
   (-1)
-
-query R
-SELECT * FROM s ORDER BY d
-----
-NULL
-NaN
-NaN
--Infinity
--1
-0
-1
-Infinity
-
-query R
-SELECT * FROM s ORDER BY d DESC
-----
-Infinity
-1
-0
--1
--Infinity
-NaN
-NaN
-NULL
 
 statement ok
 INSERT INTO s VALUES
@@ -169,11 +161,11 @@ query R rowsort
 SELECT * FROM s WHERE d = 0
 ----
 0
--0
--0.0
--0.00
--0.000
--0.0000
+0
+0.0
+0.00
+0.000
+0.0000
 
 query R
 SELECT * FROM s WHERE d IS NAN
@@ -186,6 +178,97 @@ SELECT * FROM s WHERE d = 'inf'::decimal
 ----
 Infinity
 
+query R
+SELECT * FROM s WHERE d = 'NaN'
+----
+NaN
+NaN
+
+# In the following tests, the various zero values all compare equal to
+# each other so we must use two ORDER BY clauses to obtain a stable result.
+
+# Check the ordering of decimal values.
+query R
+SELECT d FROM s ORDER BY d, d::TEXT
+----
+NULL
+NaN
+NaN
+-Infinity
+-1
+0
+0
+0.0
+0.00
+0.000
+0.0000
+1
+Infinity
+
+# Just test the NaN-ness of the values.
+query RBBB
+SELECT d, d IS NaN, d = 'NaN', isnan(d) FROM s@{FORCE_INDEX=primary} ORDER BY d, d::TEXT
+----
+NULL       NULL   NULL   NULL
+NaN        true   true   true
+NaN        true   true   true
+-Infinity  false  false  false
+-1         false  false  false
+0          false  false  false
+0          false  false  false
+0.0        false  false  false
+0.00       false  false  false
+0.000      false  false  false
+0.0000     false  false  false
+1          false  false  false
+Infinity   false  false  false
+
+# Just test the NaN-ness of the values in secondary index
+query RBBB
+SELECT d, d IS NaN, d = 'NaN', isnan(d) FROM s@{FORCE_INDEX=s_d_idx} ORDER BY d, d::TEXT
+----
+NULL       NULL   NULL   NULL
+NaN        true   true   true
+NaN        true   true   true
+-Infinity  false  false  false
+-1         false  false  false
+0          false  false  false
+0          false  false  false
+0.0        false  false  false
+0.00       false  false  false
+0.000      false  false  false
+0.0000     false  false  false
+1          false  false  false
+Infinity   false  false  false
+
+query RB
+select d, d > 'NaN' from s@{FORCE_INDEX=primary} where d > 'NaN' ORDER BY d, d::TEXT
+----
+-Infinity  true
+-1         true
+0          true
+0          true
+0.0        true
+0.00       true
+0.000      true
+0.0000     true
+1          true
+Infinity   true
+
+query RB
+select d, d > 'NaN' from s@{FORCE_INDEX=s_d_idx} where d > 'NaN' ORDER BY d, d::TEXT
+----
+-Infinity  true
+-1         true
+0          true
+0          true
+0.0        true
+0.00       true
+0.000      true
+0.0000     true
+1          true
+Infinity   true
+
 # Verify that decimals don't lose trailing 0s even when used for an index.
 statement ok
 CREATE INDEX idx ON s (d)
@@ -194,11 +277,11 @@ query R rowsort
 SELECT * FROM s@idx WHERE d = 0
 ----
 0
--0
--0.0
--0.00
--0.000
--0.0000
+0
+0.0
+0.00
+0.000
+0.0000
 
 statement ok
 INSERT INTO s VALUES

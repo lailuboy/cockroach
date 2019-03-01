@@ -1,3 +1,17 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import _ from "lodash";
 import React from "react";
 import classNames from "classnames";
@@ -6,6 +20,7 @@ import "./summarybar.styl";
 
 import { MetricsDataProvider } from "src/views/shared/containers/metricDataProvider";
 import { MetricsDataComponentProps } from "src/views/shared/components/metricQuery";
+import { ToolTipWrapper } from "src/views/shared/components/toolTip";
 
 interface SummaryValueProps {
   title: React.ReactNode;
@@ -163,7 +178,16 @@ export class SummaryHeadlineStat extends React.Component<SummaryHeadlineStatProp
   render() {
     return <div className="summary-headline">
       <div className="summary-headline__value">{computeValue(this.props.value, this.props.format)}</div>
-      <div className="summary-headline__title">{this.props.title}</div>
+      <div className="summary-headline__title">
+        {this.props.title}
+        <div className="section-heading__tooltip">
+          <ToolTipWrapper text={this.props.tooltip}>
+            <div className="section-heading__tooltip-hover-area">
+              <div className="section-heading__info-icon">i</div>
+            </div>
+          </ToolTipWrapper>
+        </div>
+      </div>
     </div>;
   }
 }

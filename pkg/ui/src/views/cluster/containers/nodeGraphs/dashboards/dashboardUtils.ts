@@ -1,4 +1,16 @@
-import _ from "lodash";
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
 
 import { NodesSummary } from "src/redux/nodes";
 
@@ -34,20 +46,16 @@ export interface GraphDashboardProps {
   tooltipSelection: string;
 }
 
-export function nodeAddress(nodesSummary: NodesSummary, nid: string) {
+export function nodeDisplayName(nodesSummary: NodesSummary, nid: string) {
   const ns = nodesSummary.nodeStatusByID[nid];
   if (!ns) {
     // This should only happen immediately after loading a page, and
     // associated graphs should display no data.
-    return "unknown address";
+    return "unknown node";
   }
-  return ns.desc.address.address_field;
+  return nodesSummary.nodeDisplayNameByID[ns.desc.node_id];
 }
 
 export function storeIDsForNode(nodesSummary: NodesSummary, nid: string): string[] {
-  const ns = nodesSummary.nodeStatusByID[nid];
-  if (!ns) {
-    return [];
-  }
-  return _.map(ns.store_statuses, (ss) => ss.desc.store_id.toString());
+  return nodesSummary.storeIDsByNodeID[nid] || [];
 }

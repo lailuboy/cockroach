@@ -16,164 +16,126 @@ package sql
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/pkg/errors"
 )
 
-type checkHelper struct {
-	exprs        []parser.TypedExpr
-	cols         []sqlbase.ColumnDescriptor
-	sourceInfo   *dataSourceInfo
-	ivars        []parser.IndexedVar
-	curSourceRow parser.Datums
-}
-
-func (c *checkHelper) init(
-	ctx context.Context, p *planner, tn *parser.TableName, tableDesc *sqlbase.TableDescriptor,
-) error {
-	if len(tableDesc.Checks) == 0 {
-		return nil
-	}
-
-	c.cols = tableDesc.Columns
-	c.sourceInfo = newSourceInfoForSingleTable(
-		*tn, sqlbase.ResultColumnsFromColDescs(tableDesc.Columns),
-	)
-
-	c.exprs = make([]parser.TypedExpr, len(tableDesc.Checks))
-	exprStrings := make([]string, len(tableDesc.Checks))
-	for i, check := range tableDesc.Checks {
-		exprStrings[i] = check.Expr
-	}
-	exprs, err := parser.ParseExprs(exprStrings)
-	if err != nil {
-		return err
-	}
-
-	ivarHelper := parser.MakeIndexedVarHelper(c, len(c.cols))
-	for i, raw := range exprs {
-		typedExpr, err := p.analyzeExpr(ctx, raw, multiSourceInfo{c.sourceInfo}, ivarHelper,
-			parser.TypeBool, false, "")
-		if err != nil {
-			return err
-		}
-		c.exprs[i] = typedExpr
-	}
-	c.ivars = ivarHelper.GetIndexedVars()
-	c.curSourceRow = make(parser.Datums, len(c.cols))
-	return nil
-}
-
-// Set values in the IndexedVars used by the CHECK exprs.
-// Any value not passed is set to NULL, unless `merge` is true, in which
-// case it is left unchanged (allowing updating a subset of a row's values).
-func (c *checkHelper) loadRow(
-	colIdx map[sqlbase.ColumnID]int, row parser.Datums, merge bool,
-) error {
-	if len(c.exprs) == 0 {
-		return nil
-	}
-	// Populate IndexedVars.
-	for _, ivar := range c.ivars {
-		if ivar.Idx == invalidColIdx {
-			continue
-		}
-		ri, has := colIdx[c.cols[ivar.Idx].ID]
-		if has {
-			if row[ri] != parser.DNull {
-				expected, provided := ivar.ResolvedType(), row[ri].ResolvedType()
-				if !expected.Equivalent(provided) {
-					return errors.Errorf("%s value does not match CHECK expr type %s", provided, expected)
-				}
-			}
-			c.curSourceRow[ivar.Idx] = row[ri]
-		} else if !merge {
-			c.curSourceRow[ivar.Idx] = parser.DNull
-		}
-	}
-	return nil
-}
-
-// IndexedVarEval implements the parser.IndexedVarContainer interface.
-func (c *checkHelper) IndexedVarEval(idx int, ctx *parser.EvalContext) (parser.Datum, error) {
-	return c.curSourceRow[idx].Eval(ctx)
-}
-
-// IndexedVarResolvedType implements the parser.IndexedVarContainer interface.
-func (c *checkHelper) IndexedVarResolvedType(idx int) parser.Type {
-	return c.sourceInfo.sourceColumns[idx].Typ
-}
-
-// IndexedVarFormat implements the parser.IndexedVarContainer interface.
-func (c *checkHelper) IndexedVarFormat(buf *bytes.Buffer, f parser.FmtFlags, idx int) {
-	c.sourceInfo.FormatVar(buf, f, idx)
-}
-
-func (c *checkHelper) check(ctx *parser.EvalContext) error {
-	for _, expr := range c.exprs {
-		if d, err := expr.Eval(ctx); err != nil {
-			return err
-		} else if res, err := parser.GetBool(d); err != nil {
-			return err
-		} else if !res && d != parser.DNull {
-			// Failed to satisfy CHECK constraint.
-			return fmt.Errorf("failed to satisfy CHECK constraint (%s)", expr)
-		}
-	}
-	return nil
-}
-
-func (p *planner) validateCheckExpr(
+func validateCheckExpr(
 	ctx context.Context,
 	exprStr string,
-	tableName parser.TableExpr,
 	tableDesc *sqlbase.TableDescriptor,
+	ie tree.SessionBoundInternalExecutor,
+	txn *client.Txn,
 ) error {
 	expr, err := parser.ParseExpr(exprStr)
 	if err != nil {
 		return err
 	}
-	sel := &parser.SelectClause{
-		Exprs: sqlbase.ColumnsSelectors(tableDesc.Columns),
-		From:  &parser.From{Tables: parser.TableExprs{tableName}},
-		Where: &parser.Where{Expr: &parser.NotExpr{Expr: expr}},
+	// Construct AST and then convert to a string, to avoid problems with escaping the check expression
+	tblref := tree.TableRef{TableID: int64(tableDesc.ID), As: tree.AliasClause{Alias: "t"}}
+	sel := &tree.SelectClause{
+		Exprs: sqlbase.ColumnsSelectors(tableDesc.Columns, false /* forUpdateOrDelete */),
+		From:  &tree.From{Tables: []tree.TableExpr{&tblref}},
+		Where: &tree.Where{Type: tree.AstWhere, Expr: &tree.NotExpr{Expr: expr}},
 	}
-	lim := &parser.Limit{Count: parser.NewDInt(1)}
-	// This could potentially use a variant of planner.SelectClause that could
-	// use the tableDesc we have, but this is a rare operation and be benefit
-	// would be marginal compared to the work of the actual query, so the added
-	// complexity seems unjustified.
-	rows, err := p.SelectClause(ctx, sel, nil, lim, nil, publicColumns)
+	lim := &tree.Limit{Count: tree.NewDInt(1)}
+	stmt := &tree.Select{Select: sel, Limit: lim}
+	queryStr := tree.AsStringWithFlags(stmt, tree.FmtParsable)
+	log.Infof(ctx, "Validating check constraint %q with query %q", expr.String(), queryStr)
+
+	rows, err := ie.QueryRow(ctx, "validate check constraint", txn, queryStr)
 	if err != nil {
 		return err
 	}
-	rows, err = p.optimizePlan(ctx, rows, allColumns(rows))
-	if err != nil {
-		return err
-	}
-	if err := p.startPlan(ctx, rows); err != nil {
-		return err
-	}
-	next, err := rows.Next(runParams{
-		ctx: ctx,
-		p:   p,
-	})
-	if err != nil {
-		return err
-	}
-	if next {
+	if rows.Len() > 0 {
 		return errors.Errorf("validation of CHECK %q failed on row: %s",
-			expr.String(), labeledRowValues(tableDesc.Columns, rows.Values()))
+			expr.String(), labeledRowValues(tableDesc.Columns, rows))
 	}
 	return nil
+}
+
+// matchFullUnacceptableKeyQuery generates and returns a query for rows that are
+// disallowed given the specified MATCH FULL composite FK reference, i.e., rows
+// in the referencing table where the key contains both null and non-null
+// values.
+//
+// For example, a FK constraint on columns (a_id, b_id) with an index c_id on
+// the table "child" would require the following query:
+//
+// SELECT * FROM child@c_idx
+// WHERE
+//   NOT ((COALESCE(a_id, b_id) IS NULL) OR (a_id IS NOT NULL AND b_id IS NOT NULL))
+// LIMIT 1;
+func matchFullUnacceptableKeyQuery(
+	prefix int, srcName *string, srcIdx *sqlbase.IndexDescriptor,
+) string {
+	srcCols, srcNotNullClause := make([]string, prefix), make([]string, prefix)
+	for i := 0; i < prefix; i++ {
+		srcCols[i] = tree.NameString(srcIdx.ColumnNames[i])
+		srcNotNullClause[i] = fmt.Sprintf("%s IS NOT NULL", tree.NameString(srcIdx.ColumnNames[i]))
+	}
+	return fmt.Sprintf(
+		`SELECT * FROM %s@%s WHERE NOT ((COALESCE(%s) IS NULL) OR (%s)) LIMIT 1`,
+		*srcName, tree.NameString(srcIdx.Name),
+		strings.Join(srcCols, ", "),
+		strings.Join(srcNotNullClause, " AND "),
+	)
+}
+
+// nonMatchingRowQuery generates and returns a query for rows that violate the
+// specified FK constraint, i.e., rows in the referencing table with no matching
+// key in the referenced table. Rows in the referencing table with any null
+// values in the key are excluded from matching (for both MATCH FULL and MATCH
+// SIMPLE).
+//
+// For example, a FK constraint on columns (a_id, b_id) with an index c_id on
+// the table "child", referencing columns (a, b) with an index p_id on the table
+// "parent", would require the following query:
+//
+// SELECT
+//   s.a_id, s.b_id
+// FROM
+//   (SELECT * FROM child@c_idx WHERE a_id IS NOT NULL AND b_id IS NOT NULL) AS s
+//   LEFT OUTER JOIN parent@p_idx AS t ON s.a_id = t.a AND s.b_id = t.b
+// WHERE
+//   t.a IS NULL
+// LIMIT 1;
+func nonMatchingRowQuery(
+	prefix int,
+	srcName *string,
+	srcIdx *sqlbase.IndexDescriptor,
+	targetName *string,
+	targetIdx *sqlbase.IndexDescriptor,
+) string {
+	srcCols, srcWhere, targetCols, on := make([]string, prefix), make([]string, prefix), make([]string, prefix), make([]string, prefix)
+
+	for i := 0; i < prefix; i++ {
+		// s and t are table aliases used in the query
+		srcCols[i] = fmt.Sprintf("s.%s", tree.NameString(srcIdx.ColumnNames[i]))
+		srcWhere[i] = fmt.Sprintf("%s IS NOT NULL", tree.NameString(srcIdx.ColumnNames[i]))
+		targetCols[i] = fmt.Sprintf("t.%s", tree.NameString(targetIdx.ColumnNames[i]))
+		on[i] = fmt.Sprintf("%s = %s", srcCols[i], targetCols[i])
+	}
+
+	return fmt.Sprintf(
+		`SELECT %s FROM (SELECT * FROM %s@%s WHERE %s) AS s LEFT OUTER JOIN %s@%s AS t ON %s WHERE %s IS NULL LIMIT 1`,
+		strings.Join(srcCols, ", "),
+		*srcName, tree.NameString(srcIdx.Name),
+		strings.Join(srcWhere, " AND "),
+		*targetName, tree.NameString(targetIdx.Name),
+		strings.Join(on, " AND "),
+		// Sufficient to check the first column to see whether there was no matching row
+		targetCols[0],
+	)
 }
 
 func (p *planner) validateForeignKey(
@@ -198,56 +160,85 @@ func (p *planner) validateForeignKey(
 		return err
 	}
 
-	escape := func(s string) string {
-		return parser.Name(s).String()
-	}
-
 	prefix := len(srcIdx.ColumnNames)
 	if p := len(targetIdx.ColumnNames); p < prefix {
 		prefix = p
 	}
 
-	srcCols, targetCols := make([]string, prefix), make([]string, prefix)
-	join, where := make([]string, prefix), make([]string, prefix)
+	// For MATCH FULL FKs, first check whether any disallowed keys containing both
+	// null and non-null values exist.
+	// (The matching options only matter for FKs with more than one column.)
+	if prefix > 1 && srcIdx.ForeignKey.Match == sqlbase.ForeignKeyReference_FULL {
+		query := matchFullUnacceptableKeyQuery(prefix, &srcName, srcIdx)
 
-	for i := 0; i < prefix; i++ {
-		srcCols[i] = fmt.Sprintf("s.%s", escape(srcIdx.ColumnNames[i]))
-		targetCols[i] = fmt.Sprintf("t.%s", escape(targetIdx.ColumnNames[i]))
-		join[i] = fmt.Sprintf("(%s = %s OR (%s IS NULL AND %s IS NULL))",
-			srcCols[i], targetCols[i], srcCols[i], targetCols[i])
-		where[i] = fmt.Sprintf("(%s IS NOT NULL AND %s IS NULL)", srcCols[i], targetCols[i])
+		log.Infof(ctx, "Validating MATCH FULL FK %q (%q [%v] -> %q [%v]) with query %q",
+			srcIdx.ForeignKey.Name,
+			srcTable.Name, srcIdx.ColumnNames, targetTable.Name, targetIdx.ColumnNames,
+			query,
+		)
+
+		plan, err := p.delegateQuery(ctx, "ALTER TABLE VALIDATE", query, nil, nil)
+		if err != nil {
+			return err
+		}
+
+		plan, err = p.optimizePlan(ctx, plan, allColumns(plan))
+		if err != nil {
+			return err
+		}
+		defer plan.Close(ctx)
+
+		rows, err := p.runWithDistSQL(ctx, plan)
+		if err != nil {
+			return err
+		}
+		defer rows.Close(ctx)
+
+		if rows.Len() > 0 {
+			return pgerror.NewErrorf(pgerror.CodeForeignKeyViolationError,
+				"foreign key violation: MATCH FULL does not allow mixing of null and nonnull values %s for %s",
+				rows.At(0), srcIdx.ForeignKey.Name,
+			)
+		}
 	}
-
-	query := fmt.Sprintf(
-		`SELECT %s FROM %s@%s AS s LEFT OUTER JOIN %s@%s AS t ON %s WHERE %s LIMIT 1`,
-		strings.Join(srcCols, ", "),
-		srcName, escape(srcIdx.Name), targetName, escape(targetIdx.Name),
-		strings.Join(join, " AND "),
-		strings.Join(where, " OR "),
-	)
+	query := nonMatchingRowQuery(prefix, &srcName, srcIdx, &targetName, targetIdx)
 
 	log.Infof(ctx, "Validating FK %q (%q [%v] -> %q [%v]) with query %q",
 		srcIdx.ForeignKey.Name,
-		srcTable.Name, srcCols, targetTable.Name, targetCols,
+		srcTable.Name, srcIdx.ColumnNames, targetTable.Name, targetIdx.ColumnNames,
 		query,
 	)
 
-	values, err := p.queryRows(ctx, query)
+	plan, err := p.delegateQuery(ctx, "ALTER TABLE VALIDATE", query, nil, nil)
 	if err != nil {
 		return err
 	}
 
-	if len(values) > 0 {
-		var pairs bytes.Buffer
-		for i := range values[0] {
-			if i > 0 {
-				pairs.WriteString(", ")
-			}
-			pairs.WriteString(fmt.Sprintf("%s=%v", srcIdx.ColumnNames[i], values[0][i]))
-		}
-		return pgerror.NewErrorf(pgerror.CodeForeignKeyViolationError,
-			"foreign key violation: %q row %s has no match in %q",
-			srcTable.Name, pairs.String(), targetTable.Name)
+	plan, err = p.optimizePlan(ctx, plan, allColumns(plan))
+	if err != nil {
+		return err
 	}
-	return nil
+	defer plan.Close(ctx)
+
+	rows, err := p.runWithDistSQL(ctx, plan)
+	if err != nil {
+		return err
+	}
+	defer rows.Close(ctx)
+
+	if rows.Len() == 0 {
+		return nil
+	}
+
+	values := rows.At(0)
+	var pairs bytes.Buffer
+	for i := range values {
+		if i > 0 {
+			pairs.WriteString(", ")
+		}
+		pairs.WriteString(fmt.Sprintf("%s=%v", srcIdx.ColumnNames[i], values[i]))
+	}
+	return pgerror.NewErrorf(pgerror.CodeForeignKeyViolationError,
+		"foreign key violation: %q row %s has no match in %q",
+		srcTable.Name, pairs.String(), targetTable.Name)
 }

@@ -11,19 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei(andreimatei1@gmail.com)
 
 package sql
 
 import (
+	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"golang.org/x/net/context"
 )
 
 // LeaseRemovalTracker can be used to wait for leases to be removed from the
@@ -59,7 +56,7 @@ func NewLeaseRemovalTracker() *LeaseRemovalTracker {
 // TrackRemoval starts monitoring lease removals for a particular lease.
 // This should be called before triggering the operation that (asynchronously)
 // removes the lease.
-func (w *LeaseRemovalTracker) TrackRemoval(table *sqlbase.TableDescriptor) RemovalTracker {
+func (w *LeaseRemovalTracker) TrackRemoval(table *sqlbase.ImmutableTableDescriptor) RemovalTracker {
 	id := tableVersionID{
 		id:      table.ID,
 		version: table.Version,
@@ -83,19 +80,21 @@ func (t RemovalTracker) WaitForRemoval() error {
 // LeaseRemovedNotification has to be called after a lease is removed from the
 // store. This should be hooked up as a callback to
 // LeaseStoreTestingKnobs.LeaseReleasedEvent.
-func (w *LeaseRemovalTracker) LeaseRemovedNotification(table sqlbase.TableDescriptor, err error) {
+func (w *LeaseRemovalTracker) LeaseRemovedNotification(
+	id sqlbase.ID, version sqlbase.DescriptorVersion, err error,
+) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	id := tableVersionID{
-		id:      table.ID,
-		version: table.Version,
+	idx := tableVersionID{
+		id:      id,
+		version: version,
 	}
 
-	if tracker, ok := w.tracking[id]; ok {
+	if tracker, ok := w.tracking[idx]; ok {
 		*tracker.err = err
 		close(tracker.removed)
-		delete(w.tracking, id)
+		delete(w.tracking, idx)
 	}
 }
 
@@ -111,19 +110,20 @@ func (m *LeaseManager) ExpireLeases(clock *hlc.Clock) {
 
 // AcquireAndAssertMinVersion acquires a read lease for the specified table ID.
 // The lease is grabbed on the latest version if >= specified version.
-// It returns a table descriptor and an expiration time.
-// A transaction is allowed to use the table descriptor as long as the txn
-// timestamp < expiration time.
+// It returns a table descriptor and an expiration time valid for the timestamp.
 func (m *LeaseManager) AcquireAndAssertMinVersion(
-	ctx context.Context, txn *client.Txn, tableID sqlbase.ID, minVersion sqlbase.DescriptorVersion,
-) (*sqlbase.TableDescriptor, hlc.Timestamp, error) {
+	ctx context.Context,
+	timestamp hlc.Timestamp,
+	tableID sqlbase.ID,
+	minVersion sqlbase.DescriptorVersion,
+) (*sqlbase.ImmutableTableDescriptor, hlc.Timestamp, error) {
 	t := m.findTableState(tableID, true)
-	if err := t.ensureVersion(ctx, minVersion, m); err != nil {
+	if err := ensureVersion(ctx, tableID, minVersion, m); err != nil {
 		return nil, hlc.Timestamp{}, err
 	}
-	table, err := t.acquire(ctx, txn, m)
+	table, _, err := t.findForTimestamp(ctx, timestamp)
 	if err != nil {
 		return nil, hlc.Timestamp{}, err
 	}
-	return &table.TableDescriptor, table.expiration, nil
+	return &table.ImmutableTableDescriptor, table.expiration, nil
 }

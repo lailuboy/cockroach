@@ -11,29 +11,33 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package sql
 
 import (
-	"bytes"
+	"context"
 	"fmt"
+	"strings"
 
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/pkg/errors"
 )
+
+//
+// This file contains routines for low-level access to stored object
+// descriptors, as well as accessors for the table cache.
+//
+// For higher levels in the SQL layer, these interface are likely not
+// suitable; consider instead schema_accessors.go and resolver.go.
+//
 
 var testDisableTableLeases bool
 
@@ -46,11 +50,34 @@ func TestDisableTableLeases() func() {
 	}
 }
 
-// tableKey implements sqlbase.DescriptorKey.
-type tableKey struct {
+type namespaceKey struct {
 	parentID sqlbase.ID
 	name     string
 }
+
+// getAllNames returns a map from ID to namespaceKey for every entry in
+// system.namespace.
+func (p *planner) getAllNames(ctx context.Context) (map[sqlbase.ID]namespaceKey, error) {
+	namespace := map[sqlbase.ID]namespaceKey{}
+	rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
+		ctx, "get-all-names", p.txn,
+		`SELECT id, "parentID", name FROM system.namespace`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		id, parentID, name := tree.MustBeDInt(r[0]), tree.MustBeDInt(r[1]), tree.MustBeDString(r[2])
+		namespace[sqlbase.ID(id)] = namespaceKey{
+			parentID: sqlbase.ID(parentID),
+			name:     string(name),
+		}
+	}
+	return namespace, nil
+}
+
+// tableKey implements sqlbase.DescriptorKey.
+type tableKey namespaceKey
 
 func (tk tableKey) Key() roachpb.Key {
 	return sqlbase.MakeNameMetadataKey(tk.parentID, tk.name)
@@ -65,7 +92,7 @@ func (tk tableKey) Name() string {
 func GetKeysForTableDescriptor(
 	tableDesc *sqlbase.TableDescriptor,
 ) (zoneKey roachpb.Key, nameKey roachpb.Key, descKey roachpb.Key) {
-	zoneKey = sqlbase.MakeZoneKey(tableDesc.ID)
+	zoneKey = config.MakeZoneKey(uint32(tableDesc.ID))
 	nameKey = sqlbase.MakeNameMetadataKey(tableDesc.ParentID, tableDesc.GetName())
 	descKey = sqlbase.MakeDescMetadataKey(tableDesc.ID)
 	return
@@ -77,133 +104,8 @@ type tableVersionID struct {
 	version sqlbase.DescriptorVersion
 }
 
-// SchemaAccessor provides helper methods for using the SQL schema.
-type SchemaAccessor interface {
-	// NB: one can use GetTableDescFromID() to retrieve a descriptor for
-	// a table from a transaction using its ID, assuming it was loaded
-	// in the transaction already.
-
-	// notifySchemaChange notifies that an outstanding schema change
-	// exists for the table.
-	notifySchemaChange(tableDesc *sqlbase.TableDescriptor, mutationID sqlbase.MutationID)
-
-	// writeTableDesc effectively writes a table descriptor to the
-	// database within the current planner transaction.
-	writeTableDesc(ctx context.Context, tableDesc *sqlbase.TableDescriptor) error
-}
-
-var _ SchemaAccessor = &planner{}
-
 func (p *planner) getVirtualTabler() VirtualTabler {
-	return &p.session.virtualSchemas
-}
-
-// getTableOrViewDesc returns a table descriptor for either a table or view,
-// or nil if the descriptor is not found.
-func getTableOrViewDesc(
-	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName,
-) (*sqlbase.TableDescriptor, error) {
-	virtual, err := vt.getVirtualTableDesc(tn)
-	if err != nil || virtual != nil {
-		if sqlbase.IsUndefinedRelationError(err) {
-			return nil, nil
-		}
-		return virtual, err
-	}
-
-	dbDesc, err := MustGetDatabaseDesc(ctx, txn, vt, tn.Database())
-	if err != nil {
-		return nil, err
-	}
-
-	desc := sqlbase.TableDescriptor{}
-	found, err := getDescriptor(ctx, txn, tableKey{parentID: dbDesc.ID, name: tn.Table()}, &desc)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, nil
-	}
-	return &desc, nil
-}
-
-// getTableDesc returns a table descriptor for a table, or nil if the
-// descriptor is not found. If you want the "not found" condition to
-// return an error, use mustGetTableDesc() instead.
-//
-// Returns an error if the underlying table descriptor actually
-// represents a view rather than a table.
-func getTableDesc(
-	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName,
-) (*sqlbase.TableDescriptor, error) {
-	desc, err := getTableOrViewDesc(ctx, txn, vt, tn)
-	if err != nil {
-		return desc, err
-	}
-	if desc != nil && !desc.IsTable() {
-		return nil, sqlbase.NewWrongObjectTypeError(tn, "table")
-	}
-	return desc, nil
-}
-
-// getViewDesc returns a table descriptor for a table, or nil if the
-// descriptor is not found.
-//
-// Returns an error if the underlying table descriptor actually
-// represents a table rather than a view.
-func getViewDesc(
-	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName,
-) (*sqlbase.TableDescriptor, error) {
-	desc, err := getTableOrViewDesc(ctx, txn, vt, tn)
-	if err != nil {
-		return desc, err
-	}
-	if desc != nil && !desc.IsView() {
-		return nil, sqlbase.NewWrongObjectTypeError(tn, "view")
-	}
-	return desc, nil
-}
-
-// mustGetTableOrViewDesc returns a table descriptor for either a table or
-// view, or an error if the descriptor is not found. allowAdding when set allows
-// a table descriptor in the ADD state to also be returned.
-func mustGetTableOrViewDesc(
-	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName, allowAdding bool,
-) (*sqlbase.TableDescriptor, error) {
-	desc, err := getTableOrViewDesc(ctx, txn, vt, tn)
-	if err != nil {
-		return nil, err
-	}
-	if desc == nil {
-		return nil, sqlbase.NewUndefinedRelationError(tn)
-	}
-	if err := filterTableState(desc); err != nil {
-		if !allowAdding && err != errTableAdding {
-			return nil, err
-		}
-	}
-	return desc, nil
-}
-
-// mustGetTableDesc returns a table descriptor for a table, or an error if
-// the descriptor is not found. allowAdding when set allows a table descriptor
-// in the ADD state to also be returned.
-func mustGetTableDesc(
-	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName, allowAdding bool,
-) (*sqlbase.TableDescriptor, error) {
-	desc, err := getTableDesc(ctx, txn, vt, tn)
-	if err != nil {
-		return nil, err
-	}
-	if desc == nil {
-		return nil, sqlbase.NewUndefinedRelationError(tn)
-	}
-	if err := filterTableState(desc); err != nil {
-		if !allowAdding && err != errTableAdding {
-			return nil, err
-		}
-	}
-	return desc, nil
+	return p.extendedEvalCtx.VirtualSchemas
 }
 
 var errTableDropped = errors.New("table is being dropped")
@@ -230,19 +132,24 @@ type uncommittedDatabase struct {
 	dropped bool
 }
 
+type uncommittedTable struct {
+	*sqlbase.MutableTableDescriptor
+	*sqlbase.ImmutableTableDescriptor
+}
+
 // TableCollection is a collection of tables held by a single session that
 // serves SQL requests, or a background job using a table descriptor. The
 // collection is cleared using releaseTables() which is called at the
 // end of each transaction on the session, or on hitting conditions such
 // as errors, or retries that result in transaction timestamp changes.
 type TableCollection struct {
-	timestamp hlc.Timestamp
+	// leaseMgr manages acquiring and releasing per-table leases.
+	leaseMgr *LeaseManager
 	// A collection of table descriptor valid for the timestamp.
 	// They are released once the transaction using them is complete.
 	// If the transaction gets pushed and the timestamp changes,
 	// the tables are released.
-	tables []*sqlbase.TableDescriptor
-
+	leasedTables []*sqlbase.ImmutableTableDescriptor
 	// Tables modified by the uncommitted transaction affiliated
 	// with this TableCollection. This allows a transaction to see
 	// its own modifications while bypassing the table lease mechanism.
@@ -251,134 +158,214 @@ type TableCollection struct {
 	// the table. These table descriptors are local to this
 	// TableCollection and invisible to other transactions. A dropped
 	// table is marked dropped.
-	uncommittedTables []*sqlbase.TableDescriptor
+	uncommittedTables []uncommittedTable
+
+	// databaseCache is used as a cache for database names.
+	// TODO(andrei): get rid of it and replace it with a leasing system for
+	// database descriptors.
+	databaseCache *databaseCache
+
+	// dbCacheSubscriber is used to block until the node's database cache has been
+	// updated when releaseTables is called.
+	dbCacheSubscriber dbCacheSubscriber
 
 	// Same as uncommittedTables applying to databases modified within
 	// an uncommitted transaction.
 	uncommittedDatabases []uncommittedDatabase
 
-	// leaseMgr manages acquiring and releasing per-table leases.
-	leaseMgr *LeaseManager
-	// databaseCache is used as a cache for database names.
-	// TODO(andrei): get rid of it and replace it with a leasing system for
-	// database descriptors.
-	databaseCache *databaseCache
+	// allDescriptors is a slice of all available descriptors. The descriptors
+	// are cached to avoid repeated lookups by users like virtual tables. The
+	// cache is purged whenever events would cause a scan of all descriptors to
+	// return different values, such as when the txn timestamp changes or when
+	// new descriptors are written in the txn.
+	allDescriptors []sqlbase.DescriptorProto
 }
 
-func (tc *TableCollection) maybeChangeTimestamp(ctx context.Context, txn *client.Txn) {
-	if tc.timestamp != (hlc.Timestamp{}) && tc.timestamp != txn.OrigTimestamp() {
-		txn.ResetDeadline()
-		tc.releaseTables(ctx)
-	}
+type dbCacheSubscriber interface {
+	// waitForCacheState takes a callback depending on the cache state and blocks
+	// until the callback declares success. The callback is repeatedly called as
+	// the cache is updated.
+	waitForCacheState(cond func(*databaseCache) bool)
 }
 
-// getTableVersion returns a table descriptor with a version suitable for
-// the transaction. The table must be released by calling tc.releaseTables().
+// getMutableTableDescriptor returns a mutable table descriptor.
 //
-// TODO(vivek): The suitability of the table version returned is only partial
-// checked. The expiration time for the table descriptor is added as a deadline
-// for the transaction. The ModificationTime of the table is not compared to the
-// timestamp of the transaction. Fix this to be such that:
-// table.ModificationTime <= txn.Timestamp < expirationTime
+// If flags.required is false, getMutableTableDescriptor() will gracefully
+// return a nil descriptor and no error if the table does not exist.
 //
-// TODO(vivek): Rollback most of #6418. #6418 introduced a transaction deadline
-// that is enforced at the KV layer, and was introduced to manager the validity
-// window of a table descriptor. Since we will be checking for the valid use
-// of a table descriptor here, we do not need the extra check at the KV layer.
-func (tc *TableCollection) getTableVersion(
-	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName,
-) (*sqlbase.TableDescriptor, error) {
+func (tc *TableCollection) getMutableTableDescriptor(
+	ctx context.Context, txn *client.Txn, tn *tree.TableName, flags ObjectLookupFlags,
+) (*sqlbase.MutableTableDescriptor, *sqlbase.DatabaseDescriptor, error) {
 	if log.V(2) {
-		log.Infof(ctx, "planner acquiring lease on table '%s'", tn)
+		log.Infof(ctx, "reading mutable descriptor on table '%s'", tn)
 	}
 
-	isSystemDB := tn.Database() == sqlbase.SystemDB.Name
-	isVirtualDB := vt.getVirtualDatabaseDesc(tn.Database()) != nil
-	if isSystemDB || isVirtualDB || testDisableTableLeases {
-		// We don't go through the normal lease mechanism for:
-		// - system tables. The system.lease and system.descriptor table, in
-		//   particular, are problematic because they are used for acquiring
-		//   leases itself, creating a chicken&egg problem.
-		// - virtual tables. These tables' descriptors are not persisted,
-		//   so they cannot be leased. Instead, we simply return the static
-		//   descriptor and rely on the immutability privileges set on the
-		//   descriptors to cause upper layers to reject mutations statements.
-		tbl, err := mustGetTableDesc(ctx, txn, vt, tn, false /*allowAdding*/)
-		if err != nil {
-			return nil, err
+	if tn.SchemaName != tree.PublicSchemaName {
+		if flags.required {
+			return nil, nil, sqlbase.NewUnsupportedSchemaUsageError(tree.ErrString(tn))
 		}
-		return tbl, nil
+		return nil, nil, nil
 	}
 
-	dbID, err := tc.getUncommittedDatabaseID(tn)
-	if err != nil {
-		return nil, err
+	refuseFurtherLookup, dbID, err := tc.getUncommittedDatabaseID(tn.Catalog(), flags.required)
+	if refuseFurtherLookup || err != nil {
+		return nil, nil, err
 	}
 
 	if dbID == 0 {
 		// Resolve the database from the database cache when the transaction
 		// hasn't modified the database.
-		if err := tc.leaseMgr.LeaseStore.db.Txn(
-			ctx,
-			func(ctx context.Context, txn *client.Txn) error {
-				var err error
-				dbID, err = tc.databaseCache.getDatabaseID(ctx, txn, vt, tn.Database())
-				return err
-			},
-		); err != nil {
-			return nil, err
+		dbID, err = tc.databaseCache.getDatabaseID(ctx,
+			tc.leaseMgr.execCfg.DB.Txn, tn.Catalog(), flags.required)
+		if err != nil || dbID == 0 {
+			// dbID can still be 0 if required is false and the database is not found.
+			return nil, nil, err
 		}
 	}
 
-	if table, err := tc.getUncommittedTable(dbID, tn); err != nil {
-		return nil, err
-	} else if table != nil {
-		log.VEventf(ctx, 2, "found uncommitted table %d", table.ID)
-		return table, nil
+	if refuseFurtherLookup, table, err := tc.getUncommittedTable(dbID, tn, flags.required); refuseFurtherLookup || err != nil {
+		return nil, nil, err
+	} else if mut := table.MutableTableDescriptor; mut != nil {
+		log.VEventf(ctx, 2, "found uncommitted table %d", mut.ID)
+		return mut, nil, nil
 	}
 
-	// If the txn has been pushed the table collection is released and
-	// txn deadline is reset.
-	tc.maybeChangeTimestamp(ctx, txn)
+	phyAccessor := UncachedPhysicalAccessor{}
+	obj, db, err := phyAccessor.GetObjectDesc(ctx, txn, tn, flags)
+	if obj == nil {
+		return nil, db, err
+	}
+	return obj.(*sqlbase.MutableTableDescriptor), db, err
+}
+
+// getTableVersion returns a table descriptor with a version suitable for
+// the transaction: table.ModificationTime <= txn.Timestamp < expirationTime.
+// The table must be released by calling tc.releaseTables().
+//
+// If flags.required is false, getTableVersion() will gracefully
+// return a nil descriptor and no error if the table does not exist.
+//
+// It might also add a transaction deadline to the transaction that is
+// enforced at the KV layer to ensure that the transaction doesn't violate
+// the validity window of the table descriptor version returned.
+//
+func (tc *TableCollection) getTableVersion(
+	ctx context.Context, txn *client.Txn, tn *tree.TableName, flags ObjectLookupFlags,
+) (*sqlbase.ImmutableTableDescriptor, *sqlbase.DatabaseDescriptor, error) {
+	if log.V(2) {
+		log.Infof(ctx, "planner acquiring lease on table '%s'", tn)
+	}
+
+	if tn.SchemaName != tree.PublicSchemaName {
+		if flags.required {
+			return nil, nil, sqlbase.NewUnsupportedSchemaUsageError(tree.ErrString(tn))
+		}
+		return nil, nil, nil
+	}
+
+	refuseFurtherLookup, dbID, err := tc.getUncommittedDatabaseID(tn.Catalog(), flags.required)
+	if refuseFurtherLookup || err != nil {
+		return nil, nil, err
+	}
+
+	if dbID == 0 {
+		// Resolve the database from the database cache when the transaction
+		// hasn't modified the database.
+		dbID, err = tc.databaseCache.getDatabaseID(ctx,
+			tc.leaseMgr.execCfg.DB.Txn, tn.Catalog(), flags.required)
+		if err != nil || dbID == 0 {
+			// dbID can still be 0 if required is false and the database is not found.
+			return nil, nil, err
+		}
+	}
+
+	// TODO(vivek): Ideally we'd avoid caching for only the
+	// system.descriptor and system.lease tables, because they are
+	// used for acquiring leases, creating a chicken&egg problem.
+	// But doing so turned problematic and the tests pass only by also
+	// disabling caching of system.eventlog, system.rangelog, and
+	// system.users. For now we're sticking to disabling caching of
+	// all system descriptors except the role-members-table.
+	avoidCache := flags.avoidCached || testDisableTableLeases ||
+		(tn.Catalog() == sqlbase.SystemDB.Name && tn.TableName.String() != sqlbase.RoleMembersTable.Name)
+
+	if refuseFurtherLookup, table, err := tc.getUncommittedTable(dbID, tn, flags.required); refuseFurtherLookup || err != nil {
+		return nil, nil, err
+	} else if immut := table.ImmutableTableDescriptor; immut != nil {
+		// If not forcing to resolve using KV, tables being added aren't visible.
+		if immut.Adding() && !avoidCache {
+			err := errTableAdding
+			if !flags.required {
+				err = nil
+			}
+			return nil, nil, err
+		}
+
+		log.VEventf(ctx, 2, "found uncommitted table %d", immut.ID)
+		return immut, nil, nil
+	}
+
+	readTableFromStore := func() (*sqlbase.ImmutableTableDescriptor, *sqlbase.DatabaseDescriptor, error) {
+		phyAccessor := UncachedPhysicalAccessor{}
+		obj, db, err := phyAccessor.GetObjectDesc(ctx, txn, tn, flags)
+		if obj == nil {
+			return nil, db, err
+		}
+		return obj.(*sqlbase.ImmutableTableDescriptor), db, err
+	}
+
+	if avoidCache {
+		return readTableFromStore()
+	}
 
 	// First, look to see if we already have the table.
 	// This ensures that, once a SQL transaction resolved name N to id X, it will
 	// continue to use N to refer to X even if N is renamed during the
 	// transaction.
-	for _, table := range tc.tables {
+	for _, table := range tc.leasedTables {
 		if table.Name == string(tn.TableName) &&
 			table.ParentID == dbID {
 			log.VEventf(ctx, 2, "found table in table collection for table '%s'", tn)
-			return table, nil
+			return table, nil, nil
 		}
 	}
 
-	table, expiration, err := tc.leaseMgr.AcquireByName(ctx, txn, dbID, tn.Table())
+	origTimestamp := txn.OrigTimestamp()
+	table, expiration, err := tc.leaseMgr.AcquireByName(ctx, origTimestamp, dbID, tn.Table())
 	if err != nil {
-		if err == sqlbase.ErrDescriptorNotFound {
-			// Transform the descriptor error into an error that references the
-			// table's name.
-			return nil, sqlbase.NewUndefinedRelationError(tn)
+		// Read the descriptor from the store in the face of some specific errors
+		// because of a known limitation of AcquireByName. See the known
+		// limitations of AcquireByName for details.
+		if err == errTableDropped || err == sqlbase.ErrDescriptorNotFound {
+			return readTableFromStore()
 		}
-		return nil, err
+		// Lease acquisition failed with some other error. This we don't
+		// know how to deal with, so propagate the error.
+		return nil, nil, err
 	}
-	tc.timestamp = txn.OrigTimestamp()
-	tc.tables = append(tc.tables, table)
+
+	if !origTimestamp.Less(expiration) {
+		log.Fatalf(ctx, "bad table for T=%s, expiration=%s", origTimestamp, expiration)
+	}
+
+	tc.leasedTables = append(tc.leasedTables, table)
 	log.VEventf(ctx, 2, "added table '%s' to table collection", tn)
 
 	// If the table we just acquired expires before the txn's deadline, reduce
-	// the deadline.
-	txn.UpdateDeadlineMaybe(expiration)
-	return table, nil
+	// the deadline. We use OrigTimestamp() that doesn't return the commit timestamp,
+	// so we need to set a deadline on the transaction to prevent it from committing
+	// beyond the table version expiration time.
+	txn.UpdateDeadlineMaybe(ctx, expiration)
+	return table, nil, nil
 }
 
 // getTableVersionByID is a by-ID variant of getTableVersion (i.e. uses same cache).
 func (tc *TableCollection) getTableVersionByID(
-	ctx context.Context, txn *client.Txn, tableID sqlbase.ID,
-) (*sqlbase.TableDescriptor, error) {
+	ctx context.Context, txn *client.Txn, tableID sqlbase.ID, flags ObjectLookupFlags,
+) (*sqlbase.ImmutableTableDescriptor, error) {
 	log.VEventf(ctx, 2, "planner getting table on table ID %d", tableID)
 
-	if testDisableTableLeases {
+	if flags.avoidCached || testDisableTableLeases {
 		table, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
 		if err != nil {
 			return nil, err
@@ -386,450 +373,547 @@ func (tc *TableCollection) getTableVersionByID(
 		if err := filterTableState(table); err != nil {
 			return nil, err
 		}
-		return table, nil
+		return sqlbase.NewImmutableTableDescriptor(*table), nil
 	}
 
 	for _, table := range tc.uncommittedTables {
-		if table.ID == tableID {
+		if immut := table.ImmutableTableDescriptor; immut.ID == tableID {
 			log.VEventf(ctx, 2, "found uncommitted table %d", tableID)
-			if table.Dropped() {
+			if immut.Dropped() {
 				return nil, sqlbase.NewUndefinedRelationError(
-					&parser.TableName{TableName: parser.Name(fmt.Sprintf("<id=%d>", tableID))},
+					tree.NewUnqualifiedTableName(tree.Name(fmt.Sprintf("<id=%d>", tableID))),
 				)
 			}
-			return table, nil
+			return immut, nil
 		}
 	}
 
-	// If the txn has been pushed the table collection is released and
-	// txn deadline is reset.
-	tc.maybeChangeTimestamp(ctx, txn)
-
 	// First, look to see if we already have the table -- including those
 	// via `getTableVersion`.
-	for _, table := range tc.tables {
+	for _, table := range tc.leasedTables {
 		if table.ID == tableID {
 			log.VEventf(ctx, 2, "found table %d in table cache", tableID)
 			return table, nil
 		}
 	}
 
-	table, expiration, err := tc.leaseMgr.Acquire(ctx, txn, tableID)
+	origTimestamp := txn.OrigTimestamp()
+	table, expiration, err := tc.leaseMgr.Acquire(ctx, origTimestamp, tableID)
 	if err != nil {
 		if err == sqlbase.ErrDescriptorNotFound {
 			// Transform the descriptor error into an error that references the
 			// table's ID.
 			return nil, sqlbase.NewUndefinedRelationError(
-				&parser.TableRef{TableID: int64(tableID)})
+				&tree.TableRef{TableID: int64(tableID)})
 		}
 		return nil, err
 	}
-	tc.timestamp = txn.OrigTimestamp()
-	tc.tables = append(tc.tables, table)
+
+	if !origTimestamp.Less(expiration) {
+		log.Fatalf(ctx, "bad table for T=%s, expiration=%s", origTimestamp, expiration)
+	}
+
+	tc.leasedTables = append(tc.leasedTables, table)
 	log.VEventf(ctx, 2, "added table '%s' to table collection", table.Name)
 
 	// If the table we just acquired expires before the txn's deadline, reduce
-	// the deadline.
-	txn.UpdateDeadlineMaybe(expiration)
+	// the deadline. We use OrigTimestamp() that doesn't return the commit timestamp,
+	// so we need to set a deadline on the transaction to prevent it from committing
+	// beyond the table version expiration time.
+	txn.UpdateDeadlineMaybe(ctx, expiration)
 	return table, nil
 }
 
-// releaseTables releases all tables currently held by the Session.
-func (tc *TableCollection) releaseTables(ctx context.Context) {
-	tc.timestamp = hlc.Timestamp{}
-	if len(tc.tables) > 0 {
-		log.VEventf(ctx, 2, "releasing %d tables", len(tc.tables))
-		for _, table := range tc.tables {
+// getMutableTableVersionByID is a variant of sqlbase.GetTableDescFromID which returns a mutable
+// table descriptor of the table modified in the same transaction.
+func (tc *TableCollection) getMutableTableVersionByID(
+	ctx context.Context, tableID sqlbase.ID, txn *client.Txn,
+) (*sqlbase.MutableTableDescriptor, error) {
+	log.VEventf(ctx, 2, "planner getting mutable table on table ID %d", tableID)
+
+	if table := tc.getUncommittedTableByID(tableID).MutableTableDescriptor; table != nil {
+		log.VEventf(ctx, 2, "found uncommitted table %d", tableID)
+		return table, nil
+	}
+	return sqlbase.GetMutableTableDescFromID(ctx, txn, tableID)
+}
+
+func (tc *TableCollection) releaseLeases(ctx context.Context) {
+	if len(tc.leasedTables) > 0 {
+		log.VEventf(ctx, 2, "releasing %d tables", len(tc.leasedTables))
+		for _, table := range tc.leasedTables {
 			if err := tc.leaseMgr.Release(table); err != nil {
 				log.Warning(ctx, err)
 			}
 		}
-		tc.tables = tc.tables[:0]
+		tc.leasedTables = tc.leasedTables[:0]
 	}
+}
+
+// releaseTables releases all tables currently held by the TableCollection.
+func (tc *TableCollection) releaseTables(ctx context.Context) {
+	tc.releaseLeases(ctx)
 	tc.uncommittedTables = nil
 	tc.uncommittedDatabases = nil
+	tc.releaseAllDescriptors()
 }
 
-func (tc *TableCollection) addUncommittedTable(desc sqlbase.TableDescriptor) {
+// Wait until the database cache has been updated to properly
+// reflect all dropped databases, so that future commands on the
+// same gateway node observe the dropped databases.
+func (tc *TableCollection) waitForCacheToDropDatabases(ctx context.Context) {
+	for _, uc := range tc.uncommittedDatabases {
+		if !uc.dropped {
+			continue
+		}
+		// Wait until the database cache has been updated to properly
+		// reflect a dropped database, so that future commands on the
+		// same gateway node observe the dropped database.
+		tc.dbCacheSubscriber.waitForCacheState(
+			func(dc *databaseCache) bool {
+				// Resolve the database name from the database cache.
+				dbID, err := dc.getCachedDatabaseID(ctx, uc.name)
+				if err != nil || dbID == 0 {
+					// dbID can still be 0 if required is false and
+					// the database is not found. Swallowing error here
+					// because it was felt there was no value in returning
+					// it to a higher layer only to be swallow there. This
+					// entire codepath is only called from one place so
+					// it's better to swallow it here.
+					return true
+				}
+
+				// If the database name still exists but it now references another
+				// db with a more recent id, we're good - it means that the database
+				// name has been reused.
+				return dbID > uc.id
+			})
+	}
+}
+
+func (tc *TableCollection) hasUncommittedTables() bool {
+	return len(tc.uncommittedTables) > 0
+}
+
+func (tc *TableCollection) addUncommittedTable(desc sqlbase.MutableTableDescriptor) error {
+	if desc.Version != desc.ClusterVersion.Version+1 {
+		return errors.Errorf(
+			"descriptor version %d not incremented from cluster version %d",
+			desc.Version, desc.ClusterVersion.Version)
+	}
+	tbl := uncommittedTable{
+		MutableTableDescriptor:   &desc,
+		ImmutableTableDescriptor: sqlbase.NewImmutableTableDescriptor(desc.TableDescriptor),
+	}
 	for i, table := range tc.uncommittedTables {
-		if table.ID == desc.ID {
-			tc.uncommittedTables[i] = &desc
-			return
+		if table.MutableTableDescriptor.ID == desc.ID {
+			tc.uncommittedTables[i] = tbl
+			return nil
 		}
 	}
-	tc.uncommittedTables = append(tc.uncommittedTables, &desc)
+	tc.uncommittedTables = append(tc.uncommittedTables, tbl)
+	tc.releaseAllDescriptors()
+	return nil
 }
 
-func (tc *TableCollection) addUncommittedDatabase(name string, id sqlbase.ID, dropped bool) {
-	db := uncommittedDatabase{name: name, id: id, dropped: dropped}
+// returns all the idVersion pairs that have undergone a schema change.
+// Returns nil for no schema changes. The version returned for each
+// schema change is ClusterVersion - 1, because that's the one that will be
+// used when checking for table descriptor two version invariance.
+// Also returns strings representing the new <name, version> pairs
+func (tc *TableCollection) getTablesWithNewVersion() []IDVersion {
+	var tables []IDVersion
+	for _, table := range tc.uncommittedTables {
+		if mut := table.MutableTableDescriptor; !mut.IsNewTable() {
+			tables = append(tables, NewIDVersionPrev(&mut.ClusterVersion))
+		}
+	}
+	return tables
+}
+
+type dbAction bool
+
+const (
+	dbCreated dbAction = false
+	dbDropped dbAction = true
+)
+
+func (tc *TableCollection) addUncommittedDatabase(name string, id sqlbase.ID, action dbAction) {
+	db := uncommittedDatabase{name: name, id: id, dropped: action == dbDropped}
 	tc.uncommittedDatabases = append(tc.uncommittedDatabases, db)
+	tc.releaseAllDescriptors()
 }
 
 // getUncommittedDatabaseID returns a database ID for the requested tablename
 // if the requested tablename is for a database modified within the transaction
 // affiliated with the LeaseCollection.
-func (tc *TableCollection) getUncommittedDatabaseID(tn *parser.TableName) (sqlbase.ID, error) {
-	// Walk latest to earliest.
+func (tc *TableCollection) getUncommittedDatabaseID(
+	requestedDbName string, required bool,
+) (c bool, res sqlbase.ID, err error) {
+	// Walk latest to earliest so that a DROP DATABASE followed by a
+	// CREATE DATABASE with the same name will result in the CREATE DATABASE
+	// being seen.
 	for i := len(tc.uncommittedDatabases) - 1; i >= 0; i-- {
 		db := tc.uncommittedDatabases[i]
-		if tn.Database() == db.name {
+		if requestedDbName == db.name {
 			if db.dropped {
-				return 0, sqlbase.NewUndefinedRelationError(tn)
+				if required {
+					return true, 0, sqlbase.NewUndefinedDatabaseError(requestedDbName)
+				}
+				return true, 0, nil
 			}
-			return db.id, nil
+			return false, db.id, nil
 		}
 	}
-	return 0, nil
+	return false, 0, nil
 }
 
 // getUncommittedTable returns a table for the requested tablename
 // if the requested tablename is for a table modified within the transaction
 // affiliated with the LeaseCollection.
+//
+// The first return value "refuseFurtherLookup" is true when there is
+// a known deletion of that table, so it would be invalid to miss the
+// cache and go to KV (where the descriptor prior to the DROP may
+// still exist).
 func (tc *TableCollection) getUncommittedTable(
-	dbID sqlbase.ID, tn *parser.TableName,
-) (*sqlbase.TableDescriptor, error) {
-	for _, table := range tc.uncommittedTables {
-		if table.Name == string(tn.TableName) &&
-			table.ParentID == dbID {
-			if err := filterTableState(table); err != nil {
-				return nil, sqlbase.NewUndefinedRelationError(tn)
-			}
-			return table, nil
-		}
+	dbID sqlbase.ID, tn *tree.TableName, required bool,
+) (refuseFurtherLookup bool, table uncommittedTable, err error) {
+	// Walk latest to earliest so that a DROP TABLE followed by a CREATE TABLE
+	// with the same name will result in the CREATE TABLE being seen.
+	for i := len(tc.uncommittedTables) - 1; i >= 0; i-- {
+		table := tc.uncommittedTables[i]
+		mutTbl := table.MutableTableDescriptor
 		// If a table has gotten renamed we'd like to disallow using the old names.
 		// The renames could have happened in another transaction but it's still okay
 		// to disallow the use of the old name in this transaction because the other
 		// transaction has already committed and this transaction is seeing the
 		// effect of it.
-		for _, rename := range table.GetRenames() {
-			if rename.OldName == string(tn.TableName) &&
-				rename.OldParentID == dbID {
-				return nil, sqlbase.NewUndefinedRelationError(tn)
+		for _, drain := range mutTbl.DrainingNames {
+			if drain.Name == string(tn.TableName) &&
+				drain.ParentID == dbID {
+				// Table name has gone away.
+				if required {
+					// If it's required here, say it doesn't exist.
+					err = sqlbase.NewUndefinedRelationError(tn)
+				}
+				// The table collection knows better; the caller has to avoid
+				// going to KV in any case: refuseFurtherLookup = true
+				return true, uncommittedTable{}, err
 			}
 		}
+
+		// Do we know about a table with this name?
+		if mutTbl.Name == string(tn.TableName) &&
+			mutTbl.ParentID == dbID {
+			// Right state?
+			if err = filterTableState(mutTbl.TableDesc()); err != nil && err != errTableAdding {
+				if !required {
+					// If it's not required here, we simply say we don't have it.
+					err = nil
+				}
+				// The table collection knows better; the caller has to avoid
+				// going to KV in any case: refuseFurtherLookup = true
+				return true, uncommittedTable{}, err
+			}
+
+			// Got a table.
+			return false, table, nil
+		}
 	}
-	return nil, nil
+	return false, uncommittedTable{}, nil
 }
 
-// getTableNames retrieves the list of qualified names of tables
-// present in the given database.
-func getTableNames(
-	ctx context.Context,
-	txn *client.Txn,
-	vt VirtualTabler,
-	dbDesc *sqlbase.DatabaseDescriptor,
-	dbNameOriginallyOmitted bool,
-) (parser.TableNames, error) {
-	if e, ok := vt.getVirtualSchemaEntry(dbDesc.Name); ok {
-		return e.tableNames(dbNameOriginallyOmitted), nil
+func (tc *TableCollection) getUncommittedTableByID(id sqlbase.ID) uncommittedTable {
+	// Walk latest to earliest so that a DROP TABLE followed by a CREATE TABLE
+	// with the same name will result in the CREATE TABLE being seen.
+	for i := len(tc.uncommittedTables) - 1; i >= 0; i-- {
+		table := tc.uncommittedTables[i]
+		if table.MutableTableDescriptor.ID == id {
+			return table
+		}
 	}
+	return uncommittedTable{}
+}
 
-	prefix := sqlbase.MakeNameMetadataKey(dbDesc.ID, "")
-	sr, err := txn.Scan(ctx, prefix, prefix.PrefixEnd(), 0)
-	if err != nil {
-		return nil, err
-	}
-
-	var tableNames parser.TableNames
-	for _, row := range sr {
-		_, tableName, err := encoding.DecodeUnsafeStringAscending(
-			bytes.TrimPrefix(row.Key, prefix), nil)
+// getAllDescriptors returns all descriptors visible by the transaction,
+// first checking the TableCollection's cached descriptors for validity
+// before defaulting to a key-value scan, if necessary.
+func (tc *TableCollection) getAllDescriptors(
+	ctx context.Context, txn *client.Txn,
+) ([]sqlbase.DescriptorProto, error) {
+	if tc.allDescriptors == nil {
+		descs, err := GetAllDescriptors(ctx, txn)
 		if err != nil {
 			return nil, err
 		}
-		tn := parser.TableName{
-			DatabaseName:            parser.Name(dbDesc.Name),
-			TableName:               parser.Name(tableName),
-			DBNameOriginallyOmitted: dbNameOriginallyOmitted,
-		}
-		tableNames = append(tableNames, tn)
+		tc.allDescriptors = descs
 	}
-	return tableNames, nil
+	return tc.allDescriptors, nil
 }
 
-func (p *planner) getAliasedTableName(n parser.TableExpr) (*parser.TableName, error) {
-	if ate, ok := n.(*parser.AliasedTableExpr); ok {
-		n = ate.Expr
-	}
-	table, ok := n.(*parser.NormalizableTableName)
-	if !ok {
-		return nil, errors.Errorf("TODO(pmattis): unsupported FROM: %s", n)
-	}
-	return table.NormalizeWithDatabaseName(p.session.Database)
+// releaseAllDescriptors releases the cached slice of all descriptors
+// held by TableCollection.
+func (tc *TableCollection) releaseAllDescriptors() {
+	tc.allDescriptors = nil
 }
 
-// createSchemaChangeJob finalizes the current mutations in the table
-// descriptor and creates a schema change job in the system.jobs table.
-// The identifiers of the mutations and newly-created job are written to a new
+// Copy the modified schema to the table collection. Used when initializing
+// an InternalExecutor.
+func (tc *TableCollection) copyModifiedSchema(to *TableCollection) {
+	if tc == nil {
+		return
+	}
+	to.uncommittedTables = tc.uncommittedTables
+	to.uncommittedDatabases = tc.uncommittedDatabases
+	// Do not copy the leased descriptors because we do not want
+	// the leased descriptors to be released by the "to" TableCollection.
+	// The "to" TableCollection can re-lease the same descriptors.
+}
+
+type tableCollectionModifier interface {
+	copyModifiedSchema(to *TableCollection)
+}
+
+// createOrUpdateSchemaChangeJob finalizes the current mutations in the table
+// descriptor. If a schema change job in the system.jobs table has not been
+// created for mutations in the current transaction, one is created. The
+// identifiers of the mutations and newly-created job are written to a new
 // MutationJob in the table descriptor.
-func (p *planner) createSchemaChangeJob(
-	ctx context.Context, tableDesc *sqlbase.TableDescriptor, stmt string,
+//
+// The job creation is done within the planner's txn. This is important - if the
+// txn ends up rolling back, the job needs to go away.
+//
+// If a job for this table has already been created, update the job's details
+// and description.
+func (p *planner) createOrUpdateSchemaChangeJob(
+	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor, stmt string,
 ) (sqlbase.MutationID, error) {
-	mutationID, err := tableDesc.FinalizeMutation()
-	if err != nil {
-		return sqlbase.InvalidMutationID, err
+	mutationID := tableDesc.ClusterVersion.NextMutationID
+
+	var job *jobs.Job
+	var spanList []jobspb.ResumeSpanList
+	if len(tableDesc.MutationJobs) > len(tableDesc.ClusterVersion.MutationJobs) {
+		// Already created a job and appended the job ID to MutationJobs.
+		jobID := tableDesc.MutationJobs[len(tableDesc.MutationJobs)-1].JobID
+		var err error
+		job, err = p.ExecCfg().JobRegistry.LoadJobWithTxn(ctx, jobID, p.txn)
+		if err != nil {
+			return sqlbase.InvalidMutationID, err
+		}
+		spanList = job.Details().(jobspb.SchemaChangeDetails).ResumeSpanList
+	}
+
+	span := tableDesc.PrimaryIndexSpan()
+	for i := len(tableDesc.ClusterVersion.Mutations) + len(spanList); i < len(tableDesc.Mutations); i++ {
+		spanList = append(spanList,
+			jobspb.ResumeSpanList{
+				ResumeSpans: []roachpb.Span{span},
+			},
+		)
+	}
+
+	if job == nil {
+		jobRecord := jobs.Record{
+			Description:   stmt,
+			Username:      p.User(),
+			DescriptorIDs: sqlbase.IDs{tableDesc.GetID()},
+			Details:       jobspb.SchemaChangeDetails{ResumeSpanList: spanList},
+			Progress:      jobspb.SchemaChangeProgress{},
+		}
+		job = p.ExecCfg().JobRegistry.NewJob(jobRecord)
+		if err := job.WithTxn(p.txn).Created(ctx); err != nil {
+			return sqlbase.InvalidMutationID, err
+		}
+		tableDesc.MutationJobs = append(tableDesc.MutationJobs, sqlbase.TableDescriptor_MutationJob{
+			MutationID: mutationID, JobID: *job.ID()})
+	} else {
+		if err := job.WithTxn(p.txn).SetDetails(
+			ctx,
+			jobspb.SchemaChangeDetails{ResumeSpanList: spanList},
+		); err != nil {
+			return sqlbase.InvalidMutationID, err
+		}
+		if err := job.WithTxn(p.txn).SetDescription(
+			ctx,
+			func(ctx context.Context, description string) (string, error) {
+				return strings.Join([]string{description, stmt}, ";"), nil
+			},
+		); err != nil {
+			return sqlbase.InvalidMutationID, err
+		}
+	}
+
+	return mutationID, nil
+}
+
+// createDropTablesJob creates a schema change job in the system.jobs table.
+// The identifiers of the newly-created job are written in the table descriptor.
+// If no job is created (no tables were dropped), a job ID of 0 is returned.
+//
+// The job creation is done within the planner's txn. This is important - if the`
+// txn ends up rolling back, the job needs to go away.
+func (p *planner) createDropTablesJob(
+	ctx context.Context,
+	tableDescs []*sqlbase.MutableTableDescriptor,
+	droppedDetails []jobspb.DroppedTableDetails,
+	stmt string,
+	drainNames bool,
+	droppedDatabaseID sqlbase.ID,
+) (int64, error) {
+
+	if len(tableDescs) == 0 {
+		return 0, nil
+	}
+
+	descriptorIDs := make([]sqlbase.ID, 0, len(tableDescs))
+
+	for _, tableDesc := range tableDescs {
+		descriptorIDs = append(descriptorIDs, tableDesc.ID)
+	}
+
+	detailStatus := jobspb.Status_DRAINING_NAMES
+	if !drainNames {
+		detailStatus = jobspb.Status_WAIT_FOR_GC_INTERVAL
+	}
+	for _, droppedDetail := range droppedDetails {
+		droppedDetail.Status = detailStatus
+	}
+
+	runningStatus := jobs.RunningStatusDrainingNames
+	if !drainNames {
+		runningStatus = jobs.RunningStatusWaitingGC
 	}
 	jobRecord := jobs.Record{
 		Description:   stmt,
 		Username:      p.User(),
-		DescriptorIDs: sqlbase.IDs{tableDesc.GetID()},
-		Details:       jobs.SchemaChangeDetails{},
+		DescriptorIDs: descriptorIDs,
+		Details:       jobspb.SchemaChangeDetails{DroppedTables: droppedDetails, DroppedDatabaseID: droppedDatabaseID},
+		Progress:      jobspb.SchemaChangeProgress{},
+		RunningStatus: runningStatus,
 	}
 	job := p.ExecCfg().JobRegistry.NewJob(jobRecord)
 	if err := job.WithTxn(p.txn).Created(ctx); err != nil {
-		return sqlbase.InvalidMutationID, nil
+		return 0, err
 	}
-	tableDesc.MutationJobs = append(tableDesc.MutationJobs, sqlbase.TableDescriptor_MutationJob{
-		MutationID: mutationID, JobID: *job.ID()})
-	return mutationID, nil
+
+	if err := job.WithTxn(p.txn).Started(ctx); err != nil {
+		return 0, err
+	}
+
+	for _, tableDesc := range tableDescs {
+		tableDesc.DropJobID = *job.ID()
+	}
+	return *job.ID(), nil
 }
 
-// notifySchemaChange implements the SchemaAccessor interface.
-func (p *planner) notifySchemaChange(
+// queueSchemaChange queues up a schema changer to process an outstanding
+// schema change for the table.
+func (p *planner) queueSchemaChange(
 	tableDesc *sqlbase.TableDescriptor, mutationID sqlbase.MutationID,
 ) {
 	sc := SchemaChanger{
-		tableID:     tableDesc.GetID(),
-		mutationID:  mutationID,
-		nodeID:      p.evalCtx.NodeID,
-		leaseMgr:    p.LeaseMgr(),
-		jobRegistry: p.ExecCfg().JobRegistry,
+		tableID:              tableDesc.GetID(),
+		mutationID:           mutationID,
+		nodeID:               p.extendedEvalCtx.NodeID,
+		leaseMgr:             p.LeaseMgr(),
+		jobRegistry:          p.ExecCfg().JobRegistry,
+		leaseHolderCache:     p.ExecCfg().LeaseHolderCache,
+		rangeDescriptorCache: p.ExecCfg().RangeDescriptorCache,
+		clock:                p.ExecCfg().Clock,
+		settings:             p.ExecCfg().Settings,
+		execCfg:              p.ExecCfg(),
 	}
-	p.session.TxnState.schemaChangers.queueSchemaChanger(sc)
+	p.extendedEvalCtx.SchemaChangers.queueSchemaChanger(sc)
 }
 
-// writeTableDesc implements the SchemaAccessor interface.
-func (p *planner) writeTableDesc(ctx context.Context, tableDesc *sqlbase.TableDescriptor) error {
-	if isVirtualDescriptor(tableDesc) {
-		panic(fmt.Sprintf("Virtual Descriptors cannot be stored, found: %v", tableDesc))
+// writeSchemaChange effectively writes a table descriptor to the
+// database within the current planner transaction, and queues up
+// a schema changer for future processing.
+func (p *planner) writeSchemaChange(
+	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor, mutationID sqlbase.MutationID,
+) error {
+	if tableDesc.Dropped() {
+		// We don't allow schema changes on a dropped table.
+		return fmt.Errorf("table %q is being dropped", tableDesc.Name)
 	}
-	// Some statements setTestingVerifyMetadata to verify the descriptor they
-	// have written, but if they are followed by other statements that modify
-	// the descriptor the verification of the overwritten descriptor cannot be
-	// done.
-	p.session.setTestingVerifyMetadata(nil)
+	return p.writeTableDesc(ctx, tableDesc, mutationID)
+}
 
-	p.session.tables.addUncommittedTable(*tableDesc)
+func (p *planner) writeSchemaChangeToBatch(
+	ctx context.Context,
+	tableDesc *sqlbase.MutableTableDescriptor,
+	mutationID sqlbase.MutationID,
+	b *client.Batch,
+) error {
+	if tableDesc.Dropped() {
+		// We don't allow schema changes on a dropped table.
+		return fmt.Errorf("table %q is being dropped", tableDesc.Name)
+	}
+	return p.writeTableDescToBatch(ctx, tableDesc, mutationID, b)
+}
+
+func (p *planner) writeDropTable(
+	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor,
+) error {
+	return p.writeTableDesc(ctx, tableDesc, sqlbase.InvalidMutationID)
+}
+
+func (p *planner) writeTableDesc(
+	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor, mutationID sqlbase.MutationID,
+) error {
+	b := p.txn.NewBatch()
+	if err := p.writeTableDescToBatch(ctx, tableDesc, mutationID, b); err != nil {
+		return err
+	}
+	return p.txn.Run(ctx, b)
+}
+
+func (p *planner) writeTableDescToBatch(
+	ctx context.Context,
+	tableDesc *sqlbase.MutableTableDescriptor,
+	mutationID sqlbase.MutationID,
+	b *client.Batch,
+) error {
+	if tableDesc.IsVirtualTable() {
+		return pgerror.NewAssertionErrorf("virtual descriptors cannot be stored, found: %v", tableDesc)
+	}
+
+	if tableDesc.IsNewTable() {
+		if err := runSchemaChangesInTxn(ctx,
+			p.txn,
+			p.Tables(),
+			p.execCfg,
+			p.EvalContext(),
+			tableDesc,
+			p.ExtendedEvalContext().Tracing.KVTracingEnabled(),
+		); err != nil {
+			return err
+		}
+	} else {
+		// Only increment the table descriptor version once in this transaction.
+		if err := maybeIncrementVersion(ctx, tableDesc, p.txn); err != nil {
+			return err
+		}
+
+		// Schedule a schema changer for later.
+		p.queueSchemaChange(tableDesc.TableDesc(), mutationID)
+	}
+
+	if err := tableDesc.ValidateTable(p.extendedEvalCtx.Settings); err != nil {
+		return pgerror.NewAssertionErrorf("table descriptor is not valid: %s\n%v", err, tableDesc)
+	}
+
+	if err := p.Tables().addUncommittedTable(*tableDesc); err != nil {
+		return err
+	}
 
 	descKey := sqlbase.MakeDescMetadataKey(tableDesc.GetID())
 	descVal := sqlbase.WrapDescriptor(tableDesc)
-	if p.session.Tracing.KVTracingEnabled() {
+	if p.extendedEvalCtx.Tracing.KVTracingEnabled() {
 		log.VEventf(ctx, 2, "Put %s -> %s", descKey, descVal)
 	}
-	return p.txn.Put(ctx, descKey, descVal)
-}
 
-// expandTableGlob expands pattern into a list of tables represented
-// as a parser.TableNames.
-func expandTableGlob(
-	ctx context.Context,
-	txn *client.Txn,
-	vt VirtualTabler,
-	database string,
-	pattern parser.TablePattern,
-) (parser.TableNames, error) {
-	if t, ok := pattern.(*parser.TableName); ok {
-		if err := t.QualifyWithDatabase(database); err != nil {
-			return nil, err
-		}
-		return parser.TableNames{*t}, nil
-	}
-
-	glob := pattern.(*parser.AllTablesSelector)
-
-	if err := glob.QualifyWithDatabase(database); err != nil {
-		return nil, err
-	}
-
-	dbDesc, err := MustGetDatabaseDesc(ctx, txn, vt, string(glob.Database))
-	if err != nil {
-		return nil, err
-	}
-
-	tableNames, err := getTableNames(ctx, txn, vt, dbDesc, glob.DBNameOriginallyOmitted)
-	if err != nil {
-		return nil, err
-	}
-	return tableNames, nil
-}
-
-// searchAndQualifyDatabase augments the table name with the database
-// where it was found. It searches first in the session current
-// database, if that's defined, otherwise the search path.  The
-// provided TableName is modified in-place in case of success, and
-// left unchanged otherwise.
-// The table name must not be qualified already.
-func (p *planner) searchAndQualifyDatabase(ctx context.Context, tn *parser.TableName) error {
-	t := *tn
-
-	descFunc := p.session.tables.getTableVersion
-	if p.avoidCachedDescriptors {
-		// AS OF SYSTEM TIME queries need to fetch the table descriptor at the
-		// specified time, and never lease anything. The proto transaction already
-		// has its timestamps set correctly so getTableOrViewDesc will fetch with
-		// the correct timestamp.
-		descFunc = getTableOrViewDesc
-	}
-
-	if p.session.Database != "" {
-		t.DatabaseName = parser.Name(p.session.Database)
-		desc, err := descFunc(ctx, p.txn, p.getVirtualTabler(), &t)
-		if err != nil && !sqlbase.IsUndefinedRelationError(err) && !sqlbase.IsUndefinedDatabaseError(err) {
-			return err
-		}
-		if desc != nil {
-			// Table was found, use this name.
-			*tn = t
-			return nil
-		}
-	}
-
-	// Not found using the current session's database, so try
-	// the search path instead.
-	for _, database := range p.session.SearchPath {
-		t.DatabaseName = parser.Name(database)
-		desc, err := descFunc(ctx, p.txn, p.getVirtualTabler(), &t)
-		if err != nil && !sqlbase.IsUndefinedRelationError(err) && !sqlbase.IsUndefinedDatabaseError(err) {
-			return err
-		}
-		if desc != nil {
-			// The table or view exists in this database, so return it.
-			*tn = t
-			return nil
-		}
-	}
-
-	return sqlbase.NewUndefinedRelationError(&t)
-}
-
-// getQualifiedTableName returns the database-qualified name of the table
-// or view represented by the provided descriptor.
-func (p *planner) getQualifiedTableName(
-	ctx context.Context, desc *sqlbase.TableDescriptor,
-) (string, error) {
-	dbDesc, err := sqlbase.GetDatabaseDescFromID(ctx, p.txn, desc.ParentID)
-	if err != nil {
-		return "", err
-	}
-	tbName := parser.TableName{
-		DatabaseName: parser.Name(dbDesc.Name),
-		TableName:    parser.Name(desc.Name),
-	}
-	return tbName.String(), nil
-}
-
-// findTableContainingIndex returns the name of the table containing
-// an index of the given name. An error is returned if the index is
-// not found or if the index name is ambiguous (i.e. exists in
-// multiple tables).
-func (p *planner) findTableContainingIndex(
-	ctx context.Context, txn *client.Txn, vt VirtualTabler, dbName parser.Name, idxName parser.Name,
-) (result *parser.TableName, err error) {
-	dbDesc, err := MustGetDatabaseDesc(ctx, txn, vt, string(dbName))
-	if err != nil {
-		return nil, err
-	}
-
-	tns, err := getTableNames(ctx, txn, vt, dbDesc, false)
-	if err != nil {
-		return nil, err
-	}
-
-	result = nil
-	for i := range tns {
-		tn := &tns[i]
-		tableDesc, err := mustGetTableDesc(
-			ctx, p.txn, p.getVirtualTabler(), tn, true, /*allowAdding*/
-		)
-		if err != nil {
-			return nil, err
-		}
-		_, dropped, err := tableDesc.FindIndexByName(string(idxName))
-		if err != nil || dropped {
-			continue
-		}
-		if result != nil {
-			return nil, fmt.Errorf("index name %q is ambiguous (found in %s and %s)",
-				idxName, tn.String(), result.String())
-		}
-		result = tn
-	}
-	if result == nil {
-		return nil, fmt.Errorf("index %q does not exist", idxName)
-	}
-	return result, nil
-}
-
-// expandIndexName ensures that the index name is qualified with a
-// table name, and searches the table name if not yet specified. It returns
-// the TableName of the underlying table for convenience.
-func (p *planner) expandIndexName(
-	ctx context.Context, index *parser.TableNameWithIndex,
-) (*parser.TableName, error) {
-	tn, err := index.Table.NormalizeWithDatabaseName(p.session.Database)
-	if err != nil {
-		return nil, err
-	}
-
-	if index.SearchTable {
-		realTableName, err := p.findTableContainingIndex(ctx, p.txn, p.getVirtualTabler(), tn.DatabaseName, tn.TableName)
-		if err != nil {
-			return nil, err
-		}
-		index.Index = tn.TableName
-		index.Table.TableNameReference = realTableName
-		tn = realTableName
-	}
-	return tn, nil
-}
-
-// getTableAndIndex returns the table and index descriptors for a table
-// (primary index) or table-with-index. Only one of table and tableWithIndex can
-// be set.  This is useful for statements that have both table and index
-// variants (like `ALTER TABLE/INDEX ... SPLIT AT ...`).
-// It can return indexes that are being rolled out.
-func (p *planner) getTableAndIndex(
-	ctx context.Context,
-	table *parser.NormalizableTableName,
-	tableWithIndex *parser.TableNameWithIndex,
-	privilege privilege.Kind,
-) (*sqlbase.TableDescriptor, *sqlbase.IndexDescriptor, error) {
-	var tn *parser.TableName
-	var err error
-	if tableWithIndex == nil {
-		// Variant: ALTER TABLE
-		tn, err = table.NormalizeWithDatabaseName(p.session.Database)
-	} else {
-		// Variant: ALTER INDEX
-		tn, err = p.expandIndexName(ctx, tableWithIndex)
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	tableDesc, err := getTableDesc(ctx, p.txn, p.getVirtualTabler(), tn)
-	if err != nil {
-		return nil, nil, err
-	}
-	if tableDesc == nil {
-		return nil, nil, sqlbase.NewUndefinedRelationError(tn)
-	}
-	if err := p.CheckPrivilege(tableDesc, privilege); err != nil {
-		return nil, nil, err
-	}
-
-	// Determine which index to use.
-	var index sqlbase.IndexDescriptor
-	if tableWithIndex == nil {
-		index = tableDesc.PrimaryIndex
-	} else {
-		idx, dropped, err := tableDesc.FindIndexByName(string(tableWithIndex.Index))
-		if err != nil {
-			return nil, nil, err
-		}
-		if dropped {
-			return nil, nil, fmt.Errorf("index %q being dropped", tableWithIndex.Index)
-		}
-		index = idx
-	}
-	return tableDesc, &index, nil
+	b.Put(descKey, descVal)
+	return nil
 }

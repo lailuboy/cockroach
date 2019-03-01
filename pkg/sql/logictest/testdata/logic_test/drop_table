@@ -1,4 +1,4 @@
-# LogicTest: default
+# LogicTest: local local-opt
 
 statement ok
 CREATE TABLE a (id INT PRIMARY KEY)
@@ -6,10 +6,9 @@ CREATE TABLE a (id INT PRIMARY KEY)
 statement ok
 CREATE TABLE b (id INT PRIMARY KEY)
 
-query T colnames
+query T
 SHOW TABLES FROM test
 ----
-Table
 a
 b
 
@@ -26,16 +25,23 @@ SELECT * FROM a
 statement ok
 DROP TABLE a
 
-query T colnames
+query TT
+SELECT status, running_status FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE'
+----
+running  waiting for GC TTL
+
+query T
 SHOW TABLES FROM test
 ----
-Table
 b
 
-statement error relation "a" does not exist
+statement error pgcode 42P01 relation "a" does not exist
 SELECT * FROM a
 
-statement error relation "a" does not exist
+statement error pq: \[53 AS a\]: table is being dropped
+SELECT * FROM [53 AS a]
+
+statement error pgcode 42P01 relation "a" does not exist
 DROP TABLE a
 
 statement ok

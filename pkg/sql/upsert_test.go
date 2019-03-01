@@ -11,18 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Daniel Harrison (dan@cockroachlabs.com)
 
 package sql_test
 
 import (
 	"bytes"
+	"context"
 	"sync/atomic"
 	"testing"
-
-	"golang.org/x/net/context"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -32,22 +28,23 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"golang.org/x/sync/errgroup"
 )
 
 func TestUpsertFastPath(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	// This filter increments scans and beginTxn for every ScanRequest and
-	// BeginTransactionRequest that hits user table data.
+	// This filter increments scans and endTxn for every ScanRequest and
+	// EndTransactionRequest that hits user table data.
 	var scans uint64
-	var beginTxn uint64
+	var endTxn uint64
 	filter := func(filterArgs storagebase.FilterArgs) *roachpb.Error {
 		if bytes.Compare(filterArgs.Req.Header().Key, keys.UserTableDataMin) >= 0 {
 			switch filterArgs.Req.Method() {
 			case roachpb.Scan:
 				atomic.AddUint64(&scans, 1)
-			case roachpb.BeginTransaction:
-				atomic.AddUint64(&beginTxn, 1)
+			case roachpb.EndTransaction:
+				atomic.AddUint64(&endTxn, 1)
 			}
 		}
 		return nil
@@ -55,52 +52,54 @@ func TestUpsertFastPath(t *testing.T) {
 
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{Store: &storage.StoreTestingKnobs{
-			TestingEvalFilter: filter,
+			EvalKnobs: storagebase.BatchEvalTestingKnobs{
+				TestingEvalFilter: filter,
+			},
 		}},
 	})
 	defer s.Stopper().Stop(context.TODO())
-	sqlDB := sqlutils.MakeSQLRunner(t, conn)
-	sqlDB.Exec(`CREATE DATABASE d`)
-	sqlDB.Exec(`CREATE TABLE d.kv (k INT PRIMARY KEY, v INT)`)
+	sqlDB := sqlutils.MakeSQLRunner(conn)
+	sqlDB.Exec(t, `CREATE DATABASE d`)
+	sqlDB.Exec(t, `CREATE TABLE d.kv (k INT PRIMARY KEY, v INT)`)
 
 	// This should hit the fast path.
 	atomic.StoreUint64(&scans, 0)
-	atomic.StoreUint64(&beginTxn, 0)
-	sqlDB.Exec(`UPSERT INTO d.kv VALUES (1, 1)`)
+	atomic.StoreUint64(&endTxn, 0)
+	sqlDB.Exec(t, `UPSERT INTO d.kv VALUES (1, 1)`)
 	if s := atomic.LoadUint64(&scans); s != 0 {
 		t.Errorf("expected no scans (the upsert fast path) but got %d", s)
 	}
-	if s := atomic.LoadUint64(&beginTxn); s != 0 {
-		t.Errorf("expected no begin-txn (1PC) but got %d", s)
+	if s := atomic.LoadUint64(&endTxn); s != 0 {
+		t.Errorf("expected no end-txn (1PC) but got %d", s)
 	}
 
 	// This could hit the fast path, but doesn't right now because of #14482.
 	atomic.StoreUint64(&scans, 0)
-	atomic.StoreUint64(&beginTxn, 0)
-	sqlDB.Exec(`INSERT INTO d.kv VALUES (1, 1) ON CONFLICT (k) DO UPDATE SET v=excluded.v`)
+	atomic.StoreUint64(&endTxn, 0)
+	sqlDB.Exec(t, `INSERT INTO d.kv VALUES (1, 1) ON CONFLICT (k) DO UPDATE SET v=excluded.v`)
 	if s := atomic.LoadUint64(&scans); s != 1 {
 		t.Errorf("expected 1 scans (no upsert fast path) but got %d", s)
 	}
-	if s := atomic.LoadUint64(&beginTxn); s != 0 {
-		t.Errorf("expected no begin-txn (1PC) but got %d", s)
+	if s := atomic.LoadUint64(&endTxn); s != 0 {
+		t.Errorf("expected no end-txn (1PC) but got %d", s)
 	}
 
 	// This should not hit the fast path because it doesn't set every column.
 	atomic.StoreUint64(&scans, 0)
-	atomic.StoreUint64(&beginTxn, 0)
-	sqlDB.Exec(`UPSERT INTO d.kv (k) VALUES (1)`)
+	atomic.StoreUint64(&endTxn, 0)
+	sqlDB.Exec(t, `UPSERT INTO d.kv (k) VALUES (1)`)
 	if s := atomic.LoadUint64(&scans); s != 1 {
 		t.Errorf("expected 1 scans (no upsert fast path) but got %d", s)
 	}
-	if s := atomic.LoadUint64(&beginTxn); s != 0 {
-		t.Errorf("expected no begin-txn (1PC) but got %d", s)
+	if s := atomic.LoadUint64(&endTxn); s != 0 {
+		t.Errorf("expected no end-txn (1PC) but got %d", s)
 	}
 
 	// This should hit the fast path, but won't be a 1PC because of the explicit
 	// transaction.
 	atomic.StoreUint64(&scans, 0)
-	atomic.StoreUint64(&beginTxn, 0)
-	tx, err := sqlDB.DB.Begin()
+	atomic.StoreUint64(&endTxn, 0)
+	tx, err := conn.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,33 +112,32 @@ func TestUpsertFastPath(t *testing.T) {
 	if s := atomic.LoadUint64(&scans); s != 0 {
 		t.Errorf("expected no scans (the upsert fast path) but got %d", s)
 	}
-	if s := atomic.LoadUint64(&beginTxn); s != 1 {
-		t.Errorf("expected 1 begin-txn (no 1PC) but got %d", s)
+	if s := atomic.LoadUint64(&endTxn); s != 1 {
+		t.Errorf("expected 1 end-txn (no 1PC) but got %d", s)
 	}
 
 	// This should not hit the fast path because kv has a secondary index.
-	sqlDB.Exec(`CREATE INDEX vidx ON d.kv (v)`)
+	sqlDB.Exec(t, `CREATE INDEX vidx ON d.kv (v)`)
 	atomic.StoreUint64(&scans, 0)
-	atomic.StoreUint64(&beginTxn, 0)
-	sqlDB.Exec(`UPSERT INTO d.kv VALUES (1, 1)`)
+	atomic.StoreUint64(&endTxn, 0)
+	sqlDB.Exec(t, `UPSERT INTO d.kv VALUES (1, 1)`)
 	if s := atomic.LoadUint64(&scans); s != 1 {
 		t.Errorf("expected 1 scans (no upsert fast path) but got %d", s)
 	}
-	if s := atomic.LoadUint64(&beginTxn); s != 0 {
-		t.Errorf("expected no begin-txn (1PC) but got %d", s)
+	if s := atomic.LoadUint64(&endTxn); s != 0 {
+		t.Errorf("expected no end-txn (1PC) but got %d", s)
 	}
 }
 
-func TestConcurrentUpsertWithSnapshotIsolation(t *testing.T) {
+func TestConcurrentUpsert(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
-	sqlDB := sqlutils.MakeSQLRunner(t, conn)
+	sqlDB := sqlutils.MakeSQLRunner(conn)
 
-	sqlDB.Exec(`CREATE DATABASE d`)
-	sqlDB.Exec(`CREATE TABLE d.t (a INT PRIMARY KEY, b INT, INDEX b_idx (b))`)
-	sqlDB.Exec(`SET DEFAULT_TRANSACTION_ISOLATION TO SNAPSHOT`)
+	sqlDB.Exec(t, `CREATE DATABASE d`)
+	sqlDB.Exec(t, `CREATE TABLE d.t (a INT PRIMARY KEY, b INT, INDEX b_idx (b))`)
 
 	testCases := []struct {
 		name       string
@@ -180,8 +178,8 @@ SELECT * FROM d.t@primary = %s
 SELECT * FROM d.t@b_idx   = %s
 `,
 					err,
-					sqlDB.QueryStr(`SELECT * FROM d.t@primary`),
-					sqlDB.QueryStr(`SELECT * FROM d.t@b_idx`),
+					sqlDB.QueryStr(t, `SELECT * FROM d.t@primary`),
+					sqlDB.QueryStr(t, `SELECT * FROM d.t@b_idx`),
 				)
 			}
 		})

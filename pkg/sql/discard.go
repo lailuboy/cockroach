@@ -11,41 +11,50 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
 
 package sql
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 // Discard implements the DISCARD statement.
 // See https://www.postgresql.org/docs/9.6/static/sql-discard.html for details.
-func (p *planner) Discard(ctx context.Context, s *parser.Discard) (planNode, error) {
+func (p *planner) Discard(ctx context.Context, s *tree.Discard) (planNode, error) {
 	switch s.Mode {
-	case parser.DiscardModeAll:
+	case tree.DiscardModeAll:
 		if !p.autoCommit {
 			return nil, pgerror.NewError(pgerror.CodeActiveSQLTransactionError,
 				"DISCARD ALL cannot run inside a transaction block")
 		}
 
 		// RESET ALL
-		for _, v := range varGen {
-			if v.Reset != nil {
-				if err := v.Reset(p.session); err != nil {
-					return nil, err
-				}
-			}
+		if err := resetSessionVars(ctx, p.sessionDataMutator); err != nil {
+			return nil, err
 		}
 
 		// DEALLOCATE ALL
-		p.session.PreparedStatements.DeleteAll(ctx)
+		p.preparedStatements.DeleteAll(ctx)
 	default:
-		return nil, pgerror.NewErrorf(pgerror.CodeInternalError,
-			"unknown mode for DISCARD: %d", s.Mode)
+		return nil, pgerror.NewAssertionErrorf("unknown mode for DISCARD: %d", s.Mode)
 	}
-	return &emptyNode{}, nil
+	return newZeroNode(nil /* columns */), nil
+}
+
+func resetSessionVars(ctx context.Context, m *sessionDataMutator) error {
+	for _, varName := range varNames {
+		v := varGen[varName]
+		if v.Set != nil {
+			hasDefault, defVal := getSessionVarDefaultString(varName, v, m)
+			if hasDefault {
+				if err := v.Set(ctx, m, defVal); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }

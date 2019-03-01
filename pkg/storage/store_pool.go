@@ -11,27 +11,28 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package storage
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"sort"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/shuffle"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -44,53 +45,64 @@ const (
 	TestTimeUntilStoreDeadOff = 24 * time.Hour
 )
 
-// declinedReservationsTimeout needs to be non-zero to prevent useless retries
-// in the replicateQueue.process() retry loop.
-var declinedReservationsTimeout = settings.RegisterNonNegativeDurationSetting(
+// DeclinedReservationsTimeout specifies a duration during which the local
+// replicate queue will not consider stores which have rejected a reservation a
+// viable target.
+var DeclinedReservationsTimeout = settings.RegisterNonNegativeDurationSetting(
 	"server.declined_reservation_timeout",
 	"the amount of time to consider the store throttled for up-replication after a reservation was declined",
 	1*time.Second,
 )
 
-var failedReservationsTimeout = settings.RegisterNonNegativeDurationSetting(
+// FailedReservationsTimeout specifies a duration during which the local
+// replicate queue will not consider stores which have failed a reservation a
+// viable target.
+var FailedReservationsTimeout = settings.RegisterNonNegativeDurationSetting(
 	"server.failed_reservation_timeout",
 	"the amount of time to consider the store throttled for up-replication after a failed reservation call",
 	5*time.Second,
 )
 
-type nodeStatus int
+const timeUntilStoreDeadSettingName = "server.time_until_store_dead"
 
-const (
-	_ nodeStatus = iota
-	// The node has not heartbeat the node liveness for longer than the
-	// time until store dead threshold.
-	nodeStatusDead
-	// The node liveness either couldn't be consulted or the node is draining.
-	nodeStatusUnknown
-	// The node is considered live.
-	nodeStatusLive
+// TimeUntilStoreDead wraps "server.time_until_store_dead".
+var TimeUntilStoreDead = settings.RegisterValidatedDurationSetting(
+	timeUntilStoreDeadSettingName,
+	"the time after which if there is no new gossiped information about a store, it is considered dead",
+	5*time.Minute,
+	func(v time.Duration) error {
+		// Setting this to less than the interval for gossiping stores is a big
+		// no-no, since this value is compared to the age of the most recent gossip
+		// from each store to determine whether that store is live. Put a buffer of
+		// 15 seconds on top to allow time for gossip to propagate.
+		const minTimeUntilStoreDead = gossip.StoresInterval + 15*time.Second
+		if v < minTimeUntilStoreDead {
+			return errors.Errorf("cannot set %s to less than %v: %v",
+				timeUntilStoreDeadSettingName, minTimeUntilStoreDead, v)
+		}
+		return nil
+	},
 )
+
+// The NodeCountFunc returns a count of the total number of nodes the user
+// intends for their to be in the cluster. The count includes dead nodes, but
+// not decommissioned nodes.
+type NodeCountFunc func() int
 
 // A NodeLivenessFunc accepts a node ID, current time and threshold before
 // a node is considered dead and returns whether or not the node is live.
-type NodeLivenessFunc func(roachpb.NodeID, time.Time, time.Duration) nodeStatus
+type NodeLivenessFunc func(roachpb.NodeID, time.Time, time.Duration) storagepb.NodeLivenessStatus
 
 // MakeStorePoolNodeLivenessFunc returns a function which determines
 // the status of a node based on information provided by the specified
 // NodeLiveness.
 func MakeStorePoolNodeLivenessFunc(nodeLiveness *NodeLiveness) NodeLivenessFunc {
-	return func(nodeID roachpb.NodeID, now time.Time, threshold time.Duration) nodeStatus {
+	return func(nodeID roachpb.NodeID, now time.Time, threshold time.Duration) storagepb.NodeLivenessStatus {
 		liveness, err := nodeLiveness.GetLiveness(nodeID)
-		if err == nil && !liveness.Draining {
-			if liveness.isLive(hlc.Timestamp{WallTime: now.UnixNano()}, nodeLiveness.clock.MaxOffset()) {
-				return nodeStatusLive
-			}
-			deadAsOf := liveness.Expiration.GoTime().Add(threshold)
-			if !now.Before(deadAsOf) {
-				return nodeStatusDead
-			}
+		if err != nil {
+			return storagepb.NodeLivenessStatus_UNAVAILABLE
 		}
-		return nodeStatusUnknown
+		return liveness.LivenessStatus(now, threshold, nodeLiveness.clock.MaxOffset())
 	}
 }
 
@@ -102,7 +114,6 @@ type storeDetail struct {
 	// lastUpdatedTime is set when a store is first consulted and every time
 	// gossip arrives for a store.
 	lastUpdatedTime time.Time
-	deadReplicas    map[roachpb.RangeID][]roachpb.ReplicaDescriptor
 }
 
 // isThrottled returns whether the store is currently throttled.
@@ -131,6 +142,8 @@ const (
 	storeStatusReplicaCorrupted
 	// The store is alive and available.
 	storeStatusAvailable
+	// The store is decommissioning.
+	storeStatusDecommissioning
 )
 
 // status returns the current status of the store, including whether
@@ -155,17 +168,16 @@ func (sd *storeDetail) status(
 	// Even if the store has been updated via gossip, we still rely on
 	// the node liveness to determine whether it is considered live.
 	switch nl(sd.desc.Node.NodeID, now, threshold) {
-	case nodeStatusDead:
+	case storagepb.NodeLivenessStatus_DEAD, storagepb.NodeLivenessStatus_DECOMMISSIONED:
 		return storeStatusDead
-	case nodeStatusUnknown:
+	case storagepb.NodeLivenessStatus_DECOMMISSIONING:
+		return storeStatusDecommissioning
+	case storagepb.NodeLivenessStatus_UNKNOWN, storagepb.NodeLivenessStatus_UNAVAILABLE:
 		return storeStatusUnknown
 	}
 
 	if sd.isThrottled(now) {
 		return storeStatusThrottled
-	}
-	if len(sd.deadReplicas[rangeID]) > 0 {
-		return storeStatusReplicaCorrupted
 	}
 
 	return storeStatusAvailable
@@ -185,13 +197,14 @@ type localityWithString struct {
 // information on their health.
 type StorePool struct {
 	log.AmbientContext
+	st *cluster.Settings
 
-	clock              *hlc.Clock
-	gossip             *gossip.Gossip
-	nodeLivenessFn     NodeLivenessFunc
-	timeUntilStoreDead *settings.DurationSetting
-	startTime          time.Time
-	deterministic      bool
+	clock          *hlc.Clock
+	gossip         *gossip.Gossip
+	nodeCountFn    NodeCountFunc
+	nodeLivenessFn NodeLivenessFunc
+	startTime      time.Time
+	deterministic  bool
 	// We use separate mutexes for storeDetails and nodeLocalities because the
 	// nodeLocalities map is used in the critical code path of Replica.Send()
 	// and we'd rather not block that on something less important accessing
@@ -210,28 +223,31 @@ type StorePool struct {
 // with gossip.
 func NewStorePool(
 	ambient log.AmbientContext,
+	st *cluster.Settings,
 	g *gossip.Gossip,
 	clock *hlc.Clock,
+	nodeCountFn NodeCountFunc,
 	nodeLivenessFn NodeLivenessFunc,
-	timeUntilStoreDead *settings.DurationSetting,
 	deterministic bool,
 ) *StorePool {
 	sp := &StorePool{
-		AmbientContext:     ambient,
-		clock:              clock,
-		gossip:             g,
-		nodeLivenessFn:     nodeLivenessFn,
-		timeUntilStoreDead: timeUntilStoreDead,
-		startTime:          clock.PhysicalTime(),
-		deterministic:      deterministic,
+		AmbientContext: ambient,
+		st:             st,
+		clock:          clock,
+		gossip:         g,
+		nodeCountFn:    nodeCountFn,
+		nodeLivenessFn: nodeLivenessFn,
+		startTime:      clock.PhysicalTime(),
+		deterministic:  deterministic,
 	}
 	sp.detailsMu.storeDetails = make(map[roachpb.StoreID]*storeDetail)
 	sp.localitiesMu.nodeLocalities = make(map[roachpb.NodeID]localityWithString)
 
+	// Enable redundant callbacks for the store keys because we use these
+	// callbacks as a clock to determine when a store was last updated even if it
+	// hasn't otherwise changed.
 	storeRegex := gossip.MakePrefixPattern(gossip.KeyStorePrefix)
-	g.RegisterCallback(storeRegex, sp.storeGossipUpdate)
-	deadReplicasRegex := gossip.MakePrefixPattern(gossip.KeyDeadReplicasPrefix)
-	g.RegisterCallback(deadReplicasRegex, sp.deadReplicasGossipUpdate)
+	g.RegisterCallback(storeRegex, sp.storeGossipUpdate, gossip.Redundant)
 
 	return sp
 }
@@ -248,16 +264,19 @@ func (sp *StorePool) String() string {
 
 	var buf bytes.Buffer
 	now := sp.clock.PhysicalTime()
+	timeUntilStoreDead := TimeUntilStoreDead.Get(&sp.st.SV)
 
 	for _, id := range ids {
 		detail := sp.detailsMu.storeDetails[id]
 		fmt.Fprintf(&buf, "%d", id)
-		status := detail.status(now, sp.timeUntilStoreDead.Get(), 0, sp.nodeLivenessFn)
+		status := detail.status(now, timeUntilStoreDead, 0, sp.nodeLivenessFn)
 		if status != storeStatusAvailable {
 			fmt.Fprintf(&buf, " (status=%d)", status)
 		}
-		fmt.Fprintf(&buf, ": range-count=%d fraction-used=%.2f",
-			detail.desc.Capacity.RangeCount, detail.desc.Capacity.FractionUsed())
+		if detail.desc != nil {
+			fmt.Fprintf(&buf, ": range-count=%d fraction-used=%.2f",
+				detail.desc.Capacity.RangeCount, detail.desc.Capacity.FractionUsed())
+		}
 		throttled := detail.throttledUntil.Sub(now)
 		if throttled > 0 {
 			fmt.Fprintf(&buf, " [throttled=%.1fs]", throttled.Seconds())
@@ -288,31 +307,72 @@ func (sp *StorePool) storeGossipUpdate(_ string, content roachpb.Value) {
 	sp.localitiesMu.Unlock()
 }
 
-// deadReplicasGossipUpdate is the gossip callback used to keep the StorePool up to date.
-func (sp *StorePool) deadReplicasGossipUpdate(_ string, content roachpb.Value) {
-	var replicas roachpb.StoreDeadReplicas
-	if err := content.GetProto(&replicas); err != nil {
-		ctx := sp.AnnotateCtx(context.TODO())
-		log.Error(ctx, err)
-		return
-	}
-
+// updateLocalStoreAfterRebalance is used to update the local copy of the
+// target store immediately after a replica addition or removal.
+func (sp *StorePool) updateLocalStoreAfterRebalance(
+	storeID roachpb.StoreID, rangeInfo RangeInfo, changeType roachpb.ReplicaChangeType,
+) {
 	sp.detailsMu.Lock()
 	defer sp.detailsMu.Unlock()
-	detail := sp.getStoreDetailLocked(replicas.StoreID)
-	deadReplicas := make(map[roachpb.RangeID][]roachpb.ReplicaDescriptor)
-	for _, r := range replicas.Replicas {
-		deadReplicas[r.RangeID] = append(deadReplicas[r.RangeID], r.Replica)
+	detail := *sp.getStoreDetailLocked(storeID)
+	if detail.desc == nil {
+		// We don't have this store yet (this is normal when we're
+		// starting up and don't have full information from the gossip
+		// network). We can't update the local store at this time.
+		return
 	}
-	detail.deadReplicas = deadReplicas
+	switch changeType {
+	case roachpb.ADD_REPLICA:
+		detail.desc.Capacity.RangeCount++
+		detail.desc.Capacity.LogicalBytes += rangeInfo.LogicalBytes
+		detail.desc.Capacity.WritesPerSecond += rangeInfo.WritesPerSecond
+	case roachpb.REMOVE_REPLICA:
+		detail.desc.Capacity.RangeCount--
+		if detail.desc.Capacity.LogicalBytes <= rangeInfo.LogicalBytes {
+			detail.desc.Capacity.LogicalBytes = 0
+		} else {
+			detail.desc.Capacity.LogicalBytes -= rangeInfo.LogicalBytes
+		}
+		if detail.desc.Capacity.WritesPerSecond <= rangeInfo.WritesPerSecond {
+			detail.desc.Capacity.WritesPerSecond = 0
+		} else {
+			detail.desc.Capacity.WritesPerSecond -= rangeInfo.WritesPerSecond
+		}
+	}
+	sp.detailsMu.storeDetails[storeID] = &detail
+}
+
+// updateLocalStoresAfterLeaseTransfer is used to update the local copies of the
+// involved store descriptors immediately after a lease transfer.
+func (sp *StorePool) updateLocalStoresAfterLeaseTransfer(
+	from roachpb.StoreID, to roachpb.StoreID, rangeQPS float64,
+) {
+	sp.detailsMu.Lock()
+	defer sp.detailsMu.Unlock()
+
+	fromDetail := *sp.getStoreDetailLocked(from)
+	if fromDetail.desc != nil {
+		fromDetail.desc.Capacity.LeaseCount--
+		if fromDetail.desc.Capacity.QueriesPerSecond < rangeQPS {
+			fromDetail.desc.Capacity.QueriesPerSecond = 0
+		} else {
+			fromDetail.desc.Capacity.QueriesPerSecond -= rangeQPS
+		}
+		sp.detailsMu.storeDetails[from] = &fromDetail
+	}
+
+	toDetail := *sp.getStoreDetailLocked(to)
+	if toDetail.desc != nil {
+		toDetail.desc.Capacity.LeaseCount++
+		toDetail.desc.Capacity.QueriesPerSecond += rangeQPS
+		sp.detailsMu.storeDetails[to] = &toDetail
+	}
 }
 
 // newStoreDetail makes a new storeDetail struct. It sets index to be -1 to
 // ensure that it will be processed by a queue immediately.
 func newStoreDetail() *storeDetail {
-	return &storeDetail{
-		deadReplicas: make(map[roachpb.RangeID][]roachpb.ReplicaDescriptor),
-	}
+	return &storeDetail{}
 }
 
 // getStoreDetailLocked returns the store detail for the given storeID.
@@ -345,10 +405,39 @@ func (sp *StorePool) getStoreDescriptor(storeID roachpb.StoreID) (roachpb.StoreD
 	return roachpb.StoreDescriptor{}, false
 }
 
-// liveAndDeadReplicas divides the provided repls slice into two
-// slices: the first for live replicas, and the second for dead
-// replicas. Replicas for which liveness or deadness cannot be
-// ascertained are excluded from the returned slices.
+// decommissioningReplicas filters out replicas on decommissioning node/store
+// from the provided repls and returns them in a slice.
+func (sp *StorePool) decommissioningReplicas(
+	rangeID roachpb.RangeID, repls []roachpb.ReplicaDescriptor,
+) (decommissioningReplicas []roachpb.ReplicaDescriptor) {
+	sp.detailsMu.Lock()
+	defer sp.detailsMu.Unlock()
+
+	now := sp.clock.PhysicalTime()
+	timeUntilStoreDead := TimeUntilStoreDead.Get(&sp.st.SV)
+
+	for _, repl := range repls {
+		detail := sp.getStoreDetailLocked(repl.StoreID)
+		switch detail.status(now, timeUntilStoreDead, rangeID, sp.nodeLivenessFn) {
+		case storeStatusDecommissioning:
+			decommissioningReplicas = append(decommissioningReplicas, repl)
+		}
+	}
+	return
+}
+
+// ClusterNodeCount returns the number of nodes that are possible allocation
+// targets. This includes dead nodes, but not decommissioning or decommissioned
+// nodes.
+func (sp *StorePool) ClusterNodeCount() int {
+	return sp.nodeCountFn()
+}
+
+// liveAndDeadReplicas divides the provided repls slice into two slices: the
+// first for live replicas, and the second for dead replicas.
+// Replicas for which liveness or deadness cannot be ascertained are excluded
+// from the returned slices.  Replicas on decommissioning node/store are
+// considered live.
 func (sp *StorePool) liveAndDeadReplicas(
 	rangeID roachpb.RangeID, repls []roachpb.ReplicaDescriptor,
 ) (liveReplicas, deadReplicas []roachpb.ReplicaDescriptor) {
@@ -356,32 +445,25 @@ func (sp *StorePool) liveAndDeadReplicas(
 	defer sp.detailsMu.Unlock()
 
 	now := sp.clock.PhysicalTime()
+	timeUntilStoreDead := TimeUntilStoreDead.Get(&sp.st.SV)
+
 	for _, repl := range repls {
 		detail := sp.getStoreDetailLocked(repl.StoreID)
 		// Mark replica as dead if store is dead.
-		switch detail.status(now, sp.timeUntilStoreDead.Get(), rangeID, sp.nodeLivenessFn) {
+		status := detail.status(now, timeUntilStoreDead, rangeID, sp.nodeLivenessFn)
+		switch status {
 		case storeStatusDead:
 			deadReplicas = append(deadReplicas, repl)
-		case storeStatusReplicaCorrupted:
-			// Check whether the replica we're examining has been marked as dead.
-			var corrupt bool
-			for _, deadRepl := range detail.deadReplicas[rangeID] {
-				if deadRepl.ReplicaID == repl.ReplicaID {
-					corrupt = true
-					break
-				}
-			}
-			// This replica is the corrupt replica, so consider the store dead.
-			if corrupt {
-				deadReplicas = append(deadReplicas, repl)
-			} else {
-				// Otherwise, consider the store live.
-				liveReplicas = append(liveReplicas, repl)
-			}
-		case storeStatusAvailable, storeStatusThrottled:
+		case storeStatusAvailable, storeStatusThrottled, storeStatusDecommissioning:
 			// We count both available and throttled stores to be live for the
 			// purpose of computing quorum.
+			// We count decommissioning replicas to be alive because they are readable
+			// and should be used for up-replication if necessary.
 			liveReplicas = append(liveReplicas, repl)
+		case storeStatusUnknown:
+		// No-op.
+		default:
+			log.Fatalf(context.TODO(), "unknown store status %d", status)
 		}
 	}
 	return
@@ -403,14 +485,26 @@ func (s *stat) update(x float64) {
 type StoreList struct {
 	stores []roachpb.StoreDescriptor
 
-	// candidateCount tracks range count stats for stores that are eligible to
+	// candidateRanges tracks range count stats for stores that are eligible to
 	// be rebalance targets (their used capacity percentage must be lower than
 	// maxFractionUsedThreshold).
-	candidateCount stat
+	candidateRanges stat
 
 	// candidateLeases tracks range lease stats for stores that are eligible to
 	// be rebalance targets.
 	candidateLeases stat
+
+	// candidateLogicalBytes tracks disk usage stats for stores that are eligible
+	// to be rebalance targets.
+	candidateLogicalBytes stat
+
+	// candidateQueriesPerSecond tracks queries-per-second stats for stores that
+	// are eligible to be rebalance targets.
+	candidateQueriesPerSecond stat
+
+	// candidateWritesPerSecond tracks writes-per-second stats for stores that are
+	// eligible to be rebalance targets.
+	candidateWritesPerSecond stat
 }
 
 // Generates a new store list based on the passed in descriptors. It will
@@ -418,47 +512,51 @@ type StoreList struct {
 func makeStoreList(descriptors []roachpb.StoreDescriptor) StoreList {
 	sl := StoreList{stores: descriptors}
 	for _, desc := range descriptors {
-		if desc.Capacity.FractionUsed() <= maxFractionUsedThreshold {
-			sl.candidateCount.update(float64(desc.Capacity.RangeCount))
+		if maxCapacityCheck(desc) {
+			sl.candidateRanges.update(float64(desc.Capacity.RangeCount))
 		}
 		sl.candidateLeases.update(float64(desc.Capacity.LeaseCount))
+		sl.candidateLogicalBytes.update(float64(desc.Capacity.LogicalBytes))
+		sl.candidateQueriesPerSecond.update(desc.Capacity.QueriesPerSecond)
+		sl.candidateWritesPerSecond.update(desc.Capacity.WritesPerSecond)
 	}
 	return sl
 }
 
 func (sl StoreList) String() string {
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "  candidate: avg-ranges=%v avg-leases=%v\n",
-		sl.candidateCount.mean, sl.candidateLeases.mean)
+	fmt.Fprintf(&buf,
+		"  candidate: avg-ranges=%v avg-leases=%v avg-disk-usage=%v avg-queries-per-second=%v",
+		sl.candidateRanges.mean,
+		sl.candidateLeases.mean,
+		humanizeutil.IBytes(int64(sl.candidateLogicalBytes.mean)),
+		sl.candidateQueriesPerSecond.mean)
+	if len(sl.stores) > 0 {
+		fmt.Fprintf(&buf, "\n")
+	} else {
+		fmt.Fprintf(&buf, " <no candidates>")
+	}
 	for _, desc := range sl.stores {
-		fmt.Fprintf(&buf, "  %d: ranges=%d leases=%d fraction-used=%.2f\n",
+		fmt.Fprintf(&buf, "  %d: ranges=%d leases=%d disk-usage=%s queries-per-second=%.2f\n",
 			desc.StoreID, desc.Capacity.RangeCount,
-			desc.Capacity.LeaseCount, desc.Capacity.FractionUsed())
+			desc.Capacity.LeaseCount, humanizeutil.IBytes(desc.Capacity.LogicalBytes),
+			desc.Capacity.QueriesPerSecond)
 	}
 	return buf.String()
 }
 
 // filter takes a store list and filters it using the passed in constraints. It
 // maintains the original order of the passed in store list.
-func (sl StoreList) filter(constraints config.Constraints) StoreList {
-	if len(constraints.Constraints) == 0 {
+func (sl StoreList) filter(constraints []config.Constraints) StoreList {
+	if len(constraints) == 0 {
 		return sl
 	}
 	var filteredDescs []roachpb.StoreDescriptor
-storeLoop:
 	for _, store := range sl.stores {
-		m := map[string]struct{}{}
-		for _, s := range store.CombinedAttrs().Attrs {
-			m[s] = struct{}{}
+		if ok := constraintsCheck(store, constraints); ok {
+			filteredDescs = append(filteredDescs, store)
 		}
-		for _, c := range constraints.Constraints {
-			if _, ok := m[c.Value]; !ok {
-				continue storeLoop
-			}
-		}
-		filteredDescs = append(filteredDescs, store)
 	}
-
 	return makeStoreList(filteredDescs)
 }
 
@@ -521,9 +619,11 @@ func (sp *StorePool) getStoreListFromIDsRLocked(
 	var storeDescriptors []roachpb.StoreDescriptor
 
 	now := sp.clock.PhysicalTime()
+	timeUntilStoreDead := TimeUntilStoreDead.Get(&sp.st.SV)
+
 	for _, storeID := range storeIDs {
 		detail := sp.detailsMu.storeDetails[storeID]
-		switch s := detail.status(now, sp.timeUntilStoreDead.Get(), rangeID, sp.nodeLivenessFn); s {
+		switch s := detail.status(now, timeUntilStoreDead, rangeID, sp.nodeLivenessFn); s {
 		case storeStatusThrottled:
 			aliveStoreCount++
 			throttledStoreCount++
@@ -535,7 +635,7 @@ func (sp *StorePool) getStoreListFromIDsRLocked(
 		case storeStatusAvailable:
 			aliveStoreCount++
 			storeDescriptors = append(storeDescriptors, *detail.desc)
-		case storeStatusDead, storeStatusUnknown:
+		case storeStatusDead, storeStatusUnknown, storeStatusDecommissioning:
 			// Do nothing; this node cannot be used.
 		default:
 			panic(fmt.Sprintf("unknown store status: %d", s))
@@ -568,7 +668,7 @@ func (sp *StorePool) throttle(reason throttleReason, storeID roachpb.StoreID) {
 	// timeout period has passed.
 	switch reason {
 	case throttleDeclined:
-		timeout := declinedReservationsTimeout.Get()
+		timeout := DeclinedReservationsTimeout.Get(&sp.st.SV)
 		detail.throttledUntil = sp.clock.PhysicalTime().Add(timeout)
 		if log.V(2) {
 			ctx := sp.AnnotateCtx(context.TODO())
@@ -576,7 +676,7 @@ func (sp *StorePool) throttle(reason throttleReason, storeID roachpb.StoreID) {
 				storeID, timeout, detail.throttledUntil)
 		}
 	case throttleFailed:
-		timeout := failedReservationsTimeout.Get()
+		timeout := FailedReservationsTimeout.Get(&sp.st.SV)
 		detail.throttledUntil = sp.clock.PhysicalTime().Add(timeout)
 		if log.V(2) {
 			ctx := sp.AnnotateCtx(context.TODO())

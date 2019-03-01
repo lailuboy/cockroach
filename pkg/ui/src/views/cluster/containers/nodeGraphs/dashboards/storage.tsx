@@ -1,10 +1,24 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import React from "react";
 import _ from "lodash";
 
 import { LineGraph } from "src/views/cluster/components/linegraph";
 import { Metric, Axis, AxisUnits } from "src/views/shared/components/metricQuery";
 
-import { GraphDashboardProps, nodeAddress, storeIDsForNode } from "./dashboardUtils";
+import { GraphDashboardProps, nodeDisplayName, storeIDsForNode } from "./dashboardUtils";
 
 export default function (props: GraphDashboardProps) {
   const { nodeIDs, nodesSummary, nodeSources, storeSources, tooltipSelection } = props;
@@ -15,15 +29,10 @@ export default function (props: GraphDashboardProps) {
       sources={storeSources}
       tooltip={`Summary of total and available capacity ${tooltipSelection}.`}
     >
-      <Axis>
+      <Axis units={AxisUnits.Bytes} label="capacity">
         <Metric name="cr.store.capacity" title="Capacity" />
-        {
-          // TODO(mrtracy): We really want to display a used capacity
-          // stat, but that is not directly recorded. We either need to
-          // start directly recording it, or add the ability to create
-          // derived series.
-        }
         <Metric name="cr.store.capacity.available" title="Available" />
+        <Metric name="cr.store.capacity.used" title="Used" />
       </Axis>
     </LineGraph>,
 
@@ -35,7 +44,7 @@ export default function (props: GraphDashboardProps) {
            CockroachDB system ${tooltipSelection}. This excludes historical and deleted data.`
       }
     >
-      <Axis units={AxisUnits.Bytes}>
+      <Axis units={AxisUnits.Bytes} label="live bytes">
         <Metric name="cr.store.livebytes" title="Live" />
         <Metric name="cr.store.sysbytes" title="System" />
       </Axis>
@@ -46,13 +55,13 @@ export default function (props: GraphDashboardProps) {
       sources={storeSources}
       tooltip={`The 99th %ile latency for commits to the Raft Log.`}
     >
-      <Axis units={AxisUnits.Duration}>
+      <Axis units={AxisUnits.Duration} label="latency">
         {
           _.map(nodeIDs, (nid) => (
             <Metric
               key={nid}
               name="cr.store.raft.process.logcommit.latency-p99"
-              title={nodeAddress(nodesSummary, nid)}
+              title={nodeDisplayName(nodesSummary, nid)}
               sources={storeIDsForNode(nodesSummary, nid)}
             />
           ))
@@ -65,13 +74,13 @@ export default function (props: GraphDashboardProps) {
       sources={storeSources}
       tooltip={`The 99th %ile latency for commits of Raft commands.`}
     >
-      <Axis units={AxisUnits.Duration}>
+      <Axis units={AxisUnits.Duration} label="latency">
         {
           _.map(nodeIDs, (nid) => (
             <Metric
               key={nid}
               name="cr.store.raft.process.commandcommit.latency-p99"
-              title={nodeAddress(nodesSummary, nid)}
+              title={nodeDisplayName(nodesSummary, nid)}
               sources={storeIDsForNode(nodesSummary, nid)}
             />
           ))
@@ -87,7 +96,7 @@ export default function (props: GraphDashboardProps) {
            executed per logical read operation ${tooltipSelection}.`
       }
     >
-      <Axis>
+      <Axis label="factor">
         <Metric name="cr.store.rocksdb.read-amplification" title="Read Amplification" aggregateAvg />
       </Axis>
     </LineGraph>,
@@ -97,7 +106,7 @@ export default function (props: GraphDashboardProps) {
       sources={storeSources}
       tooltip={`The number of RocksDB SSTables in use ${tooltipSelection}.`}
     >
-      <Axis>
+      <Axis label="sstables">
         <Metric name="cr.store.rocksdb.num-sstables" title="SSTables" />
       </Axis>
     </LineGraph>,
@@ -110,9 +119,56 @@ export default function (props: GraphDashboardProps) {
           file descriptor limit.`
       }
     >
-      <Axis>
+      <Axis label="descriptors">
         <Metric name="cr.node.sys.fd.open" title="Open" />
         <Metric name="cr.node.sys.fd.softlimit" title="Limit" />
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="RocksDB Compactions/Flushes"
+      sources={storeSources}
+      tooltip={
+        `The number of RocksDB compactions and memtable flushes, per second ${tooltipSelection}.`
+      }
+    >
+      <Axis label="count">
+        <Metric name="cr.store.rocksdb.compactions" title="Compactions" nonNegativeRate />
+        <Metric name="cr.store.rocksdb.flushes" title="Flushes" nonNegativeRate />
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="Time Series Writes"
+      sources={nodeSources}
+      tooltip={
+        `The number of successfully written time series samples, and number of errors attempting
+        to write time series, per second ${tooltipSelection}.`
+      }
+    >
+      <Axis label="count">
+        <Metric name="cr.node.timeseries.write.samples" title="Samples Written" nonNegativeRate />
+        <Metric name="cr.node.timeseries.write.errors" title="Errors" nonNegativeRate />
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="Time Series Bytes Written"
+      sources={nodeSources}
+      tooltip={
+        <div>
+          The number of bytes written by the time series system per second {tooltipSelection}.
+          <br />
+          Note that this does not reflect the rate at which disk space is consumed by time series;
+          the data is highly compressed on disk. This rate is instead intended to indicate the
+          amount of network traffic and disk activity generated by time series writes.
+          <br />
+          See the "databases" tab to find the current disk usage for time series data.
+        </div>
+      }
+    >
+      <Axis units={AxisUnits.Bytes}>
+        <Metric name="cr.node.timeseries.write.bytes" title="Bytes Written" nonNegativeRate />
       </Axis>
     </LineGraph>,
   ];

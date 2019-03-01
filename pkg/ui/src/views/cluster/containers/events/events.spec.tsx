@@ -1,3 +1,17 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import React from "react";
 import { assert } from "chai";
 import { shallow } from "enzyme";
@@ -5,6 +19,7 @@ import _ from "lodash";
 import Long from "long";
 import * as sinon from "sinon";
 
+import "src/enzymeInit";
 import * as protos from  "src/js/protos";
 import { EventBoxUnconnected as EventBox, EventRow, getEventInfo } from "src/views/cluster/containers/events";
 import { refreshEvents } from "src/redux/apiReducers";
@@ -13,7 +28,7 @@ import { allEvents } from "src/util/eventTypes";
 type Event = protos.cockroach.server.serverpb.EventsResponse.Event;
 
 function makeEventBox(
-  events: protos.cockroach.server.serverpb.EventsResponse.Event$Properties[],
+  events: protos.cockroach.server.serverpb.EventsResponse.IEvent[],
   refreshEventsFn: typeof refreshEvents,
 ) {
   return shallow(
@@ -81,8 +96,8 @@ describe("<EventRow>", function () {
 
       const provider = makeEvent(e);
       assert.lengthOf(provider.first().children(), 2);
-      const text = provider.first().childAt(0).text();
-      assert(_.includes(text, "created database"));
+      const tooltip = provider.first().childAt(0).childAt(0).childAt(0).childAt(0).childAt(0);
+      assert(_.includes(tooltip.text(), "created database"));
     });
 
     it("correctly renders an unknown event", function () {
@@ -93,8 +108,8 @@ describe("<EventRow>", function () {
 
       const provider = makeEvent(e);
       assert.lengthOf(provider.first().children(), 2);
-      const text = provider.first().childAt(0).text();
-      assert(_.includes(text, "Unknown Event Type"));
+      const tooltip = provider.first().childAt(0).childAt(0).childAt(0).childAt(0).childAt(0);
+      assert(_.includes(tooltip.text(), "Unknown Event Type"));
     });
   });
 });

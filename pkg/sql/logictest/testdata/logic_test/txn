@@ -1,4 +1,4 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata
 
 # Transaction involving schema changes.
 statement ok
@@ -6,8 +6,8 @@ BEGIN TRANSACTION
 
 statement ok
 CREATE TABLE kv (
-  k CHAR PRIMARY KEY,
-  v CHAR
+  k VARCHAR PRIMARY KEY,
+  v VARCHAR
 )
 
 statement ok
@@ -94,7 +94,7 @@ statement ok
 BEGIN
 
 query error syntax error at or near ","
-SELECT COUNT(*, 1) FROM kv
+SELECT count(*, 1) FROM kv
 
 statement error pgcode 25P02 current transaction is aborted, commands ignored until end of transaction block
 UPDATE kv SET v = 'b' WHERE k in ('a')
@@ -163,7 +163,6 @@ BEGIN TRANSACTION
 
 statement error current transaction is aborted, commands ignored until end of transaction block
 SELECT * FROM kv
-----
 
 statement ok
 ROLLBACK TRANSACTION
@@ -210,9 +209,6 @@ BEGIN TRANSACTION
 statement ok
 UPDATE kv SET v = 'b' WHERE k in ('a')
 
-statement error cannot change the isolation level of a running transaction
-SET TRANSACTION ISOLATION LEVEL SNAPSHOT
-
 statement ok
 ROLLBACK
 
@@ -221,9 +217,6 @@ BEGIN TRANSACTION
 
 statement ok
 UPDATE kv SET v = 'b' WHERE k in ('a')
-
-statement error cannot change the isolation level of a running transaction
-SET TRANSACTION ISOLATION LEVEL SNAPSHOT
 
 statement ok
 ROLLBACK
@@ -236,20 +229,37 @@ BEGIN TRANSACTION
 query T
 SHOW TRANSACTION ISOLATION LEVEL
 ----
-SERIALIZABLE
+serializable
 
+query T
+SHOW transaction_isolation
+----
+serializable
+
+# SNAPSHOT is now mapped to serializable
 statement ok
 SET TRANSACTION ISOLATION LEVEL SNAPSHOT
 
 query T
 SHOW TRANSACTION ISOLATION LEVEL
 ----
-SNAPSHOT
+serializable
+
+query T
+SHOW transaction_isolation
+----
+serializable
 
 statement ok
 COMMIT
 
-# We can explicitly start a transaction in snapshot isolation.
+# We can't set isolation level to an unsupported one.
+
+statement error invalid value for parameter "transaction_isolation": "read committed"
+SET transaction_isolation = 'read committed'
+
+# We can explicitly start a transaction with isolation level
+# specified.
 
 statement ok
 BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT
@@ -257,7 +267,7 @@ BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT
 query T
 SHOW TRANSACTION ISOLATION LEVEL
 ----
-SNAPSHOT
+serializable
 
 statement ok
 SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
@@ -265,7 +275,7 @@ SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
 query T
 SHOW TRANSACTION ISOLATION LEVEL
 ----
-SERIALIZABLE
+serializable
 
 statement ok
 COMMIT
@@ -327,7 +337,7 @@ BEGIN TRANSACTION
 query T
 SHOW TRANSACTION PRIORITY
 ----
-NORMAL
+normal
 
 statement ok
 SET TRANSACTION PRIORITY HIGH
@@ -335,7 +345,7 @@ SET TRANSACTION PRIORITY HIGH
 query T
 SHOW TRANSACTION PRIORITY
 ----
-HIGH
+high
 
 statement ok
 COMMIT
@@ -348,7 +358,7 @@ BEGIN TRANSACTION PRIORITY LOW
 query T
 SHOW TRANSACTION PRIORITY
 ----
-LOW
+low
 
 statement ok
 SET TRANSACTION PRIORITY NORMAL
@@ -356,7 +366,7 @@ SET TRANSACTION PRIORITY NORMAL
 query T
 SHOW TRANSACTION PRIORITY
 ----
-NORMAL
+normal
 
 statement ok
 COMMIT
@@ -369,7 +379,7 @@ BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT, PRIORITY LOW; COMMIT
 statement ok
 BEGIN TRANSACTION PRIORITY LOW, ISOLATION LEVEL SNAPSHOT; COMMIT
 
-# We can explicitly start a transaction in snapshot isolation level and low user priority.
+# We can explicitly start a transaction with specified isolation level and low user priority.
 
 statement ok
 BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT, PRIORITY LOW
@@ -377,12 +387,12 @@ BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT, PRIORITY LOW
 query T
 SHOW TRANSACTION ISOLATION LEVEL
 ----
-SNAPSHOT
+serializable
 
 query T
 SHOW TRANSACTION PRIORITY
 ----
-LOW
+low
 
 statement ok
 SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, PRIORITY HIGH
@@ -390,12 +400,12 @@ SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, PRIORITY HIGH
 query T
 SHOW TRANSACTION ISOLATION LEVEL
 ----
-SERIALIZABLE
+serializable
 
 query T
 SHOW TRANSACTION PRIORITY
 ----
-HIGH
+high
 
 statement ok
 SET TRANSACTION PRIORITY NORMAL, ISOLATION LEVEL SNAPSHOT
@@ -403,12 +413,12 @@ SET TRANSACTION PRIORITY NORMAL, ISOLATION LEVEL SNAPSHOT
 query T
 SHOW TRANSACTION ISOLATION LEVEL
 ----
-SNAPSHOT
+serializable
 
 query T
 SHOW TRANSACTION PRIORITY
 ----
-NORMAL
+normal
 
 statement ok
 COMMIT
@@ -419,13 +429,13 @@ SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SNAPSHOT
 query T
 SHOW DEFAULT_TRANSACTION_ISOLATION
 ----
-SNAPSHOT
+serializable
 
 # SHOW without a transaction should create an auto-transaction with the default level
 query T
 SHOW TRANSACTION ISOLATION LEVEL
 ----
-SNAPSHOT
+serializable
 
 statement ok
 SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE
@@ -433,7 +443,7 @@ SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE
 query T
 SHOW DEFAULT_TRANSACTION_ISOLATION
 ----
-SERIALIZABLE
+serializable
 
 statement ok
 SET DEFAULT_TRANSACTION_ISOLATION TO 'SNAPSHOT'
@@ -441,7 +451,7 @@ SET DEFAULT_TRANSACTION_ISOLATION TO 'SNAPSHOT'
 query T
 SHOW DEFAULT_TRANSACTION_ISOLATION
 ----
-SNAPSHOT
+serializable
 
 # Without the isolation level specified, BEGIN should use the default
 
@@ -451,7 +461,7 @@ BEGIN
 query T
 SHOW TRANSACTION ISOLATION LEVEL
 ----
-SNAPSHOT
+serializable
 
 statement ok
 COMMIT
@@ -467,7 +477,7 @@ SET TRANSACTION ISOLATION LEVEL SNAPSHOT
 query T
 SHOW TRANSACTION ISOLATION LEVEL
 ----
-SNAPSHOT
+serializable
 
 statement ok
 SET TRANSACTION PRIORITY HIGH
@@ -475,10 +485,14 @@ SET TRANSACTION PRIORITY HIGH
 query T
 SHOW TRANSACTION ISOLATION LEVEL
 ----
-SNAPSHOT
+serializable
 
 statement ok
 COMMIT
+
+# restore default
+statement ok
+SET DEFAULT_TRANSACTION_ISOLATION TO 'SERIALIZABLE'
 
 # SHOW TRANSACTION STATUS
 
@@ -506,7 +520,7 @@ NoTxn
 statement ok
 BEGIN
 
-query error pq: database "t" does not exist
+query error pq: relation "t\.b" does not exist
 SELECT a FROM t.b
 
 query T
@@ -538,13 +552,13 @@ statement ok
 COMMIT
 
 # RestartWait state
-# The SELECT 1 is necessary to move the txn out of the FirstBatch state,
+# The SELECT 1 is necessary to move the txn out of the AutoRetry state,
 # otherwise the next statement is automatically retried on the server.
 statement ok
 BEGIN TRANSACTION; SAVEPOINT cockroach_restart; SELECT 1
 
-query error pgcode 40001 restart transaction: HandledRetryableTxnError: forced by crdb_internal.force_retry()
-SELECT CRDB_INTERNAL.FORCE_RETRY('1s':::INTERVAL)
+query error pgcode 40001 restart transaction: TransactionRetryWithProtoRefreshError: forced by crdb_internal.force_retry()
+SELECT crdb_internal.force_retry('1s':::INTERVAL)
 
 query T
 SHOW TRANSACTION STATUS
@@ -565,7 +579,7 @@ COMMIT
 
 # Automatic retries for the first batch.
 statement ok
-BEGIN TRANSACTION; SELECT CRDB_INTERNAL.FORCE_RETRY('100ms':::INTERVAL)
+BEGIN TRANSACTION; SELECT crdb_internal.force_retry('100ms':::INTERVAL)
 
 statement ok
 ROLLBACK
@@ -576,29 +590,29 @@ statement ok
 BEGIN TRANSACTION;
 
 statement ok
-SELECT 1; SELECT CRDB_INTERNAL.FORCE_RETRY('100ms':::INTERVAL)
+SELECT 1; SELECT crdb_internal.force_retry('100ms':::INTERVAL)
 
 statement ok
 ROLLBACK
 
 # Automatic retries for the first batch even when that first batch comes after
 # the BEGIN and the BEGIN also has special statements that don't move the txn
-# state out of the "FirstBatch" state.
+# state out of the "AutoRetry" state.
 statement ok
 BEGIN TRANSACTION; SAVEPOINT cockroach_restart; SET TRANSACTION PRIORITY HIGH; SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
 
 statement ok
-SELECT CRDB_INTERNAL.FORCE_RETRY('100ms':::INTERVAL)
+SELECT crdb_internal.force_retry('100ms':::INTERVAL)
 
 query T
 SHOW TRANSACTION ISOLATION LEVEL
 ----
-SNAPSHOT
+serializable
 
 query T
 SHOW TRANSACTION PRIORITY
 ----
-HIGH
+high
 
 statement ok
 ROLLBACK
@@ -611,7 +625,7 @@ statement ok
 SAVEPOINT cockroach_restart;
 
 statement ok
-SELECT CRDB_INTERNAL.FORCE_RETRY('100ms':::INTERVAL)
+SELECT crdb_internal.force_retry('100ms':::INTERVAL)
 
 statement ok
 ROLLBACK
@@ -621,15 +635,15 @@ ROLLBACK
 statement ok
 BEGIN TRANSACTION; SAVEPOINT cockroach_restart; SELECT 1;
 
-query error pgcode 40001 restart transaction: HandledRetryableTxnError: forced by crdb_internal.force_retry()
-SELECT CRDB_INTERNAL.FORCE_RETRY('1h':::INTERVAL)
+query error pgcode 40001 restart transaction: TransactionRetryWithProtoRefreshError: forced by crdb_internal.force_retry()
+SELECT crdb_internal.force_retry('1h':::INTERVAL)
 
 statement ok
 ROLLBACK TO SAVEPOINT COCKROACH_RESTART;
 
 # This is the automatic retry we care about.
 statement ok
-SELECT CRDB_INTERNAL.FORCE_RETRY('50ms':::INTERVAL)
+SELECT crdb_internal.force_retry('50ms':::INTERVAL)
 
 statement ok
 ROLLBACK
@@ -639,15 +653,15 @@ ROLLBACK
 statement ok
 BEGIN TRANSACTION; SAVEPOINT cockroach_restart; SELECT 1;
 
-query error pgcode 40001 restart transaction: HandledRetryableTxnError: forced by crdb_internal.force_retry()
-SELECT CRDB_INTERNAL.FORCE_RETRY('1s':::INTERVAL)
+query error pgcode 40001 restart transaction: TransactionRetryWithProtoRefreshError: forced by crdb_internal.force_retry()
+SELECT crdb_internal.force_retry('1s':::INTERVAL)
 
 query T
 SHOW TRANSACTION STATUS
 ----
 RestartWait
 
-statement error SAVEPOINT not supported except for COCKROACH_RESTART
+statement error pq: SAVEPOINT "cockroach_restart" is in use
 ROLLBACK TO SAVEPOINT bogus_name
 
 query T
@@ -662,7 +676,7 @@ ROLLBACK
 statement ok
 BEGIN TRANSACTION
 
-statement error SAVEPOINT not supported except for COCKROACH_RESTART
+statement error SAVEPOINT not supported except for cockroach_restart
 SAVEPOINT other
 
 statement ok
@@ -671,7 +685,7 @@ ROLLBACK
 statement ok
 BEGIN TRANSACTION
 
-statement error SAVEPOINT not supported except for COCKROACH_RESTART
+statement error SAVEPOINT not supported except for cockroach_restart
 RELEASE SAVEPOINT other
 
 statement ok
@@ -680,7 +694,7 @@ ROLLBACK
 statement ok
 BEGIN TRANSACTION
 
-statement error SAVEPOINT not supported except for COCKROACH_RESTART
+statement error SAVEPOINT not supported except for cockroach_restart
 ROLLBACK TO SAVEPOINT other
 
 statement ok
@@ -690,7 +704,7 @@ ROLLBACK
 statement ok
 BEGIN TRANSACTION; UPSERT INTO kv VALUES('savepoint', 'true')
 
-statement error SAVEPOINT COCKROACH_RESTART needs to be the first statement in a transaction
+statement error SAVEPOINT cockroach_restart needs to be the first statement in a transaction
 SAVEPOINT cockroach_restart
 
 statement ok
@@ -719,7 +733,7 @@ COMMIT
 
 # Because we rolled back, the 'savepoint' insert will not have been committed.
 query I
-SELECT COUNT(*) FROM kv WHERE k = 'savepoint'
+SELECT count(*) FROM kv WHERE k = 'savepoint'
 ----
 0
 
@@ -752,7 +766,7 @@ ROLLBACK
 statement ok
 BEGIN
 
-statement error SAVEPOINT COCKROACH_RESTART has not been used
+statement error pgcode 3B000 savepoint cockroach_restart has not been used
 ROLLBACK TO SAVEPOINT cockroach_restart
 
 statement ok
@@ -766,7 +780,7 @@ BEGIN
 statement error pq: relation "bogus_name" does not exist
 SELECT * from bogus_name
 
-statement error SAVEPOINT COCKROACH_RESTART has not been used
+statement error pgcode 3B000 savepoint cockroach_restart has not been used
 ROLLBACK TO SAVEPOINT cockroach_restart
 
 statement ok
@@ -778,6 +792,43 @@ ROLLBACK
 statement ok
 BEGIN
 
+query T
+SHOW transaction_read_only
+----
+off
+
+statement ok
+SET TRANSACTION READ ONLY
+
+query T
+SHOW transaction_read_only
+----
+on
+
+statement ok
+SET TRANSACTION READ WRITE
+
+query T
+SHOW transaction_read_only
+----
+off
+
+statement ok
+SET transaction_read_only = true
+
+query T
+SHOW transaction_read_only
+----
+on
+
+statement ok
+SET transaction_read_only = false
+
+query T
+SHOW transaction_read_only
+----
+off
+
 statement error read mode specified multiple times
 SET TRANSACTION READ ONLY, READ WRITE
 
@@ -785,10 +836,121 @@ statement ok
 ROLLBACK
 
 statement ok
-BEGIN READ WRITE; COMMIT
+BEGIN READ WRITE
 
-statement error read only not supported
+query T
+SHOW transaction_read_only
+----
+off
+
+statement ok
+COMMIT
+
+statement ok
 BEGIN READ ONLY
+
+query T
+SHOW transaction_read_only
+----
+on
+
+statement ok
+COMMIT
+
+# Test default read-only status.
+query T
+SHOW default_transaction_read_only
+----
+off
+
+statement ok
+SET default_transaction_read_only = true
+
+query T
+SHOW default_transaction_read_only
+----
+on
+
+statement ok
+SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE
+
+query T
+SHOW default_transaction_read_only
+----
+off
+
+statement ok
+SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY
+
+query T
+SHOW default_transaction_read_only
+----
+on
+
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT cockroach_restart
+
+query T
+SHOW transaction_read_only
+----
+on
+
+# Can override setting.
+statement ok
+SET TRANSACTION READ WRITE
+
+query T
+SHOW transaction_read_only
+----
+off
+
+# Rolling back to savepoint doesn't reset to default.
+# TODO(jordan) fix this if necessary.
+statement ok
+ROLLBACK TO SAVEPOINT cockroach_restart
+
+query T
+SHOW transaction_read_only
+----
+off
+
+statement ok
+COMMIT
+
+# BEGIN READ WRITE overwrites READ ONLY default
+statement ok
+BEGIN READ WRITE
+
+statement ok
+CREATE SEQUENCE a
+
+statement ok
+COMMIT
+
+statement error cannot execute CREATE TABLE in a read-only transaction
+CREATE TABLE tab (a int)
+
+statement error cannot execute INSERT in a read-only transaction
+INSERT INTO kv VALUES('foo')
+
+statement error cannot execute UPDATE in a read-only transaction
+UPDATE kv SET v = 'foo'
+
+# The heuristic planner uses INSERT, the optimizer uses UPSERT; accept both.
+statement error SERT in a read-only transaction
+UPSERT INTO kv VALUES('foo')
+
+statement error cannot execute DELETE in a read-only transaction
+DELETE FROM kv
+
+statement error cannot execute nextval\(\) in a read-only transaction
+SELECT nextval('a')
+
+statement error cannot execute setval\(\) in a read-only transaction
+SELECT setval('a', 2)
 
 query T
 SHOW TRANSACTION STATUS
@@ -806,13 +968,25 @@ BEGIN ISOLATION LEVEL SERIALIZABLE, ISOLATION LEVEL SERIALIZABLE
 
 # Retryable error in a txn that hasn't performed any KV operations. It used to
 # not work.
-# The SELECT 1 is necessary to take the session out of the FirstBatch state,
+# The SELECT 1 is necessary to take the session out of the AutoRetry state,
 # otherwise the statement below would be retries automatically.
 statement ok
 BEGIN; SELECT 1
 
-query error pgcode 40001 restart transaction: HandledRetryableTxnError: forced by crdb_internal.force_retry()
-SELECT CRDB_INTERNAL.FORCE_RETRY('1s':::INTERVAL)
+query error pgcode 40001 restart transaction: TransactionRetryWithProtoRefreshError: forced by crdb_internal.force_retry()
+SELECT crdb_internal.force_retry('1s':::INTERVAL)
 
 statement ok
 ROLLBACK
+
+# Check that we don't crash when doing a release that wasn't preceded by a
+# savepoint.
+statement error pgcode 3B000 savepoint cockroach_restart has not been used
+BEGIN; RELEASE SAVEPOINT cockroach_restart
+
+statement ok
+ROLLBACK
+
+# restore the default
+statement ok
+SET default_transaction_read_only = false

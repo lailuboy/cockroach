@@ -7,7 +7,7 @@
 
 set -euxo pipefail
 
-if [ -z "$1" ]; then
+if [ -z "${1-}" ]; then
   echo "Usage: $0 <num_periods> [shutdown command...]"
   exit 1
 fi
@@ -27,7 +27,7 @@ FILE=/dev/shm/autoshutdown-count
 COUNT=0
 
 
-if [ -f /.active ] || w -hs | grep pts | grep -vq "pts/[0-9]* *tmux"; then
+if [ -f /.active ] || w -hs | grep pts | grep -vq "pts/[0-9]* *tmux" || pgrep unison; then
   # Auto-shutdown is disabled (via /.active) or there is a remote session.
   echo 0 > $FILE
   exit 0
@@ -46,7 +46,7 @@ fi
 
 # Shut down.
 
-if [ -z "$1" ]; then
+if [ -z "${1-}" ]; then
   /sbin/shutdown -h
 else
   # Run whatever command was passed on the command line.

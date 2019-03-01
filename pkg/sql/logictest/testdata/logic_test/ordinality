@@ -1,7 +1,7 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata
 
 query TI colnames
-SELECT * FROM (VALUES ('a'), ('b')) WITH ORDINALITY AS X(name, i)
+SELECT * FROM (VALUES ('a'), ('b')) WITH ORDINALITY AS x(name, i)
 ----
 name i
 a 1
@@ -29,11 +29,11 @@ SELECT * FROM foo WITH ORDINALITY LIMIT 1
 a 1
 
 query I
-SELECT MAX(ordinality) FROM foo WITH ORDINALITY
+SELECT max(ordinality) FROM foo WITH ORDINALITY
 ----
 2
 
-query TITI
+query TITI rowsort
 SELECT * FROM foo WITH ORDINALITY AS a, foo WITH ORDINALITY AS b
 ----
 a 1 a 1
@@ -81,22 +81,6 @@ true
 true
 true
 
-# Show that the primary key is used under ordinalityNode.
-query ITTTTT
-EXPLAIN (METADATA) SELECT * FROM (SELECT * FROM foo WHERE x > 'a') WITH ORDINALITY
-----
-0  ordinality  ·      ·            (x, "ordinality")  +x,unique
-1  scan        ·      ·            (x)                +x,unique
-1  ·           table  foo@primary  ·                  ·
-1  ·           spans  /"a\x00"-    ·                  ·
-
-# Show that the primary key cannot be used with a PK predicate
-# outside of ordinalityNode.
-query ITTTTT
-EXPLAIN (METADATA) SELECT * FROM foo WITH ORDINALITY WHERE x > 'a'
-----
-0  filter      ·      ·            (x, "ordinality")  +x,unique
-1  ordinality  ·      ·            (x, "ordinality")  +x,unique
-2  scan        ·      ·            (x)                +x,unique
-2  ·           table  foo@primary  ·                  ·
-2  ·           spans  ALL          ·                  ·
+# Regression test for #33659
+statement ok
+TABLE [SHOW ZONE CONFIGURATIONS] WITH ORDINALITY

@@ -11,43 +11,44 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer@cockroachlabs.com)
 
 package sql_test
 
 import (
 	"bytes"
-	"fmt"
+	"context"
 	"sync/atomic"
 	"testing"
-
-	"github.com/lib/pq"
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/lib/pq"
+	"github.com/pkg/errors"
 )
 
 type interceptingTransport struct {
 	kv.Transport
-	sendNext func(context.Context, chan<- kv.BatchCall)
+	sendNext func(context.Context, roachpb.BatchRequest) (*roachpb.BatchResponse, error)
 }
 
-func (t *interceptingTransport) SendNext(ctx context.Context, done chan<- kv.BatchCall) {
+func (t *interceptingTransport) SendNext(
+	ctx context.Context, ba roachpb.BatchRequest,
+) (*roachpb.BatchResponse, error) {
 	if fn := t.sendNext; fn != nil {
-		fn(ctx, done)
+		return fn(ctx, ba)
 	} else {
-		t.Transport.SendNext(ctx, done)
+		return t.Transport.SendNext(ctx, ba)
 	}
 }
 
@@ -63,139 +64,138 @@ func (t *interceptingTransport) SendNext(ctx context.Context, done chan<- kv.Bat
 func TestAmbiguousCommit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	for _, ambiguousSuccess := range []bool{true, false} {
-		t.Run(fmt.Sprintf("ambiguousSuccess=%t", ambiguousSuccess), func(t *testing.T) {
-			var params base.TestServerArgs
-			var processed int32
-			var tableStartKey atomic.Value
+	testutils.RunTrueAndFalse(t, "ambiguousSuccess", func(t *testing.T, ambiguousSuccess bool) {
+		var params base.TestServerArgs
+		var processed int32
+		var tableStartKey atomic.Value
 
-			translateToRPCError := roachpb.NewError(errors.Errorf("%s: RPC error: success=%t", t.Name(), ambiguousSuccess))
+		translateToRPCError := roachpb.NewError(errors.Errorf("%s: RPC error: success=%t", t.Name(), ambiguousSuccess))
 
-			maybeRPCError := func(req *roachpb.ConditionalPutRequest) *roachpb.Error {
-				tsk, ok := tableStartKey.Load().([]byte)
-				if !ok {
-					return nil
-				}
-				if !bytes.HasPrefix(req.Header().Key, tsk) {
-					return nil
-				}
-				if atomic.AddInt32(&processed, 1) == 1 {
-					return translateToRPCError
-				}
+		maybeRPCError := func(req *roachpb.ConditionalPutRequest) *roachpb.Error {
+			tsk, ok := tableStartKey.Load().([]byte)
+			if !ok {
 				return nil
 			}
+			if !bytes.HasPrefix(req.Header().Key, tsk) {
+				return nil
+			}
+			if atomic.AddInt32(&processed, 1) == 1 {
+				return translateToRPCError
+			}
+			return nil
+		}
 
-			params.Knobs.DistSender = &kv.DistSenderTestingKnobs{
-				TransportFactory: func(opts kv.SendOptions, rpcContext *rpc.Context, replicas kv.ReplicaSlice, args roachpb.BatchRequest) (kv.Transport, error) {
-					transport, err := kv.GRPCTransportFactory(opts, rpcContext, replicas, args)
-					return &interceptingTransport{
-						Transport: transport,
-						sendNext: func(ctx context.Context, done chan<- kv.BatchCall) {
-							if ambiguousSuccess {
-								interceptDone := make(chan kv.BatchCall)
-								transport.SendNext(ctx, interceptDone)
-								call := <-interceptDone
-								if pErr := call.Reply.Error; pErr.Equal(translateToRPCError) {
-									// Translate the injected error into an RPC
-									// error to simulate an ambiguous result.
-									done <- kv.BatchCall{Err: pErr.GoError()}
-								} else {
-									// Either the call succeeded or we got a non-
-									// sentinel error; let normal machinery do its
-									// thing.
-									done <- call
-								}
-							} else {
-								if req, ok := args.GetArg(roachpb.ConditionalPut); ok {
-									if pErr := maybeRPCError(req.(*roachpb.ConditionalPutRequest)); pErr != nil {
-										// Blackhole the RPC and return an
-										// error to simulate an ambiguous
-										// result.
-										done <- kv.BatchCall{Err: pErr.GoError()}
-
-										return
-									}
-								}
-								transport.SendNext(ctx, done)
+		params.Knobs.KVClient = &kv.ClientTestingKnobs{
+			TransportFactory: func(opts kv.SendOptions, nodeDialer *nodedialer.Dialer, replicas kv.ReplicaSlice) (kv.Transport, error) {
+				transport, err := kv.GRPCTransportFactory(opts, nodeDialer, replicas)
+				return &interceptingTransport{
+					Transport: transport,
+					sendNext: func(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, error) {
+						if ambiguousSuccess {
+							br, err := transport.SendNext(ctx, ba)
+							// During shutdown, we may get responses that
+							// have call.Err set and all we have to do is
+							// not crash on those.
+							//
+							// For the rest, compare and perhaps inject an
+							// RPC error ourselves.
+							if err == nil && br.Error.Equal(translateToRPCError) {
+								// Translate the injected error into an RPC
+								// error to simulate an ambiguous result.
+								return nil, br.Error.GoError()
 							}
-						},
-					}, err
+							return br, err
+						} else {
+							if req, ok := ba.GetArg(roachpb.ConditionalPut); ok {
+								if pErr := maybeRPCError(req.(*roachpb.ConditionalPutRequest)); pErr != nil {
+									// Blackhole the RPC and return an
+									// error to simulate an ambiguous
+									// result.
+									return nil, pErr.GoError()
+								}
+							}
+							return transport.SendNext(ctx, ba)
+						}
+					},
+				}, err
+			},
+		}
+
+		if ambiguousSuccess {
+			params.Knobs.Store = &storage.StoreTestingKnobs{
+				TestingResponseFilter: func(args roachpb.BatchRequest, _ *roachpb.BatchResponse) *roachpb.Error {
+					if req, ok := args.GetArg(roachpb.ConditionalPut); ok {
+						return maybeRPCError(req.(*roachpb.ConditionalPutRequest))
+					}
+					return nil
 				},
 			}
+		}
 
-			{
-				storeTestingKnobs := new(storage.StoreTestingKnobs)
+		testClusterArgs := base.TestClusterArgs{
+			ReplicationMode: base.ReplicationAuto,
+			ServerArgs:      params,
+		}
 
-				if ambiguousSuccess {
-					storeTestingKnobs.TestingResponseFilter = func(args roachpb.BatchRequest, _ *roachpb.BatchResponse) *roachpb.Error {
-						if req, ok := args.GetArg(roachpb.ConditionalPut); ok {
-							return maybeRPCError(req.(*roachpb.ConditionalPutRequest))
-						}
-						return nil
-					}
-				}
-				params.Knobs.Store = storeTestingKnobs
-			}
+		const numReplicas = 3
+		tc := testcluster.StartTestCluster(t, numReplicas, testClusterArgs)
+		defer tc.Stopper().Stop(context.TODO())
 
-			testClusterArgs := base.TestClusterArgs{
-				ReplicationMode: base.ReplicationAuto,
-				ServerArgs:      params,
-			}
-			const numReplicas = 3
-			tc := testcluster.StartTestCluster(t, numReplicas, testClusterArgs)
-			defer tc.Stopper().Stop(context.TODO())
+		// Avoid distSQL so we can reliably hydrate the intended dist
+		// sender's cache below.
+		for _, server := range tc.Servers {
+			st := server.ClusterSettings()
+			st.Manual.Store(true)
+			sql.DistSQLClusterExecMode.Override(&st.SV, int64(sessiondata.DistSQLOff))
+		}
 
-			sqlDB := tc.Conns[0]
+		sqlDB := tc.Conns[0]
 
-			if _, err := sqlDB.Exec(`CREATE DATABASE test`); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := sqlDB.Exec(`CREATE TABLE test.t (k SERIAL PRIMARY KEY, v INT)`); err != nil {
-				t.Fatal(err)
-			}
+		if _, err := sqlDB.Exec(`CREATE DATABASE test`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqlDB.Exec(`CREATE TABLE test.t (k SERIAL PRIMARY KEY, v INT)`); err != nil {
+			t.Fatal(err)
+		}
 
-			tableID, err := sqlutils.QueryTableID(sqlDB, "test", "t")
-			if err != nil {
-				t.Fatal(err)
-			}
-			tableStartKey.Store(keys.MakeTablePrefix(tableID))
+		tableID := sqlutils.QueryTableID(t, sqlDB, "test", "t")
+		tableStartKey.Store(keys.MakeTablePrefix(tableID))
 
-			// Wait for new table to split & replication.
-			if err := tc.WaitForSplitAndReplication(tableStartKey.Load().([]byte)); err != nil {
-				t.Fatal(err)
-			}
+		// Wait for new table to split & replication.
+		if err := tc.WaitForSplitAndReplication(tableStartKey.Load().([]byte)); err != nil {
+			t.Fatal(err)
+		}
 
-			// Ensure that the dist sender's cache is up to date before
-			// fault injection.
-			if rows, err := sqlDB.Query(`SELECT * FROM test.t`); err != nil {
-				t.Fatal(err)
-			} else if err := rows.Close(); err != nil {
-				t.Fatal(err)
-			}
+		// Ensure that the dist sender's cache is up to date before
+		// fault injection.
+		if rows, err := sqlDB.Query(`SELECT * FROM test.t`); err != nil {
+			t.Fatal(err)
+		} else if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
 
-			if _, err := sqlDB.Exec(`INSERT INTO test.t (v) VALUES (1)`); ambiguousSuccess {
-				if pqErr, ok := err.(*pq.Error); ok {
-					if pqErr.Code != pgerror.CodeStatementCompletionUnknownError {
-						t.Errorf("expected code %q, got %q (err: %s)",
-							pgerror.CodeStatementCompletionUnknownError, pqErr.Code, err)
-					}
-				} else {
-					t.Errorf("expected pq error; got %v", err)
+		if _, err := sqlDB.Exec(`INSERT INTO test.t (v) VALUES (1)`); ambiguousSuccess {
+			if pqErr, ok := err.(*pq.Error); ok {
+				if pqErr.Code != pgerror.CodeStatementCompletionUnknownError {
+					t.Errorf("expected code %q, got %q (err: %s)",
+						pgerror.CodeStatementCompletionUnknownError, pqErr.Code, err)
 				}
 			} else {
-				if err != nil {
-					t.Error(err)
-				}
+				t.Errorf("expected pq error; got %v", err)
 			}
+		} else {
+			if err != nil {
+				t.Error(err)
+			}
+		}
 
-			// Verify a single row exists in the table.
-			var rowCount int
-			if err := sqlDB.QueryRow(`SELECT count(*) FROM test.t`).Scan(&rowCount); err != nil {
-				t.Fatal(err)
-			}
-			if e := 1; rowCount != e {
-				t.Errorf("expected %d row(s) but found %d", e, rowCount)
-			}
-		})
-	}
+		// Verify a single row exists in the table.
+		var rowCount int
+		if err := sqlDB.QueryRow(`SELECT count(*) FROM test.t`).Scan(&rowCount); err != nil {
+			t.Fatal(err)
+		}
+		if e := 1; rowCount != e {
+			t.Errorf("expected %d row(s) but found %d", e, rowCount)
+		}
+	})
 }

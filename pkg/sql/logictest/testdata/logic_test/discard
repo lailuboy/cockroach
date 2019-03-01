@@ -1,10 +1,12 @@
+# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata
+
 statement ok
 SET SEARCH_PATH = foo
 
 query T
 SHOW SEARCH_PATH
 ----
-pg_catalog, foo
+foo
 
 statement ok
 DISCARD ALL
@@ -12,10 +14,20 @@ DISCARD ALL
 query T
 SHOW SEARCH_PATH
 ----
-pg_catalog
+public
 
 query T
-SET "time zone" = 'Europe/Amsterdam'; SHOW TIME ZONE
+SET timezone = 'Europe/Amsterdam'; SHOW TIMEZONE
+----
+Europe/Amsterdam
+
+query T
+DISCARD ALL; SHOW TIMEZONE
+----
+UTC
+
+query T
+SET TIME ZONE 'Europe/Amsterdam'; SHOW TIME ZONE
 ----
 Europe/Amsterdam
 

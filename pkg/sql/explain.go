@@ -11,210 +11,65 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
+	"context"
 	"fmt"
-	"strings"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/pkg/errors"
 )
-
-type explainMode int
-
-const (
-	explainNone explainMode = iota
-	explainPlan
-	// explainDistSQL shows the physical distsql plan for a query and whether a
-	// query would be run in "auto" DISTSQL mode. See explainDistSQLNode for
-	// details.
-	explainDistSQL
-)
-
-var explainStrings = map[explainMode]string{
-	explainPlan:    "plan",
-	explainDistSQL: "distsql",
-}
 
 // Explain executes the explain statement, providing debugging and analysis
 // info about the wrapped statement.
 //
 // Privileges: the same privileges as the statement being explained.
-func (p *planner) Explain(ctx context.Context, n *parser.Explain) (planNode, error) {
-	mode := explainNone
-
-	optimized := true
-	expanded := true
-	normalizeExprs := true
-	explainer := explainer{
-		showMetadata: false,
-		showExprs:    false,
-		showTypes:    false,
-		doIndent:     false,
-	}
-
-	for _, opt := range n.Options {
-		optLower := strings.ToLower(opt)
-		newMode := explainNone
-		// Search for the string in `explainStrings`.
-		for mode, modeStr := range explainStrings {
-			if optLower == modeStr {
-				newMode = mode
-				break
-			}
-		}
-		if newMode == explainNone {
-			switch optLower {
-			case "types":
-				newMode = explainPlan
-				explainer.showExprs = true
-				explainer.showTypes = true
-				// TYPES implies METADATA.
-				explainer.showMetadata = true
-
-			case "indent":
-				explainer.doIndent = true
-
-			case "symvars":
-				explainer.symbolicVars = true
-
-			case "metadata":
-				explainer.showMetadata = true
-
-			case "qualify":
-				explainer.qualifyNames = true
-
-			case "verbose":
-				// VERBOSE implies EXPRS.
-				explainer.showExprs = true
-				// VERBOSE implies QUALIFY.
-				explainer.qualifyNames = true
-				// VERBOSE implies METADATA.
-				explainer.showMetadata = true
-
-			case "exprs":
-				explainer.showExprs = true
-
-			case "noexpand":
-				expanded = false
-
-			case "nonormalize":
-				normalizeExprs = false
-
-			case "nooptimize":
-				optimized = false
-
-			default:
-				return nil, fmt.Errorf("unsupported EXPLAIN option: %s", opt)
-			}
-		}
-		if newMode != explainNone {
-			if mode != explainNone {
-				return nil, fmt.Errorf("cannot set EXPLAIN mode more than once: %s", opt)
-			}
-			mode = newMode
-		}
-	}
-	if mode == explainNone {
-		mode = explainPlan
-	}
-
-	p.evalCtx.SkipNormalize = !normalizeExprs
-
-	plan, err := p.newPlan(ctx, n.Statement, nil)
+func (p *planner) Explain(ctx context.Context, n *tree.Explain) (planNode, error) {
+	opts, err := n.ParseOptions()
 	if err != nil {
 		return nil, err
 	}
-	switch mode {
-	case explainDistSQL:
+
+	defer func(save bool) { p.extendedEvalCtx.SkipNormalize = save }(p.extendedEvalCtx.SkipNormalize)
+	p.extendedEvalCtx.SkipNormalize = opts.Flags.Contains(tree.ExplainFlagNoNormalize)
+
+	switch opts.Mode {
+	case tree.ExplainDistSQL:
+		analyze := opts.Flags.Contains(tree.ExplainFlagAnalyze)
+		if analyze && tree.IsStmtParallelized(n.Statement) {
+			return nil, errors.New("EXPLAIN ANALYZE does not support RETURNING NOTHING statements")
+		}
+		// Build the plan for the query being explained.  We want to capture
+		// all the analyzed sub-queries in the explain node, so we are going
+		// to override the planner's subquery plan slice.
+		defer func(s []subquery) { p.curPlan.subqueryPlans = s }(p.curPlan.subqueryPlans)
+		p.curPlan.subqueryPlans = nil
+		plan, err := p.newPlan(ctx, n.Statement, nil)
+		if err != nil {
+			return nil, err
+		}
 		return &explainDistSQLNode{
-			plan:           plan,
-			distSQLPlanner: p.session.distSQLPlanner,
-			txn:            p.txn,
+			plan:               plan,
+			subqueryPlans:      p.curPlan.subqueryPlans,
+			optimizeSubqueries: true,
+			analyze:            analyze,
+			stmtType:           n.Statement.StatementType(),
 		}, nil
 
-	case explainPlan:
-		// We may want to show placeholder types, so ensure no values
-		// are missing.
-		p.semaCtx.Placeholders.FillUnassigned()
-		return p.makeExplainPlanNode(explainer, expanded, optimized, plan), nil
+	case tree.ExplainPlan:
+		if opts.Flags.Contains(tree.ExplainFlagAnalyze) {
+			return nil, errors.New("EXPLAIN ANALYZE only supported with (DISTSQL) option")
+		}
+		// We may want to show placeholder types, so allow missing values.
+		p.semaCtx.Placeholders.PermitUnassigned()
+		return p.makeExplainPlanNode(ctx, &opts, n.Statement)
+
+	case tree.ExplainOpt:
+		return nil, errors.New("EXPLAIN (OPT) only supported with the cost-based optimizer")
 
 	default:
-		return nil, fmt.Errorf("unsupported EXPLAIN mode: %d", mode)
+		return nil, fmt.Errorf("unsupported EXPLAIN mode: %d", opts.Mode)
 	}
-}
-
-// explainDistSQLNode is a planNode that wraps a plan and returns
-// information related to running that plan under DistSQL.
-type explainDistSQLNode struct {
-	optColumnsSlot
-
-	plan           planNode
-	distSQLPlanner *distSQLPlanner
-
-	// txn is the current transaction (used for the fake span resolver).
-	txn *client.Txn
-
-	// The single row returned by the node.
-	values parser.Datums
-
-	// done is set if Next() was called.
-	done bool
-}
-
-func (*explainDistSQLNode) Close(context.Context) {}
-
-var explainDistSQLColumns = sqlbase.ResultColumns{
-	{Name: "Automatic", Typ: parser.TypeBool},
-	{Name: "URL", Typ: parser.TypeString},
-	{Name: "JSON", Typ: parser.TypeString},
-}
-
-func (n *explainDistSQLNode) Start(params runParams) error {
-	// Trigger limit propagation.
-	setUnlimited(n.plan)
-
-	auto, err := n.distSQLPlanner.CheckSupport(n.plan)
-	if err != nil {
-		return err
-	}
-
-	planCtx := n.distSQLPlanner.NewPlanningCtx(params.ctx, n.txn)
-	plan, err := n.distSQLPlanner.createPlanForNode(&planCtx, n.plan)
-	if err != nil {
-		return err
-	}
-	n.distSQLPlanner.FinalizePlan(&planCtx, &plan)
-	flows := plan.GenerateFlowSpecs()
-	planJSON, planURL, err := distsqlrun.GeneratePlanDiagramWithURL(flows)
-	if err != nil {
-		return err
-	}
-
-	n.values = parser.Datums{
-		parser.MakeDBool(parser.DBool(auto)),
-		parser.NewDString(planURL.String()),
-		parser.NewDString(planJSON),
-	}
-	return nil
-}
-
-func (n *explainDistSQLNode) Next(runParams) (bool, error) {
-	if n.done {
-		return false, nil
-	}
-	n.done = true
-	return true, nil
-}
-
-func (n *explainDistSQLNode) Values() parser.Datums {
-	return n.values
 }

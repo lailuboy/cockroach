@@ -16,37 +16,16 @@ package testutils
 
 import (
 	"regexp"
-	"sync"
 
-	"golang.org/x/net/context"
-
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 )
 
-// MakeRecordCtx returns a context with an embedded trace span which is finished
-// and its contents returned when the returned closure (which is idempotent but
-// not thread safe) is called. This closure also cancels the context.
-func MakeRecordCtx() (context.Context, func() string) {
-	tr := tracing.NewTracer()
-	sp := tr.StartSpan("test span", tracing.Recordable)
-	tracing.StartRecording(sp, tracing.SingleNodeRecording)
-	ctx, cancel := context.WithCancel(context.Background())
-	ctx = opentracing.ContextWithSpan(ctx, sp)
-
-	var once sync.Once
-	var dump string
-
-	return ctx, func() string {
-		once.Do(func() {
-			dump = tracing.FormatRecordedSpans(tracing.GetRecording(sp))
-			tracing.StopRecording(sp)
-			sp.Finish()
-			tr.Close()
-			cancel()
-		})
-		return dump
+// MakeAmbientCtx creates an AmbientContext with a Tracer in it.
+func MakeAmbientCtx() log.AmbientContext {
+	return log.AmbientContext{
+		Tracer: tracing.NewTracer(),
 	}
 }
 

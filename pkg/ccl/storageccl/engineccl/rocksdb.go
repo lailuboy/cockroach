@@ -4,7 +4,7 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
 package engineccl
 
@@ -25,12 +25,17 @@ import (
 // #cgo LDFLAGS: -lprotobuf
 // #cgo LDFLAGS: -lrocksdb
 // #cgo LDFLAGS: -lsnappy
+// #cgo LDFLAGS: -lcryptopp
 // #cgo linux LDFLAGS: -lrt -lpthread
-// #cgo windows LDFLAGS: -lrpcrt4
+// #cgo windows LDFLAGS: -lshlwapi -lrpcrt4
 //
 // #include <stdlib.h>
 // #include <libroachccl.h>
 import "C"
+
+func init() {
+	engine.SetRocksDBOpenHook(C.DBOpenHookCCL)
+}
 
 // VerifyBatchRepr asserts that all keys in a BatchRepr are between the specified
 // start and end keys and computes the enginepb.MVCCStats for it.
@@ -52,11 +57,11 @@ func VerifyBatchRepr(
 		for r.Next() {
 			switch r.BatchType() {
 			case engine.BatchTypeValue:
-				mvccKey, err := engine.DecodeKey(r.UnsafeKey())
+				mvccKey, err := r.MVCCKey()
 				if err != nil {
 					return enginepb.MVCCStats{}, errors.Wrapf(err, "verifying key/value checksums")
 				}
-				v := roachpb.Value{RawBytes: r.UnsafeValue()}
+				v := roachpb.Value{RawBytes: r.Value()}
 				if err := v.Verify(mvccKey.Key); err != nil {
 					return enginepb.MVCCStats{}, err
 				}

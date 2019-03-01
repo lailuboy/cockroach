@@ -1,8 +1,7 @@
 # CockroachDB on Kubernetes as a StatefulSet
 
 This example deploys CockroachDB on [Kubernetes](https://kubernetes.io) as a
-a
-[StatefulSet](http://kubernetes.io/docs/concepts/abstractions/controllers/statefulsets/).
+[StatefulSet](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/).
 Kubernetes is an open source system for managing containerized applications
 across multiple hosts, providing basic mechanisms for deployment, maintenance,
 and scaling of applications.
@@ -18,14 +17,19 @@ testing and don't care about data persistence, you can do so with just a single
 command instead of following this guide (which sets up a more reliable cluster):
 
 ```shell
-kubectl run cockroachdb --image=cockroachdb/cockroach --restart=Never -- start
+kubectl run cockroachdb --image=cockroachdb/cockroach --restart=Never -- start --insecure
 ```
 
 ## Limitations
 
 ### Kubernetes version
 
-The minimum kubernetes version to successfully run the examples in this directory is `1.6`.
+The minimum Kubernetes version to successfully run the examples in this
+directory without modification is `1.8`. If you want to run them on an older
+version of Kubernetes, use the files from the appropriate subdirectory (e.g. the
+`v1.7` directory for Kubernetes 1.7 or the `v1.6` directory for Kubernetes 1.6).
+Older Kubernetes versions that don't have their own directory are no longer
+supported.
 
 For secure mode, the controller must enable `certificatesigningrequests`.
 You can check if this is enabled by looking at the controller logs:
@@ -43,7 +47,7 @@ W0628 12:38:23.473106       1 controllermanager.go:434] Skipping "certificatesig
 # This shows that the certificate controller is not running, approved CSRs will not trigger a certificate.
 
 # On minikube:
-$ minikube logs|grep certificate
+$ minikube logs | grep certificate
 Jun 28 12:49:00 minikube localkube[3440]: I0628 12:49:00.224903    3440 controllermanager.go:437] Started "certificatesigningrequests"
 Jun 28 12:49:00 minikube localkube[3440]: I0628 12:49:00.231134    3440 certificate_controller.go:120] Starting certificate controller manager
 # This shows that the certificate controller is running, approved CSRs will get a certificate.
@@ -52,57 +56,66 @@ Jun 28 12:49:00 minikube localkube[3440]: I0628 12:49:00.231134    3440 certific
 
 ### StatefulSet limitations
 
-There is currently no possibility to use node-local storage (outside of
-single-node tests), and so there is likely a performance hit associated with
-running CockroachDB on some external storage. Note that CockroachDB already
-does replication and thus, for better performance, should not be deployed on a
-persistent volume which already replicates internally. High-performance use
-cases on a private Kubernetes cluster may want to consider a
-[DaemonSet](http://kubernetes.io/docs/admin/daemons/) deployment until
-StatefulSets support node-local storage
-([open issue here](https://github.com/kubernetes/kubernetes/issues/7562)).
-
-### Recovery after persistent storage failure
-
-A persistent storage failure (e.g. losing the hard drive) is gracefully handled
-by CockroachDB as long as enough replicas survive (two out of three by
-default). Due to the bootstrapping in this deployment, a storage failure of the
-first node is special in that the administrator must manually prepopulate the
-"new" storage medium by running an instance of CockroachDB with the `--join`
-parameter. If this is not done, the first node will bootstrap a new cluster,
-which will lead to a lot of trouble.
+Node-local storage for StatefulSets was only recently promoted to beta as a
+Kubernetes feature (known as [local persistent
+volumes](https://kubernetes.io/docs/concepts/storage/volumes/#local)), so we
+don't yet recommend running that way in production. Instead, these examples use
+dynamically provisioned remote persistent volumes. Note that CockroachDB already
+replicates its data and thus, for the best performance, should not be deployed
+on a persistent volume which already replicates internally. High-performance use
+cases that need the very best performance may want to consider a
+[DaemonSet](https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/)
+deployment until node-local storage has been more rigorously hardened.
 
 ### Secure mode
 
-Secure mode currently works by requesting node/client certificates from the kubernetes
-controller at pod initialization time.
+Secure mode currently works by requesting node/client certificates from the kubernetes controller at pod initialization time.
 
-This means that rescheduled pods will go through the CSR process, requiring manual involvement.
-A future improvement for node/client certificates will use kubernetes secrets, simplifying
-deployment and maintenance.
+### Geographically distributed clusters
+
+The configuration files and instructions in this directory are limited to
+deployments that exist entirely within a single Kubernetes cluster. If you'd
+like to deploy CockroachDB across multiple geographically distributed Kubernetes
+clusters, see the [multiregion subdirectory](multiregion).
 
 ## Creating your kubernetes cluster
 
 ### Locally on minikube
 
 Set up your minikube cluster following the
-[instructions provided in the Kubernetes docs](http://kubernetes.io/docs/getting-started-guides/minikube/).
+[instructions provided in the Kubernetes docs](https://kubernetes.io/docs/getting-started-guides/minikube/).
 
 ### On AWS
 
 Set up your cluster following the
-[instructions provided in the Kubernetes docs](http://kubernetes.io/docs/getting-started-guides/aws/).
+[instructions provided in the Kubernetes docs](https://kubernetes.io/docs/getting-started-guides/aws/).
 
 ### On GCE
 
 You can either set up your cluster following the
-[instructions provided in the Kubernetes docs](http://kubernetes.io/docs/getting-started-guides/gce/)
+[instructions provided in the Kubernetes docs](https://kubernetes.io/docs/getting-started-guides/gce/)
 or by using the hosted
-[Container Engine](https://cloud.google.com/container-engine/docs) service:
+[Google Kubernetes Engine (GKE)](https://cloud.google.com/container-engine/docs) service:
 
 ```shell
 gcloud container clusters create NAME
 ```
+
+If you're using GKE and want to run a secure cluster, one extra step is
+required. A limitation in GKE's Role-Based Access Control (RBAC) integration
+necessitates running a special command in order to let you create the RBAC
+roles that CockroachDB needs to manage certificates.
+
+1. Get the email address associated with your Google Cloud account by running:
+   ```shell
+   `gcloud info | grep Account`
+   ```
+2. Run [the following command from the GKE
+   documentation](https://cloud.google.com/kubernetes-engine/docs/how-to/role-based-access-control#prerequisites_for_using_role-based_access_control)
+   with that email address:
+   ```shell
+   kubectl create clusterrolebinding cluster-admin-binding --clusterrole=cluster-admin --user=<your.google.cloud.email@example.org>
+   ```
 
 ### On Azure
 
@@ -116,23 +129,45 @@ Once your kubernetes cluster is up and running, you can launch your cockroach cl
 
 ### Insecure mode
 
-Run: `kubectl create -f cockroachdb-statefulset.yaml`
+To create the cluster, run:
+```shell
+kubectl create -f cockroachdb-statefulset.yaml
+```
+
+Then, to initialize the cluster, run:
+```shell
+kubectl create -f cluster-init.yaml
+```
 
 ### Secure mode
 
+#### Prerequisites
+
 **REQUIRED**: the kubernetes cluster must run with the certificate controller enabled.
 This is done by passing the `--cluster-signing-cert-file` and `--cluster-signing-key-file` flags.
-On minikube, you can tell it to use the minikube-generated CA by specifying:
+If you are using minikube v0.23.0 or newer (run `minikube version` if you aren't sure), you can
+tell it to use the minikube-generated CA by specifying:
+```shell
+minikube start --extra-config=controller-manager.ClusterSigningCertFile="/var/lib/localkube/certs/ca.crt" --extra-config=controller-manager.ClusterSigningKeyFile="/var/lib/localkube/certs/ca.key"
 ```
-$ minikube start --extra-config=controller-manager.ClusterSigningCertFile="/var/lib/localkube/ca.crt" --extra-config=controller-manager.ClusterSigningKeyFile="/var/lib/localkube/ca.key"
+
+If you're running on an older version of minikube, you can similarly run:
+```shell
+minikube start --extra-config=controller-manager.ClusterSigningCertFile="/var/lib/localkube/ca.crt" --extra-config=controller-manager.ClusterSigningKeyFile="/var/lib/localkube/ca.key"
 ```
+
+#### Creating the cluster
 
 Run: `kubectl create -f cockroachdb-statefulset-secure.yaml`
 
-Each new node will request a certificate from the kubernetes CA during its initialization phase.
-Statefulsets create pods one at a time, waiting for each previous pod to be initialized.
-This means that you must approve podN's certificate for podN+1 to be created.
+If you get an error saying "attempt to grant extra privileges", you don't have
+sufficient permissions in the cluster to manage certificates. If this happens
+and you're running on Google Kubernetes Engine, see [the note above](#on-gce).
+If not, talk to your cluster administrator.
 
+Each new node will request a certificate from the kubernetes CA during its initialization phase.
+We have configured the StatefulSet to bring up all its pods at once, so you can approve all of
+the pods' certificates in quick succession.
 
 If a pod is rescheduled, it will reuse the previously-generated certificate.
 
@@ -142,6 +177,8 @@ You can view pending certificates and approve them using:
 $ kubectl get csr
 NAME                         AGE       REQUESTOR                               CONDITION
 default.node.cockroachdb-0   4s        system:serviceaccount:default:default   Pending
+default.node.cockroachdb-1   4s        system:serviceaccount:default:default   Pending
+default.node.cockroachdb-2   4s        system:serviceaccount:default:default   Pending
 
 # Examine the CSR:
 $ kubectl describe csr default.node.cockroachdb-0
@@ -172,20 +209,53 @@ $ kubectl certificate deny default.node.cockroachdb-0
 certificatesigningrequest "default.node.cockroachdb-0" denied
 ```
 
+Once all the pods have started, to initialize the cluster run:
+```shell
+kubectl create -f cluster-init-secure.yaml
+```
+
+This will create a CSR called "default.client.root", which you can approve by
+running:
+```shell
+kubectl certificate approve default.client.root
+```
+
+To confirm that it's done, run:
+```shell
+kubectl get job cluster-init-secure
+```
+
+The output should look like:
+```
+NAME                  DESIRED   SUCCESSFUL   AGE
+cluster-init-secure   1         1            5m
+```
+
 ## Accessing the database
 
 Along with our StatefulSet configuration, we expose a standard Kubernetes service
 that offers a load-balanced virtual IP for clients to access the database
 with. In our example, we've called this service `cockroachdb-public`.
 
-Start up a client pod and open up an interactive, (mostly) Postgres-flavor
-SQL shell using:
+In insecure mode, start up a client pod and open up an interactive, (mostly) Postgres-flavor
+SQL shell:
 
-```console
-$ kubectl run -it --rm cockroach-client --image=cockroachdb/cockroach --restart=Never --command -- ./cockroach sql --host cockroachdb-public
+```shell
+kubectl run cockroachdb -it --image=cockroachdb/cockroach --rm --restart=Never \
+    -- sql --insecure --host=cockroachdb-public
 ```
 
-**WARNING**: there is no secure mode equivalent of doing this (yet).
+In secure mode, use our `client-secure.yaml` config to launch a pod that runs indefinitely with the `cockroach` binary inside it:
+
+```shell
+kubectl create -f client-secure.yaml
+```
+
+Check and approve the CSR for the pod as described above, and then get a shell to the pod and run:
+
+```shell
+kubectl exec -it cockroachdb-client-secure -- ./cockroach sql --certs-dir=/cockroach-certs --host=cockroachdb-public
+```
 
 You can see example SQL statements for inserting and querying data in the
 included [demo script](demo.sh), but can use almost any Postgres-style SQL
@@ -211,12 +281,12 @@ This directory contains the configuration to launch a simple load generator with
 
 If you created an insecure cockroach cluster, run:
 ```shell
-kubectl create -f example_app.yaml
+kubectl create -f example-app.yaml
 ```
 
 If you created a secure cockroach cluster, run:
 ```shell
-kubectl create -f example_app_secure.yaml
+kubectl create -f example-app-secure.yaml
 ```
 
 When the first pod is being initialized, you will need to approve its client certificate request:
@@ -228,6 +298,65 @@ If more pods are then added through `kubectl scale deployment example-secure --r
 certificate will be reused.
 **WARNING**: the example app in secure mode should be started with only one replica, or concurrent and
 conflicting certificate requests will be sent, causing issues.
+
+
+## Secure client apps with other users
+
+Applications should be run with a user other than `root`. This can be done using the following:
+
+#### Create the desired user and database
+
+Connect to the `cockroachdb-client-secure` pod (created in the "Accessing the database" section):
+```shell
+kubectl exec -it cockroachdb-client-secure -- ./cockroach sql --certs-dir=/cockroach-certs --host=cockroachdb-public
+```
+
+Create the the app user, its database, and grant it privileges:
+```shell
+root@:26257/defaultdb> CREATE USER myapp;
+CREATE USER 1
+
+Time: 164.811054ms
+
+root@:26257/defaultdb> CREATE DATABASE myappdb;
+CREATE DATABASE
+
+Time: 153.44247ms
+
+root@:26257/defaultdb> GRANT ALL ON DATABASE myappdb TO myapp;
+GRANT
+
+Time: 90.488168ms
+```
+
+#### Create the client pod
+
+Modify [example-app-secure.yaml](example-app-secure.yaml) to match your user and app:
+
+The init container `init-certs` needs to request a certificate and key for your new user:
+```shell
+"/request-cert -namespace=${POD_NAMESPACE} -certs-dir=/cockroach-certs -type=client -user=myapp -symlink-ca-from=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+```
+
+The `loadgen` container should be modified for your client app docker image and command, and the connection url modified to match the user and database:
+```shell
+"postgres://myapp@cockroachdb-public:26257/myappdb?sslmode=verify-full&sslcert=/cockroach-certs/client.myapp.crt&sslkey=/cockroach-certs/client.myapp.key&sslrootcert=/cockroach-certs/ca.crt"
+```
+
+You can now create the client pod:
+```shell
+kubectl create -f example-app-secure.yaml
+```
+
+#### Approve the client CSR
+
+The init container sends a CSR and waits for approval. You can approve it using:
+```shell
+kubectl certificate approve default.client.myapp
+```
+
+Once approved, the init container copies the certificate and key to `/cockroach-certs` and terminates. The app container now starts, using the mounted certificate directory.
+
 
 ## Simulating failures
 
@@ -255,13 +384,37 @@ Scale the StatefulSet by running
 kubectl scale statefulset cockroachdb --replicas=4
 ```
 
+You should never scale the StatefulSet down by more than one replica at a time.
+Doing so could lead to data unavailability. For best practices on safely
+removing nodes from a safely, see our docs on [node
+decommissioning](https://www.cockroachlabs.com/docs/stable/remove-nodes.html).
+
+## Doing a rolling upgrade to a different CockroachDB version
+
+Open up the StatefulSet's current configuration in your default text editor
+using the command below, find the line specifying the `cockroachdb/cockroach`
+image being used, change the version tag to the new one, save the file, and
+quit.
+
+```shell
+kubectl edit statefulset cockroachdb
+```
+
+Kubernetes will then automatically replace the pods in your StatefulSet one by
+one to run on the newly specified image. For more details on upgrading
+CockroachDB, see [our
+docs](https://www.cockroachlabs.com/docs/stable/upgrade-cockroach-version.html).
+For how to use alternative rolling update commands such as `kubectl patch` and
+`kubectl replace`, see the [Kubernetes
+docs](https://kubernetes.io/docs/tutorials/stateful-application/basic-stateful-set/#rolling-update).
+
 ## Cleaning up when you're done
 
 Because all of the resources in this example have been tagged with the label `app=cockroachdb`,
 we can clean up everything that we created in one quick command using a selector on that label:
 
 ```shell
-kubectl delete statefulsets,pods,persistentvolumes,persistentvolumeclaims,services,poddisruptionbudget -l app=cockroachdb
+kubectl delete statefulsets,pods,persistentvolumes,persistentvolumeclaims,services,poddisruptionbudget,jobs,rolebinding,clusterrolebinding,role,clusterrole,serviceaccount -l app=cockroachdb
 ```
 
 If running in secure mode, you'll want to cleanup old certificate requests:

@@ -12,8 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 //
-// Author: Radu Berinde (radu@cockroachlabs.com)
-//
 // The parallel_test adds an orchestration layer on top of the logic_test code
 // with the capability of running multiple test data files in parallel.
 //
@@ -24,6 +22,7 @@
 package logictest
 
 import (
+	"context"
 	gosql "database/sql"
 	"flag"
 	"fmt"
@@ -33,21 +32,20 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/net/context"
-
-	"gopkg.in/yaml.v2"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/gogo/protobuf/proto"
+	"gopkg.in/yaml.v2"
 )
 
 var (
@@ -99,7 +97,7 @@ func (t *parallelTest) getClient(nodeIdx, clientIdx int) *gosql.DB {
 		if err != nil {
 			t.Fatal(err)
 		}
-		sqlutils.MakeSQLRunner(t, db).Exec("SET DATABASE = test")
+		sqlutils.MakeSQLRunner(db).Exec(t, "SET DATABASE = test")
 		t.cluster.Stopper().AddCloser(
 			stop.CloserFn(func() {
 				_ = db.Close()
@@ -136,8 +134,7 @@ func (t *parallelTest) run(dir string) {
 		t.Fatalf("%s: %s", mainFile, err)
 	}
 	var spec parTestSpec
-	err = yaml.Unmarshal(yamlData, &spec)
-	if err != nil {
+	if err := yaml.UnmarshalStrict(yamlData, &spec); err != nil {
 		t.Fatalf("%s: %s", mainFile, err)
 	}
 
@@ -190,41 +187,49 @@ func (t *parallelTest) setup(spec *parTestSpec) {
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				SQLExecutor: &sql.ExecutorTestingKnobs{
-					WaitForGossipUpdate:   true,
 					CheckStmtStringChange: true,
 				},
 			},
 		},
 	}
 	t.cluster = serverutils.StartTestCluster(t, spec.ClusterSize, args)
+
+	for i := 0; i < t.cluster.NumServers(); i++ {
+		server := t.cluster.Server(i)
+		mode := sessiondata.DistSQLOff
+		st := server.ClusterSettings()
+		st.Manual.Store(true)
+		sql.DistSQLClusterExecMode.Override(&st.SV, int64(mode))
+	}
+
 	t.clients = make([][]*gosql.DB, spec.ClusterSize)
 	for i := range t.clients {
 		t.clients[i] = append(t.clients[i], t.cluster.ServerConn(i))
 	}
-	r0 := sqlutils.MakeSQLRunner(t, t.clients[0][0])
+	r0 := sqlutils.MakeSQLRunner(t.clients[0][0])
 
 	if spec.RangeSplitSize != 0 {
 		if testing.Verbose() || log.V(1) {
 			log.Infof(t.ctx, "Setting range split size: %d", spec.RangeSplitSize)
 		}
 		zoneCfg := config.DefaultZoneConfig()
-		zoneCfg.RangeMaxBytes = int64(spec.RangeSplitSize)
-		zoneCfg.RangeMinBytes = zoneCfg.RangeMaxBytes / 2
+		zoneCfg.RangeMaxBytes = proto.Int64(int64(spec.RangeSplitSize))
+		zoneCfg.RangeMinBytes = proto.Int64(*zoneCfg.RangeMaxBytes / 2)
 		buf, err := protoutil.Marshal(&zoneCfg)
 		if err != nil {
 			t.Fatal(err)
 		}
 		objID := keys.RootNamespaceID
-		r0.Exec(`UPDATE system.zones SET config = $2 WHERE id = $1`, objID, buf)
+		r0.Exec(t, `UPDATE system.zones SET config = $2 WHERE id = $1`, objID, buf)
 	}
 
 	if testing.Verbose() || log.V(1) {
 		log.Infof(t.ctx, "Creating database")
 	}
 
-	r0.Exec("CREATE DATABASE test")
+	r0.Exec(t, "CREATE DATABASE test")
 	for i := range t.clients {
-		sqlutils.MakeSQLRunner(t, t.clients[i][0]).Exec("SET DATABASE = test")
+		sqlutils.MakeSQLRunner(t.clients[i][0]).Exec(t, "SET DATABASE = test")
 	}
 
 	if testing.Verbose() || log.V(1) {
@@ -235,7 +240,7 @@ func (t *parallelTest) setup(spec *parTestSpec) {
 func TestParallel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	glob := string(*paralleltestdata)
+	glob := *paralleltestdata
 	paths, err := filepath.Glob(glob)
 	if err != nil {
 		t.Fatal(err)

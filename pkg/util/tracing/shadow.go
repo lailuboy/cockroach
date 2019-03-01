@@ -12,8 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 //
-// Author: Radu Berinde (radu@cockroachlabs.com)
-//
 // A "shadow" tracer can be any opentracing.Tracer implementation that is used
 // in addition to the normal functionality of our tracer. It works by attaching
 // a shadow span to every span, and attaching a shadow context to every span
@@ -23,14 +21,16 @@
 package tracing
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	lightstep "github.com/lightstep/lightstep-tracer-go"
 	opentracing "github.com/opentracing/opentracing-go"
-	zipkin "github.com/openzipkin/zipkin-go-opentracing"
+	zipkin "github.com/openzipkin-contrib/zipkin-go-opentracing"
 )
 
 type shadowTracerManager interface {
@@ -45,13 +45,7 @@ func (lightStepManager) Name() string {
 }
 
 func (lightStepManager) Close(tr opentracing.Tracer) {
-	// TODO(radu): these calls are not reliable. FlushLightstepTracer exits
-	// immediately if a flush is in progress (see
-	// github.com/lightstep/lightstep-tracer-go/issues/89), and CloseTracer always
-	// exits immediately (see
-	// https://github.com/lightstep/lightstep-tracer-go/pull/85#discussion_r123800322).
-	_ = lightstep.FlushLightStepTracer(tr)
-	_ = lightstep.CloseTracer(tr)
+	lightstep.Close(context.TODO(), tr)
 }
 
 type zipkinManager struct {
@@ -110,12 +104,6 @@ func linkShadowSpan(
 	s.shadowSpan = shadowTr.StartSpan(s.operation, opts...)
 }
 
-var lightStepToken = settings.RegisterStringSetting(
-	"trace.lightstep.token",
-	"if set, traces go to Lightstep using this token",
-	envutil.EnvOrDefaultString("COCKROACH_TEST_LIGHTSTEP_TOKEN", ""),
-)
-
 func createLightStepTracer(token string) (shadowTracerManager, opentracing.Tracer) {
 	return lightStepManager{}, lightstep.NewTracer(lightstep.Options{
 		AccessToken:      token,
@@ -125,21 +113,19 @@ func createLightStepTracer(token string) (shadowTracerManager, opentracing.Trace
 	})
 }
 
-var zipkinCollector = settings.RegisterStringSetting(
-	"trace.zipkin.collector",
-	"if set, traces go to the given Zipkin instance (example: '127.0.0.1:9411'); ignored if trace.lightstep.token is set.",
-	envutil.EnvOrDefaultString("COCKROACH_TEST_ZIPKIN_COLLECTOR", ""),
-)
+var zipkinLogEveryN = util.Every(5 * time.Second)
 
 func createZipkinTracer(collectorAddr string) (shadowTracerManager, opentracing.Tracer) {
 	// Create our HTTP collector.
 	collector, err := zipkin.NewHTTPCollector(
 		fmt.Sprintf("http://%s/api/v1/spans", collectorAddr),
 		zipkin.HTTPLogger(zipkin.LoggerFunc(func(keyvals ...interface{}) error {
-			// These logs are from the collector (e.g. errors sending data, dropped
-			// traces). We can't use `log` from this package so print them to stderr.
-			toPrint := append([]interface{}{"Zipkin collector"}, keyvals...)
-			fmt.Fprintln(os.Stderr, toPrint)
+			if zipkinLogEveryN.ShouldProcess(timeutil.Now()) {
+				// These logs are from the collector (e.g. errors sending data, dropped
+				// traces). We can't use `log` from this package so print them to stderr.
+				toPrint := append([]interface{}{"Zipkin collector"}, keyvals...)
+				fmt.Fprintln(os.Stderr, toPrint)
+			}
 			return nil
 		})),
 	)
@@ -148,7 +134,7 @@ func createZipkinTracer(collectorAddr string) (shadowTracerManager, opentracing.
 	}
 
 	// Create our recorder.
-	recorder := zipkin.NewRecorder(collector, false /* !debug */, "0.0.0.0:0", "cockroach")
+	recorder := zipkin.NewRecorder(collector, false /* debug */, "0.0.0.0:0", "cockroach")
 
 	// Create our tracer.
 	zipkinTr, err := zipkin.NewTracer(recorder)
@@ -156,23 +142,4 @@ func createZipkinTracer(collectorAddr string) (shadowTracerManager, opentracing.
 		panic(err)
 	}
 	return &zipkinManager{collector: collector}, zipkinTr
-}
-
-// We don't call OnChange inline above because it causes an "initialization
-// loop" compile error.
-var _ = lightStepToken.OnChange(updateShadowTracers)
-var _ = zipkinCollector.OnChange(updateShadowTracers)
-
-func updateShadowTracer(t *Tracer) {
-	if lsToken := lightStepToken.Get(); lsToken != "" {
-		t.setShadowTracer(createLightStepTracer(lsToken))
-	} else if zipkinAddr := zipkinCollector.Get(); zipkinAddr != "" {
-		t.setShadowTracer(createZipkinTracer(zipkinAddr))
-	} else {
-		t.setShadowTracer(nil, nil)
-	}
-}
-
-func updateShadowTracers() {
-	tracerRegistry.ForEach(updateShadowTracer)
 }

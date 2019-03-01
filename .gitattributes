@@ -1,7 +1,5 @@
 *.pb.* -diff
-embedded.go -diff
-pkg/sql/parser/sql.go -diff
-pkg/ui/src/js/protos.* -diff
-pkg/ui/generated/* -diff
-pkg/ui/yarn.lock -merge
-Gopkg.toml -merge
+
+# Due to bytes not being escaped during array encoding, this file gets
+# rendered as binary.
+pkg/sql/logictest/testdata/logic_test/array diff

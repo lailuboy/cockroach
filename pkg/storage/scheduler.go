@@ -16,13 +16,11 @@ package storage
 
 import (
 	"container/list"
+	"context"
 	"fmt"
 	"sync"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
@@ -141,7 +139,7 @@ type raftScheduler struct {
 }
 
 func newRaftScheduler(
-	ambient log.AmbientContext, metrics *StoreMetrics, processor raftProcessor, numWorkers int,
+	metrics *StoreMetrics, processor raftProcessor, numWorkers int,
 ) *raftScheduler {
 	s := &raftScheduler{
 		processor:  processor,

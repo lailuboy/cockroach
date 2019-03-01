@@ -11,12 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson
 
 package sql_test
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"math/rand"
@@ -25,20 +24,19 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/lib/pq"
 )
 
 func TestCopyNullInfNaN(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	params, _ := createTestServerParams()
+	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 
@@ -51,11 +49,14 @@ func TestCopyNullInfNaN(t *testing.T) {
 			s STRING NULL,
 			b BYTES NULL,
 			d DATE NULL,
-			t TIMESTAMP NULL,
+			t TIME NULL,
+			ts TIMESTAMP NULL,
 			n INTERVAL NULL,
 			o BOOL NULL,
 			e DECIMAL NULL,
-			tz TIMESTAMP WITH TIME ZONE NULL
+			u UUID NULL,
+			ip INET NULL,
+			tz TIMESTAMPTZ NULL
 		);
 	`); err != nil {
 		t.Fatal(err)
@@ -66,16 +67,18 @@ func TestCopyNullInfNaN(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stmt, err := txn.Prepare(pq.CopyIn("t"))
+	stmt, err := txn.Prepare(pq.CopyIn(
+		"t", "i", "f", "s", "b", "d", "t",
+		"ts", "n", "o", "e", "u", "ip", "tz"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	input := [][]interface{}{
-		{nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.Inf(1), nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.Inf(-1), nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.NaN(), nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.Inf(1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.Inf(-1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.NaN(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
 	}
 
 	for _, in := range input {
@@ -129,7 +132,7 @@ func TestCopyNullInfNaN(t *testing.T) {
 func TestCopyRandom(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	params, _ := createTestServerParams()
+	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 
@@ -142,11 +145,15 @@ func TestCopyRandom(t *testing.T) {
 			i INT,
 			f FLOAT,
 			e DECIMAL,
-			t TIMESTAMP,
+			t TIME,
+			ts TIMESTAMP,
 			s STRING,
 			b BYTES,
-			tz TIMESTAMP WITH TIME ZONE
+			u UUID,
+			ip INET,
+			tz TIMESTAMPTZ
 		);
+		SET extra_float_digits = 3; -- to preserve floats entirely
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -156,41 +163,42 @@ func TestCopyRandom(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stmt, err := txn.Prepare(pq.CopyInSchema("d", "t", "id", "n", "o", "i", "f", "e", "t", "s", "b", "tz"))
+	stmt, err := txn.Prepare(pq.CopyInSchema("d", "t", "id", "n", "o", "i", "f", "e", "t", "ts", "s", "b", "u", "ip", "tz"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	rng := rand.New(rand.NewSource(0))
 	types := []sqlbase.ColumnType_SemanticType{
+		sqlbase.ColumnType_INT,
+		sqlbase.ColumnType_INTERVAL,
 		sqlbase.ColumnType_BOOL,
 		sqlbase.ColumnType_INT,
 		sqlbase.ColumnType_FLOAT,
 		sqlbase.ColumnType_DECIMAL,
+		sqlbase.ColumnType_TIME,
 		sqlbase.ColumnType_TIMESTAMP,
 		sqlbase.ColumnType_STRING,
 		sqlbase.ColumnType_BYTES,
+		sqlbase.ColumnType_UUID,
+		sqlbase.ColumnType_INET,
 		sqlbase.ColumnType_TIMESTAMPTZ,
 	}
 
 	var inputs [][]interface{}
 
 	for i := 0; i < 100; i++ {
-		row := make([]interface{}, len(types)+2)
-		row[0] = strconv.Itoa(i)
-
-		sign := 1 - rng.Int63n(2)*2
-		d := duration.Duration{
-			Months: sign * rng.Int63n(1000),
-			Days:   sign * rng.Int63n(1000),
-			Nanos:  sign * rng.Int63(),
-		}
-
-		row[1] = d.String()
+		row := make([]interface{}, len(types))
 		for j, t := range types {
-			d := sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: t}, false)
-			ds := parser.AsStringWithFlags(d, parser.FmtBareStrings)
-			row[j+2] = ds
+			var ds string
+			if j == 0 {
+				// Special handling for ID field
+				ds = strconv.Itoa(i)
+			} else {
+				d := sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: t}, false)
+				ds = tree.AsStringWithFlags(d, tree.FmtBareStrings)
+			}
+			row[j] = ds
 		}
 		_, err = stmt.Exec(row...)
 		if err != nil {
@@ -233,8 +241,13 @@ func TestCopyRandom(t *testing.T) {
 			case []byte:
 				ds = string(d)
 			case time.Time:
-				dt := parser.MakeDTimestamp(d, time.Microsecond)
-				ds = parser.AsStringWithFlags(dt, parser.FmtBareStrings)
+				var dt tree.NodeFormatter
+				if types[i] == sqlbase.ColumnType_TIME {
+					dt = tree.MakeDTime(timeofday.FromTime(d))
+				} else {
+					dt = tree.MakeDTimestamp(d, time.Microsecond)
+				}
+				ds = tree.AsStringWithFlags(dt, tree.FmtBareStrings)
 			}
 			if !reflect.DeepEqual(in[i], ds) {
 				t.Fatalf("row %v, col %v: got %#v (%T), expected %#v", row, i, ds, d, in[i])
@@ -246,7 +259,7 @@ func TestCopyRandom(t *testing.T) {
 func TestCopyError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	params, _ := createTestServerParams()
+	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 
@@ -299,9 +312,9 @@ func TestCopyError(t *testing.T) {
 func TestCopyOne(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	t.Skip("https://github.com/lib/pq/issues/558")
+	t.Skip("#18352")
 
-	params, _ := createTestServerParams()
+	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 
@@ -333,9 +346,9 @@ func TestCopyOne(t *testing.T) {
 func TestCopyInProgress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	t.Skip("https://github.com/lib/pq/issues/558")
+	t.Skip("#18352")
 
-	params, _ := createTestServerParams()
+	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 
@@ -368,7 +381,7 @@ func TestCopyInProgress(t *testing.T) {
 func TestCopyTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	params, _ := createTestServerParams()
+	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 
@@ -387,6 +400,9 @@ func TestCopyTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Note that, at least with lib/pq, this doesn't actually send a Parse msg
+	// (which we wouldn't support, as we don't support Copy-in in extended
+	// protocol mode). lib/pq has magic for recognizing a Copy.
 	stmt, err := txn.Prepare(pq.CopyIn("t", "i"))
 	if err != nil {
 		t.Fatal(err)

@@ -11,20 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package stop_test
 
 import (
+	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -32,6 +29,7 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/util/log" // for flags
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/pkg/errors"
 )
 
 func TestStopper(t *testing.T) {
@@ -110,6 +108,8 @@ func TestStopperIsStopped(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("stopper should have finished stopping")
 	}
+
+	s.Stop(context.Background())
 }
 
 func TestStopperMultipleStopees(t *testing.T) {
@@ -255,6 +255,35 @@ func TestStopperClosers(t *testing.T) {
 	}
 }
 
+func TestStopperCloserConcurrent(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const trials = 10
+	for i := 0; i < trials; i++ {
+		s := stop.NewStopper()
+		var tc1 testCloser
+
+		// Add Closer and Stop concurrently. There should be
+		// no circumstance where the Closer is not called.
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			s.AddCloser(&tc1)
+		}()
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			s.Stop(context.Background())
+		}()
+		wg.Wait()
+
+		if !tc1 {
+			t.Errorf("expected true; got %t", tc1)
+		}
+	}
+}
+
 func TestStopperNumTasks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
@@ -351,10 +380,89 @@ func TestStopperRunTaskPanic(t *testing.T) {
 func TestStopperWithCancel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
-	ctx := s.WithCancel(context.Background())
+	ctx := context.Background()
+	ctx1, _ := s.WithCancelOnQuiesce(ctx)
+	ctx2, _ := s.WithCancelOnStop(ctx)
+	ctx3, cancel3 := s.WithCancelOnQuiesce(ctx)
+	ctx4, cancel4 := s.WithCancelOnStop(ctx)
+
+	if err := ctx1.Err(); err != nil {
+		t.Fatalf("should not be canceled: %v", err)
+	}
+	if err := ctx2.Err(); err != nil {
+		t.Fatalf("should not be canceled: %v", err)
+	}
+	if err := ctx3.Err(); err != nil {
+		t.Fatalf("should not be canceled: %v", err)
+	}
+	if err := ctx4.Err(); err != nil {
+		t.Fatalf("should not be canceled: %v", err)
+	}
+
+	cancel3()
+	cancel4()
+	if err := ctx1.Err(); err != nil {
+		t.Fatalf("should not be canceled: %v", err)
+	}
+	if err := ctx2.Err(); err != nil {
+		t.Fatalf("should not be canceled: %v", err)
+	}
+	if err := ctx3.Err(); err != context.Canceled {
+		t.Fatalf("should be canceled: %v", err)
+	}
+	if err := ctx4.Err(); err != context.Canceled {
+		t.Fatalf("should be canceled: %v", err)
+	}
+
+	s.Quiesce(ctx)
+	if err := ctx1.Err(); err != context.Canceled {
+		t.Fatalf("should be canceled: %v", err)
+	}
+	if err := ctx2.Err(); err != nil {
+		t.Fatalf("should not be canceled: %v", err)
+	}
+
 	s.Stop(ctx)
-	if err := ctx.Err(); err != context.Canceled {
-		t.Fatal(err)
+	if err := ctx2.Err(); err != context.Canceled {
+		t.Fatalf("should be canceled: %v", err)
+	}
+}
+
+func TestStopperWithCancelConcurrent(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const trials = 10
+	for i := 0; i < trials; i++ {
+		s := stop.NewStopper()
+		ctx := context.Background()
+		var ctx1, ctx2 context.Context
+
+		// Tie two contexts to the Stopper and Stop concurrently. There should
+		// be no circumstance where either Context is not canceled.
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			ctx1, _ = s.WithCancelOnQuiesce(ctx)
+		}()
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			ctx2, _ = s.WithCancelOnStop(ctx)
+		}()
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			s.Stop(ctx)
+		}()
+		wg.Wait()
+
+		if err := ctx1.Err(); err != context.Canceled {
+			t.Errorf("should be canceled: %v", err)
+		}
+		if err := ctx2.Err(); err != context.Canceled {
+			t.Errorf("should be canceled: %v", err)
+		}
 	}
 }
 
@@ -505,7 +613,7 @@ func TestStopperRunLimitedAsyncTaskCancelContext(t *testing.T) {
 	workerStarted := make(chan struct{})
 
 	var workersRun int32
-	var workersCancelled int32
+	var workersCanceled int32
 
 	ctx, cancel := context.WithCancel(context.Background())
 	f := func(ctx context.Context) {
@@ -521,7 +629,7 @@ func TestStopperRunLimitedAsyncTaskCancelContext(t *testing.T) {
 				if err != context.Canceled {
 					t.Fatal(err)
 				}
-				atomic.AddInt32(&workersCancelled, 1)
+				atomic.AddInt32(&workersCanceled, 1)
 			}
 		}
 		close(workersDone)
@@ -543,8 +651,8 @@ func TestStopperRunLimitedAsyncTaskCancelContext(t *testing.T) {
 	if a, e := atomic.LoadInt32(&workersRun), int32(maxConcurrency); a != e {
 		t.Fatalf("%d workers ran before context close, expected exactly %d", a, e)
 	}
-	if a, e := atomic.LoadInt32(&workersCancelled), int32(maxConcurrency); a != e {
-		t.Fatalf("%d workers cancelled after context close, expected exactly %d", a, e)
+	if a, e := atomic.LoadInt32(&workersCanceled), int32(maxConcurrency); a != e {
+		t.Fatalf("%d workers canceled after context close, expected exactly %d", a, e)
 	}
 }
 

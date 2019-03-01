@@ -11,17 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: David Taylor (david@cockroachlabs.com)
-// Author: Andrei Matei (andrei@cockroachlabs.com)
 
 package testcluster
 
 import (
+	"context"
 	"testing"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -29,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
@@ -38,32 +35,37 @@ import (
 
 func TestManualReplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip("#13502")
 
 	tc := StartTestCluster(t, 3,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
 				UseDatabase: "t",
+				Knobs: base.TestingKnobs{
+					Store: &storage.StoreTestingKnobs{
+						// Prevent the merge queue from immediately discarding our splits.
+						DisableMergeQueue: true,
+					},
+				},
 			},
 		})
 	defer tc.Stopper().Stop(context.TODO())
 
-	s0 := sqlutils.MakeSQLRunner(t, tc.Conns[0])
-	s1 := sqlutils.MakeSQLRunner(t, tc.Conns[1])
-	s2 := sqlutils.MakeSQLRunner(t, tc.Conns[2])
+	s0 := sqlutils.MakeSQLRunner(tc.Conns[0])
+	s1 := sqlutils.MakeSQLRunner(tc.Conns[1])
+	s2 := sqlutils.MakeSQLRunner(tc.Conns[2])
 
-	s0.Exec(`CREATE DATABASE t`)
-	s0.Exec(`CREATE TABLE test (k INT PRIMARY KEY, v INT)`)
-	s0.Exec(`INSERT INTO test VALUES (5, 1), (4, 2), (1, 2)`)
+	s0.Exec(t, `CREATE DATABASE t`)
+	s0.Exec(t, `CREATE TABLE test (k INT PRIMARY KEY, v INT)`)
+	s0.Exec(t, `INSERT INTO test VALUES (5, 1), (4, 2), (1, 2)`)
 
-	if r := s1.Query(`SELECT * FROM test WHERE k = 5`); !r.Next() {
+	if r := s1.Query(t, `SELECT * FROM test WHERE k = 5`); !r.Next() {
 		t.Fatal("no rows")
 	} else {
 		r.Close()
 	}
 
-	s2.ExecRowsAffected(3, `DELETE FROM test`)
+	s2.ExecRowsAffected(t, 3, `DELETE FROM test`)
 
 	// Split the table to a new range.
 	kvDB := tc.Servers[0].DB()
@@ -212,9 +214,11 @@ func TestStopServer(t *testing.T) {
 	}
 
 	rpcContext := rpc.NewContext(
-		log.AmbientContext{}, tc.Server(1).RPCContext().Config, tc.Server(1).Clock(), tc.Stopper(),
+		log.AmbientContext{Tracer: tc.Server(0).ClusterSettings().Tracer},
+		tc.Server(1).RPCContext().Config, tc.Server(1).Clock(), tc.Stopper(),
+		&tc.Server(1).ClusterSettings().Version,
 	)
-	conn, err := rpcContext.GRPCDial(server1.ServingAddr())
+	conn, err := rpcContext.GRPCDial(server1.ServingAddr()).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

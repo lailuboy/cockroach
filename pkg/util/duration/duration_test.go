@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Daniel Harrison (daniel.harrison@gmail.com)
 
 package duration
 
@@ -42,34 +40,34 @@ type durationTest struct {
 // TODO(dan): Write more tests with a mixture of positive and negative
 // components.
 var positiveDurationTests = []durationTest{
-	{1, Duration{Months: 0, Days: 0, Nanos: 0}, false},
-	{1, Duration{Months: 0, Days: 0, Nanos: 1}, false},
-	{1, Duration{Months: 0, Days: 0, Nanos: nanosInDay - 1}, false},
-	{1, Duration{Months: 0, Days: 1, Nanos: 0}, false},
-	{0, Duration{Months: 0, Days: 0, Nanos: nanosInDay}, false},
-	{1, Duration{Months: 0, Days: 0, Nanos: nanosInDay + 1}, false},
-	{1, Duration{Months: 0, Days: daysInMonth - 1, Nanos: 0}, false},
-	{1, Duration{Months: 0, Days: 0, Nanos: nanosInMonth - 1}, false},
-	{1, Duration{Months: 1, Days: 0, Nanos: 0}, false},
-	{0, Duration{Months: 0, Days: daysInMonth, Nanos: 0}, false},
-	{0, Duration{Months: 0, Days: 0, Nanos: nanosInMonth}, false},
-	{1, Duration{Months: 0, Days: 0, Nanos: nanosInMonth + 1}, false},
-	{1, Duration{Months: 0, Days: daysInMonth + 1, Nanos: 0}, false},
-	{1, Duration{Months: 1, Days: 1, Nanos: 1}, false},
-	{1, Duration{Months: 1, Days: 10, Nanos: 0}, false},
-	{0, Duration{Months: 0, Days: 40, Nanos: 0}, false},
-	{1, Duration{Months: 2, Days: 0, Nanos: 0}, false},
-	{1, Duration{Months: math.MaxInt64 - 1, Days: daysInMonth - 1, Nanos: nanosInDay * 2}, true},
-	{1, Duration{Months: math.MaxInt64 - 1, Days: daysInMonth * 2, Nanos: nanosInDay * 2}, true},
-	{1, Duration{Months: math.MaxInt64, Days: math.MaxInt64, Nanos: nanosInMonth + nanosInDay}, true},
-	{1, Duration{Months: math.MaxInt64, Days: math.MaxInt64, Nanos: math.MaxInt64}, true},
+	{1, Duration{Months: 0, Days: 0, nanos: 0}, false},
+	{1, Duration{Months: 0, Days: 0, nanos: 1}, false},
+	{1, Duration{Months: 0, Days: 0, nanos: nanosInDay - 1}, false},
+	{1, Duration{Months: 0, Days: 1, nanos: 0}, false},
+	{0, Duration{Months: 0, Days: 0, nanos: nanosInDay}, false},
+	{1, Duration{Months: 0, Days: 0, nanos: nanosInDay + 1}, false},
+	{1, Duration{Months: 0, Days: daysInMonth - 1, nanos: 0}, false},
+	{1, Duration{Months: 0, Days: 0, nanos: nanosInMonth - 1}, false},
+	{1, Duration{Months: 1, Days: 0, nanos: 0}, false},
+	{0, Duration{Months: 0, Days: daysInMonth, nanos: 0}, false},
+	{0, Duration{Months: 0, Days: 0, nanos: nanosInMonth}, false},
+	{1, Duration{Months: 0, Days: 0, nanos: nanosInMonth + 1}, false},
+	{1, Duration{Months: 0, Days: daysInMonth + 1, nanos: 0}, false},
+	{1, Duration{Months: 1, Days: 1, nanos: 1}, false},
+	{1, Duration{Months: 1, Days: 10, nanos: 0}, false},
+	{0, Duration{Months: 0, Days: 40, nanos: 0}, false},
+	{1, Duration{Months: 2, Days: 0, nanos: 0}, false},
+	{1, Duration{Months: math.MaxInt64 - 1, Days: daysInMonth - 1, nanos: nanosInDay * 2}, true},
+	{1, Duration{Months: math.MaxInt64 - 1, Days: daysInMonth * 2, nanos: nanosInDay * 2}, true},
+	{1, Duration{Months: math.MaxInt64, Days: math.MaxInt64, nanos: nanosInMonth + nanosInDay}, true},
+	{1, Duration{Months: math.MaxInt64, Days: math.MaxInt64, nanos: math.MaxInt64}, true},
 }
 
 func fullDurationTests() []durationTest {
 	var ret []durationTest
 	for _, test := range positiveDurationTests {
 		d := test.duration
-		negDuration := Duration{Months: -d.Months, Days: -d.Days, Nanos: -d.Nanos}
+		negDuration := Duration{Months: -d.Months, Days: -d.Days, nanos: -d.nanos}
 		ret = append(ret, durationTest{cmpToPrev: -test.cmpToPrev, duration: negDuration, err: test.err})
 	}
 	ret = append(ret, positiveDurationTests...)
@@ -102,7 +100,7 @@ func TestEncodeDecode(t *testing.T) {
 }
 
 func TestCompare(t *testing.T) {
-	prev := Duration{Nanos: 1} // It's expected that we start with something greater than 0.
+	prev := Duration{nanos: 1} // It's expected that we start with something greater than 0.
 	for i, test := range fullDurationTests() {
 		cmp := test.duration.Compare(prev)
 		if cmp != test.cmpToPrev {
@@ -124,8 +122,8 @@ func TestNormalize(t *testing.T) {
 			normalized.Days < -daysInMonth && normalized.Months != math.MinInt64 {
 			t.Errorf("%d days were not normalized [%s]", i, normalized)
 		}
-		if normalized.Nanos > nanosInDay && normalized.Days != math.MaxInt64 ||
-			normalized.Nanos < -nanosInDay && normalized.Days != math.MinInt64 {
+		if normalized.nanos > nanosInDay && normalized.Days != math.MaxInt64 ||
+			normalized.nanos < -nanosInDay && normalized.Days != math.MinInt64 {
 			t.Errorf("%d nanos were not normalized [%s]", i, normalized)
 		}
 	}
@@ -199,6 +197,92 @@ func TestDiffMicros(t *testing.T) {
 	}
 }
 
+// TestAdd looks at various rounding cases, comparing our date math
+// to behavior observed in PostgreSQL 10.
+func TestAdd(t *testing.T) {
+	tests := []struct {
+		t   time.Time
+		d   Duration
+		exp time.Time
+	}{
+		// Year wraparound
+		{
+			t:   time.Date(1993, 10, 01, 0, 0, 0, 0, time.UTC),
+			d:   Duration{Months: 3},
+			exp: time.Date(1994, 1, 01, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			t:   time.Date(1992, 10, 01, 0, 0, 0, 0, time.UTC),
+			d:   Duration{Months: 15},
+			exp: time.Date(1994, 1, 01, 0, 0, 0, 0, time.UTC),
+		},
+
+		// Check leap behaviors
+		{
+			t:   time.Date(1996, 02, 29, 0, 0, 0, 0, time.UTC),
+			d:   Duration{Months: 12},
+			exp: time.Date(1997, 02, 28, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			t:   time.Date(1996, 02, 29, 0, 0, 0, 0, time.UTC),
+			d:   Duration{Months: 48},
+			exp: time.Date(2000, 02, 29, 0, 0, 0, 0, time.UTC),
+		},
+
+		// This pair shows something one might argue is weird:
+		// that two different times plus the same duration results
+		// in the same result.
+		{
+			t:   time.Date(1996, 01, 30, 0, 0, 0, 0, time.UTC),
+			d:   Duration{Months: 1, Days: 1},
+			exp: time.Date(1996, 03, 01, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			t:   time.Date(1996, 01, 31, 0, 0, 0, 0, time.UTC),
+			d:   Duration{Months: 1, Days: 1},
+			exp: time.Date(1996, 03, 01, 0, 0, 0, 0, time.UTC),
+		},
+
+		// Check negative operations
+		{
+			t:   time.Date(2016, 02, 29, 0, 0, 0, 0, time.UTC),
+			d:   Duration{Months: -1},
+			exp: time.Date(2016, 01, 29, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			t:   time.Date(2016, 02, 29, 0, 0, 0, 0, time.UTC),
+			d:   Duration{Months: -1, Days: -1},
+			exp: time.Date(2016, 01, 28, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			t:   time.Date(2016, 03, 31, 0, 0, 0, 0, time.UTC),
+			d:   Duration{Months: -1},
+			exp: time.Date(2016, 02, 29, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			t:   time.Date(2016, 03, 31, 0, 0, 0, 0, time.UTC),
+			d:   Duration{Months: -1, Days: -1},
+			exp: time.Date(2016, 02, 28, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			t:   time.Date(2016, 02, 01, 0, 0, 0, 0, time.UTC),
+			d:   Duration{Months: -1},
+			exp: time.Date(2016, 01, 01, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			t:   time.Date(2016, 02, 01, 0, 0, 0, 0, time.UTC),
+			d:   Duration{Months: -1, Days: -1},
+			exp: time.Date(2015, 12, 31, 0, 0, 0, 0, time.UTC),
+		},
+	}
+	for i, test := range tests {
+		if res := Add(nil, test.t, test.d); !test.exp.Equal(res) {
+			t.Errorf("%d: expected Add(%v, %d) = %v, found %v",
+				i, test.t, test.d, test.exp, res)
+		}
+	}
+}
+
 func TestAddMicros(t *testing.T) {
 	tests := []struct {
 		t   time.Time
@@ -258,4 +342,93 @@ func TestAddMicros(t *testing.T) {
 				i, test.t, test.d, test.exp, res)
 		}
 	}
+}
+
+func TestTruncate(t *testing.T) {
+	zero := time.Duration(0).String()
+	testCases := []struct {
+		d, r time.Duration
+		s    string
+	}{
+		{0, 1, zero},
+		{0, 1, zero},
+		{time.Second, 1, "1s"},
+		{time.Second, 2 * time.Second, zero},
+		{time.Second + 1, time.Second, "1s"},
+		{11 * time.Nanosecond, 10 * time.Nanosecond, "10ns"},
+		{time.Hour + time.Nanosecond + 3*time.Millisecond + time.Second, time.Millisecond, "1h0m1.003s"},
+	}
+	for i, tc := range testCases {
+		if s := Truncate(tc.d, tc.r).String(); s != tc.s {
+			t.Errorf("%d: (%s,%s) should give %s, but got %s", i, tc.d, tc.r, tc.s, s)
+		}
+	}
+}
+
+// TestNanos verifies that nanoseconds can only be present after Decode and
+// that any operation will remove them.
+func TestNanos(t *testing.T) {
+	d, err := Decode(1, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expect, actual := int64(1), d.nanos; expect != actual {
+		t.Fatalf("expected %d, got %d", expect, actual)
+	}
+	if expect, actual := "00:00:00+1ns", d.StringNanos(); expect != actual {
+		t.Fatalf("expected %s, got %s", expect, actual)
+	}
+	// Add, even of a 0-duration interval, should call round.
+	d = d.Add(Duration{})
+	if expect, actual := int64(0), d.nanos; expect != actual {
+		t.Fatalf("expected %d, got %d", expect, actual)
+	}
+	d, err = Decode(500, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expect, actual := int64(500), d.nanos; expect != actual {
+		t.Fatalf("expected %d, got %d", expect, actual)
+	}
+	if expect, actual := "00:00:00+500ns", d.StringNanos(); expect != actual {
+		t.Fatalf("expected %s, got %s", expect, actual)
+	}
+	d = d.Add(Duration{})
+	if expect, actual := int64(1000), d.nanos; expect != actual {
+		t.Fatalf("expected %d, got %d", expect, actual)
+	}
+	if expect, actual := "00:00:00.000001", d.StringNanos(); expect != actual {
+		t.Fatalf("expected %s, got %s", expect, actual)
+	}
+}
+
+func BenchmarkAdd(b *testing.B) {
+	b.Run("fast-path-by-no-months-in-duration", func(b *testing.B) {
+		s := time.Date(2018, 01, 01, 0, 0, 0, 0, time.UTC)
+		d := Duration{Days: 1}
+		for i := 0; i < b.N; i++ {
+			Add(AdditionModeCompatible, s, d)
+		}
+	})
+	b.Run("fast-path-by-day-number", func(b *testing.B) {
+		s := time.Date(2018, 01, 01, 0, 0, 0, 0, time.UTC)
+		d := Duration{Months: 1}
+		for i := 0; i < b.N; i++ {
+			Add(AdditionModeCompatible, s, d)
+		}
+	})
+	b.Run("no-adjustment", func(b *testing.B) {
+		s := time.Date(2018, 01, 31, 0, 0, 0, 0, time.UTC)
+		d := Duration{Months: 2}
+		for i := 0; i < b.N; i++ {
+			Add(AdditionModeCompatible, s, d)
+		}
+	})
+	b.Run("with-adjustment", func(b *testing.B) {
+		s := time.Date(2018, 01, 31, 0, 0, 0, 0, time.UTC)
+		d := Duration{Months: 1}
+		for i := 0; i < b.N; i++ {
+			Add(AdditionModeCompatible, s, d)
+		}
+	})
 }

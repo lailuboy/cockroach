@@ -1,16 +1,27 @@
-import React from "react";
-import _ from "lodash";
-import { RouterState } from "react-router";
-import { StickyContainer } from "react-sticky";
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
 
-import { TitledComponent } from "src/interfaces/layout";
+import React from "react";
+import { Helmet } from "react-helmet";
+import { RouterState } from "react-router";
+
 import NavigationBar from "src/views/app/components/layoutSidebar";
 import TimeWindowManager from "src/views/app/containers/timewindow";
 import AlertBanner from "src/views/app/containers/alertBanner";
+import RequireLogin from "src/views/login/requireLogin";
 
-function isTitledComponent(obj: Object | TitledComponent): obj is TitledComponent {
-  return obj && _.isFunction((obj as TitledComponent).title);
-}
+import "./layout.styl";
 
 /**
  * Defines the main layout of all admin ui pages. This includes static
@@ -20,34 +31,16 @@ function isTitledComponent(obj: Object | TitledComponent): obj is TitledComponen
  */
 export default class extends React.Component<RouterState, {}> {
   render() {
-    // Responsibility for rendering a title is decided based on the route;
-    // specifically, the most specific current route for which that route's
-    // component implements a "title" method.
-    const { routes, children } = this.props;
-    let title: React.ReactElement<any>;
-
-    for (let i = routes.length - 1; i >= 0; i--) {
-      const component: Object | TitledComponent = routes[i].component;
-      if (isTitledComponent(component)) {
-        title = component.title(this.props);
-        break;
-      }
-    }
-
-    return <div>
-      <TimeWindowManager/>
-      <AlertBanner/>
-      <NavigationBar/>
-      <StickyContainer className="page">
-        {
-          // TODO(mrtracy): The title can be moved down to individual pages,
-          // it is not always the top element on the page (for example, on
-          // pages with a back button).
-          !!title ? <section className="header">{ title }</section>
-                  : null
-        }
-        { children }
-      </StickyContainer>
-    </div>;
+    return (
+      <RequireLogin>
+        <Helmet titleTemplate="%s | Cockroach Console" defaultTitle="Cockroach Console" />
+        <TimeWindowManager/>
+        <AlertBanner/>
+        <NavigationBar/>
+        <div className="page">
+          { this.props.children }
+        </div>
+      </RequireLogin>
+    );
   }
 }

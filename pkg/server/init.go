@@ -11,91 +11,95 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Adam Gee (adamgee@gmail.com)
 
 package server
 
 import (
-	"errors"
-	"net"
+	"context"
+	"fmt"
 
-	"google.golang.org/grpc"
-
-	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"golang.org/x/net/context"
 )
-
-// initListener wraps a net.Listener and turns its Close() method into
-// a no-op. This is used so that the initServer's grpc.Server can be
-// stopped without closing the listener (which it shares with the main
-// grpc.Server).
-type initListener struct {
-	net.Listener
-}
-
-func (initListener) Close() error {
-	return nil
-}
 
 // initServer manages the temporary init server used during
 // bootstrapping.
 type initServer struct {
-	server       *Server
-	grpc         *grpc.Server
-	bootstrapped chan struct{}
-	mu           struct {
+	mu struct {
 		syncutil.Mutex
-		awaitDone bool
+		// If set, a Bootstrap() call is rejected with this error.
+		rejectErr error
+	}
+	bootstrapReqCh chan struct{}
+	connected      <-chan struct{}
+	shouldStop     <-chan struct{}
+}
+
+func newInitServer(connected <-chan struct{}, shouldStop <-chan struct{}) *initServer {
+	return &initServer{
+		bootstrapReqCh: make(chan struct{}),
+		connected:      connected,
+		shouldStop:     shouldStop,
 	}
 }
 
-func newInitServer(s *Server) *initServer {
-	return &initServer{server: s, bootstrapped: make(chan struct{})}
-}
-
-func (s *initServer) serve(ctx context.Context, ln net.Listener) {
-	s.grpc = rpc.NewServer(s.server.rpcContext)
-	serverpb.RegisterInitServer(s.grpc, s)
-
-	s.server.stopper.RunWorker(ctx, func(context.Context) {
-		netutil.FatalIfUnexpected(s.grpc.Serve(initListener{ln}))
-	})
-}
-
-func (s *initServer) awaitBootstrap() error {
-	select {
-	case <-s.server.node.storeCfg.Gossip.Connected:
-	case <-s.bootstrapped:
-	case <-s.server.stopper.ShouldStop():
-		return errors.New("stop called while waiting to bootstrap")
-	}
+// testOrSetRejectErr set the reject error unless a reject error was already
+// set, in which case it returns the one that was already set. If no error had
+// previously been set, returns nil.
+func (s *initServer) testOrSetRejectErr(err error) error {
 	s.mu.Lock()
-	s.mu.awaitDone = true
-	s.mu.Unlock()
-	s.grpc.GracefulStop()
-
+	defer s.mu.Unlock()
+	if s.mu.rejectErr != nil {
+		return s.mu.rejectErr
+	}
+	s.mu.rejectErr = err
 	return nil
 }
 
+type initServerResult int
+
+const (
+	invalidInitResult initServerResult = iota
+	connectedToCluster
+	needBootstrap
+)
+
+// awaitBootstrap blocks until the connected channel is closed or a Bootstrap()
+// call is received. It returns true if a Bootstrap() call is received,
+// instructing the caller to perform cluster bootstrap. It returns false if the
+// connected channel is closed, telling the caller that someone else
+// bootstrapped the cluster. Assuming that the connected channel comes from
+// Gossip, this means that the cluster ID is now available in gossip.
+func (s *initServer) awaitBootstrap() (initServerResult, error) {
+	select {
+	case <-s.connected:
+		_ = s.testOrSetRejectErr(fmt.Errorf("already connected to cluster"))
+		return connectedToCluster, nil
+	case <-s.bootstrapReqCh:
+		return needBootstrap, nil
+	case <-s.shouldStop:
+		err := fmt.Errorf("stop called while waiting to bootstrap")
+		_ = s.testOrSetRejectErr(err)
+		return invalidInitResult, err
+	}
+}
+
+// Bootstrap unblocks an awaitBootstrap() call. If awaitBootstrap() hasn't been
+// called yet, it will not block the next time it's called.
+//
+// TODO(andrei): There's a race between gossip connecting and this initServer
+// getting a Bootstrap request that allows both to succeed: there's no
+// synchronization between gossip and this server and so gossip can succeed in
+// propagating one cluster ID while this call succeeds in telling the Server to
+// bootstrap and created a new cluster ID. We should fix it somehow by tangling
+// the gossip.Server with this initServer such that they serialize access to a
+// clusterID and decide among themselves a single winner for the race.
 func (s *initServer) Bootstrap(
 	ctx context.Context, request *serverpb.BootstrapRequest,
 ) (response *serverpb.BootstrapResponse, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.mu.awaitDone {
-		return nil, errors.New("bootstrap called after cluster already initialized")
-	}
-
-	if err := s.server.node.bootstrap(ctx, s.server.engines); err != nil {
-		log.Error(ctx, "node bootstrap failed: ", err)
+	if err := s.testOrSetRejectErr(fmt.Errorf("cluster has already been initialized")); err != nil {
 		return nil, err
 	}
-
-	close(s.bootstrapped)
+	close(s.bootstrapReqCh)
 	return &serverpb.BootstrapResponse{}, nil
 }

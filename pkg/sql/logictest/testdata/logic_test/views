@@ -1,5 +1,8 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata
 
+# NOTE: Keep this table at the beginning of the file to ensure that its numeric
+#       reference is 53 (the numeric reference of the first table). If the
+#       numbering scheme in cockroach changes, this test will break.
 statement ok
 CREATE TABLE t (a INT PRIMARY KEY, b INT)
 
@@ -7,28 +10,31 @@ statement ok
 INSERT INTO t VALUES (1, 99), (2, 98), (3, 97)
 
 statement ok
-CREATE VIEW v1 AS select a, b from t
+CREATE VIEW v1 AS SELECT a, b FROM t
 
 statement error pgcode 42P07 relation \"v1\" already exists
-CREATE VIEW v1 AS select a, b from t
+CREATE VIEW v1 AS SELECT a, b FROM t
 
 statement error pgcode 42P07 relation \"t\" already exists
-CREATE VIEW t AS select a, b from t
+CREATE VIEW t AS SELECT a, b FROM t
 
 statement ok
-CREATE VIEW v2 (x, y) AS select a, b from t
+CREATE VIEW v2 (x, y) AS SELECT a, b FROM t
 
 statement error pgcode 42601 CREATE VIEW specifies 1 column name, but data source has 2 columns
-CREATE VIEW v3 (x) AS select a, b from t
+CREATE VIEW v3 (x) AS SELECT a, b FROM t
 
 statement error pgcode 42601 CREATE VIEW specifies 3 column names, but data source has 2 columns
-CREATE VIEW v4 (x, y, z) AS select a, b from t
+CREATE VIEW v4 (x, y, z) AS SELECT a, b FROM t
 
 statement error pgcode 42P01 relation "dne" does not exist
-CREATE VIEW v5 AS select a, b from dne
+CREATE VIEW v5 AS SELECT a, b FROM dne
 
 statement ok
-CREATE VIEW v6 (x, y) AS select a, b from v1
+CREATE VIEW v6 (x, y) AS SELECT a, b FROM v1
+
+statement ok
+CREATE VIEW v7 (x, y) AS SELECT a, b FROM v1 ORDER BY a DESC LIMIT 2
 
 query II colnames,rowsort
 SELECT * FROM v1
@@ -54,6 +60,19 @@ x y
 2 98
 3 97
 
+query II colnames
+SELECT * FROM v7
+----
+x y
+3 97
+2 98
+
+query II colnames
+SELECT * FROM v7 ORDER BY x LIMIT 1
+----
+x y
+2 98
+
 query II
 SELECT * FROM v2 ORDER BY x DESC LIMIT 1
 ----
@@ -72,6 +91,28 @@ SELECT y FROM v2
 99
 98
 97
+
+query I
+SELECT x FROM v7
+----
+3
+2
+
+query I
+SELECT x FROM v7 ORDER BY x LIMIT 1
+----
+2
+
+query I
+SELECT y FROM v7
+----
+97
+98
+
+query I
+SELECT y FROM v7 ORDER BY x LIMIT 1
+----
+98
 
 query IIII rowsort
 SELECT * FROM v1 AS v1 INNER JOIN v2 AS v2 ON v1.a = v2.x
@@ -110,6 +151,19 @@ x y
 2 98
 3 97
 
+query II colnames
+SELECT * FROM test.v7
+----
+x y
+3 97
+2 98
+
+query II colnames
+SELECT * FROM test.v7 ORDER BY x LIMIT 1
+----
+x y
+2 98
+
 statement ok
 CREATE VIEW v1 AS SELECT x, y FROM test.v2
 
@@ -127,22 +181,27 @@ x y
 query TT
 SHOW CREATE VIEW v1
 ----
-v1 CREATE VIEW v1 (a, b) AS SELECT a, b FROM test.t
+v1  CREATE VIEW v1 (a, b) AS SELECT a, b FROM test.public.t
 
 query TT
 SHOW CREATE VIEW v2
 ----
-v2 CREATE VIEW v2 (x, y) AS SELECT a, b FROM test.t
+v2  CREATE VIEW v2 (x, y) AS SELECT a, b FROM test.public.t
 
 query TT
 SHOW CREATE VIEW v6
 ----
-v6 CREATE VIEW v6 (x, y) AS SELECT a, b FROM test.v1
+v6  CREATE VIEW v6 (x, y) AS SELECT a, b FROM test.public.v1
+
+query TT
+SHOW CREATE VIEW v7
+----
+v7  CREATE VIEW v7 (x, y) AS SELECT a, b FROM test.public.v1 ORDER BY a DESC LIMIT 2
 
 query TT
 SHOW CREATE VIEW test2.v1
 ----
-test2.v1 CREATE VIEW v1 (x, y) AS SELECT x, y FROM test.v2
+test2.public.v1  CREATE VIEW v1 (x, y) AS SELECT x, y FROM test.public.v2
 
 statement ok
 GRANT SELECT ON t TO testuser
@@ -191,7 +250,7 @@ SELECT * FROM v6
 query TT
 SHOW CREATE VIEW v1
 ----
-v1 CREATE VIEW v1 (a, b) AS SELECT a, b FROM test.t
+v1  CREATE VIEW v1 (a, b) AS SELECT a, b FROM test.public.t
 
 user root
 
@@ -218,6 +277,27 @@ SELECT * FROM v6
 
 user root
 
+# Ensure that views work over tables identified by numeric reference.
+statement ok
+CREATE VIEW num_ref_view AS SELECT a, b FROM [53 AS t]
+
+statement ok
+GRANT SELECT ON num_ref_view TO testuser
+
+user testuser
+
+query II rowsort
+SELECT * FROM num_ref_view
+----
+1 99
+2 98
+3 97
+
+user root
+
+statement ok
+DROP VIEW num_ref_view
+
 statement error pgcode 42809 "v1" is not a table
 DROP TABLE v1
 
@@ -227,11 +307,14 @@ DROP VIEW t
 statement error cannot drop relation "v1" because view "v6" depends on it
 DROP VIEW v1
 
-statement error cannot drop relation "v2" because view "test2.v1" depends on it
+statement error cannot drop relation "v2" because view "test2.public.v1" depends on it
 DROP VIEW v2
 
 statement ok
 DROP VIEW test2.v1
+
+statement ok
+DROP VIEW v7
 
 statement ok
 DROP VIEW v6
@@ -258,7 +341,7 @@ statement error views do not currently support \* expressions
 create view s1 AS SELECT a FROM t ORDER BY t.*
 
 statement error views do not currently support \* expressions
-create view s1 AS SELECT COUNT(1) FROM t GROUP BY t.*
+create view s1 AS SELECT count(1) FROM t GROUP BY t.*
 
 statement error views do not currently support \* expressions
 create view s1 AS SELECT alias.* FROM t AS alias
@@ -297,16 +380,16 @@ statement error views do not currently support \* expressions
 create view s1 AS SELECT t1.a, t2.a FROM t AS t1 JOIN t AS t2 ON t1.a IN (SELECT a FROM (SELECT * FROM t))
 
 statement ok
-create view s1 AS SELECT COUNT(*) FROM t
+create view s1 AS SELECT count(*) FROM t
 
 statement ok
-create view s2 AS SELECT a FROM t WHERE a IN (SELECT COUNT(*) FROM t)
+create view s2 AS SELECT a FROM t WHERE a IN (SELECT count(*) FROM t)
 
 statement ok
-create view s3 AS SELECT a, COUNT(*) FROM t GROUP BY a
+create view s3 AS SELECT a, count(*) FROM t GROUP BY a
 
 statement ok
-create view s4 AS SELECT a, COUNT(*) FROM t GROUP BY a HAVING a > (SELECT COUNT(*) FROM t)
+create view s4 AS SELECT a, count(*) FROM t GROUP BY a HAVING a > (SELECT count(*) FROM t)
 
 statement ok
 DROP VIEW s4
@@ -351,7 +434,7 @@ SELECT * FROM dt2
 statement ok
 CREATE VIEW v AS SELECT d, t FROM t
 
-statement error pq: unexpected AS OF SYSTEM TIME
+statement error pq: AS OF SYSTEM TIME must be provided on a top-level statement
 CREATE TABLE t2 AS SELECT d, t FROM t AS OF SYSTEM TIME '2017-02-13 21:30:00'
 
 statement ok
@@ -416,3 +499,47 @@ SELECT sum ("QuotedCaps15951". a) FROM "QuotedCaps15951" GROUP BY b ORDER BY b
 1
 3
 6
+
+# Regression tests for #23833
+
+statement ok
+CREATE VIEW w AS WITH a AS (SELECT 1 AS x) SELECT x FROM a
+
+query T
+SELECT create_statement FROM [SHOW CREATE w]
+----
+CREATE VIEW w (x) AS WITH a AS (SELECT 1 AS x) SELECT x FROM a
+
+statement ok
+CREATE VIEW w2 AS WITH t AS (SELECT x FROM w) SELECT x FROM t
+
+query T
+SELECT create_statement FROM [SHOW CREATE w2]
+----
+CREATE VIEW w2 (x) AS WITH t AS (SELECT x FROM test.public.w) SELECT x FROM t
+
+statement ok
+CREATE VIEW w3 AS (WITH t AS (SELECT x FROM w) SELECT x FROM t)
+
+query T
+SELECT create_statement FROM [SHOW CREATE w3]
+----
+CREATE VIEW w3 (x) AS (WITH t AS (SELECT x FROM test.public.w) SELECT x FROM t)
+
+# Test CRUD privilege in view.
+
+statement ok
+CREATE TABLE t (a INT PRIMARY KEY, b INT)
+
+statement ok
+CREATE VIEW crud_view AS SELECT a, b FROM [INSERT INTO t (a, b) VALUES (100, 100) RETURNING a, b]
+
+statement ok
+GRANT SELECT ON crud_view TO testuser
+
+user testuser
+
+query error user testuser does not have INSERT privilege on relation t
+SELECT * FROM crud_view
+
+user root

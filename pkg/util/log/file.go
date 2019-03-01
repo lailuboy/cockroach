@@ -1,6 +1,5 @@
 // Copyright 2013 Google Inc. All Rights Reserved.
-//
-// Go support for leveled logs, analogous to https://code.google.com/p/google-clog/
+// Copyright 2017 The Cockroach Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// File I/O for logs.
+// This code originated in the github.com/golang/glog package.
 
-// Author: Bram Gruneir (bram@cockroachlabs.com)
+// File I/O for logs.
 
 package log
 
@@ -35,9 +34,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
 )
 
 // LogFileMaxSize is the maximum size of a log file in bytes.
@@ -49,21 +48,19 @@ var LogFileMaxSize int64 = 10 << 20 // 10MiB
 // to LogFileMaxSize larger.
 var LogFilesCombinedMaxSize = LogFileMaxSize * 10 // 100MiB
 
-// If non-empty, overrides the choice of directory in which to write logs. See
-// createLogDirs for the full list of possible destinations. Note that the
-// default is to log to stderr independent of this setting. See --logtostderr.
-
-type logDirName struct {
+// DirName overrides (if non-empty) the choice of directory in
+// which to write logs. See createLogDirs for the full list of
+// possible destinations. Note that the default is to log to stderr
+// independent of this setting. See --logtostderr.
+type DirName struct {
 	syncutil.Mutex
 	name string
 }
 
-var _ flag.Value = &logDirName{}
-
-var logDir logDirName
+var _ flag.Value = &DirName{}
 
 // Set implements the flag.Value interface.
-func (l *logDirName) Set(dir string) error {
+func (l *DirName) Set(dir string) error {
 	if len(dir) > 0 && dir[0] == '~' {
 		return fmt.Errorf("log directory cannot start with '~': %s", dir)
 	}
@@ -81,18 +78,18 @@ func (l *logDirName) Set(dir string) error {
 }
 
 // Type implements the flag.Value interface.
-func (l *logDirName) Type() string {
+func (l *DirName) Type() string {
 	return "string"
 }
 
 // String implements the flag.Value interface.
-func (l *logDirName) String() string {
+func (l *DirName) String() string {
 	l.Lock()
 	defer l.Unlock()
 	return l.name
 }
 
-func (l *logDirName) get() (string, error) {
+func (l *DirName) get() (string, error) {
 	l.Lock()
 	defer l.Unlock()
 	if len(l.name) == 0 {
@@ -101,7 +98,8 @@ func (l *logDirName) get() (string, error) {
 	return l.name, nil
 }
 
-func (l *logDirName) isSet() bool {
+// IsSet returns true iff the directory name is set.
+func (l *DirName) IsSet() bool {
 	l.Lock()
 	res := l.name != ""
 	l.Unlock()
@@ -109,17 +107,38 @@ func (l *logDirName) isSet() bool {
 }
 
 // DirSet returns true of the log directory has been changed from its default.
-func DirSet() bool { return logDir.isSet() }
+func DirSet() bool { return logging.logDir.IsSet() }
 
-// logFileRE matches log files to avoid exposing non-log files accidentally
-// and it splits the details of the filename into groups for easy parsing.
-// The log file format is {process}.{host}.{username}.{timestamp}.{pid}.log
-// cockroach.Brams-MacBook-Pro.bram.2015-06-09T16-10-48Z.30209.log
+// FileNamePattern matches log files to avoid exposing non-log files
+// accidentally and it splits the details of the filename into groups for easy
+// parsing. The log file format is
+//
+//   {program}.{host}.{username}.{timestamp}.{pid}.log
+//   cockroach.Brams-MacBook-Pro.bram.2015-06-09T16-10-48Z.30209.log
+//
 // All underscore in process, host and username are escaped to double
 // underscores and all periods are escaped to an underscore.
 // For compatibility with Windows filenames, all colons from the timestamp
-// (RFC3339) are converted from underscores.
-var logFileRE = regexp.MustCompile(`^(?:.*/)?([^/.]+)\.([^/\.]+)\.([^/\.]+)\.([^/\.]+)\.(\d+)\.log$`)
+// (RFC3339) are converted from underscores (see FileTimePattern).
+// Note this pattern is unanchored and becomes anchored through its use in
+// LogFilePattern.
+const FileNamePattern = `(?P<program>[^/.]+)\.(?P<host>[^/\.]+)\.` +
+	`(?P<user>[^/\.]+)\.(?P<ts>[^/\.]+)\.(?P<pid>\d+)\.log`
+
+// FilePattern matches log file paths.
+const FilePattern = "^(?:.*/)?" + FileNamePattern + "$"
+
+var fileRE = regexp.MustCompile(FilePattern)
+
+// MakeFileInfo constructs a FileInfo from FileDetails and os.FileInfo.
+func MakeFileInfo(details FileDetails, info os.FileInfo) FileInfo {
+	return FileInfo{
+		Name:         info.Name(),
+		SizeBytes:    info.Size(),
+		ModTimeNanos: info.ModTime().UnixNano(),
+		Details:      details,
+	}
+}
 
 var (
 	pid      = os.Getpid()
@@ -146,7 +165,7 @@ func init() {
 // shortHostname returns its argument, truncating at the first period.
 // For instance, given "www.google.com" it returns "www".
 func shortHostname(hostname string) string {
-	if i := strings.Index(hostname, "."); i >= 0 {
+	if i := strings.IndexByte(hostname, '.'); i >= 0 {
 		return hostname[:i]
 	}
 	return hostname
@@ -159,33 +178,35 @@ func removePeriods(s string) string {
 	return strings.Replace(s, ".", "", -1)
 }
 
+// FileTimeFormat is RFC3339 with the colons replaced with underscores.
+// It is the format used for timestamps in log file names.
+// This removal of colons creates log files safe for Windows file systems.
+const FileTimeFormat = "2006-01-02T15_04_05Z07:00"
+
 // logName returns a new log file name with start time t, and the name
 // for the symlink.
-func logName(t time.Time) (name, link string) {
-	// Replace the ':'s in the time format with '_'s to allow for log files in
-	// Windows.
-	tFormatted := strings.Replace(t.Format(time.RFC3339), ":", "_", -1)
-
+func logName(prefix string, t time.Time) (name, link string) {
 	name = fmt.Sprintf("%s.%s.%s.%s.%06d.log",
-		removePeriods(program),
+		removePeriods(prefix),
 		removePeriods(host),
 		removePeriods(userName),
-		tFormatted,
+		t.Format(FileTimeFormat),
 		pid)
-	return name, removePeriods(program) + ".log"
+	return name, removePeriods(prefix) + ".log"
 }
 
 var errMalformedName = errors.New("malformed log filename")
 
-func parseLogFilename(filename string) (FileDetails, error) {
-	matches := logFileRE.FindStringSubmatch(filename)
+// ParseLogFilename parses a filename into FileDetails if it matches the pattern
+// for log files. If the filename does not match the log file pattern, an error
+// is returned.
+func ParseLogFilename(filename string) (FileDetails, error) {
+	matches := fileRE.FindStringSubmatch(filename)
 	if matches == nil || len(matches) != 6 {
 		return FileDetails{}, errMalformedName
 	}
 
-	// Replace the '_'s with ':'s to restore the correct time format.
-	fixTime := strings.Replace(matches[4], "_", ":", -1)
-	time, err := time.Parse(time.RFC3339, fixTime)
+	time, err := time.Parse(FileTimeFormat, matches[4])
 	if err != nil {
 		return FileDetails{}, err
 	}
@@ -199,7 +220,6 @@ func parseLogFilename(filename string) (FileDetails, error) {
 		Program:  matches[1],
 		Host:     matches[2],
 		UserName: matches[3],
-		Severity: Severity_INFO,
 		Time:     time.UnixNano(),
 		PID:      pid,
 	}, nil
@@ -211,7 +231,7 @@ var errDirectoryNotSet = errors.New("log: log directory not set")
 // filename. If the file is created successfully, create also attempts
 // to update the symlink for that tag, ignoring errors.
 func create(
-	t time.Time, lastRotation int64,
+	logDir *DirName, prefix string, t time.Time, lastRotation int64,
 ) (f *os.File, updatedRotation int64, filename string, err error) {
 	dir, err := logDir.get()
 	if err != nil {
@@ -225,10 +245,10 @@ func create(
 		unix = lastRotation + 1
 	}
 	updatedRotation = unix
-	t = time.Unix(unix, 0)
+	t = timeutil.Unix(unix, 0)
 
 	// Generate the file name.
-	name, link := logName(t)
+	name, link := logName(prefix, t)
 	fname := filepath.Join(dir, name)
 	// Open the file os.O_APPEND|os.O_CREATE rather than use os.Create.
 	// Append is almost always more efficient than O_RDRW on most modern file systems.
@@ -256,8 +276,12 @@ func create(
 // ListLogFiles returns a slice of FileInfo structs for each log file
 // on the local node, in any of the configured log directories.
 func ListLogFiles() ([]FileInfo, error) {
+	return logging.listLogFiles()
+}
+
+func (l *loggingT) listLogFiles() ([]FileInfo, error) {
 	var results []FileInfo
-	dir, err := logDir.get()
+	dir, err := logging.logDir.get()
 	if err != nil {
 		// No log directory configured: simply indicate that there are no
 		// log files.
@@ -267,16 +291,16 @@ func ListLogFiles() ([]FileInfo, error) {
 	if err != nil {
 		return results, err
 	}
+	// The file names have a fixed structure with fields delimited by
+	// periods. create() for new files removes the periods from the
+	// provided prefix; do the same here to filter out selected names
+	// below.
+	programPrefix := removePeriods(l.prefix)
 	for _, info := range infos {
 		if info.Mode().IsRegular() {
-			details, err := parseLogFilename(info.Name())
-			if err == nil {
-				results = append(results, FileInfo{
-					Name:         info.Name(),
-					SizeBytes:    info.Size(),
-					ModTimeNanos: info.ModTime().UnixNano(),
-					Details:      details,
-				})
+			details, err := ParseLogFilename(info.Name())
+			if err == nil && details.Program == programPrefix {
+				results = append(results, MakeFileInfo(details, info))
 			}
 		}
 	}
@@ -292,7 +316,7 @@ func ListLogFiles() ([]FileInfo, error) {
 // file names will be searched in this process's log directory if not
 // found in the current directory.
 func GetLogReader(filename string, restricted bool) (io.ReadCloser, error) {
-	dir, err := logDir.get()
+	dir, err := logging.logDir.get()
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +374,7 @@ func GetLogReader(filename string, restricted bool) (io.ReadCloser, error) {
 	}
 
 	// Check that the file name is valid.
-	if _, err := parseLogFilename(filepath.Base(filename)); err != nil {
+	if _, err := ParseLogFilename(filepath.Base(filename)); err != nil {
 		return nil, err
 	}
 

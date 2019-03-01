@@ -11,12 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/pkg/errors"
 )
@@ -45,7 +44,7 @@ import (
 // AddMessage can be called multiple times before getting the rows, but this
 // will cause data to accumulate internally.
 type StreamDecoder struct {
-	typing       []DatumInfo
+	typing       []distsqlpb.DatumInfo
 	data         []byte
 	numEmptyRows int
 	metadata     []ProducerMetadata
@@ -61,7 +60,7 @@ type StreamDecoder struct {
 // msg.Data.Metadata until all the rows in the message are retrieved with GetRow.
 //
 // If an error is returned, no records have been buffered in the StreamDecoder.
-func (sd *StreamDecoder) AddMessage(msg *ProducerMessage) error {
+func (sd *StreamDecoder) AddMessage(msg *distsqlpb.ProducerMessage) error {
 	if msg.Header != nil {
 		if sd.headerReceived {
 			return errors.Errorf("received multiple headers")
@@ -104,13 +103,22 @@ func (sd *StreamDecoder) AddMessage(msg *ProducerMessage) error {
 		for _, md := range msg.Data.Metadata {
 			var meta ProducerMetadata
 			switch v := md.Value.(type) {
-			case *RemoteProducerMetadata_RangeInfo:
+			case *distsqlpb.RemoteProducerMetadata_RangeInfo:
 				meta.Ranges = v.RangeInfo.RangeInfo
 
-			case *RemoteProducerMetadata_TraceData_:
+			case *distsqlpb.RemoteProducerMetadata_TraceData_:
 				meta.TraceData = v.TraceData.CollectedSpans
 
-			case *RemoteProducerMetadata_Error:
+			case *distsqlpb.RemoteProducerMetadata_TxnCoordMeta:
+				meta.TxnCoordMeta = v.TxnCoordMeta
+
+			case *distsqlpb.RemoteProducerMetadata_RowNum_:
+				meta.RowNum = v.RowNum
+
+			case *distsqlpb.RemoteProducerMetadata_Progress:
+				meta.Progress = v.Progress
+
+			case *distsqlpb.RemoteProducerMetadata_Error:
 				meta.Err = v.Error.ErrorDetail()
 
 			default:
@@ -133,9 +141,9 @@ func (sd *StreamDecoder) AddMessage(msg *ProducerMessage) error {
 // coming from the upstream (through ProducerMetadata.Err).
 func (sd *StreamDecoder) GetRow(
 	rowBuf sqlbase.EncDatumRow,
-) (sqlbase.EncDatumRow, ProducerMetadata, error) {
+) (sqlbase.EncDatumRow, *ProducerMetadata, error) {
 	if len(sd.metadata) != 0 {
-		r := sd.metadata[0]
+		r := &sd.metadata[0]
 		sd.metadata = sd.metadata[1:]
 		return nil, r, nil
 	}
@@ -143,11 +151,11 @@ func (sd *StreamDecoder) GetRow(
 	if sd.numEmptyRows > 0 {
 		sd.numEmptyRows--
 		row := make(sqlbase.EncDatumRow, 0) // this doesn't actually allocate.
-		return row, ProducerMetadata{}, nil
+		return row, nil, nil
 	}
 
 	if len(sd.data) == 0 {
-		return nil, ProducerMetadata{}, nil
+		return nil, nil, nil
 	}
 	rowLen := len(sd.typing)
 	if cap(rowBuf) >= rowLen {
@@ -158,13 +166,23 @@ func (sd *StreamDecoder) GetRow(
 	for i := range rowBuf {
 		var err error
 		rowBuf[i], sd.data, err = sqlbase.EncDatumFromBuffer(
-			sd.typing[i].Type, sd.typing[i].Encoding, sd.data,
+			&sd.typing[i].Type, sd.typing[i].Encoding, sd.data,
 		)
 		if err != nil {
 			// Reset sd because it is no longer usable.
 			*sd = StreamDecoder{}
-			return nil, ProducerMetadata{}, err
+			return nil, nil, err
 		}
 	}
-	return rowBuf, ProducerMetadata{}, nil
+	return rowBuf, nil, nil
+}
+
+// Types returns the types of the columns; can only be used after we received at
+// least one row.
+func (sd *StreamDecoder) Types() []sqlbase.ColumnType {
+	types := make([]sqlbase.ColumnType, len(sd.typing))
+	for i := range types {
+		types[i] = sd.typing[i].Type
+	}
+	return types
 }

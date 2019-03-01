@@ -1,4 +1,4 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata
 
 statement ok
 CREATE TABLE kv (
@@ -52,7 +52,7 @@ a b
 c d
 g h
 
-statement error pq: database "x" does not exist
+statement error pq: relation "x.y" does not exist
 BEGIN; INSERT INTO x.y(a) VALUES (1); END
 
 statement error pq: current transaction is aborted, commands ignored until end of transaction block
@@ -61,5 +61,5 @@ SELECT * from kv; ROLLBACK
 statement ok
 ROLLBACK
 
-statement error pq: relation "system.t" does not exist
+statement error pgcode 42P01 relation "system.t" does not exist
 BEGIN TRANSACTION; SELECT * FROM system.t; INSERT INTO t(a) VALUES (1)

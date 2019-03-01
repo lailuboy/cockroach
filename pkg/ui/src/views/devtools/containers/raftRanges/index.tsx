@@ -1,3 +1,17 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import _ from "lodash";
 import React from "react";
 import ReactPaginate from "react-paginate";
@@ -75,14 +89,14 @@ class RangesMain extends React.Component<RangesMainProps, RangesMainState> {
     }
   }
 
-  renderPagination(pageNum: number): React.ReactNode {
+  renderPagination(pageCount: number): React.ReactNode {
     return <ReactPaginate previousLabel={"previous"}
       nextLabel={"next"}
-      breakLabel={<a href="">...</a>}
-      pageNum={pageNum}
+      breakLabel={"..."}
+      pageCount={pageCount}
       marginPagesDisplayed={2}
       pageRangeDisplayed={5}
-      clickCallback={this.handlePageClick.bind(this)}
+      onPageChange={this.handlePageClick.bind(this)}
       containerClassName={"pagination"}
       activeClassName={"active"} />;
   }
@@ -100,22 +114,22 @@ class RangesMain extends React.Component<RangesMainProps, RangesMainState> {
       <b>Filters</b>
       <label>
         <input type="checkbox" checked={this.state.showState}
-          onChange={() => this.setState({showState: !this.state.showState})} />
+          onChange={() => this.setState({ showState: !this.state.showState })} />
         State
       </label>
       <label>
         <input type="checkbox" checked={this.state.showReplicas}
-          onChange={() => this.setState({showReplicas: !this.state.showReplicas})} />
+          onChange={() => this.setState({ showReplicas: !this.state.showReplicas })} />
         Replicas
       </label>
       <label>
         <input type="checkbox" checked={this.state.showPending}
-          onChange={() => this.setState({showPending: !this.state.showPending})} />
+          onChange={() => this.setState({ showPending: !this.state.showPending })} />
         Pending
       </label>
       <label>
         <input type="checkbox" checked={this.state.showOnlyErrors}
-          onChange={() => this.setState({showOnlyErrors: !this.state.showOnlyErrors})} />
+          onChange={() => this.setState({ showOnlyErrors: !this.state.showOnlyErrors })} />
         Only Error Ranges
       </label>
     </div>;
@@ -130,28 +144,32 @@ class RangesMain extends React.Component<RangesMainProps, RangesMainState> {
       errors.push(this.props.state.lastError.message);
     }
 
-    if (this.props.state.inFlight) {
+    if (!this.props.state.data) {
       content = <div className="section">Loading...</div>;
     } else if (statuses) {
       errors = errors.concat(statuses.errors.map(err => err.message));
 
       // Build list of all nodes for static ordering.
-      const nodeIDs = _(statuses.ranges).flatMap((range: protos.cockroach.server.serverpb.RaftRangeStatus$Properties) => {
+      const nodeIDs = _(statuses.ranges).flatMap((range: protos.cockroach.server.serverpb.IRaftRangeStatus) => {
         return range.nodes;
-      }).map((node: protos.cockroach.server.serverpb.RaftRangeNode$Properties) => {
+      }).map((node: protos.cockroach.server.serverpb.IRaftRangeNode) => {
         return node.node_id;
       }).uniq().sort().value();
 
-      const nodeIDIndex: {[nodeID: number]: number} = {};
+      const nodeIDIndex: { [nodeID: number]: number } = {};
       const columns = [<th key={-1}>Range</th>];
       nodeIDs.forEach((id, i) => {
         nodeIDIndex[id] = i + 1;
-        columns.push(<th key={i}><Link to={"/nodes/" + id}>Node {id}</Link></th>);
+        columns.push((
+          <th key={i}>
+            <Link className="debug-link" to={"/nodes/" + id}>Node {id}</Link>
+          </th>
+        ));
       });
 
       // Filter ranges and paginate
-      const rangesPairs: [string, protos.cockroach.server.serverpb.RaftRangeStatus$Properties][] = _.toPairs(statuses.ranges);
-      const filteredRanges = _.filter(rangesPairs, ([, range]) => {
+      const justRanges = _.values(statuses.ranges);
+      const filteredRanges = _.filter(justRanges, (range) => {
         return !this.state.showOnlyErrors || range.errors.length > 0;
       });
       let offset = this.state.offset;
@@ -160,25 +178,27 @@ class RangesMain extends React.Component<RangesMainProps, RangesMainState> {
       }
       const ranges = filteredRanges.slice(offset, offset + RANGES_PER_PAGE);
       const rows: React.ReactNode[][] = [];
-      ranges.forEach(([key, range], i) => {
+      _.map(ranges, (range, i) => {
         const hasErrors = range.errors.length > 0;
         const rangeErrors = <ul>{_.map(range.errors, (error, j) => {
           return <li key={j}>{error.message}</li>;
-          })}</ul>;
-        const row = [<td key={-1}>
-            {key}
-            {
-              (hasErrors) ? (
-                <span style={{position: "relative"}}>
-                  <ToolTipWrapper text={rangeErrors}>
-                    <div className="viz-info-icon">
-                      <div className="icon-warning" />
-                    </div>
-                  </ToolTipWrapper>
-                </span>
-              ) : ""
-            }
-          </td>];
+        })}</ul>;
+        const row = [<td key="row{i}">
+          <Link className="debug-link" to={`/reports/range/${range.range_id.toString()}`}>
+            r{range.range_id.toString()}
+          </Link>
+          {
+            (hasErrors) ? (
+              <span style={{ position: "relative" }}>
+                <ToolTipWrapper text={rangeErrors}>
+                  <div className="viz-info-icon">
+                    <div className="icon-warning" />
+                  </div>
+                </ToolTipWrapper>
+              </span>
+            ) : ""
+          }
+        </td>];
         rows[i] = row;
 
         // Render each replica into a cell
@@ -186,8 +206,8 @@ class RangesMain extends React.Component<RangesMainProps, RangesMainState> {
           const nodeRange = node.range;
           const replicaLocations = nodeRange.state.state.desc.replicas.map(
             (replica) => "(Node " + replica.node_id.toString() +
-                         " Store " + replica.store_id.toString() +
-                         " ReplicaID " + replica.replica_id.toString() + ")",
+              " Store " + replica.store_id.toString() +
+              " ReplicaID " + replica.replica_id.toString() + ")",
           );
           const display = (l?: Long): string => {
             if (l) {
@@ -240,10 +260,10 @@ class RangesMain extends React.Component<RangesMainProps, RangesMainState> {
       }
     }
     return <div className="section table">
-      { this.props.children }
+      {this.props.children}
       <div className="stats-table">
-        { this.renderErrors(errors) }
-        { content }
+        {this.renderErrors(errors)}
+        {content}
       </div>
     </div>;
   }
@@ -255,7 +275,7 @@ class RangesMain extends React.Component<RangesMainProps, RangesMainState> {
     return <div className="section">
       {errors.map((err: string, i: number) => {
         return <div key={i}>Error: {err}</div>;
-      }) }
+      })}
     </div>;
   }
 }
@@ -265,13 +285,13 @@ class RangesMain extends React.Component<RangesMainProps, RangesMainState> {
  */
 
 // Base selectors to extract data from redux state.
-const raftState = (state: AdminUIState): CachedDataReducerState<protos.cockroach.server.serverpb.RaftDebugResponse> => state.cachedData.raft;
+const selectRaftState = (state: AdminUIState): CachedDataReducerState<protos.cockroach.server.serverpb.RaftDebugResponse> => state.cachedData.raft;
 
 // Connect the RangesMain class with our redux store.
 const rangesMainConnected = connect(
   (state: AdminUIState) => {
     return {
-      state: raftState(state),
+      state: selectRaftState(state),
     };
   },
   {

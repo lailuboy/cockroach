@@ -4,7 +4,7 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
 package engineccl
 
@@ -13,6 +13,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/pkg/errors"
 )
 
@@ -20,7 +21,7 @@ import (
 // [startKey,endKey) and time range (startTime,endTime]. If a key was added or
 // modified between startTime and endTime, the iterator will position at the
 // most recent version (before or at endTime) of that key. If the key was most
-// recently deleted, this is signalled with an empty value.
+// recently deleted, this is signaled with an empty value.
 //
 // Note: The endTime is inclusive to be consistent with the non-incremental
 // iterator, where reads at a given timestamp return writes at that
@@ -30,7 +31,11 @@ import (
 // CockroachDB uses that as a sentinel for key metadata anyway.
 //
 // Expected usage:
-//    iter := NewMVCCIncrementalIterator(e, startTime, endTime)
+//    iter := NewMVCCIncrementalIterator(e, IterOptions{
+//        StartTime:  startTime,
+//        EndTime:    endTime,
+//        UpperBound: endKey,
+//    })
 //    defer iter.Close()
 //    for iter.Seek(startKey); ; iter.Next() {
 //        ok, err := iter.Valid()
@@ -45,11 +50,16 @@ type MVCCIncrementalIterator struct {
 
 	iter engine.Iterator
 
+	// fields used for a workaround for a bug in the time-bound iterator
+	// (#28358)
+	upperBound roachpb.Key
+	e          engine.Reader
+	sanityIter engine.Iterator
+
 	startTime hlc.Timestamp
 	endTime   hlc.Timestamp
 	err       error
 	valid     bool
-	nextkey   bool
 
 	// For allocation avoidance.
 	meta enginepb.MVCCMetadata
@@ -57,15 +67,32 @@ type MVCCIncrementalIterator struct {
 
 var _ engine.SimpleIterator = &MVCCIncrementalIterator{}
 
+// IterOptions bundles options for NewMVCCIncrementalIterator.
+type IterOptions struct {
+	StartTime  hlc.Timestamp
+	EndTime    hlc.Timestamp
+	UpperBound roachpb.Key
+	WithStats  bool
+}
+
 // NewMVCCIncrementalIterator creates an MVCCIncrementalIterator with the
-// specified engine and time range.
-func NewMVCCIncrementalIterator(
-	e engine.Reader, startTime, endTime hlc.Timestamp,
-) *MVCCIncrementalIterator {
+// specified engine and options.
+func NewMVCCIncrementalIterator(e engine.Reader, opts IterOptions) *MVCCIncrementalIterator {
 	return &MVCCIncrementalIterator{
-		iter:      e.NewTimeBoundIterator(startTime, endTime),
-		startTime: startTime,
-		endTime:   endTime,
+		e:          e,
+		upperBound: opts.UpperBound,
+		iter: e.NewIterator(engine.IterOptions{
+			// The call to startTime.Next() converts our exclusive start bound into
+			// the inclusive start bound that MinTimestampHint expects. This is
+			// strictly a performance optimization; omitting the call would still
+			// return correct results.
+			MinTimestampHint: opts.StartTime.Next(),
+			MaxTimestampHint: opts.EndTime,
+			UpperBound:       opts.UpperBound,
+			WithStats:        opts.WithStats,
+		}),
+		startTime: opts.StartTime,
+		endTime:   opts.EndTime,
 	}
 }
 
@@ -75,22 +102,23 @@ func (i *MVCCIncrementalIterator) Seek(startKey engine.MVCCKey) {
 	i.iter.Seek(startKey)
 	i.err = nil
 	i.valid = true
-	i.nextkey = false
-	i.NextKey()
+	i.advance()
 }
 
 // Close frees up resources held by the iterator.
 func (i *MVCCIncrementalIterator) Close() {
 	i.iter.Close()
+	if i.sanityIter != nil {
+		i.sanityIter.Close()
+	}
 }
 
 // Next advances the iterator to the next key/value in the iteration. After this
 // call, Valid() will be true if the iterator was not positioned at the last
 // key.
 func (i *MVCCIncrementalIterator) Next() {
-	// TODO(dan): Implement Next. We'll need this for `RESTORE ... AS OF SYSTEM
-	// TIME`.
-	panic("unimplemented")
+	i.iter.Next()
+	i.advance()
 }
 
 // NextKey advances the iterator to the next MVCC key. This operation is
@@ -98,6 +126,11 @@ func (i *MVCCIncrementalIterator) Next() {
 // the next key if the iterator is currently located at the last version for a
 // key.
 func (i *MVCCIncrementalIterator) NextKey() {
+	i.iter.NextKey()
+	i.advance()
+}
+
+func (i *MVCCIncrementalIterator) advance() {
 	for {
 		if !i.valid {
 			return
@@ -108,18 +141,30 @@ func (i *MVCCIncrementalIterator) NextKey() {
 			return
 		}
 
-		if i.nextkey {
-			i.nextkey = false
-			i.iter.NextKey()
-			continue
-		}
-
 		unsafeMetaKey := i.iter.UnsafeKey()
 		if unsafeMetaKey.IsValue() {
 			i.meta.Reset()
-			i.meta.Timestamp = unsafeMetaKey.Timestamp
+			i.meta.Timestamp = hlc.LegacyTimestamp(unsafeMetaKey.Timestamp)
 		} else {
-			if i.err = i.iter.ValueProto(&i.meta); i.err != nil {
+			// HACK(dan): Work around a known bug in the time-bound iterator.
+			// For reasons described in #28358, a time-bound iterator will
+			// sometimes see an unresolved intent where there is none. A normal
+			// iterator doesn't have this problem, so we work around it by
+			// double checking all non-value keys. If sanityCheckMetadataKey
+			// returns false, then the intent was a phantom and we ignore it.
+			// NB: this could return a newer intent than the one the time-bound
+			// iterator saw; this is handled.
+			unsafeValueBytes, ok, err := i.sanityCheckMetadataKey()
+			if err != nil {
+				i.err = err
+				i.valid = false
+				return
+			} else if !ok {
+				i.iter.Next()
+				continue
+			}
+
+			if i.err = protoutil.Unmarshal(unsafeValueBytes, &i.meta); i.err != nil {
 				i.valid = false
 				return
 			}
@@ -134,8 +179,9 @@ func (i *MVCCIncrementalIterator) NextKey() {
 			return
 		}
 
+		metaTimestamp := hlc.Timestamp(i.meta.Timestamp)
 		if i.meta.Txn != nil {
-			if !i.endTime.Less(i.meta.Timestamp) {
+			if i.startTime.Less(metaTimestamp) && !i.endTime.Less(metaTimestamp) {
 				i.err = &roachpb.WriteIntentError{
 					Intents: []roachpb.Intent{{
 						Span:   roachpb.Span{Key: i.iter.Key().Key},
@@ -150,24 +196,39 @@ func (i *MVCCIncrementalIterator) NextKey() {
 			continue
 		}
 
-		if i.endTime.Less(i.meta.Timestamp) {
+		if i.endTime.Less(metaTimestamp) {
 			i.iter.Next()
 			continue
 		}
-		if !i.startTime.Less(i.meta.Timestamp) {
+		if !i.startTime.Less(metaTimestamp) {
 			i.iter.NextKey()
 			continue
 		}
 
-		// Skip tombstone (len=0) records when startTime is zero (non-incremental).
-		if (i.startTime == hlc.Timestamp{}) && len(i.iter.UnsafeValue()) == 0 {
-			i.iter.NextKey()
-			continue
-		}
-
-		i.nextkey = true
 		break
 	}
+}
+
+// sanityCheckMetadataKey looks up the current `i.iter` key using a normal,
+// non-time-bound iterator and returns the value if the normal iterator also
+// sees that exact key. Otherwise, it returns false. It's used in the workaround
+// in `advance` for a time-bound iterator bug.
+func (i *MVCCIncrementalIterator) sanityCheckMetadataKey() ([]byte, bool, error) {
+	if i.sanityIter == nil {
+		// The common case is that we'll won't need the sanityIter for a given
+		// MVCCIncrementalIterator, so create it lazily.
+		i.sanityIter = i.e.NewIterator(engine.IterOptions{UpperBound: i.upperBound})
+	}
+	unsafeKey := i.iter.UnsafeKey()
+	i.sanityIter.Seek(unsafeKey)
+	if ok, err := i.sanityIter.Valid(); err != nil {
+		return nil, false, err
+	} else if !ok {
+		return nil, false, nil
+	} else if !i.sanityIter.UnsafeKey().Equal(unsafeKey) {
+		return nil, false, nil
+	}
+	return i.sanityIter.UnsafeValue(), true, nil
 }
 
 // Valid must be called after any call to Reset(), Next(), or similar methods.

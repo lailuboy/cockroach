@@ -1,3 +1,17 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import { assert } from "chai";
 import _ from "lodash";
 import { Action } from "redux";
@@ -13,7 +27,7 @@ describe("basic cachedDataReducer", function () {
     constructor(public response: string) { }
   }
 
-  const apiEndpointMock = (req = new Request(null)) => new Promise((resolve, _reject) => resolve(new Response(req.request)));
+  const apiEndpointMock: (req: Request) => Promise<Response> = (req = new Request(null)) => new Promise((resolve, _reject) => resolve(new Response(req.request)));
 
   let expected: CachedDataReducerState<Response>;
 
@@ -58,6 +72,7 @@ describe("basic cachedDataReducer", function () {
         state = reducer(state, testReducerObj.requestData());
         expected = new CachedDataReducerState<Response>();
         expected.inFlight = true;
+        expected.requestedAt = testMoment;
         assert.deepEqual(state, expected);
       });
 
@@ -113,6 +128,7 @@ describe("basic cachedDataReducer", function () {
           expected = new CachedDataReducerState<Response>();
           expected.valid = true;
           expected.data = new Response(testString);
+          expected.requestedAt = testMoment;
           expected.setAt = testMoment;
           expected.lastError = null;
           assert.deepEqual(state.cachedData.test, expected);
@@ -146,7 +162,7 @@ describe("keyed cachedDataReducer", function () {
     constructor(public response: string) { }
   }
 
-  const apiEndpointMock = (req = new Request(null)) => new Promise((resolve, _reject) => resolve(new Response(req.request)));
+  const apiEndpointMock: (req: Request) => Promise<Response> = (req = new Request(null)) => new Promise((resolve, _reject) => resolve(new Response(req.request)));
 
   const requestToID = (req: Request) => req.request;
 
@@ -211,6 +227,7 @@ describe("keyed cachedDataReducer", function () {
         state = reducer(state, testReducerObj.cachedDataReducer.requestData(request));
         expected = new KeyedCachedDataReducerState<Response>();
         expected[id] = new CachedDataReducerState<Response>();
+        expected[id].requestedAt = testMoment;
         expected[id].inFlight = true;
         assert.deepEqual(state, expected);
       });

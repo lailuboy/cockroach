@@ -11,14 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package base
 
 import (
+	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
@@ -32,6 +34,12 @@ import (
 type TestServerArgs struct {
 	// Knobs for the test server.
 	Knobs TestingKnobs
+
+	*cluster.Settings
+	RaftConfig
+
+	// LeaseManagerConfig holds configuration values specific to the LeaseManager.
+	LeaseManagerConfig *LeaseManagerConfig
 
 	// PartOfCluster must be set if the TestServer is joining others in a cluster.
 	// If not set (and hence the server is the only one in the cluster), the
@@ -51,25 +59,34 @@ type TestServerArgs struct {
 	// will be set to the the address of the cluster's first node.
 	JoinAddr string
 
-	// StoreSpecs define the stores for this server. If you want more than one
-	// store per node, populate this array with StoreSpecs each representing a
-	// store. If no StoreSpecs are provided than a single DefaultTestStoreSpec
-	// will be used.
+	// StoreSpecs define the stores for this server. If you want more than
+	// one store per node, populate this array with StoreSpecs each
+	// representing a store. If no StoreSpecs are provided then a single
+	// DefaultTestStoreSpec will be used.
 	StoreSpecs []StoreSpec
 
+	// Locality is optional and will set the server's locality.
+	Locality roachpb.Locality
+
+	// TempStorageConfig defines parameters for the temp storage used as
+	// working memory for distributed operations and CSV importing.
+	// If not initialized, will default to DefaultTestTempStorageConfig.
+	TempStorageConfig TempStorageConfig
+
+	// ExternalIODir is used to initialize field in cluster.Settings.
+	ExternalIODir string
+
 	// Fields copied to the server.Config.
-	Insecure                 bool
-	RetryOptions             retry.Options
-	MetricsSampleInterval    time.Duration
-	RaftTickInterval         time.Duration
-	RaftElectionTimeoutTicks int
-	SocketFile               string
-	ScanInterval             time.Duration
-	ScanMaxIdleTime          time.Duration
-	SSLCertsDir              string
-	TimeSeriesQueryWorkerMax int
-	SQLMemoryPoolSize        int64
-	ListeningURLFile         string
+	Insecure                    bool
+	RetryOptions                retry.Options
+	SocketFile                  string
+	ScanInterval                time.Duration
+	ScanMinIdleTime             time.Duration
+	ScanMaxIdleTime             time.Duration
+	SSLCertsDir                 string
+	TimeSeriesQueryWorkerMax    int
+	TimeSeriesQueryMemoryBudget int64
+	SQLMemoryPoolSize           int64
 
 	// If set, this will be appended to the Postgres URL by functions that
 	// automatically open a connection to the server. That's equivalent to running
@@ -82,6 +99,10 @@ type TestServerArgs struct {
 
 	// If set, the recording of events to the event log tables is disabled.
 	DisableEventLog bool
+
+	// If set, web session authentication will be disabled, even if the server
+	// is running in secure mode.
+	DisableWebSessionAuthentication bool
 }
 
 // TestClusterArgs contains the parameters one can set when creating a test
@@ -107,11 +128,33 @@ type TestClusterArgs struct {
 	ServerArgsPerNode map[int]TestServerArgs
 }
 
-// DefaultTestStoreSpec is just a single in memory store of 100 MiB with no
-// special attributes.
-var DefaultTestStoreSpec = StoreSpec{
-	SizeInBytes: 100 << 20,
-	InMemory:    true,
+var (
+	// DefaultTestStoreSpec is just a single in memory store of 100 MiB
+	// with no special attributes.
+	DefaultTestStoreSpec = StoreSpec{
+		InMemory: true,
+	}
+)
+
+// DefaultTestTempStorageConfig is the associated temp storage for
+// DefaultTestStoreSpec that is in-memory.
+// It has a maximum size of 100MiB.
+func DefaultTestTempStorageConfig(st *cluster.Settings) TempStorageConfig {
+	var maxSizeBytes int64 = DefaultInMemTempStorageMaxSizeBytes
+	monitor := mon.MakeMonitor(
+		"in-mem temp storage",
+		mon.MemoryResource,
+		nil,             /* curCount */
+		nil,             /* maxHist */
+		1024*1024,       /* increment */
+		maxSizeBytes/10, /* noteworthy */
+		st,
+	)
+	monitor.Start(context.Background(), nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
+	return TempStorageConfig{
+		InMemory: true,
+		Mon:      &monitor,
+	}
 }
 
 // TestClusterReplicationMode represents the replication settings for a TestCluster.
@@ -123,9 +166,12 @@ const (
 	// ReplicationAuto means that ranges are replicated according to the
 	// production default zone config. Replication is performed as in
 	// production, by the replication queue.
+	// If ReplicationAuto is used, StartTestCluster() blocks until the initial
+	// ranges are fully replicated.
 	ReplicationAuto TestClusterReplicationMode = iota
 	// ReplicationManual means that the split and replication queues of all
 	// servers are stopped, and the test must manually control splitting and
 	// replication through the TestServer.
+	// Note that the server starts with a number of system ranges.
 	ReplicationManual
 )

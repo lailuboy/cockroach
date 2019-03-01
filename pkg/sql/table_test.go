@@ -11,41 +11,19 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
-
-// CreateTestTableDescriptor converts a SQL string to a table for test purposes.
-// Will fail on complex tables where that operation requires e.g. looking up
-// other tables or otherwise utilizing a planner, since the planner used here is
-// just a zero value placeholder.
-func CreateTestTableDescriptor(
-	ctx context.Context,
-	parentID, id sqlbase.ID,
-	schema string,
-	privileges *sqlbase.PrivilegeDescriptor,
-) (sqlbase.TableDescriptor, error) {
-	stmt, err := parser.ParseOne(schema)
-	if err != nil {
-		return sqlbase.TableDescriptor{}, err
-	}
-	p := planner{session: new(Session)}
-	p.evalCtx = parser.MakeTestingEvalContext()
-	return p.makeTableDesc(ctx, stmt.(*parser.CreateTable), parentID, id, privileges, nil)
-}
 
 func TestMakeTableDescColumns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -57,12 +35,22 @@ func TestMakeTableDescColumns(t *testing.T) {
 	}{
 		{
 			"BIT",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, Width: 1, VisibleType: sqlbase.ColumnType_BIT},
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BIT, Width: 1},
 			true,
 		},
 		{
 			"BIT(3)",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, Width: 3, VisibleType: sqlbase.ColumnType_BIT},
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BIT, Width: 3},
+			true,
+		},
+		{
+			"VARBIT",
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BIT, Width: 0, VisibleType: sqlbase.ColumnType_VARBIT},
+			true,
+		},
+		{
+			"VARBIT(3)",
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BIT, Width: 3, VisibleType: sqlbase.ColumnType_VARBIT},
 			true,
 		},
 		{
@@ -72,12 +60,42 @@ func TestMakeTableDescColumns(t *testing.T) {
 		},
 		{
 			"INT",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT},
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, VisibleType: sqlbase.ColumnType_BIGINT, Width: 64},
+			true,
+		},
+		{
+			"INT2",
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, VisibleType: sqlbase.ColumnType_SMALLINT, Width: 16},
+			true,
+		},
+		{
+			"INT4",
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, VisibleType: sqlbase.ColumnType_INTEGER, Width: 32},
+			true,
+		},
+		{
+			"INT8",
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, VisibleType: sqlbase.ColumnType_BIGINT, Width: 64},
+			true,
+		},
+		{
+			"INT64",
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, VisibleType: sqlbase.ColumnType_BIGINT, Width: 64},
+			true,
+		},
+		{
+			"BIGINT",
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, VisibleType: sqlbase.ColumnType_BIGINT, Width: 64},
 			true,
 		},
 		{
 			"FLOAT(3)",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_FLOAT, Precision: 3},
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_FLOAT, VisibleType: sqlbase.ColumnType_REAL},
+			true,
+		},
+		{
+			"DOUBLE PRECISION",
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_FLOAT},
 			true,
 		},
 		{
@@ -88,6 +106,11 @@ func TestMakeTableDescColumns(t *testing.T) {
 		{
 			"DATE",
 			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_DATE},
+			true,
+		},
+		{
+			"TIME",
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_TIME},
 			true,
 		},
 		{
@@ -102,12 +125,32 @@ func TestMakeTableDescColumns(t *testing.T) {
 		},
 		{
 			"CHAR",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_STRING},
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_STRING, VisibleType: sqlbase.ColumnType_CHAR, Width: 1},
+			true,
+		},
+		{
+			"CHAR(3)",
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_STRING, VisibleType: sqlbase.ColumnType_CHAR, Width: 3},
+			true,
+		},
+		{
+			"VARCHAR",
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_STRING, VisibleType: sqlbase.ColumnType_VARCHAR, Width: 0},
+			true,
+		},
+		{
+			"VARCHAR(3)",
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_STRING, VisibleType: sqlbase.ColumnType_VARCHAR, Width: 3},
 			true,
 		},
 		{
 			"TEXT",
 			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_STRING},
+			true,
+		},
+		{
+			`"char"`,
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_STRING, VisibleType: sqlbase.ColumnType_QCHAR},
 			true,
 		},
 		{
@@ -117,12 +160,12 @@ func TestMakeTableDescColumns(t *testing.T) {
 		},
 		{
 			"INT NOT NULL",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT},
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, VisibleType: sqlbase.ColumnType_BIGINT, Width: 64},
 			false,
 		},
 		{
 			"INT NULL",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT},
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, VisibleType: sqlbase.ColumnType_BIGINT, Width: 64},
 			true,
 		},
 	}
@@ -261,7 +304,7 @@ func TestPrimaryKeyUnspecified(t *testing.T) {
 	}
 	desc.PrimaryIndex = sqlbase.IndexDescriptor{}
 
-	err = desc.ValidateTable()
+	err = desc.ValidateTable(cluster.MakeTestingClusterSettings())
 	if !testutils.IsError(err, sqlbase.ErrMissingPrimaryKey.Error()) {
 		t.Fatalf("unexpected error: %v", err)
 	}

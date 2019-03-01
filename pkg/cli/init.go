@@ -11,17 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Adam Gee (adamgee@gmail.com)
 
 package cli
 
 import (
-	"github.com/spf13/cobra"
+	"context"
+	"fmt"
+	"os"
 
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/spf13/cobra"
 )
 
 var initCmd = &cobra.Command{
@@ -38,30 +37,26 @@ must appear in the --join flags of other nodes.
 A node started without the --join flag initializes itself as a
 single-node cluster, so the init command is not used in that case.
 `,
-	RunE: MaybeShoutError(MaybeDecorateGRPCError(runInit)),
+	Args: cobra.NoArgs,
+	RunE: maybeShoutError(MaybeDecorateGRPCError(runInit)),
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
-	c, stopper, err := getInitClient()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	conn, _, finish, err := getClientGRPCConn(ctx)
 	if err != nil {
 		return err
 	}
-	ctx := stopperContext(stopper)
-	defer stopper.Stop(ctx)
+	defer finish()
+
+	c := serverpb.NewInitClient(conn)
 
 	if _, err = c.Bootstrap(ctx, &serverpb.BootstrapRequest{}); err != nil {
-		log.Error(ctx, err)
 		return err
 	}
 
+	fmt.Fprintln(os.Stdout, "Cluster successfully initialized")
 	return nil
-}
-
-func getInitClient() (serverpb.InitClient, *stop.Stopper, error) {
-	// TODO(adam): This depends on servercfg which is a bit weird..
-	conn, _, stopper, err := getClientGRPCConn()
-	if err != nil {
-		return nil, nil, err
-	}
-	return serverpb.NewInitClient(conn), stopper, nil
 }

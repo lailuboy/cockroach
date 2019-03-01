@@ -11,34 +11,23 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Daniel Theophanes (kardianos@gmail.com)
 
 package server
 
 import (
 	"bytes"
+	"context"
 	"fmt"
-	"io/ioutil"
-	"math"
 	"net"
-	"runtime"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
-	"github.com/dustin/go-humanize"
-	"github.com/elastic/gosigar"
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
-	"path/filepath"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/server/status"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -48,31 +37,51 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/elastic/gosigar"
+	"github.com/pkg/errors"
 )
 
 // Context defaults.
 const (
-	defaultCGroupMemPath            = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
-	defaultCacheSize                = 512 << 20 // 512 MB
-	defaultSQLMemoryPoolSize        = 512 << 20 // 512 MB
-	defaultScanInterval             = 10 * time.Minute
-	defaultConsistencyCheckInterval = 24 * time.Hour
-	defaultScanMaxIdleTime          = 200 * time.Millisecond
-	defaultMetricsSampleInterval    = 10 * time.Second
-	defaultStorePath                = "cockroach-data"
-	defaultTempStoreRelativePath    = "local"
-	defaultEventLogEnabled          = true
+	// DefaultCacheSize is the default size of the RocksDB cache. We default the
+	// cache size and SQL memory pool size to 128 MiB. Larger values might
+	// provide significantly better performance, but we're not sure what type of
+	// system we're running on (development or production or some shared
+	// environment). Production users should almost certainly override these
+	// settings and we'll warn in the logs about doing so.
+	DefaultCacheSize         = 128 << 20 // 128 MB
+	defaultSQLMemoryPoolSize = 128 << 20 // 128 MB
+	defaultScanInterval      = 10 * time.Minute
+	defaultScanMinIdleTime   = 10 * time.Millisecond
+	defaultScanMaxIdleTime   = 1 * time.Second
+	// NB: this can't easily become a variable as the UI hard-codes it to 10s.
+	// See https://github.com/cockroachdb/cockroach/issues/20310.
+	DefaultMetricsSampleInterval   = 10 * time.Second
+	DefaultHistogramWindowInterval = 6 * DefaultMetricsSampleInterval
+	defaultStorePath               = "cockroach-data"
+	// TempDirPrefix is the filename prefix of any temporary subdirectory
+	// created.
+	TempDirPrefix = "cockroach-temp"
+	// TempDirsRecordFilename is the filename for the record file
+	// that keeps track of the paths of the temporary directories created.
+	TempDirsRecordFilename = "temp-dirs-record.txt"
+	defaultEventLogEnabled = true
+
+	maximumMaxClockOffset = 5 * time.Second
 
 	minimumNetworkFileDescriptors     = 256
 	recommendedNetworkFileDescriptors = 5000
 
-	productionSettingsWebpage = "please see https://www.cockroachlabs.com/docs/stable/recommended-production-settings.html for more details"
+	defaultSQLTableStatCacheSize = 256
+
+	// This comes out to 1024 cache entries.
+	defaultSQLQueryCacheSize = 8 * 1024 * 1024
 )
 
-var timeUntilStoreDead = settings.RegisterNonNegativeDurationSetting(
-	"server.time_until_store_dead",
-	"the time after which if there is no new gossiped information about a store, it is considered dead",
-	5*time.Minute)
+var productionSettingsWebpage = fmt.Sprintf(
+	"please see %s for more details",
+	base.DocsURL("recommended-production-settings.html"),
+)
 
 // MaxOffsetType stores the configured MaxOffset.
 type MaxOffsetType time.Duration
@@ -92,8 +101,8 @@ func (mo *MaxOffsetType) Set(v string) error {
 	if err != nil {
 		return err
 	}
-	if nanos == timeutil.ClocklessMaxOffset {
-		return errors.Errorf("%s is not a valid MaxOffset", v)
+	if nanos > maximumMaxClockOffset {
+		return errors.Errorf("%s is not a valid max offset, must be less than %v.", v, maximumMaxClockOffset)
 	}
 	*mo = MaxOffsetType(nanos)
 	return nil
@@ -112,14 +121,22 @@ type Config struct {
 	// Embed the base context.
 	*base.Config
 
+	Settings *cluster.Settings
+
+	base.RaftConfig
+
+	// LeaseManagerConfig holds configuration values specific to the LeaseManager.
+	LeaseManagerConfig *base.LeaseManagerConfig
+
 	// Unix socket: for postgres only.
 	SocketFile string
 
 	// Stores is specified to enable durable key-value storage.
 	Stores base.StoreSpecList
 
-	// TempStore is currently used to store local state when processing large queries.
-	TempStore base.StoreSpec
+	// TempStorageConfig is used to configure temp storage, which stores
+	// ephemeral data when processing large queries.
+	TempStorageConfig base.TempStorageConfig
 
 	// Attrs specifies a colon-separated list of node topography or machine
 	// capabilities, used to match capabilities or location preferences specified
@@ -146,6 +163,19 @@ type Config struct {
 	// used by SQL clients to store row data in server RAM.
 	SQLMemoryPoolSize int64
 
+	// SQLAuditLogDirName is the target directory name for SQL audit logs.
+	SQLAuditLogDirName *log.DirName
+
+	// SQLTableStatCacheSize is the size (number of tables) of the table
+	// statistics cache.
+	SQLTableStatCacheSize int
+
+	// SQLQueryCacheSize is the memory size (in bytes) of the query plan cache.
+	SQLQueryCacheSize int64
+
+	// HeapProfileDirName is the directory name for heap profiles using
+	// heapprofiler.
+	HeapProfileDirName string
 	// Parsed values.
 
 	// NodeAttributes is the parsed representation of Attrs.
@@ -158,10 +188,10 @@ type Config struct {
 	// The following values can only be set via environment variables and are
 	// for testing only. They are not meant to be set by the end user.
 
-	// Enables linearizable behaviour of operations on this node by making sure
+	// Enables linearizable behavior of operations on this node by making sure
 	// that no commit timestamp is reported back to the client until all other
 	// node clocks have necessarily passed it.
-	// Environment Variable: COCKROACH_LINEARIZABLE
+	// Environment Variable: COCKROACH_EXPERIMENTAL_LINEARIZABLE
 	Linearizable bool
 
 	// Maximum allowed clock offset for the cluster. If observed clock
@@ -172,43 +202,26 @@ type Config struct {
 	// ReadWithinUncertaintyIntervalError.
 	MaxOffset MaxOffsetType
 
-	// RaftTickInterval is the resolution of the Raft timer.
-	RaftTickInterval time.Duration
-
-	// RaftElectionTimeoutTicks is the number of raft ticks before the
-	// previous election expires. This value is inherited by individual
-	// stores unless overridden.
-	RaftElectionTimeoutTicks int
-
-	// MetricsSamplePeriod determines the time between records of
-	// server internal metrics.
-	// Environment Variable: COCKROACH_METRICS_SAMPLE_INTERVAL
-	MetricsSampleInterval time.Duration
+	// TimestampCachePageSize is the size in bytes of the pages in the
+	// timestamp cache held by each store.
+	TimestampCachePageSize uint32
 
 	// ScanInterval determines a duration during which each range should be
 	// visited approximately once by the range scanner. Set to 0 to disable.
 	// Environment Variable: COCKROACH_SCAN_INTERVAL
 	ScanInterval time.Duration
 
+	// ScanMinIdleTime is the minimum time the scanner will be idle between ranges.
+	// If enabled (> 0), the scanner may complete in more than ScanInterval for large
+	// stores.
+	// Environment Variable: COCKROACH_SCAN_MIN_IDLE_TIME
+	ScanMinIdleTime time.Duration
+
 	// ScanMaxIdleTime is the maximum time the scanner will be idle between ranges.
 	// If enabled (> 0), the scanner may complete in less than ScanInterval for small
 	// stores.
 	// Environment Variable: COCKROACH_SCAN_MAX_IDLE_TIME
 	ScanMaxIdleTime time.Duration
-
-	// ConsistencyCheckInterval determines the time between range consistency checks.
-	// Set to 0 to disable.
-	// Environment Variable: COCKROACH_CONSISTENCY_CHECK_INTERVAL
-	ConsistencyCheckInterval time.Duration
-
-	// ConsistencyCheckPanicOnFailure causes the node to panic when it detects a
-	// replication consistency check failure.
-	ConsistencyCheckPanicOnFailure bool
-
-	// TimeUntilStoreDead is the time after which if there is no new gossiped
-	// information about a store, it is considered dead.
-	// Environment Variable: COCKROACH_TIME_UNTIL_STORE_DEAD
-	TimeUntilStoreDead *settings.DurationSetting
 
 	// TestingKnobs is used for internal test controls only.
 	TestingKnobs base.TestingKnobs
@@ -219,19 +232,31 @@ type Config struct {
 	// Locality is a description of the topography of the server.
 	Locality roachpb.Locality
 
+	// LocalityAddresses contains private IP addresses the can only be accessed
+	// in the corresponding locality.
+	LocalityAddresses []roachpb.LocalityAddress
+
 	// EventLogEnabled is a switch which enables recording into cockroach's SQL
 	// event log tables. These tables record transactional events about changes
 	// to cluster metadata, such as DDL statements and range rebalancing
 	// actions.
 	EventLogEnabled bool
 
-	// ListeningURLFile indicates the file to which the server writes
-	// its listening URL when it is ready.
-	ListeningURLFile string
+	// ReadyFn is called when the server has started listening on its
+	// sockets.
+	// The argument waitForInit indicates (iff true) that the
+	// server is not bootstrapped yet, will not bootstrap itself and
+	// will be waiting for an `init` command or accept bootstrapping
+	// from a joined node.
+	ReadyFn func(waitForInit bool)
 
-	// PIDFile indicates the file to which the server writes its PID when
-	// it is ready.
-	PIDFile string
+	// DelayedBootstrapFn is called if the boostrap process does not complete
+	// in a timely fashion, typically 30s after the server starts listening.
+	DelayedBootstrapFn func()
+
+	// EnableWebSessionAuthentication enables session-based authentication for
+	// the Admin API's HTTP endpoints.
+	EnableWebSessionAuthentication bool
 
 	enginesCreated bool
 }
@@ -251,73 +276,16 @@ type Config struct {
 // metrics. For more information on the issues underlying our histogram system
 // and the proposed fixes, please see issue #7896.
 func (cfg Config) HistogramWindowInterval() time.Duration {
-	hwi := cfg.MetricsSampleInterval * 6
+	hwi := DefaultHistogramWindowInterval
 
-	// Rudimentary overflow detection; this can result if MetricsSampleInterval
-	// is set to an extremely large number, likely in the context of a test or
-	// an intentional attempt to disable metrics collection. Just return
-	// cfg.MetricsSampleInterval in this case.
-	if hwi < cfg.MetricsSampleInterval {
-		return cfg.MetricsSampleInterval
+	// Rudimentary overflow detection; this can result if
+	// DefaultMetricsSampleInterval is set to an extremely large number, likely
+	// in the context of a test or an intentional attempt to disable metrics
+	// collection. Just return the default in this case.
+	if hwi < DefaultMetricsSampleInterval {
+		return DefaultMetricsSampleInterval
 	}
 	return hwi
-}
-
-// GetTotalMemory returns either the total system memory or if possible the
-// cgroups available memory.
-func GetTotalMemory(ctx context.Context) (int64, error) {
-	totalMem, err := func() (int64, error) {
-		mem := gosigar.Mem{}
-		if err := mem.Get(); err != nil {
-			return 0, err
-		}
-		if mem.Total > math.MaxInt64 {
-			return 0, fmt.Errorf("inferred memory size %s exceeds maximum supported memory size %s",
-				humanize.IBytes(mem.Total), humanize.Bytes(math.MaxInt64))
-		}
-		return int64(mem.Total), nil
-	}()
-	if err != nil {
-		return 0, err
-	}
-	checkTotal := func(x int64) (int64, error) {
-		if x <= 0 {
-			// https://github.com/elastic/gosigar/issues/72
-			return 0, fmt.Errorf("inferred memory size %d is suspicious, considering invalid", x)
-		}
-		return x, nil
-	}
-	if runtime.GOOS != "linux" {
-		return checkTotal(totalMem)
-	}
-
-	var buf []byte
-	if buf, err = ioutil.ReadFile(defaultCGroupMemPath); err != nil {
-		log.Infof(ctx, "can't read available memory from cgroups (%s), using system memory %s instead", err,
-			humanizeutil.IBytes(totalMem))
-		return checkTotal(totalMem)
-	}
-
-	cgAvlMem, err := strconv.ParseUint(strings.TrimSpace(string(buf)), 10, 64)
-	if err != nil {
-		log.Infof(ctx, "can't parse available memory from cgroups (%s), using system memory %s instead", err,
-			humanizeutil.IBytes(totalMem))
-		return checkTotal(totalMem)
-	}
-
-	if cgAvlMem == 0 || cgAvlMem > math.MaxInt64 {
-		log.Infof(ctx, "available memory from cgroups (%s) is unsupported, using system memory %s instead",
-			humanize.IBytes(cgAvlMem), humanizeutil.IBytes(totalMem))
-		return checkTotal(totalMem)
-	}
-
-	if totalMem > 0 && int64(cgAvlMem) > totalMem {
-		log.Infof(ctx, "available memory from cgroups (%s) exceeds system memory %s, using system memory",
-			humanize.IBytes(cgAvlMem), humanizeutil.IBytes(totalMem))
-		return checkTotal(totalMem)
-	}
-
-	return checkTotal(int64(cgAvlMem))
 }
 
 // setOpenFileLimit sets the soft limit for open file descriptors to the hard
@@ -338,51 +306,50 @@ func GetTotalMemory(ctx context.Context) (int64, error) {
 // On Windows there is no need to change the file descriptor, known as handles,
 // limit. This limit cannot be changed and is approximately 16,711,680. See
 // https://blogs.technet.microsoft.com/markrussinovich/2009/09/29/pushing-the-limits-of-windows-handles/
-func setOpenFileLimit(physicalStoreCount int) (int, error) {
+func setOpenFileLimit(physicalStoreCount int) (uint64, error) {
 	return setOpenFileLimitInner(physicalStoreCount)
 }
 
 // SetOpenFileLimitForOneStore sets the soft limit for open file descriptors
 // when there is only one store.
-func SetOpenFileLimitForOneStore() (int, error) {
+func SetOpenFileLimitForOneStore() (uint64, error) {
 	return setOpenFileLimit(1)
 }
 
-// MakeTempStoreSpecFromStoreSpec creates a spec for a temporary store under
-// the given StoreSpec's path.
-// TODO(arjun): Add a Cli flag to override this.
-func MakeTempStoreSpecFromStoreSpec(spec base.StoreSpec) (base.StoreSpec, error) {
-	return base.NewStoreSpec(filepath.Join(spec.Path, defaultTempStoreRelativePath))
-}
-
 // MakeConfig returns a Context with default values.
-func MakeConfig() Config {
+func MakeConfig(ctx context.Context, st *cluster.Settings) Config {
 	storeSpec, err := base.NewStoreSpec(defaultStorePath)
 	if err != nil {
 		panic(err)
 	}
-	TempStore, err := MakeTempStoreSpecFromStoreSpec(storeSpec)
-	if err != nil {
-		panic(err)
-	}
+
+	disableWebLogin := envutil.EnvOrDefaultBool("COCKROACH_DISABLE_WEB_LOGIN", false)
 
 	cfg := Config{
-		Config:                   new(base.Config),
-		MaxOffset:                MaxOffsetType(base.DefaultMaxClockOffset),
-		CacheSize:                defaultCacheSize,
-		SQLMemoryPoolSize:        defaultSQLMemoryPoolSize,
-		ScanInterval:             defaultScanInterval,
-		ScanMaxIdleTime:          defaultScanMaxIdleTime,
-		ConsistencyCheckInterval: defaultConsistencyCheckInterval,
-		MetricsSampleInterval:    defaultMetricsSampleInterval,
-		TimeUntilStoreDead:       timeUntilStoreDead,
-		EventLogEnabled:          defaultEventLogEnabled,
+		Config:                         new(base.Config),
+		MaxOffset:                      MaxOffsetType(base.DefaultMaxClockOffset),
+		Settings:                       st,
+		CacheSize:                      DefaultCacheSize,
+		SQLMemoryPoolSize:              defaultSQLMemoryPoolSize,
+		SQLTableStatCacheSize:          defaultSQLTableStatCacheSize,
+		SQLQueryCacheSize:              defaultSQLQueryCacheSize,
+		ScanInterval:                   defaultScanInterval,
+		ScanMinIdleTime:                defaultScanMinIdleTime,
+		ScanMaxIdleTime:                defaultScanMaxIdleTime,
+		EventLogEnabled:                defaultEventLogEnabled,
+		EnableWebSessionAuthentication: !disableWebLogin,
 		Stores: base.StoreSpecList{
 			Specs: []base.StoreSpec{storeSpec},
 		},
-		TempStore: TempStore,
+		TempStorageConfig: base.TempStorageConfigFromEnv(
+			ctx, st, storeSpec, "" /* parentDir */, base.DefaultTempStorageMaxSizeBytes, 0),
 	}
+	cfg.AmbientCtx.Tracer = st.Tracer
+
 	cfg.Config.InitDefaults()
+	cfg.RaftConfig.SetDefaults()
+	cfg.LeaseManagerConfig = base.NewLeaseManagerConfig()
+
 	return cfg
 }
 
@@ -395,17 +362,11 @@ func (cfg *Config) String() string {
 	fmt.Fprintln(w, "cache size\t", humanizeutil.IBytes(cfg.CacheSize))
 	fmt.Fprintln(w, "SQL memory pool size\t", humanizeutil.IBytes(cfg.SQLMemoryPoolSize))
 	fmt.Fprintln(w, "scan interval\t", cfg.ScanInterval)
+	fmt.Fprintln(w, "scan min idle time\t", cfg.ScanMinIdleTime)
 	fmt.Fprintln(w, "scan max idle time\t", cfg.ScanMaxIdleTime)
-	fmt.Fprintln(w, "consistency check interval\t", cfg.ConsistencyCheckInterval)
-	fmt.Fprintln(w, "metrics sample interval\t", cfg.MetricsSampleInterval)
-	fmt.Fprintln(w, "time until store dead\t", cfg.TimeUntilStoreDead)
 	fmt.Fprintln(w, "event log enabled\t", cfg.EventLogEnabled)
-	fmt.Fprintln(w, "linearizable\t", cfg.Linearizable)
-	if cfg.ListeningURLFile != "" {
-		fmt.Fprintln(w, "listening URL file\t", cfg.ListeningURLFile)
-	}
-	if cfg.PIDFile != "" {
-		fmt.Fprintln(w, "PID file\t", cfg.PIDFile)
+	if cfg.Linearizable {
+		fmt.Fprintln(w, "linearizable\t", cfg.Linearizable)
 	}
 	_ = w.Flush()
 
@@ -415,7 +376,7 @@ func (cfg *Config) String() string {
 // Report logs an overview of the server configuration parameters via
 // the given context.
 func (cfg *Config) Report(ctx context.Context) {
-	if memSize, err := GetTotalMemory(ctx); err != nil {
+	if memSize, err := status.GetTotalMemory(ctx); err != nil {
 		log.Infof(ctx, "unable to retrieve system total memory: %v", err)
 	} else {
 		log.Infof(ctx, "system total memory: %s", humanizeutil.IBytes(memSize))
@@ -469,36 +430,39 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 		return Engines{}, err
 	}
 
+	log.Event(ctx, "initializing engines")
+
 	skipSizeCheck := cfg.TestingKnobs.Store != nil &&
 		cfg.TestingKnobs.Store.(*storage.StoreTestingKnobs).SkipMinSizeCheck
 	for i, spec := range cfg.Stores.Specs {
-		var sizeInBytes = spec.SizeInBytes
+		log.Eventf(ctx, "initializing %+v", spec)
+		var sizeInBytes = spec.Size.InBytes
 		if spec.InMemory {
-			if spec.SizePercent > 0 {
-				sysMem, err := GetTotalMemory(ctx)
+			if spec.Size.Percent > 0 {
+				sysMem, err := status.GetTotalMemory(ctx)
 				if err != nil {
 					return Engines{}, errors.Errorf("could not retrieve system memory")
 				}
-				sizeInBytes = int64(float64(sysMem) * spec.SizePercent / 100)
+				sizeInBytes = int64(float64(sysMem) * spec.Size.Percent / 100)
 			}
 			if sizeInBytes != 0 && !skipSizeCheck && sizeInBytes < base.MinimumStoreSize {
 				return Engines{}, errors.Errorf("%f%% of memory is only %s bytes, which is below the minimum requirement of %s",
-					spec.SizePercent, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
+					spec.Size.Percent, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
 			}
 			details = append(details, fmt.Sprintf("store %d: in-memory, size %s",
 				i, humanizeutil.IBytes(sizeInBytes)))
 			engines = append(engines, engine.NewInMem(spec.Attributes, sizeInBytes))
 		} else {
-			if spec.SizePercent > 0 {
+			if spec.Size.Percent > 0 {
 				fileSystemUsage := gosigar.FileSystemUsage{}
 				if err := fileSystemUsage.Get(spec.Path); err != nil {
 					return Engines{}, err
 				}
-				sizeInBytes = int64(float64(fileSystemUsage.Total) * spec.SizePercent / 100)
+				sizeInBytes = int64(float64(fileSystemUsage.Total) * spec.Size.Percent / 100)
 			}
 			if sizeInBytes != 0 && !skipSizeCheck && sizeInBytes < base.MinimumStoreSize {
 				return Engines{}, errors.Errorf("%f%% of %s's total free space is only %s bytes, which is below the minimum requirement of %s",
-					spec.SizePercent, spec.Path, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
+					spec.Size.Percent, spec.Path, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
 			}
 
 			details = append(details, fmt.Sprintf("store %d: RocksDB, max size %s, max open file limit %d",
@@ -509,6 +473,10 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				MaxSizeBytes:            sizeInBytes,
 				MaxOpenFiles:            openFileLimitPerStore,
 				WarnLargeBatchThreshold: 500 * time.Millisecond,
+				Settings:                cfg.Settings,
+				UseFileRegistry:         spec.UseFileRegistry,
+				RocksDBOptions:          spec.RocksDBOptions,
+				ExtraOptions:            spec.ExtraOptions,
 			}
 
 			eng, err := engine.NewRocksDB(rocksDBConfig, cache)
@@ -576,17 +544,20 @@ func (cfg *Config) FilterGossipBootstrapResolvers(
 	return filtered
 }
 
+// RequireWebSession indicates whether the server should require authentication
+// sessions when serving admin API requests.
+func (cfg *Config) RequireWebSession() bool {
+	return !cfg.Insecure && cfg.EnableWebSessionAuthentication
+}
+
 // readEnvironmentVariables populates all context values that are environment
 // variable based. Note that this only happens when initializing a node and not
 // when NewContext is called.
 func (cfg *Config) readEnvironmentVariables() {
-	// cockroach-linearizable
-	cfg.Linearizable = envutil.EnvOrDefaultBool("COCKROACH_LINEARIZABLE", cfg.Linearizable)
-	cfg.ConsistencyCheckPanicOnFailure = envutil.EnvOrDefaultBool("COCKROACH_CONSISTENCY_CHECK_PANIC_ON_FAILURE", cfg.ConsistencyCheckPanicOnFailure)
-	cfg.MetricsSampleInterval = envutil.EnvOrDefaultDuration("COCKROACH_METRICS_SAMPLE_INTERVAL", cfg.MetricsSampleInterval)
+	cfg.Linearizable = envutil.EnvOrDefaultBool("COCKROACH_EXPERIMENTAL_LINEARIZABLE", cfg.Linearizable)
 	cfg.ScanInterval = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_INTERVAL", cfg.ScanInterval)
+	cfg.ScanMinIdleTime = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_MIN_IDLE_TIME", cfg.ScanMinIdleTime)
 	cfg.ScanMaxIdleTime = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_MAX_IDLE_TIME", cfg.ScanMaxIdleTime)
-	cfg.ConsistencyCheckInterval = envutil.EnvOrDefaultDuration("COCKROACH_CONSISTENCY_CHECK_INTERVAL", cfg.ConsistencyCheckInterval)
 }
 
 // parseGossipBootstrapResolvers parses list of gossip bootstrap resolvers.

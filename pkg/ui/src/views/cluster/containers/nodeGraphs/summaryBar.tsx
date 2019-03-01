@@ -1,3 +1,17 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import React from "react";
 import { Link } from "react-router";
 import * as d3 from "d3";
@@ -39,7 +53,7 @@ function ClusterNodeTotals (props: ClusterSummaryProps) {
   return (
     <SummaryStat
       title={
-        <span>Total Nodes <Link to="/cluster/nodes">View nodes list</Link></span>
+        <span>Total Nodes <Link to="/overview/list">View nodes list</Link></span>
       }
       value={nodeCounts.total}
     >
@@ -48,34 +62,38 @@ function ClusterNodeTotals (props: ClusterSummaryProps) {
   );
 }
 
+const formatOnePlace = d3.format(".1f");
+const formatPercentage = d3.format(".2%");
+function formatNanosAsMillis (n: number) {
+  return formatOnePlace(NanoToMilli(n)) + " ms";
+}
+
 /**
  * Component which displays the cluster summary bar on the graphs page.
  */
 export default function(props: ClusterSummaryProps) {
   // Capacity math used in the summary status section.
-  const { capacityTotal, capacityAvailable } = props.nodesSummary.nodeSums;
-  const capacityUsed = capacityTotal - capacityAvailable;
-  const capacityPercent = capacityTotal !== 0 ? (capacityUsed / capacityTotal * 100) : 100;
+  const { capacityUsed, capacityUsable } = props.nodesSummary.nodeSums;
+  const capacityPercent = capacityUsable !== 0 ? (capacityUsed / capacityUsable) : null;
 
   return (
     <div>
       <SummaryBar>
         <SummaryLabel>Summary</SummaryLabel>
         <ClusterNodeTotals {...props}/>
-        <SummaryStat title="Capacity Used" value={capacityPercent}
-                      format={(v) => `${d3.format(".2f")(v)}%`}>
-          <SummaryStatMessage message={`You are using ${Bytes(capacityUsed)} of ${Bytes(capacityTotal)}
-                                        storage capacity across all nodes.`} />
+        <SummaryStat title="Capacity Used" value={capacityPercent} format={formatPercentage}>
+          <SummaryStatMessage message={`You are using ${Bytes(capacityUsed)} of ${Bytes(capacityUsable)}
+                                        usable storage capacity across all nodes.`} />
         </SummaryStat>
         <SummaryStat title="Unavailable ranges" value={props.nodesSummary.nodeSums.unavailableRanges} />
-        <SummaryMetricStat id="qps" title="Queries per second" format={d3.format(".1f")} >
+        <SummaryMetricStat id="qps" title="Queries per second" format={formatOnePlace} >
           <Metric sources={props.nodeSources} name="cr.node.sql.query.count" title="Queries/Sec" nonNegativeRate />
         </SummaryMetricStat>
-        <SummaryMetricStat id="p50" title="P50 latency" format={(n) => d3.format(".1f")(NanoToMilli(n)) + " ms"} >
-          <Metric sources={props.nodeSources} name="cr.node.exec.latency-p50" aggregateMax downsampleMax />
+        <SummaryMetricStat id="p50" title="P50 latency" format={formatNanosAsMillis} >
+          <Metric sources={props.nodeSources} name="cr.node.sql.service.latency-p50" aggregateMax downsampleMax />
         </SummaryMetricStat>
-        <SummaryMetricStat id="p99" title="P99 latency" format={(n) => d3.format(".1f")(NanoToMilli(n)) + " ms"} >
-          <Metric sources={props.nodeSources} name="cr.node.exec.latency-p99" aggregateMax downsampleMax />
+        <SummaryMetricStat id="p99" title="P99 latency" format={formatNanosAsMillis} >
+          <Metric sources={props.nodeSources} name="cr.node.sql.service.latency-p99" aggregateMax downsampleMax />
         </SummaryMetricStat>
       </SummaryBar>
       <SummaryBar>

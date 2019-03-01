@@ -11,40 +11,136 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
 
 package sql
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"strings"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/pkg/errors"
 )
 
-// showCreateView returns a valid SQL representation of the CREATE
-// VIEW statement used to create the given view.
-func (p *planner) showCreateView(
-	ctx context.Context, tn parser.Name, desc *sqlbase.TableDescriptor,
-) (string, error) {
-	var buf bytes.Buffer
-	buf.WriteString("CREATE VIEW ")
-	tn.Format(&buf, parser.FmtSimple)
-	buf.WriteString(" (")
-	for i, col := range desc.Columns {
-		if i > 0 {
-			buf.WriteString(", ")
-		}
-		parser.Name(col.Name).Format(&buf, parser.FmtSimple)
-	}
-	fmt.Fprintf(&buf, ") AS %s", desc.ViewQuery)
-	return buf.String(), nil
+// ShowCreate implements the SHOW CREATE statement.
+// Privileges: Any privilege on object.
+func (p *planner) ShowCreate(ctx context.Context, n *tree.ShowCreate) (planNode, error) {
+	// The condition "database_name IS NULL" ensures that virtual tables are included.
+	const showCreateQuery = `
+     SELECT %[3]s AS table_name,
+            create_statement
+       FROM %[4]s.crdb_internal.create_statements
+      WHERE (database_name IS NULL OR database_name = %[1]s)
+        AND schema_name = %[5]s
+        AND descriptor_name = %[2]s
+`
+	return p.showTableDetails(ctx, "SHOW CREATE", &n.Name, showCreateQuery)
 }
 
-// showCreateTable returns a valid SQL representation of the CREATE
+// ShowCreateView returns a valid SQL representation of the CREATE
+// VIEW statement used to create the given view.
+func ShowCreateView(
+	ctx context.Context, tn *tree.Name, desc *sqlbase.TableDescriptor,
+) (string, error) {
+	f := tree.NewFmtCtx(tree.FmtSimple)
+	f.WriteString("CREATE VIEW ")
+	f.FormatNode(tn)
+	f.WriteString(" (")
+	for i := range desc.Columns {
+		if i > 0 {
+			f.WriteString(", ")
+		}
+		f.FormatNameP(&desc.Columns[i].Name)
+	}
+	f.WriteString(") AS ")
+	f.WriteString(desc.ViewQuery)
+	return f.CloseAndGetString(), nil
+}
+
+func printForeignKeyConstraint(
+	ctx context.Context,
+	buf *bytes.Buffer,
+	dbPrefix string,
+	idx *sqlbase.IndexDescriptor,
+	lCtx *internalLookupCtx,
+) error {
+	fk := &idx.ForeignKey
+	if !fk.IsSet() {
+		return nil
+	}
+	var refNames []string
+	var fkTableName tree.TableName
+	if lCtx != nil {
+		fkTable, err := lCtx.getTableByID(fk.Table)
+		if err != nil {
+			return err
+		}
+		fkDb, err := lCtx.getDatabaseByID(fkTable.ParentID)
+		if err != nil {
+			return err
+		}
+		fkIdx, err := fkTable.FindIndexByID(fk.Index)
+		if err != nil {
+			return err
+		}
+		refNames = fkIdx.ColumnNames
+		fkTableName = tree.MakeTableName(tree.Name(fkDb.Name), tree.Name(fkTable.Name))
+		fkTableName.ExplicitSchema = fkDb.Name != dbPrefix
+	} else {
+		refNames = []string{"???"}
+		fkTableName = tree.MakeTableName(tree.Name(""), tree.Name(fmt.Sprintf("[%d as ref]", fk.Table)))
+		fkTableName.ExplicitSchema = false
+		fkTableName.ExplicitSchema = false
+	}
+	buf.WriteString("FOREIGN KEY (")
+	formatQuoteNames(buf, idx.ColumnNames[0:idx.ForeignKey.SharedPrefixLen]...)
+	buf.WriteString(") REFERENCES ")
+	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
+	fmtCtx.FormatNode(&fkTableName)
+	buf.WriteString(fmtCtx.CloseAndGetString())
+	buf.WriteString(" (")
+	formatQuoteNames(buf, refNames...)
+	buf.WriteByte(')')
+	idx.ColNamesString()
+	// We omit MATCH SIMPLE because it is the default.
+	if fk.Match != sqlbase.ForeignKeyReference_SIMPLE {
+		buf.WriteByte(' ')
+		buf.WriteString(fk.Match.String())
+	}
+	if fk.OnDelete != sqlbase.ForeignKeyReference_NO_ACTION {
+		buf.WriteString(" ON DELETE ")
+		buf.WriteString(fk.OnDelete.String())
+	}
+	if fk.OnUpdate != sqlbase.ForeignKeyReference_NO_ACTION {
+		buf.WriteString(" ON UPDATE ")
+		buf.WriteString(fk.OnUpdate.String())
+	}
+	return nil
+}
+
+// ShowCreateSequence returns a valid SQL representation of the
+// CREATE SEQUENCE statement used to create the given sequence.
+func ShowCreateSequence(
+	ctx context.Context, tn *tree.Name, desc *sqlbase.TableDescriptor,
+) (string, error) {
+	f := tree.NewFmtCtx(tree.FmtSimple)
+	f.WriteString("CREATE SEQUENCE ")
+	f.FormatNode(tn)
+	opts := desc.SequenceOpts
+	f.Printf(" MINVALUE %d", opts.MinValue)
+	f.Printf(" MAXVALUE %d", opts.MaxValue)
+	f.Printf(" INCREMENT %d", opts.Increment)
+	f.Printf(" START %d", opts.Start)
+	if opts.Virtual {
+		f.Printf(" VIRTUAL")
+	}
+	return f.CloseAndGetString(), nil
+}
+
+// ShowCreateTable returns a valid SQL representation of the CREATE
 // TABLE statement used to create the given table.
 //
 // The names of the tables references by foreign keys, and the
@@ -52,63 +148,64 @@ func (p *planner) showCreateView(
 // unless it is equal to the given dbPrefix. This allows us to elide
 // the prefix when the given table references other tables in the
 // current database.
-func (p *planner) showCreateTable(
+func ShowCreateTable(
 	ctx context.Context,
-	tn parser.Name,
+	tn *tree.Name,
 	dbPrefix string,
 	desc *sqlbase.TableDescriptor,
-	deps map[parser.TableName]struct{},
+	lCtx *internalLookupCtx,
+	ignoreFKs bool,
 ) (string, error) {
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "CREATE TABLE %s (", tn)
-	var primary string
+	a := &sqlbase.DatumAlloc{}
+
+	f := tree.NewFmtCtx(tree.FmtSimple)
+	f.WriteString("CREATE TABLE ")
+	f.FormatNode(tn)
+	f.WriteString(" (")
+	primaryKeyIsOnVisibleColumn := false
 	for i, col := range desc.VisibleColumns() {
 		if i != 0 {
-			buf.WriteString(",")
+			f.WriteString(",")
 		}
-		buf.WriteString("\n\t")
-		buf.WriteString(col.SQLString())
+		f.WriteString("\n\t")
+		f.WriteString(col.SQLString())
 		if desc.IsPhysicalTable() && desc.PrimaryIndex.ColumnIDs[0] == col.ID {
-			// Only set primary if the primary key is on a visible column (not rowid).
-			primary = fmt.Sprintf(",\n\tCONSTRAINT %s PRIMARY KEY (%s)",
-				quoteNames(desc.PrimaryIndex.Name),
-				desc.PrimaryIndex.ColNamesString(),
-			)
+			// Only set primaryKeyIsOnVisibleColumn to true if the primary key
+			// is on a visible column (not rowid).
+			primaryKeyIsOnVisibleColumn = true
 		}
 	}
-	buf.WriteString(primary)
-	for _, idx := range desc.Indexes {
-		if fk := idx.ForeignKey; fk.IsSet() {
-			fkTable, err := p.session.tables.getTableVersionByID(ctx, p.txn, fk.Table)
-			if err != nil {
+	if primaryKeyIsOnVisibleColumn {
+		f.WriteString(",\n\tCONSTRAINT ")
+		formatQuoteNames(&f.Buffer, desc.PrimaryIndex.Name)
+		f.WriteString(" ")
+		f.WriteString(desc.PrimaryKeyString())
+	}
+	allIdx := append(desc.Indexes, desc.PrimaryIndex)
+	for i := range allIdx {
+		idx := &allIdx[i]
+		if fk := &idx.ForeignKey; fk.IsSet() && !ignoreFKs {
+			f.WriteString(",\n\tCONSTRAINT ")
+			f.FormatNameP(&fk.Name)
+			f.WriteString(" ")
+			if err := printForeignKeyConstraint(ctx, &f.Buffer, dbPrefix, idx, lCtx); err != nil {
 				return "", err
-			}
-			fkDb, err := sqlbase.GetDatabaseDescFromID(ctx, p.txn, fkTable.ParentID)
-			if err != nil {
-				return "", err
-			}
-			fkIdx, err := fkTable.FindIndexByID(fk.Index)
-			if err != nil {
-				return "", err
-			}
-			fkTableName := parser.TableName{
-				DatabaseName:            parser.Name(fkDb.Name),
-				TableName:               parser.Name(fkTable.Name),
-				DBNameOriginallyOmitted: fkDb.Name == dbPrefix,
-			}
-			fmt.Fprintf(&buf, ",\n\tCONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
-				parser.Name(fk.Name),
-				quoteNames(idx.ColumnNames...),
-				&fkTableName,
-				quoteNames(fkIdx.ColumnNames...),
-			)
-			if deps != nil {
-				deps[fkTableName] = struct{}{}
 			}
 		}
-		fmt.Fprintf(&buf, ",\n\t%s", idx.SQLString(""))
-		if err := p.showCreateInterleave(ctx, &idx, &buf, dbPrefix, deps); err != nil {
-			return "", err
+		if idx.ID != desc.PrimaryIndex.ID {
+			// Showing the primary index is handled above.
+			f.WriteString(",\n\t")
+			f.WriteString(idx.SQLString(&sqlbase.AnonymousTable))
+			// Showing the INTERLEAVE and PARTITION BY for the primary index are
+			// handled last.
+			if err := showCreateInterleave(ctx, idx, &f.Buffer, dbPrefix, lCtx); err != nil {
+				return "", err
+			}
+			if err := ShowCreatePartitioning(
+				a, desc, idx, &idx.Partitioning, &f.Buffer, 1 /* indent */, 0, /* colOffset */
+			); err != nil {
+				return "", err
+			}
 		}
 	}
 
@@ -119,36 +216,49 @@ func (p *planner) showCreateTable(
 				activeColumnNames = append(activeColumnNames, fam.ColumnNames[i])
 			}
 		}
-		fmt.Fprintf(&buf, ",\n\tFAMILY %s (%s)",
-			quoteNames(fam.Name),
-			quoteNames(activeColumnNames...),
-		)
+		f.WriteString(",\n\tFAMILY ")
+		formatQuoteNames(&f.Buffer, fam.Name)
+		f.WriteString(" (")
+		formatQuoteNames(&f.Buffer, activeColumnNames...)
+		f.WriteString(")")
 	}
 
 	for _, e := range desc.Checks {
-		fmt.Fprintf(&buf, ",\n\t")
+		f.WriteString(",\n\t")
 		if len(e.Name) > 0 {
-			fmt.Fprintf(&buf, "CONSTRAINT %s ", quoteNames(e.Name))
+			f.WriteString("CONSTRAINT ")
+			formatQuoteNames(&f.Buffer, e.Name)
+			f.WriteString(" ")
 		}
-		fmt.Fprintf(&buf, "CHECK (%s)", e.Expr)
+		f.WriteString("CHECK (")
+		f.WriteString(e.Expr)
+		f.WriteString(")")
 	}
 
-	buf.WriteString("\n)")
+	f.WriteString("\n)")
 
-	if err := p.showCreateInterleave(ctx, &desc.PrimaryIndex, &buf, dbPrefix, deps); err != nil {
+	if err := showCreateInterleave(ctx, &desc.PrimaryIndex, &f.Buffer, dbPrefix, lCtx); err != nil {
+		return "", err
+	}
+	if err := ShowCreatePartitioning(
+		a, desc, &desc.PrimaryIndex, &desc.PrimaryIndex.Partitioning, &f.Buffer, 0 /* indent */, 0, /* colOffset */
+	); err != nil {
 		return "", err
 	}
 
-	return buf.String(), nil
+	return f.CloseAndGetString(), nil
 }
 
-// quoteNames quotes and adds commas between names.
-func quoteNames(names ...string) string {
-	nameList := make(parser.NameList, len(names))
-	for i, n := range names {
-		nameList[i] = parser.Name(n)
+// formatQuoteNames quotes and adds commas between names.
+func formatQuoteNames(buf *bytes.Buffer, names ...string) {
+	f := tree.NewFmtCtx(tree.FmtSimple)
+	for i := range names {
+		if i > 0 {
+			f.WriteString(", ")
+		}
+		f.FormatNameP(&names[i])
 	}
-	return parser.AsString(nameList)
+	buf.WriteString(f.CloseAndGetString())
 }
 
 // showCreateInterleave returns an INTERLEAVE IN PARENT clause for the specified
@@ -157,38 +267,145 @@ func quoteNames(names ...string) string {
 // The name of the parent table is prefixed by its database name unless
 // it is equal to the given dbPrefix. This allows us to elide the prefix
 // when the given index is interleaved in a table of the current database.
-func (p *planner) showCreateInterleave(
+func showCreateInterleave(
 	ctx context.Context,
 	idx *sqlbase.IndexDescriptor,
 	buf *bytes.Buffer,
 	dbPrefix string,
-	deps map[parser.TableName]struct{},
+	lCtx *internalLookupCtx,
 ) error {
 	if len(idx.Interleave.Ancestors) == 0 {
 		return nil
 	}
 	intl := idx.Interleave
-	parentTable, err := sqlbase.GetTableDescFromID(ctx, p.txn, intl.Ancestors[len(intl.Ancestors)-1].TableID)
-	if err != nil {
-		return err
-	}
-	parentDbDesc, err := sqlbase.GetDatabaseDescFromID(ctx, p.txn, parentTable.ParentID)
-	if err != nil {
-		return err
-	}
-	parentName := parser.TableName{
-		DatabaseName:            parser.Name(parentDbDesc.Name),
-		TableName:               parser.Name(parentTable.Name),
-		DBNameOriginallyOmitted: parentDbDesc.Name == dbPrefix,
-	}
-	if deps != nil {
-		deps[parentName] = struct{}{}
+	parentTableID := intl.Ancestors[len(intl.Ancestors)-1].TableID
+
+	var parentName tree.TableName
+	if lCtx != nil {
+		parentTable, err := lCtx.getTableByID(parentTableID)
+		if err != nil {
+			return err
+		}
+		parentDbDesc, err := lCtx.getDatabaseByID(parentTable.ParentID)
+		if err != nil {
+			return err
+		}
+		parentName = tree.MakeTableName(tree.Name(parentDbDesc.Name), tree.Name(parentTable.Name))
+		parentName.ExplicitSchema = parentDbDesc.Name != dbPrefix
+	} else {
+		parentName = tree.MakeTableName(tree.Name(""), tree.Name(fmt.Sprintf("[%d as parent]", parentTableID)))
+		parentName.ExplicitCatalog = false
+		parentName.ExplicitSchema = false
 	}
 	var sharedPrefixLen int
 	for _, ancestor := range intl.Ancestors {
 		sharedPrefixLen += int(ancestor.SharedPrefixLen)
 	}
-	interleavedColumnNames := quoteNames(idx.ColumnNames[:sharedPrefixLen]...)
-	fmt.Fprintf(buf, " INTERLEAVE IN PARENT %s (%s)", &parentName, interleavedColumnNames)
+	buf.WriteString(" INTERLEAVE IN PARENT ")
+	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
+	fmtCtx.FormatNode(&parentName)
+	buf.WriteString(fmtCtx.CloseAndGetString())
+	buf.WriteString(" (")
+	formatQuoteNames(buf, idx.ColumnNames[:sharedPrefixLen]...)
+	buf.WriteString(")")
+	return nil
+}
+
+// ShowCreatePartitioning returns a PARTITION BY clause for the specified
+// index, if applicable.
+func ShowCreatePartitioning(
+	a *sqlbase.DatumAlloc,
+	tableDesc *sqlbase.TableDescriptor,
+	idxDesc *sqlbase.IndexDescriptor,
+	partDesc *sqlbase.PartitioningDescriptor,
+	buf *bytes.Buffer,
+	indent int,
+	colOffset int,
+) error {
+	if partDesc.NumColumns == 0 {
+		return nil
+	}
+
+	// We don't need real prefixes in the DecodePartitionTuple calls because we
+	// only use the tree.Datums part of the output.
+	fakePrefixDatums := make([]tree.Datum, colOffset)
+	for i := range fakePrefixDatums {
+		fakePrefixDatums[i] = tree.DNull
+	}
+
+	indentStr := strings.Repeat("\t", indent)
+	buf.WriteString(` PARTITION BY `)
+	if len(partDesc.List) > 0 {
+		buf.WriteString(`LIST`)
+	} else if len(partDesc.Range) > 0 {
+		buf.WriteString(`RANGE`)
+	} else {
+		return errors.Errorf(`invalid partition descriptor: %v`, partDesc)
+	}
+	buf.WriteString(` (`)
+	for i := 0; i < int(partDesc.NumColumns); i++ {
+		if i != 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(idxDesc.ColumnNames[colOffset+i])
+	}
+	buf.WriteString(`) (`)
+	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
+	for i := range partDesc.List {
+		part := &partDesc.List[i]
+		if i != 0 {
+			buf.WriteString(`, `)
+		}
+		buf.WriteString("\n")
+		buf.WriteString(indentStr)
+		buf.WriteString("\tPARTITION ")
+		fmtCtx.FormatNameP(&part.Name)
+		_, _ = fmtCtx.Buffer.WriteTo(buf)
+		buf.WriteString(` VALUES IN (`)
+		for j, values := range part.Values {
+			if j != 0 {
+				buf.WriteString(`, `)
+			}
+			tuple, _, err := sqlbase.DecodePartitionTuple(
+				a, tableDesc, idxDesc, partDesc, values, fakePrefixDatums)
+			if err != nil {
+				return err
+			}
+			buf.WriteString(tuple.String())
+		}
+		buf.WriteString(`)`)
+		if err := ShowCreatePartitioning(
+			a, tableDesc, idxDesc, &part.Subpartitioning, buf, indent+1,
+			colOffset+int(partDesc.NumColumns),
+		); err != nil {
+			return err
+		}
+	}
+	for i, part := range partDesc.Range {
+		if i != 0 {
+			buf.WriteString(`, `)
+		}
+		buf.WriteString("\n")
+		buf.WriteString(indentStr)
+		buf.WriteString("\tPARTITION ")
+		buf.WriteString(part.Name)
+		buf.WriteString(" VALUES FROM ")
+		fromTuple, _, err := sqlbase.DecodePartitionTuple(
+			a, tableDesc, idxDesc, partDesc, part.FromInclusive, fakePrefixDatums)
+		if err != nil {
+			return err
+		}
+		buf.WriteString(fromTuple.String())
+		buf.WriteString(" TO ")
+		toTuple, _, err := sqlbase.DecodePartitionTuple(
+			a, tableDesc, idxDesc, partDesc, part.ToExclusive, fakePrefixDatums)
+		if err != nil {
+			return err
+		}
+		buf.WriteString(toTuple.String())
+	}
+	buf.WriteString("\n")
+	buf.WriteString(indentStr)
+	buf.WriteString(")")
 	return nil
 }

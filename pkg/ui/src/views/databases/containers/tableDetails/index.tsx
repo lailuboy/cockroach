@@ -1,8 +1,21 @@
-import React from "react";
-import { RouterState, Link } from "react-router";
-import { connect } from "react-redux";
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
 
-import "./sqlhighlight.styl";
+import React from "react";
+import { Helmet } from "react-helmet";
+import { Link, RouterState } from "react-router";
+import { connect } from "react-redux";
 
 import * as protos from "src/js/protos";
 import { databaseNameAttr, tableNameAttr } from "src/util/constants";
@@ -15,15 +28,9 @@ import { SummaryBar, SummaryHeadlineStat } from "src/views/shared/components/sum
 import { TableInfo } from "src/views/databases/data/tableInfo";
 import { SortSetting } from "src/views/shared/components/sortabletable";
 import { SortedTable } from "src/views/shared/components/sortedtable";
-import * as hljs from "highlight.js";
+import { SqlBox } from "src/views/shared/components/sql/box";
 
-// Specialization of generic SortedTable component:
-//   https://github.com/Microsoft/TypeScript/issues/3960
-//
-// The variable name must start with a capital letter or TSX will not recognize
-// it as a component.
-// tslint:disable-next-line:variable-name
-export const GrantsSortedTable = SortedTable as new () => SortedTable<protos.cockroach.server.serverpb.TableDetailsResponse.Grant$Properties>;
+class GrantsSortedTable extends SortedTable<protos.cockroach.server.serverpb.TableDetailsResponse.IGrant> {}
 
 const databaseTableGrantsSortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "tableDetails/sort_setting/grants", (s) => s.localSettings,
@@ -60,8 +67,6 @@ type TableMainProps = TableMainData & TableMainActions & RouterState;
  * data table of all databases.
  */
 class TableMain extends React.Component<TableMainProps, {}> {
-  createStmtNode: Node;
-
   componentWillMount() {
     this.props.refreshTableDetails(new protos.cockroach.server.serverpb.TableDetailsRequest({
       database: this.props.params[databaseNameAttr],
@@ -73,28 +78,26 @@ class TableMain extends React.Component<TableMainProps, {}> {
     }));
   }
 
-  componentDidMount() {
-    hljs.highlightBlock(this.createStmtNode);
-  }
-
   render() {
     const { tableInfo, grantsSortSetting } = this.props;
 
+    const title = this.props.params[databaseNameAttr] + "." + this.props.params[tableNameAttr];
+
     if (tableInfo) {
       return <div>
-        <section className="section parent-link">
-          <Link to="/databases/tables">&lt; Back to Databases</Link>
-        </section>
+        <Helmet>
+          <title>{`${title} Table | Databases`}</title>
+        </Helmet>
         <section className="section">
+          <section className="section parent-link">
+            <Link to="/databases/tables">&lt; Back to Databases</Link>
+          </section>
           <div className="database-summary-title">
-            { this.props.params[tableNameAttr] }
+            <h2>{ title }</h2>
           </div>
           <div className="content l-columns">
             <div className="l-columns__left">
-              <pre className="sql-highlight" ref={(node) => this.createStmtNode = node}>
-                {/* TODO (mrtracy): format create table statement */}
-                {tableInfo.createStatement}
-              </pre>
+              <SqlBox value={ tableInfo.createStatement } />
               <div className="sql-table">
                 <GrantsSortedTable
                   data={tableInfo.grants}
@@ -118,12 +121,12 @@ class TableMain extends React.Component<TableMainProps, {}> {
               <SummaryBar>
                 <SummaryHeadlineStat
                   title="Size"
-                  tooltip="Total disk size of this table."
-                  value={ tableInfo.size }
+                  tooltip="Approximate total disk size of this table across all replicas."
+                  value={ tableInfo.physicalSize }
                   format={ Bytes }/>
                 <SummaryHeadlineStat
                   title="Ranges"
-                  tooltip="The total count of ranges in this database"
+                  tooltip="The total number of ranges in this table."
                   value={ tableInfo.rangeCount }/>
               </SummaryBar>
             </div>
@@ -139,7 +142,7 @@ class TableMain extends React.Component<TableMainProps, {}> {
  *         SELECTORS
  */
 
-function tableInfo(state: AdminUIState, props: RouterState): TableInfo {
+function selectTableInfo(state: AdminUIState, props: RouterState): TableInfo {
   const db = props.params[databaseNameAttr];
   const table = props.params[tableNameAttr];
   const details = state.cachedData.tableDetails[generateTableID(db, table)];
@@ -151,7 +154,7 @@ function tableInfo(state: AdminUIState, props: RouterState): TableInfo {
 const tableMainConnected = connect(
   (state: AdminUIState, ownProps: RouterState) => {
     return {
-      tableInfo: tableInfo(state, ownProps),
+      tableInfo: selectTableInfo(state, ownProps),
       grantsSortSetting: databaseTableGrantsSortSetting.selector(state),
     };
   },

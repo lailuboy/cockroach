@@ -1,28 +1,39 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import _ from "lodash";
 import React from "react";
+import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
 import { RouterState } from "react-router";
 
 import * as protos from "src/js/protos";
-import { refreshCertificates } from "src/redux/apiReducers";
+import { certificatesRequestKey, refreshCertificates } from "src/redux/apiReducers";
 import { AdminUIState } from "src/redux/state";
 import { nodeIDAttr } from "src/util/constants";
 import { LongToMoment } from "src/util/convert";
+import Loading from "src/views/shared/components/loading";
 
 interface CertificatesOwnProps {
   certificates: protos.cockroach.server.serverpb.CertificatesResponse;
+  lastError: Error;
   refreshCertificates: typeof refreshCertificates;
 }
 
 const dateFormat = "Y-MM-DD HH:mm:ss";
 
 type CertificatesProps = CertificatesOwnProps & RouterState;
-
-const loading = (
-  <div className="section">
-    <h1>Loading cluster status...</h1>
-  </div>
-);
 
 const emptyRow = (
   <tr className="certs-table__row">
@@ -31,14 +42,18 @@ const emptyRow = (
   </tr>
 );
 
+function certificatesRequestFromProps(props: CertificatesProps) {
+  return new protos.cockroach.server.serverpb.CertificatesRequest({
+    node_id: props.params[nodeIDAttr],
+  });
+}
+
 /**
- * Renders the Nodes Diagnostics Report page.
+ * Renders the Certificate Report page.
  */
 class Certificates extends React.Component<CertificatesProps, {}> {
   refresh(props = this.props) {
-    props.refreshCertificates(new protos.cockroach.server.serverpb.CertificatesRequest({
-      node_id: this.props.params[nodeIDAttr],
-    }));
+    props.refreshCertificates(certificatesRequestFromProps(props));
   }
 
   componentWillMount() {
@@ -93,7 +108,7 @@ class Certificates extends React.Component<CertificatesProps, {}> {
     return this.renderSimpleRow(header, timestamp, title);
   }
 
-  renderFields(fields: protos.cockroach.server.serverpb.CertificateDetails.Fields$Properties, id: number) {
+  renderFields(fields: protos.cockroach.server.serverpb.CertificateDetails.IFields, id: number) {
     return [
       this.renderSimpleRow("Cert ID", id.toString()),
       this.renderSimpleRow("Issuer", fields.issuer),
@@ -108,14 +123,26 @@ class Certificates extends React.Component<CertificatesProps, {}> {
     ];
   }
 
-  renderCert(cert: protos.cockroach.server.serverpb.CertificateDetails$Properties, key: number) {
+  renderCert(cert: protos.cockroach.server.serverpb.ICertificateDetails, key: number) {
     let certType: string;
     switch (cert.type) {
       case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.CA:
         certType = "Certificate Authority";
         break;
       case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.NODE:
-        certType = "Node";
+        certType = "Node Certificate";
+        break;
+      case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.CLIENT_CA:
+        certType = "Client Certificate Authority";
+        break;
+      case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.CLIENT:
+        certType = "Client Certificate";
+        break;
+      case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.UI_CA:
+        certType = "UI Certificate Authority";
+        break;
+      case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.UI:
+        certType = "UI Certificate";
         break;
       default:
         certType = "Unknown";
@@ -138,21 +165,18 @@ class Certificates extends React.Component<CertificatesProps, {}> {
     );
   }
 
-  render() {
+  renderContent = () => {
     const { certificates } = this.props;
-    if (_.isEmpty(certificates)) {
-      return loading;
-    }
+    const nodeID = this.props.params[nodeIDAttr];
 
     if (_.isEmpty(certificates.certificates)) {
       return (
-        <div>
-          <h1>No certificates were found on node {this.props.params[nodeIDAttr]}.</h1>
-        </div>
+        <React.Fragment>
+          <h2>No certificates were found on node {this.props.params[nodeIDAttr]}.</h2>
+        </React.Fragment>
       );
     }
 
-    const nodeID = this.props.params[nodeIDAttr];
     let header: string = null;
     if (_.isNaN(parseInt(nodeID, 10))) {
       header = "Local Node";
@@ -161,21 +185,42 @@ class Certificates extends React.Component<CertificatesProps, {}> {
     }
 
     return (
-      <div>
-        <h1>{header} certificates</h1>
+      <React.Fragment>
+        <h2>{header} certificates</h2>
         {
           _.map(certificates.certificates, (cert, key) => (
             this.renderCert(cert, key)
           ))
         }
+      </React.Fragment>
+    );
+  }
+
+  render() {
+    return (
+      <div className="section">
+        <Helmet>
+          <title>Certificates | Debug</title>
+        </Helmet>
+        <h1>Certificates</h1>
+
+        <section className="section">
+          <Loading
+            loading={!this.props.certificates}
+            error={this.props.lastError}
+            render={this.renderContent}
+          />
+        </section>
       </div>
     );
   }
 }
 
-function mapStateToProps(state: AdminUIState) {
+function mapStateToProps(state: AdminUIState, props: CertificatesProps) {
+  const nodeIDKey = certificatesRequestKey(certificatesRequestFromProps(props));
   return {
-    certificates: state.cachedData.certificates.data,
+    certificates: state.cachedData.certificates[nodeIDKey] && state.cachedData.certificates[nodeIDKey].data,
+    lastError: state.cachedData.certificates[nodeIDKey] && state.cachedData.certificates[nodeIDKey].lastError,
   };
 }
 

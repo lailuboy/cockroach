@@ -4,17 +4,16 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
 package storageccl_test
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strconv"
 	"testing"
-
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
@@ -22,11 +21,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/workload/bank"
 )
 
 func BenchmarkAddSSTable(b *testing.B) {
@@ -35,7 +35,7 @@ func BenchmarkAddSSTable(b *testing.B) {
 
 	for _, numEntries := range []int{100, 1000, 10000, 300000} {
 		b.Run(fmt.Sprintf("numEntries=%d", numEntries), func(b *testing.B) {
-			bankData := sampledataccl.BankRows(numEntries)
+			bankData := bank.FromRows(numEntries).Tables()[0]
 			backupDir := filepath.Join(tempDir, strconv.Itoa(numEntries))
 			backup, err := sampledataccl.ToBackup(b, bankData, backupDir)
 			if err != nil {
@@ -45,9 +45,9 @@ func BenchmarkAddSSTable(b *testing.B) {
 			ctx := context.Background()
 			tc := testcluster.StartTestCluster(b, 3, base.TestClusterArgs{})
 			defer tc.Stopper().Stop(ctx)
-			kvDB := tc.Server(0).KVClient().(*client.DB)
+			kvDB := tc.Server(0).DB()
 
-			id := sqlbase.ID(keys.MaxReservedDescID + 1)
+			id := sqlbase.ID(keys.MinUserDescID)
 
 			var totalLen int64
 			b.StopTimer()
@@ -77,7 +77,7 @@ func BenchmarkAddSSTable(b *testing.B) {
 				totalLen += int64(len(data))
 
 				b.StartTimer()
-				if err := kvDB.ExperimentalAddSSTable(ctx, span.Key, span.EndKey, data); err != nil {
+				if err := kvDB.AddSSTable(ctx, span.Key, span.EndKey, data); err != nil {
 					b.Fatalf("%+v", err)
 				}
 				b.StopTimer()
@@ -93,7 +93,7 @@ func BenchmarkWriteBatch(b *testing.B) {
 
 	for _, numEntries := range []int{100, 1000, 10000} {
 		b.Run(fmt.Sprintf("numEntries=%d", numEntries), func(b *testing.B) {
-			bankData := sampledataccl.BankRows(numEntries)
+			bankData := bank.FromRows(numEntries).Tables()[0]
 			backupDir := filepath.Join(tempDir, strconv.Itoa(numEntries))
 			backup, err := sampledataccl.ToBackup(b, bankData, backupDir)
 			if err != nil {
@@ -103,9 +103,9 @@ func BenchmarkWriteBatch(b *testing.B) {
 			ctx := context.Background()
 			tc := testcluster.StartTestCluster(b, 3, base.TestClusterArgs{})
 			defer tc.Stopper().Stop(ctx)
-			kvDB := tc.Server(0).KVClient().(*client.DB)
+			kvDB := tc.Server(0).DB()
 
-			id := sqlbase.ID(keys.MaxReservedDescID + 1)
+			id := sqlbase.ID(keys.MinUserDescID)
 			var batch engine.RocksDBBatchBuilder
 
 			var totalLen int64
@@ -136,39 +136,32 @@ func BenchmarkWriteBatch(b *testing.B) {
 }
 
 func BenchmarkImport(b *testing.B) {
-	b.Run("AddSSTable", func(b *testing.B) {
-		defer settings.TestingSetBool(&storageccl.AddSSTableEnabled, true)()
-		runBenchmarkImport(b)
-	})
-	b.Run("WriteBatch", func(b *testing.B) {
-		defer settings.TestingSetBool(&storageccl.AddSSTableEnabled, false)()
-		runBenchmarkImport(b)
-	})
-}
-
-func runBenchmarkImport(b *testing.B) {
 	tempDir, dirCleanupFn := testutils.TempDir(b)
 	defer dirCleanupFn()
 
+	args := base.TestClusterArgs{}
+	args.ServerArgs.ExternalIODir = tempDir
+
 	for _, numEntries := range []int{1, 100, 10000, 300000} {
 		b.Run(fmt.Sprintf("numEntries=%d", numEntries), func(b *testing.B) {
-			bankData := sampledataccl.BankRows(numEntries)
-			backupDir := filepath.Join(tempDir, strconv.Itoa(numEntries))
+			bankData := bank.FromRows(numEntries).Tables()[0]
+			subdir := strconv.Itoa(numEntries)
+			backupDir := filepath.Join(tempDir, subdir)
 			backup, err := sampledataccl.ToBackup(b, bankData, backupDir)
 			if err != nil {
 				b.Fatalf("%+v", err)
 			}
-			storage, err := storageccl.ExportStorageConfFromURI(`nodelocal://` + backupDir)
+			storage, err := storageccl.ExportStorageConfFromURI(`nodelocal:///` + subdir)
 			if err != nil {
 				b.Fatalf("%+v", err)
 			}
 
 			ctx := context.Background()
-			tc := testcluster.StartTestCluster(b, 3, base.TestClusterArgs{})
+			tc := testcluster.StartTestCluster(b, 3, args)
 			defer tc.Stopper().Stop(ctx)
-			kvDB := tc.Server(0).KVClient().(*client.DB)
+			kvDB := tc.Server(0).DB()
 
-			id := sqlbase.ID(keys.MaxReservedDescID + 1)
+			id := sqlbase.ID(keys.MinUserDescID)
 
 			var totalLen int64
 			b.StopTimer()
@@ -187,7 +180,7 @@ func runBenchmarkImport(b *testing.B) {
 					oldStartKey = sqlbase.MakeIndexKeyPrefix(tableDesc, tableDesc.PrimaryIndex.ID)
 					newDesc := *tableDesc
 					newDesc.ID = id
-					newDescBytes, err := sqlbase.WrapDescriptor(&newDesc).Marshal()
+					newDescBytes, err := protoutil.Marshal(sqlbase.WrapDescriptor(&newDesc))
 					if err != nil {
 						panic(err)
 					}
@@ -206,12 +199,12 @@ func runBenchmarkImport(b *testing.B) {
 					// Import is a point request because we don't want DistSender to split
 					// it. Assume (but don't require) the entire post-rewrite span is on the
 					// same range.
-					Span:     roachpb.Span{Key: newStartKey},
-					DataSpan: roachpb.Span{Key: oldStartKey, EndKey: oldStartKey.PrefixEnd()},
-					Files:    files,
-					Rekeys:   rekeys,
+					RequestHeader: roachpb.RequestHeader{Key: newStartKey},
+					DataSpan:      roachpb.Span{Key: oldStartKey, EndKey: oldStartKey.PrefixEnd()},
+					Files:         files,
+					Rekeys:        rekeys,
 				}
-				res, pErr := client.SendWrapped(ctx, kvDB.GetSender(), req)
+				res, pErr := client.SendWrapped(ctx, kvDB.NonTransactionalSender(), req)
 				if pErr != nil {
 					b.Fatalf("%+v", pErr.GoError())
 				}

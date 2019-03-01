@@ -20,37 +20,45 @@ the type system and part of the logic test infrastructure.
 
 ### Built-ins
 
-The SQL code lies within the `pkg/sql` directory. The built-in functions reside
-in `pkg/sql/parser/builtins.go`. A function is described by a `Builtin`
-structure:
+The SQL code lies within the `pkg/sql` directory. The built-in
+functions reside in `pkg/sql/sem/builtins/builtins.go`. A function is
+described by a `Overload` structure, in `pkg/sql/sem/tree/overload.go`:
 
 ```go
-type Builtin struct {
-  Types      typeList
-  ReturnType returnTyper
+type Overload struct {
+  Types      TypeList
+  ReturnType ReturnTyper
   ...
-  fn         func(*EvalContext, Datums) (Datum, error)
+  Fn         func(*EvalContext, Datums) (Datum, error)
 }
 ```
 
-`Builtin` contains a number of fields, reflecting the diversity of built-in
-functions. Three important fields for us to pay attention to our the argument
-types (`Types`), the return type (`ReturnType`) and the implementation function
-pointer (`fn`).
+`Overload` contains a number of fields, reflecting the
+diversity of built-in functions. Three important fields for us to pay
+attention to our the argument types (`Types`), the return type
+(`ReturnType`) and the implementation function pointer (`Fn`).
 
-The SQL execution engine finds the `Builtin` structure given the name of a
-function using the `Builtins` map:
+Multiple function overloads are then grouped into a single "built-in
+definition" (`builtinDefinition` in `builtins/builtins.go`), and
+during CockroachDB initialization transformed into a
+`FunctionDefinition` (in `builtins/all_builtins.go`).
+
+For example, `abs` has an overload for each numeric type (`float`,
+`decimal`, and `int`). The type system takes care of selecting the
+correct version of a function given the name and the argument
+types.
+
+The SQL execution engine finds the `builtinDefinition` structure
+given the name of a function using the `builtins` map:
 
 ```go
-var Builtins = map[string][]Builtin{...}
+var builtins = map[string]builtinDefinition{...}
 ```
 
-Notice that this is a map from `string` to a slice of `Builtin`. The slice is
-used to distinguish the "overloads" for a given function. For example, `abs` has
-an overload for each numeric type (`float`, `decimal`, and `int`). The type
-system takes care of selecting the correct version of a function given the name
-and the argument types. To add a new built-in we just have to decide on a name
-and some functionality.
+Notice that this is a map from `string` to `builtinDefinition`, which
+contains a slice of `Overload`s via the member field
+`Overloads`. The `Overloads` slice is used to distinguish the
+"overloads" for a given function. 
 
 ### What’s Your Name
 
@@ -59,21 +67,21 @@ variable number of usernames and return the corresponding real names. For
 example, `whois('pmattis')` will return `'Peter Mattis'`. For simplicity, the
 mapping of usernames to real names will be hardcoded. Let’s get started.
 
-The `Builtins` map is divided up into sections by function category, but this
+The `builtins` map is divided up into sections by function category, but this
 organization is purely for readability. We can add our function anywhere, so
 let’s add it right at the top of the definition for simplicity:
 
 ```go
-var Builtins = map[string][]Builtin{
-  "whois": {
-    Builtin{
-      Types:      VariadicType{TypeString},
-      ReturnType: fixedReturnType(TypeString),
-      fn: func(ctx *EvalContext, args Datums) (Datum, error) {
-        return DNull, fmt.Errorf("nothing to see here")
+var builtins = map[string]builtinDefinition{
+  "whois": makeBuiltin(defProps(),
+    tree.Overload{
+      Types:      tree.VariadicType{VarType: types.String},
+      ReturnType: tree.FixedReturnType(types.String),
+      Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+        return tree.DNull, fmt.Errorf("nothing to see here")
       },
     },
-  },
+  ),
   ...
 ```
 
@@ -82,7 +90,7 @@ takes a variable number of string arguments. The `ReturnType` field indicates
 our function returns a string. The implementation of our function is currently
 unfinished, so we’ll return an error for now.
 
-Go ahead and add the above code to `pkg/sql/parser/builtins.go`. If you’ve
+Go ahead and add the above code to `pkg/sql/sem/builtins/builtins.go`. If you’ve
 followed the instructions in [CONTRIBUTING.md], you should be able to build
 CockroachDB from source:
 
@@ -136,13 +144,14 @@ corresponding real names:
 ```go
 var buf bytes.Buffer
 for i, arg := range args {
-  // Because we specified the type of this function as Variadic{TypeString}, the
-  // type system will ensure that all arguments are strings, so we can perform a
-  // simple type assertion on each argument to access the string within.
-  username := string(*arg.(*DString))
+  // Because we specified the type of this function as
+  // Variadic{Typ: types.String}, the type system will ensure that all
+  // arguments are strings, so we can perform a simple type assertion on
+  // each argument to access the string within.
+  username := string(*arg.(*tree.DString))
   name, ok := users[strings.ToLower(username)]
   if !ok {
-    return DNull, fmt.Errorf("unknown username: %s", arg)
+    return tree.DNull, fmt.Errorf("unknown username: %s", arg)
   }
   if i > 0 {
     buf.WriteString(", ")
@@ -154,7 +163,7 @@ for i, arg := range args {
 Lastly, we need to return the result:
 
 ```go
-return NewDString(buf.String()), nil
+return tree.NewDString(buf.String()), nil
 ```
 
 Much of the above looks like standard Go, but what is a ``DString``? The SQL
@@ -202,9 +211,9 @@ specified and expand that to a list of all of the usernames:
 
 ```go
 if len(args) == 0 {
-  args = make(Datums, 0, len(users))
+  args = make(tree.Datums, 0, len(users))
   for user := range users {
-    args = append(args, NewDString(user))
+    args = append(args, tree.NewDString(user))
   }
 }
 var buf bytes.Buffer
@@ -336,40 +345,40 @@ check your solution against ours.
   -->
 
   ```diff
-    "whois": {
-      Builtin{
-        Types:      VariadicType{TypeString},
-        ReturnType: fixedReturnType(TypeString),
-        fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+    "whois": makeBuiltin(defProps(),
+      tree.Overload{
+        Types:      tree.VariadicType{VarType: types.String},
+        ReturnType: tree.FixedReturnType(types.TypeString),
+        Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
           users := map[string]string{
             "bdarnell": "Ben Darnell",
             "pmattis":  "Peter Mattis",
             "skimball": "Spencer Kimball",
           }
           if len(args) == 0 {
-            args = make(Datums, 0, len(users))
+            args = make(tree.Datums, 0, len(users))
             for user := range users {
-              args = append(args, NewDString(user))
+              args = append(args, tree.NewDString(user))
             }
   +          sort.Slice(args, func(i, j int) bool {
-  +            return *args[i].(*DString) < *args[j].(*DString)
+  +            return *args[i].(*tree.DString) < *args[j].(*tree.DString)
   +          })
           }
           var buf bytes.Buffer
           for i, arg := range args {
-            name, ok := users[strings.ToLower(string(*arg.(*DString)))]
+            name, ok := users[strings.ToLower(string(*arg.(*tree.DString)))]
             if !ok {
-              return DNull, fmt.Errorf("unknown username: %s", arg)
+              return tree.DNull, fmt.Errorf("unknown username: %s", arg)
             }
             if i > 0 {
               buf.WriteString(", ")
             }
             buf.WriteString(name)
           }
-          return NewDString(buf.String()), nil
+          return tree.NewDString(buf.String()), nil
         },
       },
-    },
+    ),
     ...
   ```
   </p>

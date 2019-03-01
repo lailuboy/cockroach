@@ -1,17 +1,31 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import React from "react";
 import _ from "lodash";
 
 import { LineGraph } from "src/views/cluster/components/linegraph";
 import { Metric, Axis, AxisUnits } from "src/views/shared/components/metricQuery";
 
-import { GraphDashboardProps, nodeAddress, storeIDsForNode } from "./dashboardUtils";
+import { GraphDashboardProps, nodeDisplayName, storeIDsForNode } from "./dashboardUtils";
 
 export default function (props: GraphDashboardProps) {
   const { nodeIDs, nodesSummary, storeSources } = props;
 
   return [
     <LineGraph title="Ranges" sources={storeSources}>
-      <Axis>
+      <Axis label="ranges">
         <Metric name="cr.store.ranges" title="Ranges" />
         <Metric name="cr.store.replicas.leaders" title="Leaders" />
         <Metric name="cr.store.replicas.leaseholders" title="Lease Holders" />
@@ -22,13 +36,13 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
 
     <LineGraph title="Replicas per Store" tooltip={`The number of replicas on each store.`}>
-      <Axis>
+      <Axis label="replicas">
         {
           _.map(nodeIDs, (nid) => (
             <Metric
               key={nid}
               name="cr.store.replicas"
-              title={nodeAddress(nodesSummary, nid)}
+              title={nodeDisplayName(nodesSummary, nid)}
               sources={storeIDsForNode(nodesSummary, nid)}
             />
           ))
@@ -36,14 +50,20 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Leaseholders per Store" tooltip={`The number of replicas on each store.`}>
-      <Axis>
+    <LineGraph
+      title="Leaseholders per Store"
+      tooltip={
+          `The number of leaseholder replicas on each store. A leaseholder replica is the one that
+          receives and coordinates all read and write requests for its range.`
+      }
+    >
+      <Axis label="leaseholders">
         {
           _.map(nodeIDs, (nid) => (
             <Metric
               key={nid}
               name="cr.store.replicas.leaseholders"
-              title={nodeAddress(nodesSummary, nid)}
+              title={nodeDisplayName(nodesSummary, nid)}
               sources={storeIDsForNode(nodesSummary, nid)}
             />
           ))
@@ -51,14 +71,14 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Live Bytes per Store" tooltip={`The number of live bytes of data on each store.`}>
-      <Axis units={AxisUnits.Bytes}>
+    <LineGraph title="Average Queries per Store" tooltip={`Exponentially weighted moving average of the number of KV batch requests processed by leaseholder replicas on each store per second. Tracks roughly the last 30 minutes of requests. Used for load-based rebalancing decisions.`}>
+      <Axis label="queries">
         {
           _.map(nodeIDs, (nid) => (
             <Metric
               key={nid}
-              name="cr.store.livebytes"
-              title={nodeAddress(nodesSummary, nid)}
+              name="cr.store.rebalancing.queriespersecond"
+              title={nodeDisplayName(nodesSummary, nid)}
               sources={storeIDsForNode(nodesSummary, nid)}
             />
           ))
@@ -66,14 +86,14 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Keys Written per Second per Store" tooltip={`The average number of KV keys written (i.e. applied by raft) per second on each store.`}>
-      <Axis>
+    <LineGraph title="Logical Bytes per Store" tooltip={`The number of logical bytes of data on each store.`}>
+      <Axis units={AxisUnits.Bytes} label="logical store size">
         {
           _.map(nodeIDs, (nid) => (
             <Metric
               key={nid}
-              name="cr.store.rebalancing.writespersecond"
-              title={nodeAddress(nodesSummary, nid)}
+              name="cr.store.totalbytes"
+              title={nodeDisplayName(nodesSummary, nid)}
               sources={storeIDsForNode(nodesSummary, nid)}
             />
           ))
@@ -81,26 +101,29 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Replicas" sources={storeSources}>
-      <Axis>
+    <LineGraph title="Replica Quiescence" sources={storeSources}>
+      <Axis label="replicas">
         <Metric name="cr.store.replicas" title="Replicas" />
         <Metric name="cr.store.replicas.quiescent" title="Quiescent" />
       </Axis>
     </LineGraph>,
 
     <LineGraph title="Range Operations" sources={storeSources}>
-      <Axis>
+      <Axis label="ranges">
         <Metric name="cr.store.range.splits" title="Splits" nonNegativeRate />
         <Metric name="cr.store.range.adds" title="Adds" nonNegativeRate />
         <Metric name="cr.store.range.removes" title="Removes" nonNegativeRate />
+        <Metric name="cr.store.leases.transfers.success" title="Lease Transfers" nonNegativeRate />
+        <Metric name="cr.store.rebalancing.lease.transfers" title="Load-based Lease Transfers" nonNegativeRate />
+        <Metric name="cr.store.rebalancing.range.rebalances" title="Load-based Range Rebalances" nonNegativeRate />
       </Axis>
     </LineGraph>,
 
     <LineGraph title="Snapshots" sources={storeSources}>
-      <Axis>
+      <Axis label="snapshots">
         <Metric name="cr.store.range.snapshots.generated" title="Generated" nonNegativeRate />
-        <Metric name="cr.store.range.snapshots.normal-applied" title="Normal-applied" nonNegativeRate />
-        <Metric name="cr.store.range.snapshots.preemptive-applied" title="Preemptive-applied" nonNegativeRate />
+        <Metric name="cr.store.range.snapshots.normal-applied" title="Applied (Raft-initiated)" nonNegativeRate />
+        <Metric name="cr.store.range.snapshots.preemptive-applied" title="Applied (Preemptive)" nonNegativeRate />
         <Metric name="cr.store.replicas.reserved" title="Reserved" nonNegativeRate />
       </Axis>
     </LineGraph>,

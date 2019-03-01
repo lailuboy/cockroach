@@ -11,159 +11,64 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
-
-// This file implements the SHOW TESTING_RANGES statement:
-//   SHOW TESTING_RANGES FROM TABLE t
-//   SHOW TESTING_RANGES FROM INDEX t@idx
-//
-// These statements show the ranges corresponding to the given table or index,
-// along with the list of replicas and the lease holder.
 
 package sql
 
 import (
-	"sort"
-
-	"golang.org/x/net/context"
+	"context"
+	"encoding/hex"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
-func (p *planner) ShowRanges(ctx context.Context, n *parser.ShowRanges) (planNode, error) {
-	tableDesc, index, err := p.getTableAndIndex(ctx, n.Table, n.Index, privilege.SELECT)
+// ShowRanges implements the SHOW EXPERIMENTAL_RANGES statement:
+//   SHOW EXPERIMENTAL_RANGES FROM TABLE t
+//   SHOW EXPERIMENTAL_RANGES FROM INDEX t@idx
+//
+// These statements show the ranges corresponding to the given table or index,
+// along with the list of replicas and the lease holder.
+func (p *planner) ShowRanges(ctx context.Context, n *tree.ShowRanges) (planNode, error) {
+	desc, index, err := p.getTableAndIndex(ctx, n.Table, n.Index, privilege.SELECT)
 	if err != nil {
 		return nil, err
 	}
-	// Note: for interleaved tables, the ranges we report will include rows from
-	// interleaving.
-	return &showRangesNode{
-		span:   tableDesc.IndexSpan(index.ID),
-		values: make([]parser.Datum, len(showRangesColumns)),
-	}, nil
+	span := desc.IndexSpan(index.ID)
+	if desc.ID < keys.MaxSystemConfigDescID {
+		span = keys.SystemConfigSpan
+	}
+	startKey := hex.EncodeToString([]byte(span.Key))
+	endKey := hex.EncodeToString([]byte(span.EndKey))
+	return p.delegateQuery(ctx, "SHOW RANGES",
+		fmt.Sprintf(`
+SELECT 
+  CASE WHEN r.start_key <= x'%s' THEN NULL ELSE crdb_internal.pretty_key(r.start_key, 2) END AS start_key,
+  CASE WHEN r.end_key >= x'%s' THEN NULL ELSE crdb_internal.pretty_key(r.end_key, 2) END AS end_key,
+  range_id,
+  replicas,
+  lease_holder
+FROM crdb_internal.ranges AS r
+WHERE (r.start_key < x'%s')
+  AND (r.end_key   > x'%s')
+`, startKey, endKey, endKey, startKey), nil, nil)
 }
 
-type showRangesNode struct {
-	optColumnsSlot
-
-	span roachpb.Span
-
-	// descriptorKVs are KeyValues returned from scanning the
-	// relevant meta keys.
-	descriptorKVs []client.KeyValue
-
-	rowIdx int
-	// values stores the current row, updated by Next().
-	values []parser.Datum
-}
-
-var showRangesColumns = sqlbase.ResultColumns{
-	{
-		Name: "Start Key",
-		Typ:  parser.TypeString,
-	},
-	{
-		Name: "End Key",
-		Typ:  parser.TypeString,
-	},
-	{
-		Name: "Replicas",
-		// The INTs in the array are Store IDs.
-		Typ: parser.TArray{Typ: parser.TypeInt},
-	},
-	{
-		Name: "Lease Holder",
-		// The store ID for the lease holder.
-		Typ: parser.TypeInt,
-	},
-}
-
-func (n *showRangesNode) Start(params runParams) error {
-	var err error
-	n.descriptorKVs, err = scanMetaKVs(params.ctx, params.p.txn, n.span)
-	return err
-}
-
-func (n *showRangesNode) Next(params runParams) (bool, error) {
-	if n.rowIdx >= len(n.descriptorKVs) {
-		return false, nil
-	}
-
-	var desc roachpb.RangeDescriptor
-	if err := n.descriptorKVs[n.rowIdx].ValueProto(&desc); err != nil {
-		return false, err
-	}
-	for i := range n.values {
-		n.values[i] = parser.DNull
-	}
-
-	if n.rowIdx > 0 {
-		n.values[0] = parser.NewDString(sqlbase.PrettyKey(desc.StartKey.AsRawKey(), 2))
-	}
-
-	if n.rowIdx < len(n.descriptorKVs)-1 {
-		n.values[1] = parser.NewDString(sqlbase.PrettyKey(desc.EndKey.AsRawKey(), 2))
-	}
-
-	var replicas []int
-	for _, rd := range desc.Replicas {
-		replicas = append(replicas, int(rd.StoreID))
-	}
-	sort.Ints(replicas)
-
-	replicaArr := parser.NewDArray(parser.TypeInt)
-	replicaArr.Array = make(parser.Datums, len(replicas))
-	for i, r := range replicas {
-		replicaArr.Array[i] = parser.NewDInt(parser.DInt(r))
-	}
-	n.values[2] = replicaArr
-
-	// Get the lease holder.
-	// TODO(radu): this will be slow if we have a lot of ranges; find a way to
-	// make this part optional.
-	b := &client.Batch{}
-	b.AddRawRequest(&roachpb.LeaseInfoRequest{
-		Span: roachpb.Span{
-			Key: desc.StartKey.AsRawKey(),
-		},
-	})
-	if err := params.p.txn.Run(params.ctx, b); err != nil {
-		return false, errors.Wrap(err, "error getting lease info")
-	}
-	resp := b.RawResponse().Responses[0].GetInner().(*roachpb.LeaseInfoResponse)
-	n.values[3] = parser.NewDInt(parser.DInt(resp.Lease.Replica.StoreID))
-
-	n.rowIdx++
-	return true, nil
-}
-
-func (n *showRangesNode) Values() parser.Datums {
-	return n.values
-}
-
-func (n *showRangesNode) Close(_ context.Context) {
-	n.descriptorKVs = nil
-}
-
-// scanMetaKVs returns the meta KVs for the ranges that touch the given span.
-func scanMetaKVs(
+// ScanMetaKVs returns the meta KVs for the ranges that touch the given span.
+func ScanMetaKVs(
 	ctx context.Context, txn *client.Txn, span roachpb.Span,
 ) ([]client.KeyValue, error) {
-	metaStart := keys.RangeMetaKey(keys.MustAddr(span.Key))
+	metaStart := keys.RangeMetaKey(keys.MustAddr(span.Key).Next())
 	metaEnd := keys.RangeMetaKey(keys.MustAddr(span.EndKey))
 
 	kvs, err := txn.Scan(ctx, metaStart, metaEnd, 0)
 	if err != nil {
 		return nil, err
 	}
-	if len(kvs) == 0 || !kvs[len(kvs)-1].Key.Equal(metaEnd) {
+	if len(kvs) == 0 || !kvs[len(kvs)-1].Key.Equal(metaEnd.AsRawKey()) {
 		// Normally we need to scan one more KV because the ranges are addressed by
 		// the end key.
 		extraKV, err := txn.Scan(ctx, metaEnd, keys.Meta2Prefix.PrefixEnd(), 1 /* one result */)

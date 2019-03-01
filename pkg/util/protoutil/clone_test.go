@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package protoutil_test
 
@@ -22,20 +20,19 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gogo/protobuf/proto"
-
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/gogo/protobuf/proto"
 )
 
 func TestCloneProto(t *testing.T) {
 	testCases := []struct {
-		pb          proto.Message
+		pb          protoutil.Message
 		shouldPanic bool
 	}{
 		// Uncloneable types (all contain UUID fields).
@@ -43,6 +40,7 @@ func TestCloneProto(t *testing.T) {
 		{&enginepb.TxnMeta{}, true},
 		{&roachpb.Transaction{}, true},
 		{&roachpb.Error{}, true},
+		{&protoutil.RecursiveAndUncloneable{}, true},
 
 		// Cloneable types. This includes all types for which a
 		// protoutil.Clone call exists in the codebase as of 2016-11-21.
@@ -52,11 +50,12 @@ func TestCloneProto(t *testing.T) {
 		{&sqlbase.IndexDescriptor{}, false},
 		{&roachpb.SplitTrigger{}, false},
 		{&roachpb.Value{}, false},
-		{&storagebase.ReplicaState{}, false},
+		{&storagepb.ReplicaState{}, false},
 		{&roachpb.RangeDescriptor{}, false},
+		{&sqlbase.PartitioningDescriptor{}, false},
 	}
 	for _, tc := range testCases {
-		var clone proto.Message
+		var clone protoutil.Message
 		var panicObj interface{}
 		func() {
 			defer func() {

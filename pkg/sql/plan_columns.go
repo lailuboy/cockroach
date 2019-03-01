@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
 
 package sql
 
@@ -26,7 +25,7 @@ var noColumns = make(sqlbase.ResultColumns, 0)
 //
 // The length of the returned slice is guaranteed to be equal to the
 // length of the tuple returned by the planNode's Values() method
-// during local exeecution.
+// during local execution.
 //
 // The returned slice is *not* mutable. To modify the result column
 // set, implement a separate recursion (e.g. needed_columns.go) or use
@@ -50,8 +49,6 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 	switch n := plan.(type) {
 
 	// Nodes that define their own schema.
-	case *copyNode:
-		return n.resultColumns
 	case *delayedNode:
 		return n.columns
 	case *groupNode:
@@ -68,52 +65,74 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 		return n.resultColumns
 	case *sortNode:
 		return n.columns
-	case *valueGenerator:
+	case *unionNode:
 		return n.columns
 	case *valuesNode:
 		return n.columns
+	case *virtualTableNode:
+		return n.columns
 	case *explainPlanNode:
-		return n.results.columns
+		return n.run.results.columns
 	case *windowNode:
-		return n.values.columns
-	case *traceNode:
+		return n.run.values.columns
+	case *showTraceNode:
+		return n.columns
+	case *zeroNode:
+		return n.columns
+	case *deleteNode:
+		return n.columns
+	case *updateNode:
+		return n.columns
+	case *insertNode:
+		return n.columns
+	case *upsertNode:
+		return n.columns
+	case *indexJoinNode:
+		return n.resultColumns
+	case *projectSetNode:
+		return n.columns
+	case *lookupJoinNode:
+		return n.columns
+	case *zigzagJoinNode:
 		return n.columns
 
-		// Nodes with a fixed schema.
+	// Nodes with a fixed schema.
+	case *scrubNode:
+		return n.getColumns(mut, scrubColumns)
 	case *explainDistSQLNode:
-		return n.getColumns(mut, explainDistSQLColumns)
-	case *testingRelocateNode:
+		return n.getColumns(mut, sqlbase.ExplainDistSQLColumns)
+	case *relocateNode:
 		return n.getColumns(mut, relocateNodeColumns)
 	case *scatterNode:
 		return n.getColumns(mut, scatterNodeColumns)
-	case *showRangesNode:
-		return n.getColumns(mut, showRangesColumns)
+	case *showZoneConfigNode:
+		return n.getColumns(mut, showZoneConfigNodeColumns)
 	case *showFingerprintsNode:
 		return n.getColumns(mut, showFingerprintsColumns)
 	case *splitNode:
 		return n.getColumns(mut, splitNodeColumns)
+	case *showTraceReplicaNode:
+		return n.getColumns(mut, sqlbase.ShowReplicaTraceColumns)
+	case *sequenceSelectNode:
+		return n.getColumns(mut, sequenceSelectColumns)
 
-		// Nodes using the RETURNING helper.
-	case *deleteNode:
-		return n.rh.columns
-	case *insertNode:
-		return n.rh.columns
-	case *updateNode:
-		return n.rh.columns
-
-		// Nodes that have the same schema as their source or their
-		// valueNode helper.
+	// Nodes that have the same schema as their source or their
+	// valueNode helper.
 	case *distinctNode:
 		return getPlanColumns(n.plan, mut)
 	case *filterNode:
 		return getPlanColumns(n.source.plan, mut)
-	case *indexJoinNode:
-		return getPlanColumns(n.table, mut)
+	case *max1RowNode:
+		return getPlanColumns(n.plan, mut)
 	case *limitNode:
 		return getPlanColumns(n.plan, mut)
-	case *unionNode:
-		return getPlanColumns(n.left, mut)
+	case *spoolNode:
+		return getPlanColumns(n.source, mut)
+	case *serializeNode:
+		return getPlanColumns(n.source, mut)
 
+	case *rowSourceToPlanNode:
+		return n.planCols
 	}
 
 	// Every other node has no columns in their results.

@@ -1,3 +1,11 @@
+// Copyright 2014, Google Inc.
+// All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in licenses/BSD-grpc.txt.
+
+// Portions of this file are additionally subject to the following
+// license and copyright.
+//
 // Copyright 2017 The Cockroach Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,55 +19,23 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 // The code below is a modified version of a similar structure found in
 // grpc-go (github.com/grpc/grpc-go/blob/b2fae0c/transport/control.go).
 // Specifically we allow for arbitrarily sized acquisitions and avoid
 // starvation by internally maintaining a FIFO structure.
 
-/*
-*
-* Copyright 2014, Google Inc.
-* All rights reserved.
-*
-* Redistribution and use in source and binary forms, with or without
-* modification, are permitted provided that the following conditions are
-* met:
-*
-*     * Redistributions of source code must retain the above copyright
-* notice, this list of conditions and the following disclaimer.
-*     * Redistributions in binary form must reproduce the above
-* copyright notice, this list of conditions and the following disclaimer
-* in the documentation and/or other materials provided with the
-* distribution.
-*     * Neither the name of Google Inc. nor the names of its
-* contributors may be used to endorse or promote products derived from
-* this software without specific prior written permission.
-*
-* THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-* "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-* LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-* A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-* OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-* SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-* LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-* DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-* THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-* OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*
- */
-
 package storage
 
 import (
+	"context"
+	"time"
+
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"golang.org/x/net/context"
 )
 
 type quotaPool struct {
@@ -71,7 +47,7 @@ type quotaPool struct {
 	// for a notification that indicates they're now first in line. This is
 	// done by appending to the queue the channel they will then wait
 	// on. If a goroutine no longer needs to be notified, i.e. their
-	// acquisition context has been cancelled, the goroutine is responsible for
+	// acquisition context has been canceled, the goroutine is responsible for
 	// blocking subsequent notifications to the channel by filling up the
 	// channel buffer.
 	queue []chan struct{}
@@ -110,6 +86,12 @@ func newQuotaPool(q int64) *quotaPool {
 // Safe for concurrent use.
 func (qp *quotaPool) add(v int64) {
 	qp.Lock()
+	qp.addLocked(v)
+	qp.Unlock()
+}
+
+// addLocked is like add, but it requires that qp.Lock is held.
+func (qp *quotaPool) addLocked(v int64) {
 	select {
 	case q := <-qp.quota:
 		v += q
@@ -119,7 +101,15 @@ func (qp *quotaPool) add(v int64) {
 		v = qp.max
 	}
 	qp.quota <- v
-	qp.Unlock()
+}
+
+func logSlowQuota(ctx context.Context, v int64, start time.Time) func() {
+	log.Warningf(ctx, "have been waiting %s attempting to acquire %s of proposal quota",
+		timeutil.Since(start), humanizeutil.IBytes(v))
+	return func() {
+		log.Infof(ctx, "acquired %s of proposal quota after %s",
+			humanizeutil.IBytes(v), timeutil.Since(start))
+	}
 }
 
 // acquire acquires the specified amount of quota from the pool. On success,
@@ -142,16 +132,17 @@ func (qp *quotaPool) acquire(ctx context.Context, v int64) error {
 	}
 	qp.Unlock()
 	slowTimer := timeutil.NewTimer()
-	slowTimer.Reset(base.SlowRequestThreshold)
 	defer slowTimer.Stop()
 	start := timeutil.Now()
 
+	// Intentionally reset only once, for we care more about the select duration in
+	// goroutine profiles than periodic logging.
+	slowTimer.Reset(base.SlowRequestThreshold)
 	for {
 		select {
-		case now := <-slowTimer.C:
-			slowTimer.Reset(base.SlowRequestThreshold)
-			log.Warningf(ctx, "have been waiting %s attempting to acquire quota",
-				now.Sub(start))
+		case <-slowTimer.C:
+			slowTimer.Read = true
+			defer logSlowQuota(ctx, v, start)()
 			continue
 		case <-ctx.Done():
 			qp.Lock()
@@ -177,7 +168,7 @@ func (qp *quotaPool) acquire(ctx context.Context, v int64) error {
 			return ctx.Err()
 		case <-qp.done:
 			// We don't need to 'unregister' ourselves as in the case when the
-			// context is cancelled. In fact, we want others waiters to only
+			// context is canceled. In fact, we want others waiters to only
 			// receive on qp.done and signaling them would work against that.
 			return nil
 		case <-notifyCh:
@@ -187,23 +178,21 @@ func (qp *quotaPool) acquire(ctx context.Context, v int64) error {
 
 	// We're first in line to receive quota, we keep accumulating quota until
 	// we've acquired enough or determine we no longer need the acquisition.
-	// If we have acquired the quota needed or our context gets cancelled,
+	// If we have acquired the quota needed or our context gets canceled,
 	// we're sure to remove ourselves from the queue and notify the goroutine
 	// next in line (if any).
 
 	var acquired int64
 	for acquired < v {
 		select {
-		case now := <-slowTimer.C:
-			slowTimer.Reset(base.SlowRequestThreshold)
-			log.Warningf(ctx, "have been waiting %s attempting to acquire quota",
-				now.Sub(start))
+		case <-slowTimer.C:
+			slowTimer.Read = true
+			defer logSlowQuota(ctx, v, start)()
 		case <-ctx.Done():
-			if acquired > 0 {
-				qp.add(acquired)
-			}
-
 			qp.Lock()
+			if acquired > 0 {
+				qp.addLocked(acquired)
+			}
 			qp.notifyNextLocked()
 			qp.Unlock()
 			return ctx.Err()
@@ -215,11 +204,12 @@ func (qp *quotaPool) acquire(ctx context.Context, v int64) error {
 			acquired += q
 		}
 	}
-	if acquired > v {
-		qp.add(acquired - v)
-	}
+	extra := acquired - v
 
 	qp.Lock()
+	if extra > 0 {
+		qp.addLocked(extra)
+	}
 	qp.notifyNextLocked()
 	qp.Unlock()
 	return nil
@@ -232,7 +222,7 @@ func (qp *quotaPool) notifyNextLocked() {
 	// waiting to be notified, notify the goroutine and truncate our queue so
 	// to ensure the said goroutine is at the head of the queue. Normally the
 	// next lined up waiter is the one waiting for notification, but if others
-	// behind us have also gotten their context cancelled, they
+	// behind us have also gotten their context canceled, they
 	// will leave behind waiters that we would skip below.
 	//
 	// If we determine there are no goroutines waiting, we simply truncate the

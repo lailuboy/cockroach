@@ -1,4 +1,4 @@
-# LogicTest: default
+# LogicTest: local local-opt
 
 statement ok
 CREATE USER user1
@@ -6,7 +6,8 @@ CREATE USER user1
 query T colnames
 SHOW USERS
 ----
-username
+user_name
+root
 testuser
 user1
 
@@ -16,7 +17,8 @@ DROP USER user1
 query T colnames
 SHOW USERS
 ----
-username
+user_name
+root
 testuser
 
 statement ok
@@ -25,7 +27,8 @@ CREATE USER user1
 query T colnames
 SHOW USERS
 ----
-username
+user_name
+root
 testuser
 user1
 
@@ -35,7 +38,8 @@ DROP USER USEr1
 query T colnames
 SHOW USERS
 ----
-username
+user_name
+root
 testuser
 
 statement error user user1 does not exist
@@ -50,7 +54,7 @@ DROP USER IF EXISTS user1
 statement error username "node" reserved
 DROP USER node
 
-statement error pq: username "foo☂" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits or underscores, and must not exceed 63 characters
+statement error pq: username "foo☂" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
 DROP USER foo☂
 
 statement ok
@@ -68,7 +72,8 @@ CREATE USER user4
 query T colnames
 SHOW USERS
 ----
-username
+user_name
+root
 testuser
 user1
 user2
@@ -81,7 +86,8 @@ DROP USER user1,user2
 query T colnames
 SHOW USERS
 ----
-username
+user_name
+root
 testuser
 user3
 user4
@@ -92,22 +98,51 @@ DROP USER user1,user3
 query T colnames
 SHOW USERS
 ----
-username
+user_name
+root
 testuser
 user3
 user4
 
 statement ok
+CREATE USER user1
+
+statement ok
+CREATE TABLE foo(x INT);
+ GRANT SELECT ON foo TO user3;
+ GRANT SELECT ON DATABASE test TO user1
+
+statement error cannot drop users or roles user1, user3: grants still exist on test, test.public.foo
 DROP USER IF EXISTS user1,user3
+
+statement error cannot drop users or roles user1, user3: grants still exist on test
+REVOKE SELECT ON foo FROM user3;
+  DROP USER IF EXISTS user1,user3
+
+statement ok
+REVOKE SELECT ON DATABASE test FROM user1;
+  DROP USER IF EXISTS user1,user3
+
+statement ok
+PREPARE du AS DROP USER $1;
+ EXECUTE du('user4')
 
 query T colnames
 SHOW USERS
 ----
-username
+user_name
+root
 testuser
-user4
 
 user testuser
 
 statement error pq: user testuser does not have DELETE privilege on relation users
 DROP USER user2
+
+user root
+
+statement error pq: cannot drop user or role root: grants still exist on .*
+DROP USER root
+
+statement error pq: cannot drop user or role admin: grants still exist on .*
+DROP USER admin

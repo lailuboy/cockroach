@@ -11,38 +11,35 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package server_test
 
 import (
+	"context"
 	"testing"
 	"time"
-
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/pkg/errors"
 )
 
 func TestAdminAPITableStats(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip("#8890")
 
 	const nodeCount = 3
 	tc := testcluster.StartTestCluster(t, nodeCount, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationAuto,
 		ServerArgs: base.TestServerArgs{
 			ScanInterval:    time.Millisecond,
+			ScanMinIdleTime: time.Millisecond,
 			ScanMaxIdleTime: time.Millisecond,
 		},
 	})
@@ -52,12 +49,12 @@ func TestAdminAPITableStats(t *testing.T) {
 	// Create clients (SQL, HTTP) connected to server 0.
 	db := tc.ServerConn(0)
 
-	client, err := server0.GetHTTPClient()
+	client, err := server0.GetAuthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	client.Timeout = base.NetworkTimeout * 3
+	client.Timeout = time.Hour // basically no timeout
 
 	// Make a single table and insert some data. The database and test have
 	// names which require escaping, in order to verify that database and
@@ -90,7 +87,10 @@ func TestAdminAPITableStats(t *testing.T) {
 	// this to occur, and for full replication.
 	testutils.SucceedsSoon(t, func() error {
 		if err := httputil.GetJSON(client, url, &tsResponse); err != nil {
-			return err
+			t.Fatal(err)
+		}
+		if len(tsResponse.MissingNodes) != 0 {
+			return errors.Errorf("missing nodes: %+v", tsResponse.MissingNodes)
 		}
 		if tsResponse.RangeCount != 1 {
 			return errors.Errorf("Table range not yet separated.")
@@ -101,14 +101,12 @@ func TestAdminAPITableStats(t *testing.T) {
 		if a, e := tsResponse.ReplicaCount, int64(nodeCount); a != e {
 			return errors.Errorf("expected %d replicas, found %d", e, a)
 		}
+		if a, e := tsResponse.Stats.KeyCount, int64(30); a < e {
+			return errors.Errorf("expected at least %d total keys, found %d", e, a)
+		}
 		return nil
 	})
 
-	// These two conditions *must* be true, given that the above
-	// SucceedsSoon has succeeded.
-	if a, e := tsResponse.Stats.KeyCount, int64(20); a < e {
-		t.Fatalf("expected at least 20 total keys, found %d", a)
-	}
 	if len(tsResponse.MissingNodes) > 0 {
 		t.Fatalf("expected no missing nodes, found %v", tsResponse.MissingNodes)
 	}
@@ -162,7 +160,7 @@ func TestLivenessAPI(t *testing.T) {
 		if a, e := len(resp.Livenesses), tc.NumServers(); a != e {
 			return errors.Errorf("found %d liveness records, wanted %d", a, e)
 		}
-		livenessMap := make(map[roachpb.NodeID]storage.Liveness)
+		livenessMap := make(map[roachpb.NodeID]storagepb.Liveness)
 		for _, l := range resp.Livenesses {
 			livenessMap[l.NodeID] = l
 		}
@@ -178,6 +176,15 @@ func TestLivenessAPI(t *testing.T) {
 					s.NodeID(),
 					startTime,
 					sl.Expiration,
+				)
+			}
+			status, ok := resp.Statuses[s.NodeID()]
+			if !ok {
+				return errors.Errorf("found no liveness status for node %d", s.NodeID())
+			}
+			if a, e := status, storagepb.NodeLivenessStatus_LIVE; a != e {
+				return errors.Errorf(
+					"liveness status for node %s was %s, wanted %s", s.NodeID(), a, e,
 				)
 			}
 		}

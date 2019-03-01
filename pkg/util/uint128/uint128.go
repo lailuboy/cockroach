@@ -11,15 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tristan Ohlson (tsohlson@gmail.com)
 
 package uint128
 
 import (
 	"encoding/binary"
 	"encoding/hex"
-	"fmt"
 
 	"github.com/pkg/errors"
 )
@@ -42,6 +39,25 @@ func (u Uint128) String() string {
 	return hex.EncodeToString(u.GetBytes())
 }
 
+// Equal returns whether or not the Uint128 are equivalent.
+func (u Uint128) Equal(o Uint128) bool {
+	return u.Hi == o.Hi && u.Lo == o.Lo
+}
+
+// Compare compares the two Uint128.
+func (u Uint128) Compare(o Uint128) int {
+	if u.Hi > o.Hi {
+		return 1
+	} else if u.Hi < o.Hi {
+		return -1
+	} else if u.Lo > o.Lo {
+		return 1
+	} else if u.Lo < o.Lo {
+		return -1
+	}
+	return 0
+}
+
 // Add returns a new Uint128 incremented by n.
 func (u Uint128) Add(n uint64) Uint128 {
 	lo := u.Lo + n
@@ -62,7 +78,23 @@ func (u Uint128) Sub(n uint64) Uint128 {
 	return Uint128{hi, lo}
 }
 
+// And returns a new Uint128 that is the bitwise AND of two Uint128 values.
+func (u Uint128) And(o Uint128) Uint128 {
+	return Uint128{u.Hi & o.Hi, u.Lo & o.Lo}
+}
+
+// Or returns a new Uint128 that is the bitwise OR of two Uint128 values.
+func (u Uint128) Or(o Uint128) Uint128 {
+	return Uint128{u.Hi | o.Hi, u.Lo | o.Lo}
+}
+
+// Xor returns a new Uint128 that is the bitwise XOR of two Uint128 values.
+func (u Uint128) Xor(o Uint128) Uint128 {
+	return Uint128{u.Hi ^ o.Hi, u.Lo ^ o.Lo}
+}
+
 // FromBytes parses the byte slice as a 128 bit big-endian unsigned integer.
+// The caller is responsible for ensuring the byte slice contains 16 bytes.
 func FromBytes(b []byte) Uint128 {
 	hi := binary.BigEndian.Uint64(b[:8])
 	lo := binary.BigEndian.Uint64(b[8:])
@@ -72,11 +104,11 @@ func FromBytes(b []byte) Uint128 {
 // FromString parses a hexadecimal string as a 128-bit big-endian unsigned integer.
 func FromString(s string) (Uint128, error) {
 	if len(s) > 32 {
-		return Uint128{}, fmt.Errorf("Input string %s too large for uint128", s)
+		return Uint128{}, errors.Errorf("input string %s too large for uint128", s)
 	}
 	bytes, err := hex.DecodeString(s)
 	if err != nil {
-		return Uint128{}, errors.Wrapf(err, "Could not decode %s as hex", s)
+		return Uint128{}, errors.Wrapf(err, "could not decode %s as hex", s)
 	}
 
 	// Grow the byte slice if it's smaller than 16 bytes, by prepending 0s

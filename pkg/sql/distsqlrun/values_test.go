@@ -11,81 +11,86 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
-func TestValues(t *testing.T) {
+// generateValueSpec generates a ValuesCoreSpec that encodes the given rows. We pass
+// the types as well because zero rows are allowed.
+func generateValuesSpec(
+	colTypes []sqlbase.ColumnType, rows sqlbase.EncDatumRows, rowsPerChunk int,
+) (distsqlpb.ValuesCoreSpec, error) {
+	var spec distsqlpb.ValuesCoreSpec
+	spec.Columns = make([]distsqlpb.DatumInfo, len(colTypes))
+	for i := range spec.Columns {
+		spec.Columns[i].Type = colTypes[i]
+		spec.Columns[i].Encoding = sqlbase.DatumEncoding_VALUE
+	}
+
+	var a sqlbase.DatumAlloc
+	for i := 0; i < len(rows); {
+		var buf []byte
+		for end := i + rowsPerChunk; i < len(rows) && i < end; i++ {
+			for j, info := range spec.Columns {
+				var err error
+				buf, err = rows[i][j].Encode(&colTypes[j], &a, info.Encoding, buf)
+				if err != nil {
+					return distsqlpb.ValuesCoreSpec{}, err
+				}
+			}
+		}
+		spec.RawBytes = append(spec.RawBytes, buf)
+	}
+	return spec, nil
+}
+
+func TestValuesProcessor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	rng, _ := randutil.NewPseudoRand()
 	for _, numRows := range []int{0, 1, 10, 13, 15} {
 		for _, numCols := range []int{1, 3} {
 			for _, rowsPerChunk := range []int{1, 2, 5} {
 				t.Run(fmt.Sprintf("%d-%d-%d", numRows, numCols, rowsPerChunk), func(t *testing.T) {
-					var a sqlbase.DatumAlloc
-					var spec ValuesCoreSpec
-					spec.Columns = make([]DatumInfo, numCols)
-					for i := range spec.Columns {
-						spec.Columns[i].Type = sqlbase.RandColumnType(rng)
-						spec.Columns[i].Encoding = sqlbase.DatumEncoding_VALUE
-					}
+					inRows, colTypes := sqlbase.RandEncDatumRows(rng, numRows, numCols)
 
-					// Generate random rows.
-					inRows := make(sqlbase.EncDatumRows, numRows)
-					for i := 0; i < numRows; i++ {
-						inRows[i] = make(sqlbase.EncDatumRow, numCols)
-						for j, info := range spec.Columns {
-							d := sqlbase.RandDatum(rng, info.Type, true)
-							inRows[i][j] = sqlbase.DatumToEncDatum(info.Type, d)
-						}
-					}
-
-					// Encode the rows.
-					for i := 0; i < numRows; {
-						var buf []byte
-						for end := i + rowsPerChunk; i < numRows && i < end; i++ {
-							for j, info := range spec.Columns {
-								var err error
-								buf, err = inRows[i][j].Encode(&a, info.Encoding, buf)
-								if err != nil {
-									t.Fatal(err)
-								}
-							}
-						}
-						spec.RawBytes = append(spec.RawBytes, buf)
-					}
-
-					out := &RowBuffer{}
-					flowCtx := FlowCtx{}
-
-					v, err := newValuesProcessor(&flowCtx, &spec, &PostProcessSpec{}, out)
+					spec, err := generateValuesSpec(colTypes, inRows, rowsPerChunk)
 					if err != nil {
 						t.Fatal(err)
 					}
-					v.Run(context.Background(), nil)
-					if !out.ProducerClosed {
+
+					out := &RowBuffer{}
+					st := cluster.MakeTestingClusterSettings()
+					evalCtx := tree.NewTestingEvalContext(st)
+					defer evalCtx.Stop(context.Background())
+					flowCtx := FlowCtx{
+						Settings: st,
+						EvalCtx:  evalCtx,
+					}
+
+					v, err := newValuesProcessor(&flowCtx, 0 /* processorID */, &spec, &distsqlpb.PostProcessSpec{}, out)
+					if err != nil {
+						t.Fatal(err)
+					}
+					v.Run(context.Background())
+					if !out.ProducerClosed() {
 						t.Fatalf("output RowReceiver not closed")
 					}
 
 					var res sqlbase.EncDatumRows
 					for {
-						row, meta := out.Next()
-						if !meta.Empty() {
-							t.Fatalf("unexpected metadata: %v", meta)
-						}
+						row := out.NextNoMeta(t)
 						if row == nil {
 							break
 						}
@@ -96,24 +101,63 @@ func TestValues(t *testing.T) {
 						t.Fatalf("incorrect number of rows %d, expected %d", len(res), numRows)
 					}
 
-					evalCtx := parser.NewTestingEvalContext()
-					defer evalCtx.Stop(context.Background())
+					var a sqlbase.DatumAlloc
 					for i := 0; i < numRows; i++ {
 						if len(res[i]) != numCols {
 							t.Fatalf("row %d incorrect length %d, expected %d", i, len(res[i]), numCols)
 						}
-						for j, res := range res[i] {
-							cmp, err := res.Compare(&a, evalCtx, &inRows[i][j])
+						for j, val := range res[i] {
+							cmp, err := val.Compare(&colTypes[j], &a, evalCtx, &inRows[i][j])
 							if err != nil {
 								t.Fatal(err)
 							}
 							if cmp != 0 {
-								t.Errorf("row %d, column %d: received %s, expected %s", i, j, &res, &inRows[i][j])
+								t.Errorf(
+									"row %d, column %d: received %s, expected %s",
+									i, j, val.String(&colTypes[j]), inRows[i][j].String(&colTypes[j]),
+								)
 							}
 						}
 					}
 				})
 			}
+		}
+	}
+}
+
+func BenchmarkValuesProcessor(b *testing.B) {
+	const numCols = 2
+
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+
+	flowCtx := FlowCtx{
+		Settings: st,
+		EvalCtx:  &evalCtx,
+	}
+	post := distsqlpb.PostProcessSpec{}
+	output := RowDisposer{}
+	for _, numRows := range []int{1 << 4, 1 << 8, 1 << 12, 1 << 16} {
+		for _, rowsPerChunk := range []int{1, 4, 16} {
+			b.Run(fmt.Sprintf("rows=%d,chunkSize=%d", numRows, rowsPerChunk), func(b *testing.B) {
+				rows := sqlbase.MakeIntRows(numRows, numCols)
+				spec, err := generateValuesSpec(sqlbase.TwoIntCols, rows, rowsPerChunk)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				b.SetBytes(int64(8 * numRows * numCols))
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					v, err := newValuesProcessor(&flowCtx, 0 /* processorID */, &spec, &post, &output)
+					if err != nil {
+						b.Fatal(err)
+					}
+					v.Run(context.Background())
+				}
+			})
 		}
 	}
 }

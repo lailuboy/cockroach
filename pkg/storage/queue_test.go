@@ -11,20 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
 import (
 	"container/heap"
-	"fmt"
+	"context"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
@@ -32,30 +28,34 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
 )
 
 // testQueueImpl implements queueImpl with a closure for shouldQueue.
 type testQueueImpl struct {
 	shouldQueueFn func(hlc.Timestamp, *Replica) (bool, float64)
-	processed     int32
+	processed     int32 // accessed atomically
 	duration      time.Duration
 	blocker       chan struct{} // timer() blocks on this if not nil
-	pChan         chan struct{}
+	pChan         chan time.Time
 	err           error // always returns this error on process
 }
 
 func (tq *testQueueImpl) shouldQueue(
-	_ context.Context, now hlc.Timestamp, r *Replica, _ config.SystemConfig,
+	_ context.Context, now hlc.Timestamp, r *Replica, _ *config.SystemConfig,
 ) (bool, float64) {
 	return tq.shouldQueueFn(now, r)
 }
 
-func (tq *testQueueImpl) process(_ context.Context, _ *Replica, _ config.SystemConfig) error {
+func (tq *testQueueImpl) process(_ context.Context, _ *Replica, _ *config.SystemConfig) error {
 	atomic.AddInt32(&tq.processed, 1)
 	return tq.err
 }
@@ -74,7 +74,7 @@ func (tq *testQueueImpl) timer(_ time.Duration) time.Duration {
 	return 0
 }
 
-func (tq *testQueueImpl) purgatoryChan() <-chan struct{} {
+func (tq *testQueueImpl) purgatoryChan() <-chan time.Time {
 	return tq.pChan
 }
 
@@ -93,6 +93,34 @@ func makeTestBaseQueue(
 	return newBaseQueue(name, impl, store, gossip, cfg)
 }
 
+func createReplicas(t *testing.T, tc *testContext, num int) []*Replica {
+	t.Helper()
+
+	// Remove replica for range 1 since it encompasses the entire keyspace.
+	repl1, err := tc.store.GetReplica(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tc.store.RemoveReplica(context.Background(), repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+		DestroyData: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	repls := make([]*Replica, num)
+	for i := 0; i < num; i++ {
+		id := roachpb.RangeID(1000 + i)
+		key := roachpb.RKey(strconv.Itoa(int(id)))
+		endKey := roachpb.RKey(string(key) + "/end")
+		r := createReplica(tc.store, id, key, endKey)
+		if err := tc.store.AddReplica(r); err != nil {
+			t.Fatal(err)
+		}
+		repls[i] = r
+	}
+	return repls
+}
+
 // TestQueuePriorityQueue verifies priority queue implementation.
 func TestQueuePriorityQueue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -100,14 +128,15 @@ func TestQueuePriorityQueue(t *testing.T) {
 	// establish the priority queue (heap) invariants.
 	const count = 3
 	expRanges := make([]roachpb.RangeID, count+1)
-	pq := make(priorityQueue, count)
+	pq := priorityQueue{}
+	pq.sl = make([]*replicaItem, count)
 	for i := 0; i < count; {
-		pq[i] = &replicaItem{
+		pq.sl[i] = &replicaItem{
 			value:    roachpb.RangeID(i),
 			priority: float64(i),
 			index:    i,
 		}
-		expRanges[3-i] = pq[i].value
+		expRanges[3-i] = pq.sl[i].value
 		i++
 	}
 	heap.Init(&pq)
@@ -137,26 +166,12 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
 	tc.Start(t, stopper)
 
-	// Remove replica for range 1 since it encompasses the entire keyspace.
-	repl1, err := tc.store.GetReplica(1)
-	if err != nil {
-		t.Error(err)
-	}
-	if err := tc.store.RemoveReplica(context.Background(), repl1, *repl1.Desc(), true); err != nil {
-		t.Error(err)
-	}
-
-	r1 := createReplica(tc.store, 1001, roachpb.RKey("1001"), roachpb.RKey("1001/end"))
-	if err := tc.store.AddReplica(r1); err != nil {
-		t.Fatal(err)
-	}
-	r2 := createReplica(tc.store, 1002, roachpb.RKey("1002"), roachpb.RKey("1002/end"))
-	if err := tc.store.AddReplica(r2); err != nil {
-		t.Fatal(err)
-	}
+	repls := createReplicas(t, &tc, 2)
+	r1, r2 := repls[0], repls[1]
 
 	shouldAddMap := map[*Replica]bool{
 		r1: true,
@@ -183,12 +198,16 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	}
 	if bq.pop() != r2 {
 		t.Error("expected r2")
+	} else {
+		bq.finishProcessingReplica(ctx, stopper, r2, nil)
 	}
 	if v := bq.pending.Value(); v != 1 {
 		t.Errorf("expected 1 pending replicas; got %d", v)
 	}
 	if bq.pop() != r1 {
 		t.Error("expected r1")
+	} else {
+		bq.finishProcessingReplica(ctx, stopper, r1, nil)
 	}
 	if v := bq.pending.Value(); v != 0 {
 		t.Errorf("expected 0 pending replicas; got %d", v)
@@ -221,9 +240,13 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	}
 	if bq.pop() != r1 {
 		t.Error("expected r1")
+	} else {
+		bq.finishProcessingReplica(ctx, stopper, r1, nil)
 	}
 	if bq.pop() != r2 {
 		t.Error("expected r2")
+	} else {
+		bq.finishProcessingReplica(ctx, stopper, r2, nil)
 	}
 	if r := bq.pop(); r != nil {
 		t.Errorf("expected empty queue; got %v", r)
@@ -239,9 +262,13 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	}
 	if bq.pop() != r1 {
 		t.Error("expected r1")
+	} else {
+		bq.finishProcessingReplica(ctx, stopper, r1, nil)
 	}
 	if bq.pop() != r2 {
 		t.Error("expected r2")
+	} else {
+		bq.finishProcessingReplica(ctx, stopper, r2, nil)
 	}
 	if r := bq.pop(); r != nil {
 		t.Errorf("expected empty queue; got %v", r)
@@ -259,9 +286,53 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	}
 	if bq.pop() != r1 {
 		t.Errorf("expected r1")
+	} else {
+		bq.finishProcessingReplica(ctx, stopper, r1, nil)
 	}
 	if v := bq.pending.Value(); v != 0 {
 		t.Errorf("expected 0 pending replicas; got %d", v)
+	}
+}
+
+// TestBaseQueueSamePriorityFIFO verifies that if multiple items are queued at
+// the same priority, they will be processes in first-in-first-out order.
+// This avoids starvation scenarios, in particular in the Raft snapshot queue.
+//
+// See:
+// https://github.com/cockroachdb/cockroach/issues/31947#issuecomment-434383267
+func TestBaseQueueSamePriorityFIFO(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tc := testContext{}
+	stopper := stop.NewStopper()
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
+	tc.Start(t, stopper)
+
+	repls := createReplicas(t, &tc, 5)
+
+	testQueue := &testQueueImpl{
+		shouldQueueFn: func(now hlc.Timestamp, r *Replica) (shouldQueue bool, priority float64) {
+			t.Fatal("unexpected call to shouldQueue")
+			return false, 0.0
+		},
+	}
+
+	bq := makeTestBaseQueue("test", testQueue, tc.store, tc.gossip, queueConfig{maxSize: 100})
+
+	for _, repl := range repls {
+		added, err := bq.Add(repl, 0.0)
+		if err != nil {
+			t.Fatal(errors.Wrap(err, repl.String()))
+		}
+		if !added {
+			t.Fatalf("%v not added", repl)
+		}
+	}
+	for _, expRepl := range repls {
+		actRepl := bq.pop()
+		if actRepl != expRepl {
+			t.Fatalf("expected %v, got %v", expRepl, actRepl)
+		}
 	}
 }
 
@@ -311,23 +382,8 @@ func TestBaseQueueProcess(t *testing.T) {
 	defer stopper.Stop(context.TODO())
 	tc.StartWithStoreConfig(t, stopper, tsc)
 
-	// Remove replica for range 1 since it encompasses the entire keyspace.
-	repl1, err := tc.store.GetReplica(1)
-	if err != nil {
-		t.Error(err)
-	}
-	if err := tc.store.RemoveReplica(context.Background(), repl1, *repl1.Desc(), true); err != nil {
-		t.Error(err)
-	}
-
-	r1 := createReplica(tc.store, 1001, roachpb.RKey("1001"), roachpb.RKey("1001/end"))
-	if err := tc.store.AddReplica(r1); err != nil {
-		t.Fatal(err)
-	}
-	r2 := createReplica(tc.store, 1002, roachpb.RKey("1002"), roachpb.RKey("1002/end"))
-	if err := tc.store.AddReplica(r2); err != nil {
-		t.Fatal(err)
-	}
+	repls := createReplicas(t, &tc, 2)
+	r1, r2 := repls[0], repls[1]
 
 	testQueue := &testQueueImpl{
 		blocker: make(chan struct{}, 1),
@@ -338,7 +394,7 @@ func TestBaseQueueProcess(t *testing.T) {
 		},
 	}
 	bq := makeTestBaseQueue("test", testQueue, tc.store, tc.gossip, queueConfig{maxSize: 2})
-	bq.Start(tc.Clock(), stopper)
+	bq.Start(stopper)
 
 	bq.MaybeAdd(r1, hlc.Timestamp{})
 	bq.MaybeAdd(r2, hlc.Timestamp{})
@@ -408,9 +464,7 @@ func TestBaseQueueAddRemove(t *testing.T) {
 		},
 	}
 	bq := makeTestBaseQueue("test", testQueue, tc.store, tc.gossip, queueConfig{maxSize: 2})
-	mc := hlc.NewManualClock(123)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
-	bq.Start(clock, stopper)
+	bq.Start(stopper)
 
 	bq.MaybeAdd(r, hlc.Timestamp{})
 	bq.MaybeRemove(r.RangeID)
@@ -452,7 +506,9 @@ func TestNeedsSystemConfig(t *testing.T) {
 
 	// Use a gossip instance that won't have the system config available in it.
 	// bqNeedsSysCfg will not add the replica or process it without a system config.
-	rpcContext := rpc.NewContext(tc.store.cfg.AmbientCtx, &base.Config{Insecure: true}, tc.store.cfg.Clock, stopper)
+	rpcContext := rpc.NewContext(
+		tc.store.cfg.AmbientCtx, &base.Config{Insecure: true}, tc.store.cfg.Clock, stopper,
+		&cluster.MakeTestingClusterSettings().Version)
 	emptyGossip := gossip.NewTest(
 		tc.gossip.NodeID.Get(), rpcContext, rpc.NewServer(rpcContext), stopper, tc.store.Registry())
 	bqNeedsSysCfg := makeTestBaseQueue("test", testQueue, tc.store, emptyGossip, queueConfig{
@@ -461,10 +517,7 @@ func TestNeedsSystemConfig(t *testing.T) {
 		maxSize:              1,
 	})
 
-	mc := hlc.NewManualClock(123)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
-	bqNeedsSysCfg.Start(clock, stopper)
-
+	bqNeedsSysCfg.Start(stopper)
 	bqNeedsSysCfg.MaybeAdd(r, hlc.Timestamp{})
 	if queueFnCalled != 0 {
 		t.Fatalf("expected shouldQueueFn not to be called without valid system config, got %d calls", queueFnCalled)
@@ -489,7 +542,7 @@ func TestNeedsSystemConfig(t *testing.T) {
 		acceptsUnsplitRanges: true,
 		maxSize:              1,
 	})
-	bqNoSysCfg.Start(clock, stopper)
+	bqNoSysCfg.Start(stopper)
 	bqNoSysCfg.MaybeAdd(r, hlc.Timestamp{})
 	if queueFnCalled != 1 {
 		t.Fatalf("expected shouldQueueFn to be called even without valid system config, got %d calls", queueFnCalled)
@@ -511,7 +564,13 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	s, _ := createTestStore(t, stopper)
+	s, _ := createTestStore(t,
+		testStoreOpts{
+			// This test was written before test stores could start with more than one
+			// range and was not adapted.
+			createSystemRanges: false,
+		},
+		stopper)
 
 	maxWontSplitAddr, err := keys.Addr(keys.SystemPrefix)
 	if err != nil {
@@ -527,7 +586,9 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	if err := s.RemoveReplica(context.Background(), repl1, *repl1.Desc(), true); err != nil {
+	if err := s.RemoveReplica(context.Background(), repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+		DestroyData: true,
+	}); err != nil {
 		t.Error(err)
 	}
 
@@ -551,14 +612,13 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	}
 
 	bq := makeTestBaseQueue("test", testQueue, s, s.cfg.Gossip, queueConfig{maxSize: 2})
-	bq.Start(s.cfg.Clock, stopper)
+	bq.Start(stopper)
 
 	// Check our config.
-	var sysCfg config.SystemConfig
+	var sysCfg *config.SystemConfig
 	testutils.SucceedsSoon(t, func() error {
-		var ok bool
-		sysCfg, ok = s.cfg.Gossip.GetSystemConfig()
-		if !ok {
+		sysCfg = s.cfg.Gossip.GetSystemConfig()
+		if sysCfg == nil {
 			return errors.New("system config not yet present")
 		}
 		return nil
@@ -594,7 +654,9 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	// Now add a user object, it will trigger a split.
 	// The range willSplit starts at the beginning of the user data range,
 	// which means keys.MaxReservedDescID+1.
-	config.TestingSetZoneConfig(keys.MaxReservedDescID+2, config.ZoneConfig{RangeMaxBytes: 1 << 20})
+	zoneConfig := config.DefaultZoneConfig()
+	zoneConfig.RangeMaxBytes = proto.Int64(1 << 20)
+	config.TestingSetZoneConfig(keys.MaxReservedDescID+2, zoneConfig)
 
 	// Check our config.
 	neverSplitsDesc = neverSplits.Desc()
@@ -651,29 +713,17 @@ func TestBaseQueuePurgatory(t *testing.T) {
 			priority = float64(r.RangeID)
 			return
 		},
-		pChan: make(chan struct{}, 1),
+		pChan: make(chan time.Time, 1),
 		err:   &testError{},
 	}
 
-	// Remove replica for range 1 since it encompasses the entire keyspace.
-	repl1, err := tc.store.GetReplica(1)
-	if err != nil {
-		t.Error(err)
-	}
-	if err := tc.store.RemoveReplica(context.Background(), repl1, *repl1.Desc(), true); err != nil {
-		t.Error(err)
-	}
+	const replicaCount = 10
+	repls := createReplicas(t, &tc, replicaCount)
 
-	replicaCount := 10
 	bq := makeTestBaseQueue("test", testQueue, tc.store, tc.gossip, queueConfig{maxSize: replicaCount})
-	bq.Start(tc.Clock(), stopper)
+	bq.Start(stopper)
 
-	for i := 1; i <= replicaCount; i++ {
-		r := createReplica(tc.store, roachpb.RangeID(i+1000),
-			roachpb.RKey(fmt.Sprintf("%d", i)), roachpb.RKey(fmt.Sprintf("%d/end", i)))
-		if err := tc.store.AddReplica(r); err != nil {
-			t.Fatal(err)
-		}
+	for _, r := range repls {
 		bq.MaybeAdd(r, hlc.Timestamp{})
 	}
 
@@ -709,7 +759,7 @@ func TestBaseQueuePurgatory(t *testing.T) {
 	})
 
 	// Now, signal that purgatoried replicas should retry.
-	testQueue.pChan <- struct{}{}
+	testQueue.pChan <- timeutil.Now()
 
 	testutils.SucceedsSoon(t, func() error {
 		if pc := testQueue.getProcessed(); pc != replicaCount*2 {
@@ -744,7 +794,7 @@ func TestBaseQueuePurgatory(t *testing.T) {
 
 	// Remove error and reprocess.
 	testQueue.err = nil
-	testQueue.pChan <- struct{}{}
+	testQueue.pChan <- timeutil.Now()
 
 	testutils.SucceedsSoon(t, func() error {
 		if pc := testQueue.getProcessed(); pc != replicaCount*3 {
@@ -781,7 +831,7 @@ type processTimeoutQueueImpl struct {
 }
 
 func (pq *processTimeoutQueueImpl) process(
-	ctx context.Context, r *Replica, _ config.SystemConfig,
+	ctx context.Context, r *Replica, _ *config.SystemConfig,
 ) error {
 	<-ctx.Done()
 	atomic.AddInt32(&pq.processed, 1)
@@ -814,7 +864,7 @@ func TestBaseQueueProcessTimeout(t *testing.T) {
 			processTimeout:       time.Millisecond,
 			acceptsUnsplitRanges: true,
 		})
-	bq.Start(tc.Clock(), stopper)
+	bq.Start(stopper)
 	bq.MaybeAdd(r, hlc.Timestamp{})
 
 	if l := bq.Length(); l != 1 {
@@ -839,7 +889,7 @@ type processTimeQueueImpl struct {
 }
 
 func (pq *processTimeQueueImpl) process(
-	_ context.Context, _ *Replica, _ config.SystemConfig,
+	_ context.Context, _ *Replica, _ *config.SystemConfig,
 ) error {
 	time.Sleep(5 * time.Millisecond)
 	return nil
@@ -870,7 +920,7 @@ func TestBaseQueueTimeMetric(t *testing.T) {
 			processTimeout:       time.Millisecond,
 			acceptsUnsplitRanges: true,
 		})
-	bq.Start(tc.Clock(), stopper)
+	bq.Start(stopper)
 	bq.MaybeAdd(r, hlc.Timestamp{})
 
 	testutils.SucceedsSoon(t, func() error {
@@ -937,9 +987,7 @@ func TestBaseQueueDisable(t *testing.T) {
 		},
 	}
 	bq := makeTestBaseQueue("test", testQueue, tc.store, tc.gossip, queueConfig{maxSize: 2})
-	mc := hlc.NewManualClock(123)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
-	bq.Start(clock, stopper)
+	bq.Start(stopper)
 
 	bq.SetDisabled(true)
 	bq.MaybeAdd(r, hlc.Timestamp{})
@@ -963,4 +1011,178 @@ func TestBaseQueueDisable(t *testing.T) {
 	if pc := testQueue.getProcessed(); pc > 0 {
 		t.Errorf("expected processed count of 0; got %d", pc)
 	}
+}
+
+type parallelQueueImpl struct {
+	testQueueImpl
+	processBlocker chan struct{}
+	processing     int32 // accessed atomically
+}
+
+func (pq *parallelQueueImpl) process(
+	ctx context.Context, repl *Replica, cfg *config.SystemConfig,
+) error {
+	atomic.AddInt32(&pq.processing, 1)
+	if pq.processBlocker != nil {
+		<-pq.processBlocker
+	}
+	err := pq.testQueueImpl.process(ctx, repl, cfg)
+	atomic.AddInt32(&pq.processing, -1)
+	return err
+}
+
+func (pq *parallelQueueImpl) getProcessing() int {
+	return int(atomic.LoadInt32(&pq.processing))
+}
+
+func TestBaseQueueProcessConcurrently(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tc := testContext{}
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.TODO())
+	tc.Start(t, stopper)
+
+	repls := createReplicas(t, &tc, 3)
+	r1, r2, r3 := repls[0], repls[1], repls[2]
+
+	pQueue := &parallelQueueImpl{
+		testQueueImpl: testQueueImpl{
+			blocker: make(chan struct{}, 1),
+			shouldQueueFn: func(now hlc.Timestamp, r *Replica) (shouldQueue bool, priority float64) {
+				return true, 1
+			},
+		},
+		processBlocker: make(chan struct{}, 1),
+	}
+	bq := makeTestBaseQueue("test", pQueue, tc.store, tc.gossip,
+		queueConfig{
+			maxSize:        3,
+			maxConcurrency: 2,
+		},
+	)
+	bq.Start(stopper)
+
+	bq.MaybeAdd(r1, hlc.Timestamp{})
+	bq.MaybeAdd(r2, hlc.Timestamp{})
+	bq.MaybeAdd(r3, hlc.Timestamp{})
+
+	if exp, l := 3, bq.Length(); l != exp {
+		t.Errorf("expected %d queued replica; got %d", exp, l)
+	}
+
+	assertProcessedAndProcessing := func(expProcessed, expProcessing int) {
+		t.Helper()
+		testutils.SucceedsSoon(t, func() error {
+			if p := pQueue.getProcessed(); p != expProcessed {
+				return errors.Errorf("expected %d processed replicas; got %d", expProcessed, p)
+			}
+			if p := pQueue.getProcessing(); p != expProcessing {
+				return errors.Errorf("expected %d processing replicas; got %d", expProcessing, p)
+			}
+			return nil
+		})
+	}
+
+	close(pQueue.blocker)
+	assertProcessedAndProcessing(0, 2)
+
+	pQueue.processBlocker <- struct{}{}
+	assertProcessedAndProcessing(1, 2)
+
+	pQueue.processBlocker <- struct{}{}
+	assertProcessedAndProcessing(2, 1)
+
+	pQueue.processBlocker <- struct{}{}
+	assertProcessedAndProcessing(3, 0)
+}
+
+func TestBaseQueueRequeue(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tc := testContext{}
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.TODO())
+	tc.Start(t, stopper)
+
+	repls := createReplicas(t, &tc, 1)
+	r1 := repls[0]
+
+	var shouldQueueCount int64 // accessed atomically
+	pQueue := &parallelQueueImpl{
+		testQueueImpl: testQueueImpl{
+			blocker: make(chan struct{}, 1),
+			shouldQueueFn: func(now hlc.Timestamp, r *Replica) (shouldQueue bool, priority float64) {
+				if atomic.AddInt64(&shouldQueueCount, 1) <= 4 {
+					return true, 1
+				}
+				return false, 1
+			},
+		},
+		processBlocker: make(chan struct{}, 1),
+	}
+	bq := makeTestBaseQueue("test", pQueue, tc.store, tc.gossip,
+		queueConfig{
+			maxSize:        3,
+			maxConcurrency: 2,
+		},
+	)
+	bq.Start(stopper)
+
+	assertShouldQueueCount := func(expShouldQueueCount int) {
+		t.Helper()
+		testutils.SucceedsSoon(t, func() error {
+			if count := int(atomic.LoadInt64(&shouldQueueCount)); count != expShouldQueueCount {
+				return errors.Errorf("expected %d calls to ShouldQueue; found %d",
+					expShouldQueueCount, count)
+			}
+			return nil
+		})
+	}
+	assertProcessedAndProcessing := func(expProcessed, expProcessing int) {
+		t.Helper()
+		testutils.SucceedsSoon(t, func() error {
+			if p := pQueue.getProcessed(); p != expProcessed {
+				return errors.Errorf("expected %d processed replicas; got %d", expProcessed, p)
+			}
+			if p := pQueue.getProcessing(); p != expProcessing {
+				return errors.Errorf("expected %d processing replicas; got %d", expProcessing, p)
+			}
+			return nil
+		})
+	}
+
+	// MaybeAdd a replica. Should queue after checking ShouldQueue.
+	bq.MaybeAdd(r1, hlc.Timestamp{})
+	assertShouldQueueCount(1)
+	if exp, l := 1, bq.Length(); l != exp {
+		t.Errorf("expected %d queued replica; got %d", exp, l)
+	}
+
+	// Let the first processing attempt run.
+	close(pQueue.blocker)
+	assertProcessedAndProcessing(0, 1)
+
+	// MaybeAdd the same replica. Should requeue after checking ShouldQueue.
+	bq.MaybeAdd(r1, hlc.Timestamp{})
+	assertShouldQueueCount(2)
+
+	// Let the first processing attempt finish.
+	// Should begin processing second attempt after checking ShouldQueue again.
+	pQueue.processBlocker <- struct{}{}
+	assertShouldQueueCount(3)
+	assertProcessedAndProcessing(1, 1)
+
+	// MaybeAdd the same replica. Should requeue after checking ShouldQueue.
+	bq.MaybeAdd(r1, hlc.Timestamp{})
+	assertShouldQueueCount(4)
+
+	// Let the second processing attempt finish.
+	// Should NOT processing third attempt after checking ShouldQueue again.
+	pQueue.processBlocker <- struct{}{}
+	assertShouldQueueCount(5)
+	assertProcessedAndProcessing(2, 0)
+
+	// MaybeAdd the same replica. Should NOT queue after checking ShouldQueue.
+	bq.MaybeAdd(r1, hlc.Timestamp{})
+	assertShouldQueueCount(6)
+	assertProcessedAndProcessing(2, 0)
 }

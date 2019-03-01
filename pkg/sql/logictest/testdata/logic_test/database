@@ -1,4 +1,4 @@
-# LogicTest: default
+# LogicTest: local local-opt
 
 statement ok
 CREATE DATABASE a
@@ -15,13 +15,21 @@ CREATE DATABASE ""
 query T colnames
 SHOW DATABASES
 ----
-Database
+database_name
 a
+defaultdb
+postgres
+system
+test
+
+query T colnames
+SHOW SCHEMAS FROM a
+----
+schema_name
 crdb_internal
 information_schema
 pg_catalog
-system
-test
+public
 
 statement ok
 CREATE DATABASE b TEMPLATE=template0
@@ -79,9 +87,8 @@ b4
 b5
 b6
 c
-crdb_internal
-information_schema
-pg_catalog
+defaultdb
+postgres
 system
 test
 
@@ -98,10 +105,13 @@ SELECT * FROM b.a
 3
 7
 
-statement ok
-DROP DATABASE b
+statement error database "b" is not empty
+DROP DATABASE b RESTRICT
 
-statement error database "b" does not exist
+statement ok
+DROP DATABASE b CASCADE
+
+statement error pgcode 42P01 relation "b.a" does not exist
 SELECT * FROM b.a
 
 statement error database "b" does not exist
@@ -111,7 +121,11 @@ statement ok
 DROP DATABASE IF EXISTS b
 
 statement ok
-DROP DATABASE b2; DROP DATABASE b3; DROP DATABASE b4; DROP DATABASE b5; DROP DATABASE b6
+DROP DATABASE b2 CASCADE;
+  DROP DATABASE b3 CASCADE;
+  DROP DATABASE b4 CASCADE;
+  DROP DATABASE b5 CASCADE;
+  DROP DATABASE b6 CASCADE
 
 statement error empty database name
 DROP DATABASE ""
@@ -119,19 +133,18 @@ DROP DATABASE ""
 query T colnames
 SHOW DATABASES
 ----
-Database
+database_name
 a
 c
-crdb_internal
-information_schema
-pg_catalog
+defaultdb
+postgres
 system
 test
 
 statement ok
 CREATE DATABASE b
 
-statement error relation "b.a" does not exist
+statement error pgcode 42P01 relation "b.a" does not exist
 SELECT * FROM b.a
 
 statement ok
@@ -143,7 +156,7 @@ SELECT * FROM b.a
 
 user testuser
 
-statement error only root is allowed to CREATE DATABASE
+statement error only superusers are allowed to CREATE DATABASE
 CREATE DATABASE privs
 
 user root
@@ -154,7 +167,7 @@ CREATE DATABASE privs
 user testuser
 
 statement error user testuser does not have DROP privilege on database privs
-DROP DATABASE privs
+DROP DATABASE privs CASCADE
 
 user root
 
@@ -164,4 +177,4 @@ GRANT DROP ON DATABASE privs TO testuser
 user testuser
 
 statement ok
-DROP DATABASE privs
+DROP DATABASE privs CASCADE

@@ -11,19 +11,26 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlplan
 
 import (
-	"bytes"
-	"fmt"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 )
+
+// FinalStageInfo is a wrapper around an aggregation function performed
+// in the final stage of distributed aggregations that allows us to specify the
+// corresponding inputs from the local aggregations by their indices in the LocalStage.
+type FinalStageInfo struct {
+	Fn distsqlpb.AggregatorSpec_Func
+	// Specifies the ordered slice of outputs from local aggregations to propagate
+	// as inputs to Fn. This must be ordered according to the underlying aggregate builtin
+	// arguments signature found in aggregate_builtins.go.
+	LocalIdxs []uint32
+}
 
 // DistAggregationInfo is a blueprint for planning distributed aggregations. It
 // describes two stages - a local stage performs local aggregations wherever
@@ -45,12 +52,13 @@ import (
 type DistAggregationInfo struct {
 	// The local stage consists of one or more aggregations. All aggregations have
 	// the same input.
-	LocalStage []distsqlrun.AggregatorSpec_Func
+	LocalStage []distsqlpb.AggregatorSpec_Func
 
-	// The final stage consists of the same number of aggregations as the local
-	// stage (the input of each one is the corresponding result from each instance
-	// of the local stage).
-	FinalStage []distsqlrun.AggregatorSpec_Func
+	// The final stage consists of one or more aggregations that take in an
+	// arbitrary number of inputs from the local stages. The inputs are ordered and
+	// mapped by the indices of the local aggregations in LocalStage (specified by
+	// LocalIdxs).
+	FinalStage []FinalStageInfo
 
 	// An optional rendering expression used to obtain the final result; required
 	// if there is more than one aggregation in each of the stages.
@@ -68,56 +76,106 @@ type DistAggregationInfo struct {
 	// Instead of defining a canonical non-typed expression and then tweaking it
 	// with visitors, we use a function that directly creates a typed expression
 	// on demand. The expression will refer to the final stage results using
-	// IndexedVars, with indices shifted by varIdxOffset.
-	FinalRendering func(h *parser.IndexedVarHelper, varIdxOffset int) (parser.TypedExpr, error)
+	// IndexedVars, with indices specified by varIdxs (1-1 mapping).
+	FinalRendering func(h *tree.IndexedVarHelper, varIdxs []int) (tree.TypedExpr, error)
 }
+
+// Convenient value for FinalStageInfo.LocalIdxs when there is only one aggregation
+// function in each of the LocalStage and FinalStage. Otherwise, specify the explicit
+// index corresponding to the local stage.
+var passThroughLocalIdxs = []uint32{0}
 
 // DistAggregationTable is DistAggregationInfo look-up table. Functions that
 // don't have an entry in the table are not optimized with a local stage.
-var DistAggregationTable = map[distsqlrun.AggregatorSpec_Func]DistAggregationInfo{
-	distsqlrun.AggregatorSpec_IDENT: {
-		LocalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_IDENT},
-		FinalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_IDENT},
+var DistAggregationTable = map[distsqlpb.AggregatorSpec_Func]DistAggregationInfo{
+	distsqlpb.AggregatorSpec_ANY_NOT_NULL: {
+		LocalStage: []distsqlpb.AggregatorSpec_Func{distsqlpb.AggregatorSpec_ANY_NOT_NULL},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        distsqlpb.AggregatorSpec_ANY_NOT_NULL,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
 	},
 
-	distsqlrun.AggregatorSpec_BOOL_AND: {
-		LocalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_BOOL_AND},
-		FinalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_BOOL_AND},
+	distsqlpb.AggregatorSpec_BOOL_AND: {
+		LocalStage: []distsqlpb.AggregatorSpec_Func{distsqlpb.AggregatorSpec_BOOL_AND},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        distsqlpb.AggregatorSpec_BOOL_AND,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
 	},
 
-	distsqlrun.AggregatorSpec_BOOL_OR: {
-		LocalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_BOOL_OR},
-		FinalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_BOOL_OR},
+	distsqlpb.AggregatorSpec_BOOL_OR: {
+		LocalStage: []distsqlpb.AggregatorSpec_Func{distsqlpb.AggregatorSpec_BOOL_OR},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        distsqlpb.AggregatorSpec_BOOL_OR,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
 	},
 
-	distsqlrun.AggregatorSpec_COUNT: {
-		LocalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_COUNT},
-		FinalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_SUM_INT},
+	distsqlpb.AggregatorSpec_COUNT: {
+		LocalStage: []distsqlpb.AggregatorSpec_Func{distsqlpb.AggregatorSpec_COUNT},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        distsqlpb.AggregatorSpec_SUM_INT,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
 	},
 
-	distsqlrun.AggregatorSpec_COUNT_ROWS: {
-		LocalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_COUNT_ROWS},
-		FinalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_SUM_INT},
+	distsqlpb.AggregatorSpec_COUNT_ROWS: {
+		LocalStage: []distsqlpb.AggregatorSpec_Func{distsqlpb.AggregatorSpec_COUNT_ROWS},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        distsqlpb.AggregatorSpec_SUM_INT,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
 	},
 
-	distsqlrun.AggregatorSpec_MAX: {
-		LocalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_MAX},
-		FinalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_MAX},
+	distsqlpb.AggregatorSpec_MAX: {
+		LocalStage: []distsqlpb.AggregatorSpec_Func{distsqlpb.AggregatorSpec_MAX},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        distsqlpb.AggregatorSpec_MAX,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
 	},
 
-	distsqlrun.AggregatorSpec_MIN: {
-		LocalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_MIN},
-		FinalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_MIN},
+	distsqlpb.AggregatorSpec_MIN: {
+		LocalStage: []distsqlpb.AggregatorSpec_Func{distsqlpb.AggregatorSpec_MIN},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        distsqlpb.AggregatorSpec_MIN,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
 	},
 
-	distsqlrun.AggregatorSpec_SUM: {
-		LocalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_SUM},
-		FinalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_SUM},
+	distsqlpb.AggregatorSpec_SUM: {
+		LocalStage: []distsqlpb.AggregatorSpec_Func{distsqlpb.AggregatorSpec_SUM},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        distsqlpb.AggregatorSpec_SUM,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
 	},
 
-	distsqlrun.AggregatorSpec_XOR_AGG: {
-		LocalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_XOR_AGG},
-		FinalStage: []distsqlrun.AggregatorSpec_Func{distsqlrun.AggregatorSpec_XOR_AGG},
+	distsqlpb.AggregatorSpec_XOR_AGG: {
+		LocalStage: []distsqlpb.AggregatorSpec_Func{distsqlpb.AggregatorSpec_XOR_AGG},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        distsqlpb.AggregatorSpec_XOR_AGG,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
 	},
 
 	// AVG is more tricky than the ones above; we need two intermediate values in
@@ -127,21 +185,30 @@ var DistAggregationTable = map[distsqlrun.AggregatorSpec_Func]DistAggregationInf
 	//  - a final rendering then divides the two results.
 	//
 	// At a high level, this is analogous to rewriting AVG(x) as SUM(x)/COUNT(x).
-	distsqlrun.AggregatorSpec_AVG: {
-		LocalStage: []distsqlrun.AggregatorSpec_Func{
-			distsqlrun.AggregatorSpec_SUM,
-			distsqlrun.AggregatorSpec_COUNT,
+	distsqlpb.AggregatorSpec_AVG: {
+		LocalStage: []distsqlpb.AggregatorSpec_Func{
+			distsqlpb.AggregatorSpec_SUM,
+			distsqlpb.AggregatorSpec_COUNT,
 		},
-		FinalStage: []distsqlrun.AggregatorSpec_Func{
-			distsqlrun.AggregatorSpec_SUM,
-			distsqlrun.AggregatorSpec_SUM_INT,
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        distsqlpb.AggregatorSpec_SUM,
+				LocalIdxs: []uint32{0},
+			},
+			{
+				Fn:        distsqlpb.AggregatorSpec_SUM_INT,
+				LocalIdxs: []uint32{1},
+			},
 		},
-		FinalRendering: func(h *parser.IndexedVarHelper, varIdxOffset int) (parser.TypedExpr, error) {
-			sum := h.IndexedVar(varIdxOffset)
-			count := h.IndexedVar(varIdxOffset + 1)
+		FinalRendering: func(h *tree.IndexedVarHelper, varIdxs []int) (tree.TypedExpr, error) {
+			if len(varIdxs) < 2 {
+				panic("fewer than two final aggregation values passed into final render")
+			}
+			sum := h.IndexedVar(varIdxs[0])
+			count := h.IndexedVar(varIdxs[1])
 
-			expr := &parser.BinaryExpr{
-				Operator: parser.Div,
+			expr := &tree.BinaryExpr{
+				Operator: tree.Div,
 				Left:     sum,
 				Right:    count,
 			}
@@ -149,40 +216,60 @@ var DistAggregationTable = map[distsqlrun.AggregatorSpec_Func]DistAggregationInf
 			// There is no "FLOAT / INT" operator; cast the denominator to float in
 			// this case. Note that there is a "DECIMAL / INT" operator, so we don't
 			// need the same handling for that case.
-			if sum.ResolvedType().Equivalent(parser.TypeFloat) {
-				expr.Right = &parser.CastExpr{
+			if sum.ResolvedType().Equivalent(types.Float) {
+				expr.Right = &tree.CastExpr{
 					Expr: count,
-					Type: parser.NewFloatColType(0 /* prec */, false /* precSpecified */),
+					Type: coltypes.Float8,
 				}
 			}
-			return expr.TypeCheck(nil, parser.TypeAny)
+			ctx := &tree.SemaContext{IVarContainer: h.Container()}
+			return expr.TypeCheck(ctx, types.Any)
 		},
 	},
-}
 
-// typeContainer is a helper type that implements parser.IndexedVarContainer; it
-// is intended to be used during planning (to back FinalRendering expressions).
-// It does not support evaluation.
-type typeContainer struct {
-	types []sqlbase.ColumnType
-}
+	// For VARIANCE/STDDEV the local stage consists of three aggregations,
+	// and the final stage aggregation uses all three values.
+	// respectively:
+	//  - the local stage accumulates the SQRDIFF, SUM and the COUNT
+	//  - the final stage calculates the FINAL_(VARIANCE|STDDEV)
+	//
+	// At a high level, this is analogous to rewriting VARIANCE(x) as
+	// SQRDIFF(x)/(COUNT(x) - 1) (and STDDEV(x) as sqrt(VARIANCE(x))).
+	distsqlpb.AggregatorSpec_VARIANCE: {
+		LocalStage: []distsqlpb.AggregatorSpec_Func{
+			distsqlpb.AggregatorSpec_SQRDIFF,
+			distsqlpb.AggregatorSpec_SUM,
+			distsqlpb.AggregatorSpec_COUNT,
+		},
+		// Instead of have a SUM_SQRDIFFS and SUM_INT (for COUNT) stage
+		// for VARIANCE (and STDDEV) then tailoring a FinalRendering
+		// stage specific to each, it is better to use a specific
+		// FINAL_(VARIANCE|STDDEV) aggregation stage: - For underlying
+		// Decimal results, it is not possible to reduce trailing zeros
+		// since the expression is wrapped in IndexVar. Taking the
+		// BinaryExpr Pow(0.5) for STDDEV would result in trailing
+		// zeros which is not ideal.
+		// TODO(richardwu): Consolidate FinalStage and FinalRendering:
+		// have one or the other
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        distsqlpb.AggregatorSpec_FINAL_VARIANCE,
+				LocalIdxs: []uint32{0, 1, 2},
+			},
+		},
+	},
 
-var _ parser.IndexedVarContainer = &typeContainer{}
-
-func (tc *typeContainer) IndexedVarEval(idx int, ctx *parser.EvalContext) (parser.Datum, error) {
-	panic("no eval allowed in typeContainer")
-}
-
-func (tc *typeContainer) IndexedVarResolvedType(idx int) parser.Type {
-	return tc.types[idx].ToDatumType()
-}
-
-func (tc *typeContainer) IndexedVarFormat(buf *bytes.Buffer, f parser.FmtFlags, idx int) {
-	fmt.Fprintf(buf, "@%d", idx+1)
-}
-
-// MakeTypeIndexedVarHelper returns an IndexedVarHelper which creates IndexedVars
-// with the given types.
-func MakeTypeIndexedVarHelper(types []sqlbase.ColumnType) parser.IndexedVarHelper {
-	return parser.MakeIndexedVarHelper(&typeContainer{types: types}, len(types))
+	distsqlpb.AggregatorSpec_STDDEV: {
+		LocalStage: []distsqlpb.AggregatorSpec_Func{
+			distsqlpb.AggregatorSpec_SQRDIFF,
+			distsqlpb.AggregatorSpec_SUM,
+			distsqlpb.AggregatorSpec_COUNT,
+		},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        distsqlpb.AggregatorSpec_FINAL_STDDEV,
+				LocalIdxs: []uint32{0, 1, 2},
+			},
+		},
+	},
 }

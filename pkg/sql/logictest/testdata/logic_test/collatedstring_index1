@@ -1,4 +1,4 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata fakedist-disk
 
 ##
 # Test a primary key with a collated string in first position (can get a key range).
@@ -71,14 +71,6 @@ SELECT COUNT (a) FROM t WHERE a > ('a' COLLATE da) AND a < ('c' COLLATE da)
 statement ok
 CREATE INDEX ON t (b, a) STORING (c)
 
-query ITTT
-EXPLAIN SELECT a, b FROM t ORDER BY a, b
-----
-0  render  ·      ·
-1  scan    ·      ·
-1  ·       table  t@primary
-1  ·       spans  ALL
-
 query TI
 SELECT a, b FROM t ORDER BY a, b
 ----
@@ -91,14 +83,6 @@ B  3
 x  5
 ü  5
 ü  6
-
-query ITTT
-EXPLAIN SELECT b, a FROM t ORDER BY b, a
-----
-0  render  ·      ·
-1  scan    ·      ·
-1  ·       table  t@t_b_a_idx
-1  ·       spans  ALL
 
 query IT
 SELECT b, a FROM t ORDER BY b, a
@@ -133,14 +117,6 @@ SELECT COUNT (a) FROM t WHERE a > ('a' COLLATE da) AND a < ('c' COLLATE da)
 statement ok
 UPDATE t SET a = (a :: STRING || a :: STRING) COLLATE da
 
-query ITTT
-EXPLAIN SELECT a, b FROM t ORDER BY a, b
-----
-0  render  ·      ·
-1  scan    ·      ·
-1  ·       table  t@primary
-1  ·       spans  ALL
-
 query TI
 SELECT a, b FROM t ORDER BY a, b
 ----
@@ -153,14 +129,6 @@ aa  2
 aa  3
 AA  1
 AA  2
-
-query ITTT
-EXPLAIN SELECT b, a FROM t ORDER BY b, a
-----
-0  render  ·      ·
-1  scan    ·      ·
-1  ·       table  t@t_b_a_idx
-1  ·       spans  ALL
 
 query IT
 SELECT b, a FROM t ORDER BY b, a
@@ -180,14 +148,6 @@ SELECT b, a FROM t ORDER BY b, a
 statement ok
 DELETE FROM t WHERE a > ('a' COLLATE da) AND a < ('c' COLLATE da)
 
-query ITTT
-EXPLAIN SELECT a, b FROM t ORDER BY a, b
-----
-0  render  ·      ·
-1  scan    ·      ·
-1  ·       table  t@primary
-1  ·       spans  ALL
-
 query TI
 SELECT a, b FROM t ORDER BY a, b
 ----
@@ -198,14 +158,6 @@ aa  2
 aa  3
 AA  1
 AA  2
-
-query ITTT
-EXPLAIN SELECT b, a FROM t ORDER BY b, a
-----
-0  render  ·      ·
-1  scan    ·      ·
-1  ·       table  t@t_b_a_idx
-1  ·       spans  ALL
 
 query IT
 SELECT b, a FROM t ORDER BY b, a

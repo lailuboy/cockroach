@@ -11,19 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package storage_test
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/net/context"
-
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -31,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
 )
 
 // TestSingleKey stresses the transaction retry machinery by starting

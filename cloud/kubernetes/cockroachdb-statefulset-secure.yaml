@@ -1,4 +1,72 @@
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cockroachdb
+  labels:
+    app: cockroachdb
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: Role
+metadata:
+  name: cockroachdb
+  labels:
+    app: cockroachdb
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRole
+metadata:
+  name: cockroachdb
+  labels:
+    app: cockroachdb
+rules:
+- apiGroups:
+  - certificates.k8s.io
+  resources:
+  - certificatesigningrequests
+  verbs:
+  - create
+  - get
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: RoleBinding
+metadata:
+  name: cockroachdb
+  labels:
+    app: cockroachdb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cockroachdb
+subjects:
+- kind: ServiceAccount
+  name: cockroachdb
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: cockroachdb
+  labels:
+    app: cockroachdb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cockroachdb
+subjects:
+- kind: ServiceAccount
+  name: cockroachdb
+  namespace: default
+---
+apiVersion: v1
 kind: Service
 metadata:
   # This service is meant to be used by clients of the database. It exposes a ClusterIP that will
@@ -31,12 +99,10 @@ metadata:
   labels:
     app: cockroachdb
   annotations:
-    # This is needed to make the peer-finder work properly and to help avoid
-    # edge cases where instance 0 comes up after losing its data and needs to
-    # decide whether it should create a new cluster or try to join an existing
-    # one. If it creates a new cluster when it should have joined an existing
-    # one, we'd end up with two separate clusters listening at the same service
-    # endpoint, which would be very bad.
+    # Use this annotation in addition to the actual publishNotReadyAddresses
+    # field below because the annotation will stop being respected soon but the
+    # field is broken in some versions of Kubernetes:
+    # https://github.com/kubernetes/kubernetes/issues/58662
     service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
     # Enable automatic monitoring of all instances when Prometheus is running in the cluster.
     prometheus.io/scrape: "true"
@@ -50,6 +116,10 @@ spec:
   - port: 8080
     targetPort: 8080
     name: http
+  # We want all pods in the StatefulSet to have their addresses published for
+  # the sake of the other CockroachDB pods even before they're ready, since they
+  # have to be able to talk to each other in order to become ready.
+  publishNotReadyAddresses: true
   clusterIP: None
   selector:
     app: cockroachdb
@@ -64,7 +134,7 @@ spec:
   selector:
     matchLabels:
       app: cockroachdb
-  minAvailable: 67%
+  maxUnavailable: 1
 ---
 apiVersion: apps/v1beta1
 kind: StatefulSet
@@ -78,35 +148,11 @@ spec:
       labels:
         app: cockroachdb
     spec:
+      serviceAccountName: cockroachdb
       # Init containers are run only once in the lifetime of a pod, before
       # it's started up for the first time. It has to exit successfully
       # before the pod's main containers are allowed to start.
       initContainers:
-      # This particular init container does a DNS lookup for other pods in
-      # the set to help determine whether or not a cluster already exists.
-      # If any other pods exist, it creates a file in the cockroach-data
-      # directory to pass that information along to the primary container that
-      # has to decide what command-line flags to use when starting CockroachDB.
-      # This only matters when a pod's persistent volume is empty - if it has
-      # data from a previous execution, that data will always be used.
-      #
-      # If your Kubernetes cluster uses a custom DNS domain, you will have
-      # to add an additional arg to this pod: "-domain=<your-custom-domain>"
-      - name: bootstrap
-        image: cockroachdb/cockroach-k8s-init:0.2
-        imagePullPolicy: IfNotPresent
-        args:
-        - "-on-start=/on-start.sh"
-        - "-service=cockroachdb"
-        env:
-        - name: POD_NAMESPACE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace
-        volumeMounts:
-        - name: datadir
-          mountPath: /cockroach/cockroach-data
-
       # The init-certs container sends a certificate signing request to the
       # kubernetes cluster.
       # You can see pending requests using: kubectl get csr
@@ -117,17 +163,13 @@ spec:
       # In addition to the node certificate and key, the init-certs entrypoint will symlink
       # the cluster CA to the certs directory.
       - name: init-certs
-        image: cockroachdb/cockroach-k8s-request-cert:0.2
+        image: cockroachdb/cockroach-k8s-request-cert:0.4
         imagePullPolicy: IfNotPresent
         command:
         - "/bin/ash"
         - "-ecx"
-        - "/request-cert -namespace=${POD_NAMESPACE} -certs-dir=/cockroach-certs -type=node -addresses=localhost,127.0.0.1,${POD_IP},$(hostname -f),cockroachdb-public -symlink-ca-from=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+        - "/request-cert -namespace=${POD_NAMESPACE} -certs-dir=/cockroach-certs -type=node -addresses=localhost,127.0.0.1,$(hostname -f),$(hostname -f|cut -f 1-2 -d '.'),cockroachdb-public,cockroachdb-public.$(hostname -f|cut -f 3- -d '.') -symlink-ca-from=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
         env:
-        - name: POD_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.podIP
         - name: POD_NAMESPACE
           valueFrom:
             fieldRef:
@@ -135,7 +177,6 @@ spec:
         volumeMounts:
         - name: certs
           mountPath: /cockroach-certs
-
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -150,41 +191,42 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
       - name: cockroachdb
-        image: cockroachdb/cockroach:v1.0.3
+        image: cockroachdb/cockroach:v2.1.5
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 26257
           name: grpc
         - containerPort: 8080
           name: http
+        livenessProbe:
+          httpGet:
+            path: "/health"
+            port: http
+            scheme: HTTPS
+          initialDelaySeconds: 30
+          periodSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: "/health?ready=1"
+            port: http
+            scheme: HTTPS
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 2
         volumeMounts:
         - name: datadir
           mountPath: /cockroach/cockroach-data
         - name: certs
           mountPath: /cockroach/cockroach-certs
+        env:
+        - name: COCKROACH_CHANNEL
+          value: kubernetes-secure
         command:
           - "/bin/bash"
           - "-ecx"
-          - |
-            # The use of qualified `hostname -f` is crucial:
-            # Other nodes aren't able to look up the unqualified hostname.
-            CRARGS=("start" "--logtostderr" "--certs-dir" "/cockroach/cockroach-certs" "--host" "$(hostname -f)" "--http-host" "0.0.0.0")
-            # We only want to initialize a new cluster (by omitting the join flag)
-            # if we're sure that we're the first node (i.e. index 0) and that
-            # there aren't any other nodes running as part of the cluster that
-            # this is supposed to be a part of (which indicates that a cluster
-            # already exists and we should make sure not to create a new one).
-            # It's fine to run without --join on a restart if there aren't any
-            # other nodes.
-            if [ ! "$(hostname)" == "cockroachdb-0" ] || \
-               [ -e "/cockroach/cockroach-data/cluster_exists_marker" ]
-            then
-              # We don't join cockroachdb in order to avoid a node attempting
-              # to join itself, which currently doesn't work
-              # (https://github.com/cockroachdb/cockroach/issues/9625).
-              CRARGS+=("--join" "cockroachdb-public")
-            fi
-            exec /cockroach/cockroach ${CRARGS[*]}
+          # The use of qualified `hostname -f` is crucial:
+          # Other nodes aren't able to look up the unqualified hostname.
+          - "exec /cockroach/cockroach start --logtostderr --certs-dir /cockroach/cockroach-certs --advertise-host $(hostname -f) --http-addr 0.0.0.0 --join cockroachdb-0.cockroachdb,cockroachdb-1.cockroachdb,cockroachdb-2.cockroachdb --cache 25% --max-sql-memory 25%"
       # No pre-stop hook is required, a SIGTERM plus some time is all that's
       # needed for graceful shutdown of a node.
       terminationGracePeriodSeconds: 60
@@ -194,14 +236,15 @@ spec:
           claimName: datadir
       - name: certs
         emptyDir: {}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
   volumeClaimTemplates:
   - metadata:
       name: datadir
-      annotations:
-        volume.alpha.kubernetes.io/storage-class: anything
     spec:
       accessModes:
         - "ReadWriteOnce"
       resources:
         requests:
-          storage: 1Gi
+          storage: 100Gi

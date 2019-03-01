@@ -17,22 +17,25 @@ package main
 import (
 	"fmt"
 	"os"
+
+	"github.com/spf13/cobra"
 )
 
-func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s path/to/docs", os.Args[0])
-	os.Exit(-1)
-}
+var cmds []*cobra.Command
+var quiet bool
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
+	rootCmd := func() *cobra.Command {
+		cmd := &cobra.Command{
+			Use:   "docgen",
+			Short: "docgen generates documentation for cockroachdb's SQL functions and grammar",
+		}
+		cmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "suppress output where possible")
+		cmd.AddCommand(cmds...)
+		return cmd
+	}()
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
 	}
-	outDir := os.Args[1]
-	if stat, err := os.Stat(outDir); err != nil || !stat.IsDir() {
-		fmt.Fprintf(os.Stderr, "%s does not exist", outDir)
-		os.Exit(-1)
-	}
-	// TODO(dt): add diagrams support, respect os.Args[2] to pick mode.
-	generateFuncsAndOps(outDir)
 }

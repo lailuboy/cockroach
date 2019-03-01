@@ -11,15 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
 
 package sql
 
 import (
+	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 )
 
 // SQL execution is separated in 3+ phases:
@@ -41,17 +43,14 @@ const (
 	// the session age.
 	sessionInit sessionPhase = iota
 
-	// When a batch of SQL code is received in pgwire.
-	// Used to compute the batch age.
-	sessionStartBatch
-
 	// Executor phases.
-	sessionStartParse
-	sessionEndParse
-	plannerStartLogicalPlan
-	plannerEndLogicalPlan
-	plannerStartExecStmt
-	plannerEndExecStmt
+	sessionQueryReceived    // Query is received.
+	sessionStartParse       // Parse starts.
+	sessionEndParse         // Parse ends.
+	plannerStartLogicalPlan // Planning starts.
+	plannerEndLogicalPlan   // Planning ends.
+	plannerStartExecStmt    // Execution starts.
+	plannerEndExecStmt      // Execution ends.
 
 	// sessionNumPhases must be listed last so that it can be used to
 	// define arrays sufficiently large to hold all the other values.
@@ -59,44 +58,75 @@ const (
 )
 
 // phaseTimes is the type of the session.phaseTimes array.
+//
+// It's important that this is an array and not a slice, as we rely on the array
+// copy behavior.
 type phaseTimes [sessionNumPhases]time.Time
+
+// EngineMetrics groups a set of SQL metrics.
+type EngineMetrics struct {
+	// The subset of SELECTs that are processed through DistSQL.
+	DistSQLSelectCount *metric.Counter
+	// The subset of queries that are processed by the cost-based optimizer.
+	SQLOptCount *metric.Counter
+	// The subset of queries which we attempted and failed to plan with the
+	// cost-based optimizer.
+	SQLOptFallbackCount   *metric.Counter
+	SQLOptPlanCacheHits   *metric.Counter
+	SQLOptPlanCacheMisses *metric.Counter
+
+	DistSQLExecLatency    *metric.Histogram
+	SQLExecLatency        *metric.Histogram
+	DistSQLServiceLatency *metric.Histogram
+	SQLServiceLatency     *metric.Histogram
+}
+
+// EngineMetrics implements the metric.Struct interface
+var _ metric.Struct = EngineMetrics{}
+
+// MetricStruct is part of the metric.Struct interface.
+func (EngineMetrics) MetricStruct() {}
+
+func (ex *connExecutor) maybeSavePlan(
+	ctx context.Context, p *planner,
+) *roachpb.ExplainTreePlanNode {
+	if ex.saveLogicalPlanDescription(
+		p.stmt,
+		p.curPlan.flags.IsSet(planFlagDistributed),
+		p.curPlan.flags.IsSet(planFlagOptUsed),
+		p.curPlan.execErr) {
+		// If statement plan sample is requested, collect a sample.
+		return planToTree(ctx, &p.curPlan)
+	}
+	return nil
+}
 
 // recordStatementSummery gathers various details pertaining to the
 // last executed statement/query and performs the associated
-// accounting.
+// accounting in the passed-in EngineMetrics.
 // - distSQLUsed reports whether the query was distributed.
 // - automaticRetryCount is the count of implicit txn retries
 //   so far.
 // - result is the result set computed by the query/statement.
 // - err is the error encountered, if any.
-func (e *Executor) recordStatementSummary(
-	planner *planner,
-	stmt Statement,
-	distSQLUsed bool,
-	automaticRetryCount int,
-	result Result,
-	err error,
+func (ex *connExecutor) recordStatementSummary(
+	ctx context.Context, planner *planner, automaticRetryCount int, rowsAffected int, err error,
 ) {
-	phaseTimes := &planner.phaseTimes
+	phaseTimes := planner.statsCollector.PhaseTimes()
 
 	// Compute the run latency. This is always recorded in the
 	// server metrics.
 	runLatRaw := phaseTimes[plannerEndExecStmt].Sub(phaseTimes[plannerStartExecStmt])
 
 	// Collect the statistics.
-	numRows := result.RowsAffected
-	if result.Type == parser.Rows {
-		numRows = result.Rows.Len()
-	}
-
 	runLat := runLatRaw.Seconds()
 
 	parseLat := phaseTimes[sessionEndParse].
 		Sub(phaseTimes[sessionStartParse]).Seconds()
 	planLat := phaseTimes[plannerEndLogicalPlan].
 		Sub(phaseTimes[plannerStartLogicalPlan]).Seconds()
-	// service latency: start to parse to end of run
-	svcLatRaw := phaseTimes[plannerEndExecStmt].Sub(phaseTimes[sessionStartParse])
+	// service latency: time query received to end of run
+	svcLatRaw := phaseTimes[plannerEndExecStmt].Sub(phaseTimes[sessionQueryReceived])
 	svcLat := svcLatRaw.Seconds()
 
 	// processing latency: contributing towards SQL results.
@@ -105,44 +135,68 @@ func (e *Executor) recordStatementSummary(
 	// overhead latency: txn/retry management, error checking, etc
 	execOverhead := svcLat - processingLat
 
+	stmt := planner.stmt
+	flags := planner.curPlan.flags
 	if automaticRetryCount == 0 {
-		if distSQLUsed {
-			if _, ok := stmt.AST.(*parser.Select); ok {
-				e.DistSQLSelectCount.Inc(1)
+		ex.updateOptCounters(flags)
+		m := &ex.metrics.EngineMetrics
+		if flags.IsSet(planFlagDistributed) {
+			if _, ok := stmt.AST.(*tree.Select); ok {
+				m.DistSQLSelectCount.Inc(1)
 			}
-			e.DistSQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
-			e.DistSQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
-		} else {
-			e.SQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
-			e.SQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
+			m.DistSQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
+			m.DistSQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
 		}
+		m.SQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
+		m.SQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
 	}
 
-	planner.session.appStats.recordStatement(
-		stmt, distSQLUsed, automaticRetryCount, numRows, err,
+	// Close the plan if this was not done earlier.
+	// This also ensures that curPlan.savedPlanForStats is
+	// collected (see maybeSavePlan).
+	planner.curPlan.execErr = err
+	planner.curPlan.close(ctx)
+
+	planner.statsCollector.RecordStatement(
+		stmt, planner.curPlan.savedPlanForStats,
+		flags.IsSet(planFlagDistributed), flags.IsSet(planFlagOptUsed),
+		automaticRetryCount, rowsAffected, err,
 		parseLat, planLat, runLat, svcLat, execOverhead,
 	)
 
 	if log.V(2) {
 		// ages since significant epochs
-		batchAge := phaseTimes[plannerEndExecStmt].
-			Sub(phaseTimes[sessionStartBatch]).Seconds()
 		sessionAge := phaseTimes[plannerEndExecStmt].
 			Sub(phaseTimes[sessionInit]).Seconds()
 
-		log.Infof(planner.session.Ctx(),
+		log.Infof(ctx,
 			"query stats: %d rows, %d retries, "+
 				"parse %.2fµs (%.1f%%), "+
 				"plan %.2fµs (%.1f%%), "+
 				"run %.2fµs (%.1f%%), "+
 				"overhead %.2fµs (%.1f%%), "+
-				"batch age %.3fms, session age %.4fs",
-			numRows, automaticRetryCount,
+				"session age %.4fs",
+			rowsAffected, automaticRetryCount,
 			parseLat*1e6, 100*parseLat/svcLat,
 			planLat*1e6, 100*planLat/svcLat,
 			runLat*1e6, 100*runLat/svcLat,
 			execOverhead*1e6, 100*execOverhead/svcLat,
-			batchAge*1000, sessionAge,
+			sessionAge,
 		)
+	}
+}
+
+func (ex *connExecutor) updateOptCounters(planFlags planFlags) {
+	m := &ex.metrics.EngineMetrics
+	if planFlags.IsSet(planFlagOptUsed) {
+		m.SQLOptCount.Inc(1)
+	} else if planFlags.IsSet(planFlagOptFallback) {
+		m.SQLOptFallbackCount.Inc(1)
+	}
+
+	if planFlags.IsSet(planFlagOptCacheHit) {
+		m.SQLOptPlanCacheHits.Inc(1)
+	} else if planFlags.IsSet(planFlagOptCacheMiss) {
+		m.SQLOptPlanCacheMisses.Inc(1)
 	}
 }

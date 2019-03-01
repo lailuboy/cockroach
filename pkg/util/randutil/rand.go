@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Ben Darnell
 
 package randutil
 
@@ -63,6 +61,19 @@ func RandBytes(r *rand.Rand, size int) []byte {
 		arr[i] = randLetters[r.Intn(len(randLetters))]
 	}
 	return arr
+}
+
+// ReadTestdataBytes reads random bytes, but then nudges them into printable
+// ASCII, *reducing their randomness* to make them a little friendlier for
+// humans using them as testdata.
+func ReadTestdataBytes(r *rand.Rand, arr []byte) {
+	_, _ = r.Read(arr)
+	for i := range arr {
+		arr[i] = arr[i] & 0x7F // mask out non-ascii
+		if arr[i] < ' ' {      // Nudge the control chars up, into the letters.
+			arr[i] += 'A'
+		}
+	}
 }
 
 // SeedForTests seeds the random number generator and prints the seed

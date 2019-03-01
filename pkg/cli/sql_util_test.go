@@ -11,19 +11,19 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (peter@cockroachlabs.com)
 
 package cli
 
 import (
 	"bytes"
 	"database/sql/driver"
+	"fmt"
 	"net/url"
 	"reflect"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
@@ -53,10 +53,21 @@ func TestConnRecover(t *testing.T) {
 	// Check that Query detects a connection close.
 	defer simulateServerRestart(&c, p, conn)()
 
-	_, err = conn.Query(`SELECT 1`, nil)
-	if err == nil || err != driver.ErrBadConn {
-		t.Fatalf("conn.Query(): expected bad conn, got %v", err)
-	}
+	// When the server restarts, the next Query() attempt may encounter a
+	// TCP reset error before the SQL driver realizes there is a problem
+	// and starts delivering ErrBadConn. We don't know the timing of
+	// this however.
+	testutils.SucceedsSoon(t, func() error {
+		if sqlRows, err := conn.Query(`SELECT 1`, nil); err != driver.ErrBadConn {
+			return fmt.Errorf("expected ErrBadConn, got %v", err)
+		} else if err == nil {
+			if closeErr := sqlRows.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+		}
+		return nil
+	})
+
 	// Check that Query recovers from a connection close by re-connecting.
 	rows, err = conn.Query(`SELECT 1`, nil)
 	if err != nil {
@@ -69,9 +80,14 @@ func TestConnRecover(t *testing.T) {
 	// Check that Exec detects a connection close.
 	defer simulateServerRestart(&c, p, conn)()
 
-	if err := conn.Exec(`SELECT 1`, nil); err == nil || err != driver.ErrBadConn {
-		t.Fatalf("conn.Exec(): expected bad conn, got %v", err)
-	}
+	// Ditto from Query().
+	testutils.SucceedsSoon(t, func() error {
+		if err := conn.Exec(`SELECT 1`, nil); err != driver.ErrBadConn {
+			return fmt.Errorf("expected ErrBadConn, got %v", err)
+		}
+		return nil
+	})
+
 	// Check that Exec recovers from a connection close by re-connecting.
 	if err := conn.Exec(`SELECT 1`, nil); err != nil {
 		t.Fatalf("conn.Exec(): expected no error after reconnect, got %v", err)
@@ -100,12 +116,12 @@ func TestRunQuery(t *testing.T) {
 	conn := makeSQLConn(url.String())
 	defer conn.Close()
 
-	// Use a buffer as the io.Writer.
+	setCLIDefaultsForTests()
+
 	var b bytes.Buffer
 
 	// Non-query statement.
-	if err := runQueryAndFormatResults(conn, &b, makeQuery(`SET DATABASE=system`),
-		tableDisplayPretty); err != nil {
+	if err := runQueryAndFormatResults(conn, &b, makeQuery(`SET DATABASE=system`)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -118,38 +134,44 @@ SET
 	b.Reset()
 
 	// Use system database for sample query/output as they are fairly fixed.
-	cols, rows, _, err := runQuery(conn, makeQuery(`SHOW COLUMNS FROM system.namespace`), false)
+	cols, rows, err := runQuery(conn, makeQuery(`SHOW COLUMNS FROM system.namespace`), false)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expectedCols := []string{"Field", "Type", "Null", "Default", "Indices"}
+	expectedCols := []string{
+		"column_name",
+		"data_type",
+		"is_nullable",
+		"column_default",
+		"generation_expression",
+		"indices",
+		"is_hidden",
+	}
 	if !reflect.DeepEqual(expectedCols, cols) {
 		t.Fatalf("expected:\n%v\ngot:\n%v", expectedCols, cols)
 	}
 
 	expectedRows := [][]string{
-		{`parentID`, `INT`, `false`, `NULL`, `"{\"primary\"}"`},
-		{`name`, `STRING`, `false`, `NULL`, `"{\"primary\"}"`},
-		{`id`, `INT`, `true`, `NULL`, `{}`},
+		{`parentID`, `INT8`, `false`, `NULL`, ``, `{primary}`, `false`},
+		{`name`, `STRING`, `false`, `NULL`, ``, `{primary}`, `false`},
+		{`id`, `INT8`, `true`, `NULL`, ``, `{}`, `false`},
 	}
 	if !reflect.DeepEqual(expectedRows, rows) {
 		t.Fatalf("expected:\n%v\ngot:\n%v", expectedRows, rows)
 	}
 
 	if err := runQueryAndFormatResults(conn, &b,
-		makeQuery(`SHOW COLUMNS FROM system.namespace`), tableDisplayPretty); err != nil {
+		makeQuery(`SHOW COLUMNS FROM system.namespace`)); err != nil {
 		t.Fatal(err)
 	}
 
 	expected = `
-+----------+--------+-------+---------+-------------+
-|  Field   |  Type  | Null  | Default |   Indices   |
-+----------+--------+-------+---------+-------------+
-| parentID | INT    | false | NULL    | {"primary"} |
-| name     | STRING | false | NULL    | {"primary"} |
-| id       | INT    | true  | NULL    | {}          |
-+----------+--------+-------+---------+-------------+
+  column_name | data_type | is_nullable | column_default | generation_expression |  indices  | is_hidden  
++-------------+-----------+-------------+----------------+-----------------------+-----------+-----------+
+  parentID    | INT8      |    false    | NULL           |                       | {primary} |   false    
+  name        | STRING    |    false    | NULL           |                       | {primary} |   false    
+  id          | INT8      |    true     | NULL           |                       | {}        |   false    
 (3 rows)
 `
 
@@ -160,17 +182,14 @@ SET
 
 	// Test placeholders.
 	if err := runQueryAndFormatResults(conn, &b,
-		makeQuery(`SELECT * FROM system.namespace WHERE name=$1`, "descriptor"),
-		tableDisplayPretty); err != nil {
+		makeQuery(`SELECT * FROM system.namespace WHERE name=$1`, "descriptor")); err != nil {
 		t.Fatal(err)
 	}
 
 	expected = `
+  parentID |    name    | id  
 +----------+------------+----+
-| parentID |    name    | id |
-+----------+------------+----+
-|        1 | descriptor |  3 |
-+----------+------------+----+
+         1 | descriptor |  3  
 (1 row)
 `
 	if a, e := b.String(), expected[1:]; a != e {
@@ -180,28 +199,22 @@ SET
 
 	// Test multiple results.
 	if err := runQueryAndFormatResults(conn, &b,
-		makeQuery(`SELECT 1; SELECT 2, 3; SELECT 'hello'`), tableDisplayPretty); err != nil {
+		makeQuery(`SELECT 1 AS "1"; SELECT 2 AS "2", 3 AS "3"; SELECT 'hello' AS "'hello'"`)); err != nil {
 		t.Fatal(err)
 	}
 
 	expected = `
+  1  
 +---+
-| 1 |
-+---+
-| 1 |
-+---+
+  1  
 (1 row)
+  2 | 3  
 +---+---+
-| 2 | 3 |
-+---+---+
-| 2 | 3 |
-+---+---+
+  2 | 3  
 (1 row)
+  'hello'  
 +---------+
-| 'hello' |
-+---------+
-| hello   |
-+---------+
+  hello    
 (1 row)
 `
 
@@ -209,4 +222,48 @@ SET
 		t.Fatalf("expected output:\n%s\ngot:\n%s", e, a)
 	}
 	b.Reset()
+}
+
+func TestTransactionRetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	p := cliTestParams{t: t}
+	c := newCLITest(p)
+	defer c.cleanup()
+
+	url, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), t.Name(), url.User(security.RootUser))
+	defer cleanup()
+
+	conn := makeSQLConn(url.String())
+	defer conn.Close()
+
+	var tries int
+	err := conn.ExecTxn(func(conn *sqlConn) error {
+		tries++
+		if tries > 2 {
+			return nil
+		}
+
+		// Prevent automatic server-side retries.
+		rows, err := conn.Query(`SELECT now()`, nil)
+		if err != nil {
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+
+		// Force a client-side retry.
+		rows, err = conn.Query(`SELECT crdb_internal.force_retry('1h')`, nil)
+		if err != nil {
+			return err
+		}
+		return rows.Close()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tries <= 2 {
+		t.Fatalf("expected transaction to require at least two tries, but it only required %d", tries)
+	}
 }

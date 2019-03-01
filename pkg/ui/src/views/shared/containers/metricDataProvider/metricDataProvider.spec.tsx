@@ -1,3 +1,17 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import React from "react";
 import { assert } from "chai";
 import { shallow } from "enzyme";
@@ -5,6 +19,7 @@ import _ from "lodash";
 import Long from "long";
 import * as sinon from "sinon";
 
+import "src/enzymeInit";
 import * as protos from  "src/js/protos";
 import {
   Metric, Axis, MetricsDataComponentProps, QueryTimeInfo,
@@ -12,7 +27,7 @@ import {
 import {
   MetricsDataProviderUnconnected as MetricsDataProvider,
 } from "src/views/shared/containers/metricDataProvider";
-import { queryMetrics, MetricsQuery } from "src/redux/metrics";
+import { requestMetrics, MetricsQuery } from "src/redux/metrics";
 
 // TextGraph is a proof-of-concept component used to demonstrate that
 // MetricsDataProvider is working correctly. Used in tests.
@@ -34,9 +49,9 @@ function makeDataProvider(
   id: string,
   metrics: MetricsQuery,
   timeInfo: QueryTimeInfo,
-  qm: typeof queryMetrics,
+  rm: typeof requestMetrics,
 ) {
-  return shallow(<MetricsDataProvider id={id} metrics={metrics} timeInfo={timeInfo} queryMetrics={qm}>
+  return shallow(<MetricsDataProvider id={id} metrics={metrics} timeInfo={timeInfo} requestMetrics={rm}>
     <TextGraph>
       <Axis>
         <Metric name="test.metric.1" />
@@ -197,7 +212,7 @@ describe("<MetricsDataProvider>", function() {
           <MetricsDataProvider id="id"
                                metrics={null}
                                timeInfo={timespan1}
-                               queryMetrics={spy}>
+                               requestMetrics={spy}>
             <TextGraph>
               <Axis>
                 <Metric name="test.metrics.1" />

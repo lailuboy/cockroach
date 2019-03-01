@@ -11,15 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package distsqlrun
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/pkg/errors"
 )
 
@@ -30,41 +31,67 @@ import (
 type streamMerger struct {
 	left       streamGroupAccumulator
 	right      streamGroupAccumulator
-	datumAlloc sqlbase.DatumAlloc
+	leftGroup  []sqlbase.EncDatumRow
+	rightGroup []sqlbase.EncDatumRow
+	// nulLEquality indicates when NULL = NULL is truth-y. This is helpful
+	// when we want NULL to be meaningful during equality, for example
+	// during SCRUB secondary index checks.
+	nullEquality bool
+	datumAlloc   sqlbase.DatumAlloc
+}
+
+func (sm *streamMerger) start(ctx context.Context) {
+	sm.left.start(ctx)
+	sm.right.start(ctx)
 }
 
 // NextBatch returns a set of rows from the left stream and a set of rows from
 // the right stream, all matching on the equality columns. One of the sets can
 // be empty.
-func (sm *streamMerger) NextBatch() ([]sqlbase.EncDatumRow, []sqlbase.EncDatumRow, error) {
-	lrow, err := sm.left.peekAtCurrentGroup()
-	if err != nil {
-		return nil, nil, err
+func (sm *streamMerger) NextBatch(
+	ctx context.Context, evalCtx *tree.EvalContext,
+) ([]sqlbase.EncDatumRow, []sqlbase.EncDatumRow, *ProducerMetadata) {
+	if sm.leftGroup == nil {
+		var meta *ProducerMetadata
+		sm.leftGroup, meta = sm.left.nextGroup(ctx, evalCtx)
+		if meta != nil {
+			return nil, nil, meta
+		}
 	}
-	rrow, err := sm.right.peekAtCurrentGroup()
-	if err != nil {
-		return nil, nil, err
+	if sm.rightGroup == nil {
+		var meta *ProducerMetadata
+		sm.rightGroup, meta = sm.right.nextGroup(ctx, evalCtx)
+		if meta != nil {
+			return nil, nil, meta
+		}
 	}
-	if lrow == nil && rrow == nil {
+	if sm.leftGroup == nil && sm.rightGroup == nil {
 		return nil, nil, nil
 	}
 
-	cmp, err := CompareEncDatumRowForMerge(lrow, rrow, sm.left.ordering, sm.right.ordering, &sm.datumAlloc)
+	var lrow, rrow sqlbase.EncDatumRow
+	if len(sm.leftGroup) > 0 {
+		lrow = sm.leftGroup[0]
+	}
+	if len(sm.rightGroup) > 0 {
+		rrow = sm.rightGroup[0]
+	}
+
+	cmp, err := CompareEncDatumRowForMerge(
+		sm.left.types, lrow, rrow, sm.left.ordering, sm.right.ordering,
+		sm.nullEquality, &sm.datumAlloc, evalCtx,
+	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, &ProducerMetadata{Err: err}
 	}
 	var leftGroup, rightGroup []sqlbase.EncDatumRow
 	if cmp <= 0 {
-		leftGroup, err = sm.left.advanceGroup()
-		if err != nil {
-			return nil, nil, err
-		}
+		leftGroup = sm.leftGroup
+		sm.leftGroup = nil
 	}
 	if cmp >= 0 {
-		rightGroup, err = sm.right.advanceGroup()
-		if err != nil {
-			return nil, nil, err
-		}
+		rightGroup = sm.rightGroup
+		sm.rightGroup = nil
 	}
 	return leftGroup, rightGroup, nil
 }
@@ -80,9 +107,12 @@ func (sm *streamMerger) NextBatch() ([]sqlbase.EncDatumRow, []sqlbase.EncDatumRo
 // a DatumAlloc which is used for decoding if any underlying EncDatum is not
 // yet decoded.
 func CompareEncDatumRowForMerge(
+	lhsTypes []sqlbase.ColumnType,
 	lhs, rhs sqlbase.EncDatumRow,
 	leftOrdering, rightOrdering sqlbase.ColumnOrdering,
+	nullEquality bool,
 	da *sqlbase.DatumAlloc,
+	evalCtx *tree.EvalContext,
 ) (int, error) {
 	if lhs == nil && rhs == nil {
 		return 0, nil
@@ -99,13 +129,21 @@ func CompareEncDatumRowForMerge(
 		)
 	}
 
-	// TODO(radu): plumb EvalContext
-	evalCtx := &parser.EvalContext{}
-
 	for i, ord := range leftOrdering {
 		lIdx := ord.ColIdx
 		rIdx := rightOrdering[i].ColIdx
-		cmp, err := lhs[lIdx].Compare(da, evalCtx, &rhs[rIdx])
+		// If both datums are NULL, we need to follow SQL semantics where
+		// they are not equal. This differs from our datum semantics where
+		// they are equal. In the case where we want to consider NULLs to be
+		// equal, we continue and skip to the next datums in the row.
+		if lhs[lIdx].IsNull() && rhs[rIdx].IsNull() {
+			if !nullEquality {
+				// We can return either -1 or 1, it does not change the behavior.
+				return -1, nil
+			}
+			continue
+		}
+		cmp, err := lhs[lIdx].Compare(&lhsTypes[lIdx], da, evalCtx, &rhs[rIdx])
 		if err != nil {
 			return 0, err
 		}
@@ -119,6 +157,11 @@ func CompareEncDatumRowForMerge(
 	return 0, nil
 }
 
+func (sm *streamMerger) close(ctx context.Context) {
+	sm.left.close(ctx)
+	sm.right.close(ctx)
+}
+
 // makeStreamMerger creates a streamMerger, joining rows from leftSource with
 // rows from rightSource.
 //
@@ -128,7 +171,8 @@ func makeStreamMerger(
 	leftOrdering sqlbase.ColumnOrdering,
 	rightSource RowSource,
 	rightOrdering sqlbase.ColumnOrdering,
-	metadataSink RowReceiver,
+	nullEquality bool,
+	memMonitor *mon.BytesMonitor,
 ) (streamMerger, error) {
 	if len(leftOrdering) != len(rightOrdering) {
 		return streamMerger{}, errors.Errorf(
@@ -141,11 +185,8 @@ func makeStreamMerger(
 	}
 
 	return streamMerger{
-		left: makeStreamGroupAccumulator(
-			MakeNoMetadataRowSource(leftSource, metadataSink),
-			leftOrdering),
-		right: makeStreamGroupAccumulator(
-			MakeNoMetadataRowSource(rightSource, metadataSink),
-			rightOrdering),
+		left:         makeStreamGroupAccumulator(leftSource, leftOrdering, memMonitor),
+		right:        makeStreamGroupAccumulator(rightSource, rightOrdering, memMonitor),
+		nullEquality: nullEquality,
 	}, nil
 }

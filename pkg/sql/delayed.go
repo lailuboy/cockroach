@@ -11,15 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
@@ -33,7 +31,13 @@ type delayedNode struct {
 	plan        planNode
 }
 
+// delayedNode implements the autoCommitNode interface.
+var _ autoCommitNode = &delayedNode{}
+
 type nodeConstructor func(context.Context, *planner) (planNode, error)
+
+func (d *delayedNode) Next(params runParams) (bool, error) { return d.plan.Next(params) }
+func (d *delayedNode) Values() tree.Datums                 { return d.plan.Values() }
 
 func (d *delayedNode) Close(ctx context.Context) {
 	if d.plan != nil {
@@ -42,6 +46,28 @@ func (d *delayedNode) Close(ctx context.Context) {
 	}
 }
 
-func (d *delayedNode) Start(params runParams) error        { return d.plan.Start(params) }
-func (d *delayedNode) Next(params runParams) (bool, error) { return d.plan.Next(params) }
-func (d *delayedNode) Values() parser.Datums               { return d.plan.Values() }
+// enableAutoCommit is part of the autoCommitNode interface.
+func (d *delayedNode) enableAutoCommit() {
+	if ac, ok := d.plan.(autoCommitNode); ok {
+		ac.enableAutoCommit()
+	}
+}
+
+// startExec constructs the wrapped planNode now that execution is underway.
+func (d *delayedNode) startExec(params runParams) error {
+	if d.plan != nil {
+		panic("wrapped plan should not yet exist")
+	}
+
+	plan, err := d.constructor(params.ctx, params.p)
+	if err != nil {
+		return err
+	}
+	d.plan = plan
+
+	// Recursively invoke startExec on new plan. Normally, startExec doesn't
+	// recurse - calling children is handled by the planNode walker. The reason
+	// this won't suffice here is that the the child of this node doesn't exist
+	// until after startExec is invoked.
+	return startExec(params, plan)
+}

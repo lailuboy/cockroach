@@ -11,14 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package acceptance
 
-import (
-	"testing"
-)
+import "testing"
 
 func TestMain(m *testing.M) {
 	MainTest(m)

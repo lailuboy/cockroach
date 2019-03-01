@@ -11,27 +11,23 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 // +build linux freebsd
 
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
-	"golang.org/x/net/context"
-	"golang.org/x/sys/unix"
-
 	"github.com/backtrace-labs/go-bcd"
-
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"golang.org/x/sys/unix"
 )
 
 // Currently disabled as backtrace appears to be obscuring problems when test
@@ -95,7 +91,7 @@ func initBacktrace(logDir string, options ...stop.Option) *stop.Stopper {
 	bcd.Register(tracer)
 
 	// Hook log.Fatal*.
-	log.SetExitFunc(func(code int) {
+	log.SetExitFunc(false /* hideStack */, func(code int) {
 		_ = bcd.Trace(tracer, fmt.Errorf("exit %d", code), nil)
 		os.Exit(code)
 	})

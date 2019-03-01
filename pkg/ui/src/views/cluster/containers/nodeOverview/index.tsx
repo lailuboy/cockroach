@@ -1,4 +1,19 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import React from "react";
+import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
 import { RouterState, Link } from "react-router";
@@ -7,12 +22,12 @@ import _ from "lodash";
 import "./nodeOverview.styl";
 
 import {
-  NodesSummary, nodesSummarySelector, LivenessStatus,
+  livenessNomenclature, LivenessStatus, NodesSummary, nodesSummarySelector, selectNodesSummaryValid,
 } from "src/redux/nodes";
 import { nodeIDAttr } from "src/util/constants";
 import { AdminUIState } from "src/redux/state";
-import { refreshNodes } from "src/redux/apiReducers";
-import { NodeStatus$Properties, MetricConstants, StatusMetrics } from  "src/util/proto";
+import { refreshLiveness, refreshNodes } from "src/redux/apiReducers";
+import { INodeStatus, MetricConstants, StatusMetrics } from  "src/util/proto";
 import { Bytes, Percentage } from "src/util/format";
 import { LongToMoment } from "src/util/convert";
 import {
@@ -20,9 +35,13 @@ import {
 } from "src/views/shared/components/summaryBar";
 
 interface NodeOverviewProps extends RouterState {
-  node: NodeStatus$Properties;
+  node: INodeStatus;
   nodesSummary: NodesSummary;
   refreshNodes: typeof refreshNodes;
+  refreshLiveness: typeof refreshLiveness;
+  // True if current status results are still valid. Needed so that this
+  // component refreshes status query when it becomes invalid.
+  nodesSummaryValid: boolean;
 }
 
 /**
@@ -32,12 +51,14 @@ class NodeOverview extends React.Component<NodeOverviewProps, {}> {
   componentWillMount() {
     // Refresh nodes status query when mounting.
     this.props.refreshNodes();
+    this.props.refreshLiveness();
   }
 
   componentWillReceiveProps(props: NodeOverviewProps) {
     // Refresh nodes status query when props are received; this will immediately
     // trigger a new request if previous results are invalidated.
     props.refreshNodes();
+    props.refreshLiveness();
   }
 
   render() {
@@ -50,16 +71,16 @@ class NodeOverview extends React.Component<NodeOverviewProps, {}> {
       );
     }
 
-    const liveness = nodesSummary.livenessStatusByNodeID[node.desc.node_id] || LivenessStatus.HEALTHY;
-    const livenessString = LivenessStatus[liveness].toLowerCase();
+    const liveness = nodesSummary.livenessStatusByNodeID[node.desc.node_id] || LivenessStatus.LIVE;
+    const livenessString = livenessNomenclature(liveness);
 
     return (
       <div>
-        <section className="section parent-link">
-          <Link to="/cluster/nodes">&lt; Back to Node List</Link>
-        </section>
-        <div className="header header--subsection">
-          {`Node ${node.desc.node_id} / ${node.desc.address.address_field}`}
+        <Helmet>
+          <title>{`${nodesSummary.nodeDisplayNameByID[node.desc.node_id]} | Nodes`}</title>
+        </Helmet>
+        <div className="section section--heading">
+          <h2>{`Node ${node.desc.node_id} / ${node.desc.address.address_field}`}</h2>
         </div>
         <section className="section l-columns">
           <div className="l-columns__left">
@@ -112,6 +133,9 @@ class NodeOverview extends React.Component<NodeOverviewProps, {}> {
                           title="Under Replicated %"
                           valueFn={(metrics) => Percentage(metrics[MetricConstants.underReplicatedRanges], metrics[MetricConstants.ranges])} />
                 <TableRow data={node}
+                          title="Used Capacity"
+                          valueFn={(metrics) => Bytes(metrics[MetricConstants.usedCapacity])} />
+                <TableRow data={node}
                           title="Available Capacity"
                           valueFn={(metrics) => Bytes(metrics[MetricConstants.availableCapacity])} />
                 <TableRow data={node}
@@ -132,7 +156,7 @@ class NodeOverview extends React.Component<NodeOverviewProps, {}> {
               <SummaryValue title="Build" value={node.build_info.tag} />
               <SummaryValue
                 title="Logs"
-                value={<Link to={`/cluster/nodes/${node.desc.node_id}/logs`}>View Logs</Link>}
+                value={<Link to={`/node/${node.desc.node_id}/logs`}>View Logs</Link>}
                 classModifier="link"
               />
             </SummaryBar>
@@ -149,7 +173,7 @@ class NodeOverview extends React.Component<NodeOverviewProps, {}> {
  * across the different stores on the node (along with a total value for the
  * node itself).
  */
-function TableRow(props: { data: NodeStatus$Properties, title: string, valueFn: (s: StatusMetrics) => React.ReactNode }) {
+function TableRow(props: { data: INodeStatus, title: string, valueFn: (s: StatusMetrics) => React.ReactNode }) {
   return <tr className="table__row table__row--body">
     <td className="table__cell">{ props.title }</td>
     <td className="table__cell">{ props.valueFn(props.data.metrics) }</td>
@@ -163,7 +187,7 @@ function TableRow(props: { data: NodeStatus$Properties, title: string, valueFn: 
 }
 
 export const currentNode = createSelector(
-  (state: AdminUIState, _props: RouterState): NodeStatus$Properties[] => state.cachedData.nodes.data,
+  (state: AdminUIState, _props: RouterState): INodeStatus[] => state.cachedData.nodes.data,
   (_state: AdminUIState, props: RouterState): number => parseInt(props.params[nodeIDAttr], 10),
   (nodes, id) => {
     if (!nodes || !id) {
@@ -177,9 +201,11 @@ export default connect(
     return {
       node: currentNode(state, ownProps),
       nodesSummary: nodesSummarySelector(state),
+      nodesSummaryValid: selectNodesSummaryValid(state),
     };
   },
   {
     refreshNodes,
+    refreshLiveness,
   },
 )(NodeOverview);

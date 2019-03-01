@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package util
 
@@ -23,5 +21,11 @@ package util
 // for details.
 type NoCopy struct{}
 
+// Silence unused warnings.
+var _ = NoCopy{}
+
 // Lock is a no-op used by -copylocks checker from `go vet`.
 func (*NoCopy) Lock() {}
+
+// Unlock is a no-op used by -copylocks checker from `go vet`.
+func (*NoCopy) Unlock() {}

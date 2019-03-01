@@ -11,21 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package kv
 
 import (
+	"context"
 	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -39,6 +35,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
 )
 
 // startTestWriter creates a writer which initiates a sequence of
@@ -102,13 +100,13 @@ func startTestWriter(
 // which are resolved synchronously with EndTransaction and via RPC.
 func TestRangeSplitMeta(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _ := createTestDB(t)
+	s := createTestDB(t)
 	defer s.Stop()
 
 	ctx := context.TODO()
 
-	splitKeys := []roachpb.RKey{roachpb.RKey("G"), mustMeta(roachpb.RKey("F")),
-		mustMeta(roachpb.RKey("K")), mustMeta(roachpb.RKey("H"))}
+	splitKeys := []roachpb.RKey{roachpb.RKey("G"), keys.RangeMetaKey(roachpb.RKey("F")),
+		keys.RangeMetaKey(roachpb.RKey("K")), keys.RangeMetaKey(roachpb.RKey("H"))}
 
 	// Execute the consecutive splits.
 	for _, splitRKey := range splitKeys {
@@ -121,7 +119,7 @@ func TestRangeSplitMeta(t *testing.T) {
 	}
 
 	testutils.SucceedsSoon(t, func() error {
-		if _, _, _, err := engine.MVCCScan(ctx, s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, true, nil); err != nil {
+		if _, _, _, err := engine.MVCCScan(ctx, s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, engine.MVCCScanOptions{}); err != nil {
 			return errors.Errorf("failed to verify no dangling intents: %s", err)
 		}
 		return nil
@@ -133,7 +131,7 @@ func TestRangeSplitMeta(t *testing.T) {
 // composed of a random mix of puts.
 func TestRangeSplitsWithConcurrentTxns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _ := createTestDB(t)
+	s := createTestDB(t)
 	defer s.Stop()
 
 	// This channel shuts the whole apparatus down.
@@ -181,7 +179,7 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	// Override default zone config.
 	cfg := config.DefaultZoneConfig()
-	cfg.RangeMaxBytes = 1 << 18
+	cfg.RangeMaxBytes = proto.Int64(1 << 18)
 	defer config.TestingSetDefaultZoneConfig(cfg)()
 
 	// Manually create the local test cluster so that the split queue
@@ -191,7 +189,7 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 			DisableScanner: true,
 		},
 	}
-	s.Start(t, testutils.NewNodeTestBaseContext(), InitSenderForLocalTestCluster)
+	s.Start(t, testutils.NewNodeTestBaseContext(), InitFactoryForLocalTestCluster)
 
 	// This is purely to silence log spam.
 	config.TestingSetupZoneConfigHook(s.Stopper)
@@ -229,7 +227,7 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 	// for timing of finishing the test writer and a possibly-ongoing
 	// asynchronous split.
 	testutils.SucceedsSoon(t, func() error {
-		if _, _, _, err := engine.MVCCScan(ctx, s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, true, nil); err != nil {
+		if _, _, _, err := engine.MVCCScan(ctx, s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, engine.MVCCScanOptions{}); err != nil {
 			return errors.Errorf("failed to verify no dangling intents: %s", err)
 		}
 		return nil
@@ -240,7 +238,11 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 // on the same splitKey succeeds.
 func TestRangeSplitsWithSameKeyTwice(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _ := createTestDB(t)
+	s := createTestDBWithContextAndKnobs(t, client.DefaultDBContext(), &storage.StoreTestingKnobs{
+		DisableScanner:    true,
+		DisableSplitQueue: true,
+		DisableMergeQueue: true,
+	})
 	defer s.Stop()
 
 	ctx := context.TODO()

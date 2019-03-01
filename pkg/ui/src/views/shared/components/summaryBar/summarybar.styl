@@ -1,11 +1,25 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 @require nib
 @require '~styl/base/palette.styl'
 
 .summary-section
-  width calc(100% - 48px)
+  width 100%
   float left
   background-color white
-  margin 0 6px 10px
+  margin-bottom 10px
   padding 15px 24px 12px
   border-radius 5px
   border 1px solid rgba(0, 0, 0, .1)
@@ -21,11 +35,13 @@
     text-transform uppercase
     letter-spacing 2px
     color $tooltip-color
+    white-space nowrap
 
   &__value
     font-weight 200
     font-size 30px
     color $body-color
+    white-space nowrap
 
 .summary-label
   font-family Lato-Bold
@@ -76,6 +92,10 @@
     color $warning-color
     text-transform capitalize
 
+  &--decommissioning &__value
+    color $warning-color
+    text-transform capitalize
+
   &--healthy &__value
     color $healthy-color
     text-transform capitalize
@@ -93,6 +113,9 @@
     color $alert-color
 
   &--suspect
+    color $warning-color
+
+  &--decommissioning
     color $warning-color
 
   &--healthy

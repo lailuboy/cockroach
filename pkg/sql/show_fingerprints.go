@@ -15,19 +15,25 @@
 package sql
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/pkg/errors"
 )
+
+type showFingerprintsNode struct {
+	optColumnsSlot
+
+	tableDesc *sqlbase.ImmutableTableDescriptor
+	indexes   []*sqlbase.IndexDescriptor
+
+	run showFingerprintsRun
+}
 
 // ShowFingerprints statement fingerprints the data in each index of a table.
 // For each index, a full index scan is run to hash every row with the fnv64
@@ -42,112 +48,80 @@ import (
 // (`::string::bytes`) and is an obvious area for improvement in the next
 // version.
 //
-// AS OF SYSTEM TIME is optional, but when set, uses the table definition and
-// data as of that the specified time.
+// To extract the fingerprints at some point in the past, the following
+// query can be used:
+//    SELECT * FROM [SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE foo] AS OF SYSTEM TIME xxx
 func (p *planner) ShowFingerprints(
-	ctx context.Context, n *parser.ShowFingerprints,
+	ctx context.Context, n *tree.ShowFingerprints,
 ) (planNode, error) {
-	ts := p.session.execCfg.Clock.Now()
-	if n.AsOf.Expr != nil {
-		evalCtx := p.session.evalCtx()
-		var err error
-		ts, err = EvalAsOfTimestamp(&evalCtx, n.AsOf, ts)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	tn, err := n.Table.NormalizeWithDatabaseName(p.session.Database)
+	// We avoid the cache so that we can observe the fingerprints without
+	// taking a lease, like other SHOW commands.
+	tableDesc, err := p.ResolveUncachedTableDescriptor(
+		ctx, &n.Table, true /*required*/, requireTableDesc)
 	if err != nil {
 		return nil, err
 	}
 
-	var tableDesc *sqlbase.TableDescriptor
-	if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		txn.SetFixedTimestamp(ts)
-
-		var err error
-		tableDesc, err = mustGetTableDesc(
-			ctx, txn, p.getVirtualTabler(), tn, false /*allowAdding*/)
-		return err
-	}); err != nil {
+	if err := p.CheckPrivilege(ctx, tableDesc, privilege.SELECT); err != nil {
 		return nil, err
 	}
 
-	if err := p.CheckPrivilege(tableDesc, privilege.SELECT); err != nil {
-		return nil, err
-	}
 	return &showFingerprintsNode{
-		n:         n,
-		tn:        tn,
-		ts:        ts,
 		tableDesc: tableDesc,
 		indexes:   tableDesc.AllNonDropIndexes(),
 	}, nil
 }
 
-type showFingerprintsNode struct {
-	optColumnsSlot
+var showFingerprintsColumns = sqlbase.ResultColumns{
+	{Name: "index_name", Typ: types.String},
+	{Name: "fingerprint", Typ: types.String},
+}
 
-	n *parser.ShowFingerprints
-
-	ts        hlc.Timestamp
-	tn        *parser.TableName
-	tableDesc *sqlbase.TableDescriptor
-	indexes   []sqlbase.IndexDescriptor
-
+// showFingerprintsRun contains the run-time state of
+// showFingerprintsNode during local execution.
+type showFingerprintsRun struct {
 	rowIdx int
 	// values stores the current row, updated by Next().
-	values []parser.Datum
+	values []tree.Datum
 }
 
-var showFingerprintsColumns = sqlbase.ResultColumns{
-	{
-		Name: "Index",
-		Typ:  parser.TypeString,
-	},
-	{
-		Name: "Fingerprint",
-		Typ:  parser.TypeString,
-	},
+func (n *showFingerprintsNode) startExec(params runParams) error {
+	n.run.values = []tree.Datum{tree.DNull, tree.DNull}
+	return nil
 }
 
-func (n *showFingerprintsNode) Start(params runParams) error { return nil }
-func (n *showFingerprintsNode) Values() parser.Datums        { return n.values }
-func (n *showFingerprintsNode) Close(_ context.Context)      {}
 func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
-	if n.rowIdx >= len(n.indexes) {
+	if n.run.rowIdx >= len(n.indexes) {
 		return false, nil
 	}
-	index := n.indexes[n.rowIdx]
+	index := n.indexes[n.run.rowIdx]
 
 	cols := make([]string, 0, len(n.tableDesc.Columns))
-	addColumn := func(col sqlbase.ColumnDescriptor) {
-
+	addColumn := func(col *sqlbase.ColumnDescriptor) {
 		// TODO(dan): This is known to be a flawed way to fingerprint. Any datum
 		// with the same string representation is fingerprinted the same, even
 		// if they're different types.
 		switch col.Type.SemanticType {
 		case sqlbase.ColumnType_BYTES:
-			cols = append(cols, fmt.Sprintf("%s:::bytes", parser.Name(col.Name).String()))
+			cols = append(cols, fmt.Sprintf("%s:::bytes", tree.NameStringP(&col.Name)))
 		default:
-			cols = append(cols, fmt.Sprintf("%s::string::bytes", parser.Name(col.Name).String()))
+			cols = append(cols, fmt.Sprintf("%s::string::bytes", tree.NameStringP(&col.Name)))
 		}
 	}
 
 	if index.ID == n.tableDesc.PrimaryIndex.ID {
-		for _, col := range n.tableDesc.Columns {
-			addColumn(col)
+		for i := range n.tableDesc.Columns {
+			addColumn(&n.tableDesc.Columns[i])
 		}
 	} else {
-		colsByID := make(map[sqlbase.ColumnID]sqlbase.ColumnDescriptor)
-		for _, col := range n.tableDesc.Columns {
+		colsByID := make(map[sqlbase.ColumnID]*sqlbase.ColumnDescriptor)
+		for i := range n.tableDesc.Columns {
+			col := &n.tableDesc.Columns[i]
 			colsByID[col.ID] = col
 		}
 		colIDs := append(append(index.ColumnIDs, index.ExtraColumnIDs...), index.StoreColumnIDs...)
 		for _, colID := range colIDs {
-			col := colsByID[colID]
-			addColumn(col)
+			addColumn(colsByID[colID])
 		}
 	}
 
@@ -161,38 +135,41 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	//  sha265 => 1h6m
 	//  fnv64 (again) => 17m
 	//
-	// TODO(dan): If/when this ever loses its EXERIMENTAL prefix and gets
+	// TODO(dan): If/when this ever loses its EXPERIMENTAL prefix and gets
 	// exposed to users, consider adding a version to the fingerprint output.
 	sql := fmt.Sprintf(`SELECT
-	  XOR_AGG(FNV64(%s))::string AS fingerprint
-	  FROM %s.%s@{FORCE_INDEX=%s,NO_INDEX_JOIN}
-	`, strings.Join(cols, `,`), n.tn.DatabaseName, n.tn.TableName, parser.Name(index.Name))
+	  xor_agg(fnv64(%s))::string AS fingerprint
+	  FROM [%d AS t]@{FORCE_INDEX=[%d]}
+	`, strings.Join(cols, `,`), n.tableDesc.ID, index.ID)
+	// If were'in in an AOST context, propagate it to the inner statement so that
+	// the inner statement gets planned with planner.avoidCachedDescriptors set,
+	// like the outter one.
+	if params.p.semaCtx.AsOfTimestamp != nil {
+		ts := params.p.txn.OrigTimestamp()
+		sql = sql + " AS OF SYSTEM TIME " + ts.AsOfSystemTime()
+	}
 
-	var fingerprintCols parser.Datums
-	if err := params.p.ExecCfg().DB.Txn(params.ctx, func(ctx context.Context, txn *client.Txn) error {
-		txn.SetFixedTimestamp(n.ts)
-
-		// Use internal planner directly instead of InternalExecutor because we
-		// need to set `avoidCachedDescriptors`.
-		p := makeInternalPlanner("SELECT", txn, security.RootUser, params.p.LeaseMgr().memMetrics)
-		defer finishInternalPlanner(p)
-		p.session.tables.leaseMgr = params.p.LeaseMgr()
-		p.avoidCachedDescriptors = true
-
-		var err error
-		fingerprintCols, err = p.QueryRow(ctx, sql)
-		return err
-	}); err != nil {
+	fingerprintCols, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRow(
+		params.ctx, "hash-fingerprint",
+		params.p.txn,
+		sql,
+	)
+	if err != nil {
 		return false, err
 	}
 
 	if len(fingerprintCols) != 1 {
-		return false, errors.Errorf("unexpected number of columns returned: 1 vs %d",
+		return false, pgerror.NewAssertionErrorf(
+			"unexpected number of columns returned: 1 vs %d",
 			len(fingerprintCols))
 	}
 	fingerprint := fingerprintCols[0]
 
-	n.values = []parser.Datum{parser.NewDString(index.Name), fingerprint}
-	n.rowIdx++
+	n.run.values[0] = tree.NewDString(index.Name)
+	n.run.values[1] = fingerprint
+	n.run.rowIdx++
 	return true, nil
 }
+
+func (n *showFingerprintsNode) Values() tree.Datums     { return n.run.values }
+func (n *showFingerprintsNode) Close(_ context.Context) {}

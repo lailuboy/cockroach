@@ -4,20 +4,20 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
 package engineccl
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -51,7 +51,10 @@ func loadTestData(
 	}
 
 	eng, err := engine.NewRocksDB(
-		engine.RocksDBConfig{Dir: dir},
+		engine.RocksDBConfig{
+			Settings: cluster.MakeTestingClusterSettings(),
+			Dir:      dir,
+		},
 		engine.RocksDBCache{},
 	)
 	if err != nil {
@@ -84,7 +87,7 @@ func loadTestData(
 		if scaled := len(keys) / numBatches; (i % scaled) == 0 {
 			if i > 0 {
 				log.Infof(ctx, "committing (%d/~%d)", i/scaled, numBatches)
-				if err := batch.Commit(false /* !sync */); err != nil {
+				if err := batch.Commit(false /* sync */); err != nil {
 					return nil, err
 				}
 				batch.Close()
@@ -102,7 +105,7 @@ func loadTestData(
 			return nil, err
 		}
 	}
-	if err := batch.Commit(false /* !sync */); err != nil {
+	if err := batch.Commit(false /* sync */); err != nil {
 		return nil, err
 	}
 	batch.Close()
@@ -165,12 +168,16 @@ func BenchmarkTimeBoundIterate(b *testing.B) {
 		b.Run(fmt.Sprintf("LoadFactor=%.2f", loadFactor), func(b *testing.B) {
 			b.Run("NormalIterator", func(b *testing.B) {
 				runIterate(b, loadFactor, func(e engine.Engine, _, _ hlc.Timestamp) engine.Iterator {
-					return e.NewIterator(false)
+					return e.NewIterator(engine.IterOptions{UpperBound: roachpb.KeyMax})
 				})
 			})
 			b.Run("TimeBoundIterator", func(b *testing.B) {
 				runIterate(b, loadFactor, func(e engine.Engine, startTime, endTime hlc.Timestamp) engine.Iterator {
-					return e.NewTimeBoundIterator(startTime, endTime)
+					return e.NewIterator(engine.IterOptions{
+						MinTimestampHint: startTime,
+						MaxTimestampHint: endTime,
+						UpperBound:       roachpb.KeyMax,
+					})
 				})
 			})
 		})

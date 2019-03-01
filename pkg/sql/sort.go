@@ -1,5 +1,4 @@
 // Copyright 2015 The Cockroach Authors.
-// Copyright 2009 The Go Authors (portions).
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,254 +11,29 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
-	"container/heap"
-	"sort"
+	"context"
 
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/pkg/errors"
 )
-
-// The next few sorting functions are largely unmodified
-// from the GO standard library implementation, save for occasional
-// cancellation checks.
-
-// Insertion sort
-func insertionSort(data sort.Interface, a, b int) {
-	for i := a + 1; i < b; i++ {
-		for j := i; j > a && data.Less(j, j-1); j-- {
-			data.Swap(j, j-1)
-		}
-	}
-}
-
-// siftDown implements the heap property on data[lo, hi).
-// first is an offset into the array where the root of the heap lies.
-func siftDown(data sort.Interface, lo, hi, first int) {
-	root := lo
-	for {
-		child := 2*root + 1
-		if child >= hi {
-			break
-		}
-		if child+1 < hi && data.Less(first+child, first+child+1) {
-			child++
-		}
-		if !data.Less(first+root, first+child) {
-			return
-		}
-		data.Swap(first+root, first+child)
-		root = child
-	}
-}
-
-func heapSort(data sort.Interface, a, b int, cancelChecker CancelChecker) {
-	first := a
-	lo := 0
-	hi := b - a
-
-	// Build heap with greatest element at top.
-	for i := (hi - 1) / 2; i >= 0; i-- {
-		if cancelChecker.Check() != nil {
-			return
-		}
-		siftDown(data, i, hi, first)
-	}
-
-	// Pop elements, largest first, into end of data.
-	for i := hi - 1; i >= 0; i-- {
-		data.Swap(first, first+i)
-		siftDown(data, lo, i, first)
-	}
-}
-
-// Quicksort, loosely following Bentley and McIlroy,
-// ``Engineering a Sort Function,'' SP&E November 1993.
-
-// medianOfThree moves the median of the three values data[m0], data[m1], data[m2] into data[m1].
-func medianOfThree(data sort.Interface, m1, m0, m2 int) {
-	// sort 3 elements
-	if data.Less(m1, m0) {
-		data.Swap(m1, m0)
-	}
-	// data[m0] <= data[m1]
-	if data.Less(m2, m1) {
-		data.Swap(m2, m1)
-		// data[m0] <= data[m2] && data[m1] < data[m2]
-		if data.Less(m1, m0) {
-			data.Swap(m1, m0)
-		}
-	}
-	// now data[m0] <= data[m1] <= data[m2]
-}
-
-func doPivot(data sort.Interface, lo, hi int) (midlo, midhi int) {
-	m := lo + (hi-lo)/2 // Written like this to avoid integer overflow.
-	if hi-lo > 40 {
-		// Tukey's ``Ninther,'' median of three medians of three.
-		s := (hi - lo) / 8
-		medianOfThree(data, lo, lo+s, lo+2*s)
-		medianOfThree(data, m, m-s, m+s)
-		medianOfThree(data, hi-1, hi-1-s, hi-1-2*s)
-	}
-	medianOfThree(data, lo, m, hi-1)
-
-	// Invariants are:
-	//	data[lo] = pivot (set up by ChoosePivot)
-	//	data[lo < i < a] < pivot
-	//	data[a <= i < b] <= pivot
-	//	data[b <= i < c] unexamined
-	//	data[c <= i < hi-1] > pivot
-	//	data[hi-1] >= pivot
-	pivot := lo
-	a, c := lo+1, hi-1
-
-	for ; a < c && data.Less(a, pivot); a++ {
-	}
-	b := a
-	for {
-		for ; b < c && !data.Less(pivot, b); b++ { // data[b] <= pivot
-		}
-		for ; b < c && data.Less(pivot, c-1); c-- { // data[c-1] > pivot
-		}
-		if b >= c {
-			break
-		}
-		// data[b] > pivot; data[c-1] <= pivot
-		data.Swap(b, c-1)
-		b++
-		c--
-	}
-	// If hi-c<3 then there are duplicates (by property of median of nine).
-	// Let be a bit more conservative, and set border to 5.
-	protect := hi-c < 5
-	if !protect && hi-c < (hi-lo)/4 {
-		// Lets test some points for equality to pivot
-		dups := 0
-		if !data.Less(pivot, hi-1) { // data[hi-1] = pivot
-			data.Swap(c, hi-1)
-			c++
-			dups++
-		}
-		if !data.Less(b-1, pivot) { // data[b-1] = pivot
-			b--
-			dups++
-		}
-		// m-lo = (hi-lo)/2 > 6
-		// b-lo > (hi-lo)*3/4-1 > 8
-		// ==> m < b ==> data[m] <= pivot
-		if !data.Less(m, pivot) { // data[m] = pivot
-			data.Swap(m, b-1)
-			b--
-			dups++
-		}
-		// if at least 2 points are equal to pivot, assume skewed distribution
-		protect = dups > 1
-	}
-	if protect {
-		// Protect against a lot of duplicates
-		// Add invariant:
-		//	data[a <= i < b] unexamined
-		//	data[b <= i < c] = pivot
-		for {
-			for ; a < b && !data.Less(b-1, pivot); b-- { // data[b] == pivot
-			}
-			for ; a < b && data.Less(a, pivot); a++ { // data[a] < pivot
-			}
-			if a >= b {
-				break
-			}
-			// data[a] == pivot; data[b-1] < pivot
-			data.Swap(a, b-1)
-			a++
-			b--
-		}
-	}
-	// Swap pivot into middle
-	data.Swap(pivot, b-1)
-	return b - 1, c
-}
-
-// maxDepth returns a threshold at which quicksort should switch
-// to heapsort. It returns 2*ceil(lg(n+1)).
-func maxDepth(n int) int {
-	var depth int
-	for i := n; i > 0; i >>= 1 {
-		depth++
-	}
-	return depth * 2
-}
-
-func quickSort(data sort.Interface, a, b, maxDepth int, cancelChecker CancelChecker) {
-	for b-a > 12 { // Use ShellSort for slices <= 12 elements
-		if maxDepth == 0 {
-			heapSort(data, a, b, cancelChecker)
-			return
-		}
-		maxDepth--
-		// Short-circuit sort if necessary.
-		if cancelChecker.Check() != nil {
-			return
-		}
-		mlo, mhi := doPivot(data, a, b)
-		// Avoiding recursion on the larger subproblem guarantees
-		// a stack depth of at most lg(b-a).
-		if mlo-a < b-mhi {
-			quickSort(data, a, mlo, maxDepth, cancelChecker)
-			a = mhi // i.e., quickSort(data, mhi, b)
-		} else {
-			quickSort(data, mhi, b, maxDepth, cancelChecker)
-			b = mlo // i.e., quickSort(data, a, mlo)
-		}
-	}
-	if b-a > 1 {
-		// Do ShellSort pass with gap 6
-		// It could be written in this simplified form cause b-a <= 12
-		for i := a + 6; i < b; i++ {
-			if data.Less(i, i-6) {
-				data.Swap(i, i-6)
-			}
-		}
-		insertionSort(data, a, b)
-	}
-}
-
-// doSort sorts data.
-// It makes one call to data.Len to determine n, and O(n*log(n)) calls to
-// data.Less and data.Swap. The sort is not guaranteed to be stable.
-func doSort(data sort.Interface, cancelChecker CancelChecker) {
-	n := data.Len()
-	quickSort(data, 0, n, maxDepth(n), cancelChecker)
-}
 
 // sortNode represents a node that sorts the rows returned by its
 // sub-node.
 type sortNode struct {
-	p        *planner
 	plan     planNode
 	columns  sqlbase.ResultColumns
 	ordering sqlbase.ColumnOrdering
 
-	needSort     bool
-	sortStrategy sortingStrategy
-	valueIter    valueIterator
-}
-
-func ensureColumnOrderable(c sqlbase.ResultColumn) error {
-	if _, ok := c.Typ.(parser.TArray); ok {
-		return errors.Errorf("can't order by column type %s", c.Typ)
-	}
-	return nil
+	needSort bool
 }
 
 // orderBy constructs a sortNode based on the ORDER BY clause.
@@ -276,7 +50,7 @@ func ensureColumnOrderable(c sqlbase.ResultColumn) error {
 // Support this. It will reduce some of the special casing below, but requires a
 // generalization of how to add derived columns to a SelectStatement.
 func (p *planner) orderBy(
-	ctx context.Context, orderBy parser.OrderBy, n planNode,
+	ctx context.Context, orderBy tree.OrderBy, n planNode,
 ) (*sortNode, error) {
 	if orderBy == nil {
 		return nil, nil
@@ -301,14 +75,22 @@ func (p *planner) orderBy(
 		return nil, err
 	}
 
+	// We need to reject SRFs in the ORDER BY clause until they are
+	// properly handled.
+	seenGenerator := p.semaCtx.Properties.Derived.SeenGenerator
+	p.semaCtx.Properties.Derived.SeenGenerator = false
+	defer func() {
+		p.semaCtx.Properties.Derived.SeenGenerator = p.semaCtx.Properties.Derived.SeenGenerator || seenGenerator
+	}()
+
 	for _, o := range orderBy {
 		direction := encoding.Ascending
-		if o.Direction == parser.Descending {
+		if o.Direction == tree.Descending {
 			direction = encoding.Descending
 		}
 
 		// Unwrap parenthesized expressions like "((a))" to "a".
-		expr := parser.StripParens(o.Expr)
+		expr := tree.StripParens(o.Expr)
 
 		// The logical data source for ORDER BY is the list of render
 		// expressions for a SELECT, as specified in the input SQL text
@@ -345,46 +127,14 @@ func (p *planner) orderBy(
 		//    e.g. SELECT a FROM t ORDER by b
 		//    e.g. SELECT a, b FROM t ORDER by a+b
 
-		index := -1
-
 		// First, deal with render aliases.
-		if vBase, ok := expr.(parser.VarName); ok {
-			v, err := vBase.NormalizeVarName()
-			if err != nil {
-				return nil, err
-			}
-
-			if c, ok := v.(*parser.ColumnItem); ok && c.TableName.Table() == "" {
-				// Look for an output column that matches the name. This
-				// handles cases like:
-				//
-				//   SELECT a AS b FROM t ORDER BY b
-				target := string(c.ColumnName)
-				for j, col := range columns {
-					if col.Name == target {
-						if index != -1 {
-							// There is more than one render alias that matches the ORDER BY
-							// clause. Here, SQL92 is specific as to what should be done:
-							// if the underlying expression is known (we're on a renderNode)
-							// and it is equivalent, then just accept that and ignore the ambiguity.
-							// This plays nice with `SELECT b, * FROM t ORDER BY b`. Otherwise,
-							// reject with an ambiguity error.
-							if s == nil || !s.equivalentRenders(j, index) {
-								return nil, errors.Errorf("ORDER BY \"%s\" is ambiguous", target)
-							}
-							// Note that in this case we want to use the index of the first
-							// matching column. This is because renderNode.computeOrdering
-							// also prefers the first column, and we want the orderings to
-							// match as much as possible.
-							continue
-						}
-						index = j
-					}
-				}
-			}
+		index, err := s.colIdxByRenderAlias(expr, columns, "ORDER BY")
+		if err != nil {
+			return nil, err
 		}
 
-		// So Then, deal with column ordinals.
+		// If the expression does not refer to an alias, deal with
+		// column ordinals.
 		if index == -1 {
 			col, err := p.colIndex(numOriginalCols, expr, "ORDER BY")
 			if err != nil {
@@ -410,17 +160,20 @@ func (p *planner) orderBy(
 		// to fabricate an intermediate renderNode to add the new render.
 		if index == -1 && s != nil {
 			cols, exprs, hasStar, err := p.computeRenderAllowingStars(
-				ctx, parser.SelectExpr{Expr: expr}, parser.TypeAny,
+				ctx, tree.SelectExpr{Expr: expr}, types.Any,
 				s.sourceInfo, s.ivarHelper, autoGenerateRenderOutputName)
 			if err != nil {
 				return nil, err
 			}
-			s.isStar = s.isStar || hasStar
+			p.curPlan.hasStar = p.curPlan.hasStar || hasStar
 
 			if len(cols) == 0 {
 				// Nothing was expanded! No order here.
 				continue
 			}
+
+			// ORDER BY (a, b) -> ORDER BY a, b
+			cols, exprs = flattenTuples(cols, exprs, &s.ivarHelper)
 
 			colIdxs := s.addOrReuseRenders(cols, exprs, true)
 			for i := 0; i < len(colIdxs)-1; i++ {
@@ -440,17 +193,95 @@ func (p *planner) orderBy(
 		}
 
 		if index == -1 {
-			return nil, errors.Errorf("column %s does not exist", expr)
+			return nil, sqlbase.NewUndefinedColumnError(expr.String())
 		}
 		ordering = append(ordering,
 			sqlbase.ColumnOrderInfo{ColIdx: index, Direction: direction})
+	}
+
+	if p.semaCtx.Properties.Derived.SeenGenerator {
+		return nil, tree.NewInvalidFunctionUsageError(tree.GeneratorClass, "ORDER BY")
 	}
 
 	if ordering == nil {
 		// No ordering; simply drop the sort node.
 		return nil, nil
 	}
-	return &sortNode{p: p, columns: columns, ordering: ordering}, nil
+	return &sortNode{columns: columns, ordering: ordering}, nil
+}
+
+func (n *sortNode) startExec(runParams) error {
+	panic("sortNode cannot be run in local mode")
+}
+
+func (n *sortNode) Next(params runParams) (bool, error) {
+	panic("sortNode cannot be run in local mode")
+}
+
+func (n *sortNode) Values() tree.Datums {
+	panic("sortNode cannot be run in local mode")
+}
+
+func (n *sortNode) Close(ctx context.Context) {
+	n.plan.Close(ctx)
+}
+
+func ensureColumnOrderable(c sqlbase.ResultColumn) error {
+	if _, ok := c.Typ.(types.TArray); ok || c.Typ == types.JSON {
+		return pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, "can't order by column type %s", c.Typ)
+	}
+	return nil
+}
+
+// flattenTuples extracts the members of tuples into a list of columns.
+func flattenTuples(
+	cols sqlbase.ResultColumns, exprs []tree.TypedExpr, ivarHelper *tree.IndexedVarHelper,
+) (sqlbase.ResultColumns, []tree.TypedExpr) {
+	// We want to avoid allocating new slices unless strictly necessary.
+	var newExprs []tree.TypedExpr
+	var newCols sqlbase.ResultColumns
+	for i, e := range exprs {
+		if t, ok := e.(*tree.Tuple); ok {
+			if newExprs == nil {
+				// All right, it was necessary to allocate the slices after all.
+				newExprs = make([]tree.TypedExpr, i, len(exprs))
+				newCols = make(sqlbase.ResultColumns, i, len(cols))
+				copy(newExprs, exprs[:i])
+				copy(newCols, cols[:i])
+			}
+
+			newCols, newExprs = flattenTuple(t, newCols, newExprs, ivarHelper)
+		} else if newExprs != nil {
+			newExprs = append(newExprs, e)
+			newCols = append(newCols, cols[i])
+		}
+	}
+	if newExprs != nil {
+		return newCols, newExprs
+	}
+	return cols, exprs
+}
+
+// flattenTuple extracts the members of one tuple into a list of columns.
+func flattenTuple(
+	t *tree.Tuple,
+	cols sqlbase.ResultColumns,
+	exprs []tree.TypedExpr,
+	ivarHelper *tree.IndexedVarHelper,
+) (sqlbase.ResultColumns, []tree.TypedExpr) {
+	for _, e := range t.Exprs {
+		if eT, ok := e.(*tree.Tuple); ok {
+			cols, exprs = flattenTuple(eT, cols, exprs, ivarHelper)
+		} else {
+			expr := e.(tree.TypedExpr)
+			exprs = append(exprs, expr)
+			cols = append(cols, sqlbase.ResultColumn{
+				Name: expr.String(),
+				Typ:  expr.ResolvedType(),
+			})
+		}
+	}
+	return cols, exprs
 }
 
 // rewriteIndexOrderings rewrites an ORDER BY clause that uses the
@@ -464,29 +295,36 @@ func (p *planner) orderBy(
 //   ORDER BY INDEX t@foo ASC -> ORDER BY t.a DESC, t.a ASC
 //   ORDER BY INDEX t@foo DESC -> ORDER BY t.a ASC, t.b DESC
 func (p *planner) rewriteIndexOrderings(
-	ctx context.Context, orderBy parser.OrderBy,
-) (parser.OrderBy, error) {
+	ctx context.Context, orderBy tree.OrderBy,
+) (tree.OrderBy, error) {
 	// The loop above *may* allocate a new slice, but this is only
 	// needed if the INDEX / PRIMARY KEY syntax is used. In case the
 	// ORDER BY clause only uses the column syntax, we should reuse the
-	// same slice. So we start with an empty slice whose underlying
-	// array is the same as the original specification.
-	newOrderBy := orderBy[:0]
-	for _, o := range orderBy {
+	// same slice.
+	newOrderBy := orderBy
+	rewrite := false
+	for i, o := range orderBy {
 		switch o.OrderType {
-		case parser.OrderByColumn:
+		case tree.OrderByColumn:
 			// Nothing to do, just propagate the setting.
-			newOrderBy = append(newOrderBy, o)
+			if rewrite {
+				// We only need to-reappend if we've allocated a new slice
+				// (see below).
+				newOrderBy = append(newOrderBy, o)
+			}
 
-		case parser.OrderByIndex:
-			tn, err := p.QualifyWithDatabase(ctx, &o.Table)
+		case tree.OrderByIndex:
+			tn := o.Table
+			desc, err := ResolveExistingObject(ctx, p, &tn, true /*required*/, requireTableDesc)
 			if err != nil {
 				return nil, err
 			}
-			desc, err := p.getTableDesc(ctx, tn)
-			if err != nil {
-				return nil, err
-			}
+
+			// Force the name to be fully qualified so that the column references
+			// below only match against real tables in the FROM clause.
+			tn.ExplicitCatalog = true
+			tn.ExplicitSchema = true
+
 			var idxDesc *sqlbase.IndexDescriptor
 			if o.Index == "" || string(o.Index) == desc.PrimaryIndex.Name {
 				// ORDER BY PRIMARY KEY / ORDER BY INDEX t@primary
@@ -500,58 +338,71 @@ func (p *planner) rewriteIndexOrderings(
 						break
 					}
 				}
-			}
-			if idxDesc == nil {
-				return nil, errors.Errorf("index %s@%s not found", o.Table, o.Index)
+				if idxDesc == nil {
+					return nil, errors.Errorf("index %q not found", tree.ErrString(&o.Index))
+				}
 			}
 
 			// Now, expand the ORDER BY clause by an equivalent clause using that
 			// index's columns.
 
-			// First, make the final slice bigger.
-			prevNewOrderBy := newOrderBy
-			newOrderBy = make(parser.OrderBy,
-				len(newOrderBy),
-				cap(newOrderBy)+len(idxDesc.ColumnNames)-1)
-			copy(newOrderBy, prevNewOrderBy)
+			if !rewrite {
+				// First, make a final slice that's intelligently larger.
+				newOrderBy = make(tree.OrderBy, i, len(orderBy)+len(idxDesc.ColumnNames)-1)
+				copy(newOrderBy, orderBy[:i])
+				rewrite = true
+			}
 
 			// Now expand the clause.
 			for k, colName := range idxDesc.ColumnNames {
-				newOrderBy = append(newOrderBy, &parser.Order{
-					OrderType: parser.OrderByColumn,
-					Expr:      &parser.ColumnItem{TableName: *tn, ColumnName: parser.Name(colName)},
-					Direction: chooseDirection(o.Direction == parser.Descending, idxDesc.ColumnDirections[k]),
+				newOrderBy = append(newOrderBy, &tree.Order{
+					OrderType: tree.OrderByColumn,
+					Expr:      tree.NewColumnItem(&tn, tree.Name(colName)),
+					Direction: chooseDirection(o.Direction == tree.Descending, idxDesc.ColumnDirections[k]),
+				})
+			}
+
+			for _, id := range idxDesc.ExtraColumnIDs {
+				col, err := desc.FindColumnByID(id)
+				if err != nil {
+					return nil, pgerror.NewAssertionErrorf("column with ID %d not found", id)
+				}
+
+				newOrderBy = append(newOrderBy, &tree.Order{
+					OrderType: tree.OrderByColumn,
+					Expr:      tree.NewColumnItem(&tn, tree.Name(col.Name)),
+					Direction: chooseDirection(o.Direction == tree.Descending, sqlbase.IndexDescriptor_ASC),
 				})
 			}
 
 		default:
-			return nil, errors.Errorf("unknown ORDER BY specification: %s", parser.AsString(orderBy))
+			return nil, errors.Errorf("unknown ORDER BY specification: %s", tree.ErrString(&orderBy))
 		}
 	}
 
 	if log.V(2) {
-		log.Infof(ctx, "rewritten ORDER BY clause: %s", parser.AsString(newOrderBy))
+		log.Infof(ctx, "rewritten ORDER BY clause: %s", tree.ErrString(&newOrderBy))
 	}
 	return newOrderBy, nil
 }
 
 // chooseDirection translates the specified IndexDescriptor_Direction
-// into a parser.Direction. If invert is true, the idxDir is inverted.
-func chooseDirection(invert bool, idxDir sqlbase.IndexDescriptor_Direction) parser.Direction {
+// into a tree.Direction. If invert is true, the idxDir is inverted.
+func chooseDirection(invert bool, idxDir sqlbase.IndexDescriptor_Direction) tree.Direction {
 	if (idxDir == sqlbase.IndexDescriptor_ASC) != invert {
-		return parser.Ascending
+		return tree.Ascending
 	}
-	return parser.Descending
+	return tree.Descending
 }
 
 // colIndex takes an expression that refers to a column using an integer, verifies it refers to a
 // valid render target and returns the corresponding column index. For example:
 //    SELECT a from T ORDER by 1
 // Here "1" refers to the first render target "a". The returned index is 0.
-func (p *planner) colIndex(numOriginalCols int, expr parser.Expr, context string) (int, error) {
+func (p *planner) colIndex(numOriginalCols int, expr tree.Expr, context string) (int, error) {
 	ord := int64(-1)
 	switch i := expr.(type) {
-	case *parser.NumVal:
+	case *tree.NumVal:
 		if i.ShouldBeInt64() {
 			val, err := i.AsInt64()
 			if err != nil {
@@ -559,282 +410,32 @@ func (p *planner) colIndex(numOriginalCols int, expr parser.Expr, context string
 			}
 			ord = val
 		} else {
-			return -1, errors.Errorf("non-integer constant in %s: %s", context, expr)
+			return -1, pgerror.NewErrorf(
+				pgerror.CodeSyntaxError,
+				"non-integer constant in %s: %s", context, expr,
+			)
 		}
-	case *parser.DInt:
+	case *tree.DInt:
 		if *i >= 0 {
 			ord = int64(*i)
 		}
-	case *parser.StrVal:
-		return -1, errors.Errorf("non-integer constant in %s: %s", context, expr)
-	case parser.Datum:
-		return -1, errors.Errorf("non-integer constant in %s: %s", context, expr)
+	case *tree.StrVal:
+		return -1, pgerror.NewErrorf(
+			pgerror.CodeSyntaxError, "non-integer constant in %s: %s", context, expr,
+		)
+	case tree.Datum:
+		return -1, pgerror.NewErrorf(
+			pgerror.CodeSyntaxError, "non-integer constant in %s: %s", context, expr,
+		)
 	}
 	if ord != -1 {
 		if ord < 1 || ord > int64(numOriginalCols) {
-			return -1, errors.Errorf("%s position %s is not in select list", context, expr)
+			return -1, pgerror.NewErrorf(
+				pgerror.CodeInvalidColumnReferenceError,
+				"%s position %s is not in select list", context, expr,
+			)
 		}
 		ord--
 	}
 	return int(ord), nil
 }
-
-func (n *sortNode) Values() parser.Datums {
-	// If an ordering expression was used the number of columns in each row might
-	// differ from the number of columns requested, so trim the result.
-	return n.valueIter.Values()[:len(n.columns)]
-}
-
-func (n *sortNode) Start(params runParams) error {
-	return n.plan.Start(params)
-}
-
-func (n *sortNode) Next(params runParams) (bool, error) {
-	cancelChecker := params.p.cancelChecker
-
-	for n.needSort {
-		if v, ok := n.plan.(*valuesNode); ok {
-			// The plan we wrap is already a values node. Just sort it.
-			v.ordering = n.ordering
-			n.sortStrategy = newSortAllStrategy(v)
-			n.sortStrategy.Finish(params.ctx, cancelChecker)
-			n.needSort = false
-			break
-		} else if n.sortStrategy == nil {
-			v := n.p.newContainerValuesNode(planColumns(n.plan), 0)
-			v.ordering = n.ordering
-			n.sortStrategy = newSortAllStrategy(v)
-		}
-
-		if err := cancelChecker.Check(); err != nil {
-			return false, err
-		}
-
-		// TODO(andrei): If we're scanning an index with a prefix matching an
-		// ordering prefix, we should only accumulate values for equal fields
-		// in this prefix, then sort the accumulated chunk and output.
-		// TODO(irfansharif): matching column ordering speed-ups from distsql,
-		// when implemented, could be repurposed and used here.
-		next, err := n.plan.Next(params)
-		if err != nil {
-			return false, err
-		}
-		if !next {
-			n.sortStrategy.Finish(params.ctx, cancelChecker)
-			n.valueIter = n.sortStrategy
-			n.needSort = false
-			break
-		}
-
-		values := n.plan.Values()
-		if err := n.sortStrategy.Add(params.ctx, values); err != nil {
-			return false, err
-		}
-	}
-
-	// Check again, in case sort returned early due to a cancellation.
-	if err := cancelChecker.Check(); err != nil {
-		return false, err
-	}
-
-	if n.valueIter == nil {
-		n.valueIter = n.plan
-	}
-	return n.valueIter.Next(params)
-}
-
-func (n *sortNode) Close(ctx context.Context) {
-	n.plan.Close(ctx)
-	if n.sortStrategy != nil {
-		n.sortStrategy.Close(ctx)
-	}
-	// n.valueIter points to either n.plan or n.sortStrategy and thus has already
-	// been closed.
-}
-
-// valueIterator provides iterative access to a value source's values and
-// debug values. It is a subset of the planNode interface, so all methods
-// should conform to the comments expressed in the planNode definition.
-type valueIterator interface {
-	Next(runParams) (bool, error)
-	Values() parser.Datums
-	Close(ctx context.Context)
-}
-
-type sortingStrategy interface {
-	valueIterator
-	// Add adds a single value to the sortingStrategy. It guarantees that
-	// if it decided to store the provided value, that it will make a deep
-	// copy of it.
-	Add(context.Context, parser.Datums) error
-	// Finish terminates the sorting strategy, allowing for postprocessing
-	// after all values have been provided to the strategy. The method should
-	// not be called more than once, and should only be called after all Add
-	// calls have occurred.
-	Finish(context.Context, CancelChecker)
-}
-
-// sortAllStrategy reads in all values into the wrapped valuesNode and
-// uses sort.Sort to sort all values in-place. It has a worst-case time
-// complexity of O(n*log(n)) and a worst-case space complexity of O(n).
-//
-// The strategy is intended to be used when all values need to be sorted.
-type sortAllStrategy struct {
-	vNode *valuesNode
-}
-
-func newSortAllStrategy(vNode *valuesNode) sortingStrategy {
-	return &sortAllStrategy{
-		vNode: vNode,
-	}
-}
-
-func (ss *sortAllStrategy) Add(ctx context.Context, values parser.Datums) error {
-	_, err := ss.vNode.rows.AddRow(ctx, values)
-	return err
-}
-
-func (ss *sortAllStrategy) Finish(ctx context.Context, cancelChecker CancelChecker) {
-	ss.vNode.SortAll(cancelChecker)
-}
-
-func (ss *sortAllStrategy) Next(params runParams) (bool, error) {
-	return ss.vNode.Next(params)
-}
-
-func (ss *sortAllStrategy) Values() parser.Datums {
-	return ss.vNode.Values()
-}
-
-func (ss *sortAllStrategy) Close(ctx context.Context) {
-	ss.vNode.Close(ctx)
-}
-
-// iterativeSortStrategy reads in all values into the wrapped valuesNode
-// and turns the underlying slice into a min-heap. It then pops a value
-// off of the heap for each call to Next, meaning that it only needs to
-// sort the number of values needed, instead of the entire slice. If the
-// underlying value source provides n rows and the strategy produce only
-// k rows, it has a worst-case time complexity of O(n + k*log(n)) and a
-// worst-case space complexity of O(n).
-//
-// The strategy is intended to be used when an unknown number of values
-// need to be sorted, but that most likely not all values need to be sorted.
-type iterativeSortStrategy struct {
-	vNode      *valuesNode
-	lastVal    parser.Datums
-	nextRowIdx int
-}
-
-func newIterativeSortStrategy(vNode *valuesNode) sortingStrategy {
-	return &iterativeSortStrategy{
-		vNode: vNode,
-	}
-}
-
-func (ss *iterativeSortStrategy) Add(ctx context.Context, values parser.Datums) error {
-	_, err := ss.vNode.rows.AddRow(ctx, values)
-	return err
-}
-
-func (ss *iterativeSortStrategy) Finish(context.Context, CancelChecker) {
-	ss.vNode.InitMinHeap()
-}
-
-func (ss *iterativeSortStrategy) Next(runParams) (bool, error) {
-	if ss.vNode.Len() == 0 {
-		return false, nil
-	}
-	ss.lastVal = ss.vNode.PopValues()
-	ss.nextRowIdx++
-	return true, nil
-}
-
-func (ss *iterativeSortStrategy) Values() parser.Datums {
-	return ss.lastVal
-}
-
-func (ss *iterativeSortStrategy) Close(ctx context.Context) {
-	ss.vNode.Close(ctx)
-}
-
-// sortTopKStrategy creates a max-heap in its wrapped valuesNode and keeps
-// this heap populated with only the top k values seen. It accomplishes this
-// by comparing new values (before the deep copy) with the top of the heap.
-// If the new value is less than the current top, the top will be replaced
-// and the heap will be fixed. If not, the new value is dropped. When finished,
-// all values in the heap are popped, sorting the values correctly in-place.
-// It has a worst-case time complexity of O(n*log(k)) and a worst-case space
-// complexity of O(k).
-//
-// The strategy is intended to be used when exactly k values need to be sorted,
-// where k is known before sorting begins.
-//
-// TODO(nvanbenschoten): There are better algorithms that can achieve a sorted
-// top k in a worst-case time complexity of O(n + k*log(k)) while maintaining
-// a worst-case space complexity of O(k). For instance, the top k can be found
-// in linear time, and then this can be sorted in linearithmic time.
-type sortTopKStrategy struct {
-	vNode *valuesNode
-	topK  int64
-}
-
-func newSortTopKStrategy(vNode *valuesNode, topK int64) sortingStrategy {
-	ss := &sortTopKStrategy{
-		vNode: vNode,
-		topK:  topK,
-	}
-	ss.vNode.InitMaxHeap()
-	return ss
-}
-
-func (ss *sortTopKStrategy) Add(ctx context.Context, values parser.Datums) error {
-	switch {
-	case int64(ss.vNode.Len()) < ss.topK:
-		// The first k values all go into the max-heap.
-		if err := ss.vNode.PushValues(ctx, values); err != nil {
-			return err
-		}
-	case ss.vNode.ValuesLess(values, ss.vNode.rows.At(0)):
-		// Once the heap is full, only replace the top
-		// value if a new value is less than it. If so
-		// replace and fix the heap.
-		if err := ss.vNode.rows.Replace(ctx, 0, values); err != nil {
-			return err
-		}
-		heap.Fix(ss.vNode, 0)
-	}
-	return nil
-}
-
-func (ss *sortTopKStrategy) Finish(ctx context.Context, cancelChecker CancelChecker) {
-	// Pop all values in the heap, resulting in the inverted ordering
-	// being sorted in reverse. Therefore, the slice is ordered correctly
-	// in-place.
-	for ss.vNode.Len() > 0 {
-		if cancelChecker.Check() != nil {
-			return
-		}
-		heap.Pop(ss.vNode)
-	}
-	ss.vNode.ResetLen()
-}
-
-func (ss *sortTopKStrategy) Next(params runParams) (bool, error) {
-	return ss.vNode.Next(params)
-}
-
-func (ss *sortTopKStrategy) Values() parser.Datums {
-	return ss.vNode.Values()
-}
-
-func (ss *sortTopKStrategy) Close(ctx context.Context) {
-	ss.vNode.Close(ctx)
-}
-
-// TODO(pmattis): If the result set is large, we might need to perform the
-// sort on disk. There is no point in doing this while we're buffering the
-// entire result set in memory. If/when we start streaming results back to
-// the client we should revisit.
-//
-// type onDiskSortStrategy struct{}

@@ -1,9 +1,23 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import React from "react";
+import { Helmet } from "react-helmet";
 import { Link } from "react-router";
 import _ from "lodash";
 import { connect } from "react-redux";
 import moment from "moment";
-import * as protobuf from "protobufjs/minimal";
 
 import "./events.styl";
 
@@ -11,13 +25,15 @@ import * as protos from "src/js/protos";
 
 import { AdminUIState } from "src/redux/state";
 import { refreshEvents } from "src/redux/apiReducers";
+import { eventsSelector, eventsValidSelector } from "src/redux/events";
 import { LocalSetting } from "src/redux/localsettings";
 import { TimestampToMoment } from "src/util/convert";
-import * as eventTypes from "src/util/eventTypes";
+import { getEventDescription } from "src/util/events";
 import { SortSetting } from "src/views/shared/components/sortabletable";
 import { SortedTable } from "src/views/shared/components/sortedtable";
+import { ToolTipWrapper } from "src/views/shared/components/toolTip";
 
-type Event$Properties = protos.cockroach.server.serverpb.EventsResponse.Event$Properties;
+type Event$Properties = protos.cockroach.server.serverpb.EventsResponse.IEvent;
 
 // Number of events to show in the sidebar.
 const EVENT_BOX_NUM_EVENTS = 10;
@@ -33,89 +49,18 @@ export interface SimplifiedEvent {
   content: React.ReactNode;
 }
 
-// Specialization of generic SortedTable component:
-//   https://github.com/Microsoft/TypeScript/issues/3960
-//
-// The variable name must start with a capital letter or TSX will not recognize
-// it as a component.
-// tslint:disable-next-line:variable-name
-const EventSortedTable = SortedTable as new () => SortedTable<SimplifiedEvent>;
+class EventSortedTable extends SortedTable<SimplifiedEvent> {}
 
 export interface EventRowProps {
   event: Event$Properties;
 }
 
-const s = (v: {}) => JSON.stringify(v, undefined, 2);
-
 export function getEventInfo(e: Event$Properties): SimplifiedEvent {
-  const info: {
-    DatabaseName: string,
-    DroppedTables: string[],
-    IndexName: string,
-    MutationID: string,
-    TableName: string,
-    User: string,
-    ViewName: string,
-  } = protobuf.util.isset(e, "info") ? JSON.parse(e.info) : {};
-  const targetId: number = e.target_id ? e.target_id.toNumber() : null;
-  let content: React.ReactNode;
-
-  switch (e.event_type) {
-    case eventTypes.CREATE_DATABASE:
-      content = <span>Database Created: User {info.User} created database {info.DatabaseName}</span>;
-      break;
-    case eventTypes.DROP_DATABASE:
-      info.DroppedTables = info.DroppedTables || [];
-      let tableDropText: string = `${info.DroppedTables.length} tables were dropped: ${info.DroppedTables.join(", ")}`;
-      if (info.DroppedTables.length === 0) {
-        tableDropText = "No tables were dropped.";
-      } else if (info.DroppedTables.length === 1) {
-        tableDropText = `1 table was dropped: ${info.DroppedTables[0]}`;
-      }
-      content = <span>Database Dropped: User {info.User} dropped database {info.DatabaseName}.{tableDropText}</span>;
-      break;
-    case eventTypes.CREATE_TABLE:
-      content = <span>Table Created: User {info.User} created table {info.TableName}</span>;
-      break;
-    case eventTypes.DROP_TABLE:
-      content = <span>Table Dropped: User {info.User} dropped table {info.TableName}</span>;
-      break;
-    case eventTypes.ALTER_TABLE:
-      content = <span>Schema Change: User {info.User} began a schema change to alter table {info.TableName} with ID {info.MutationID}</span>;
-      break;
-    case eventTypes.CREATE_INDEX:
-      content = <span>Schema Change: User {info.User} began a schema change to create an index {info.IndexName} on table {info.TableName} with ID {info.MutationID}</span>;
-      break;
-    case eventTypes.DROP_INDEX:
-      content = <span>Schema Change: User {info.User} began a schema change to drop index {info.IndexName} on table {info.TableName} with ID {info.MutationID}</span>;
-      break;
-    case eventTypes.CREATE_VIEW:
-      content = <span>View Created: User {info.User} created view {info.ViewName}</span>;
-      break;
-    case eventTypes.DROP_VIEW:
-      content = <span>View Dropped: User {info.User} dropped view {info.ViewName}</span>;
-      break;
-    case eventTypes.REVERSE_SCHEMA_CHANGE:
-      content = <span>Schema Change Reversed: Schema change with ID {info.MutationID} was reversed.</span>;
-      break;
-    case eventTypes.FINISH_SCHEMA_CHANGE:
-      content = <span>Schema Change Finished: Schema Change Completed: Schema change with ID {info.MutationID} was completed.</span>;
-      break;
-    case eventTypes.NODE_JOIN:
-      content = <span>Node Joined: Node {targetId} joined the cluster</span>;
-      break;
-    case eventTypes.NODE_RESTART:
-      content = <span>Node Rejoined: Node {targetId} rejoined the cluster</span>;
-      break;
-    default:
-      content = <span>Unknown Event Type: {e.event_type}, content: {s(info)}</span>;
-  }
-
   return {
     fromNowString: TimestampToMoment(e.timestamp).fromNow()
       .replace("second", "sec")
       .replace("minute", "min"),
-    content,
+    content: <span>{ getEventDescription(e) }</span>,
     sortableTimestamp: TimestampToMoment(e.timestamp),
   };
 }
@@ -125,7 +70,11 @@ export class EventRow extends React.Component<EventRowProps, {}> {
     const { event } = this.props;
     const e = getEventInfo(event);
     return <tr>
-      <td><div className="events__message">{e.content}</div></td>
+      <td>
+        <ToolTipWrapper text={ e.content }>
+          <div className="events__message">{e.content}</div>
+        </ToolTipWrapper>
+      </td>
       <td><div className="events__timestamp">{e.fromNowString}</div></td>
     </tr>;
   }
@@ -160,7 +109,7 @@ export class EventBoxUnconnected extends React.Component<EventBoxProps, {}> {
             return <EventRow event={e} key={i} />;
           })}
           <tr>
-            <td className="events__more-link" colSpan={2}><Link to="/cluster/events">View all events</Link></td>
+            <td className="events__more-link" colSpan={2}><Link to="/events">View all events</Link></td>
           </tr>
         </tbody>
       </table>
@@ -195,15 +144,11 @@ export class EventPageUnconnected extends React.Component<EventPageProps, {}> {
     const simplifiedEvents = _.map(events, getEventInfo);
 
     return <div>
-      {
-        // TODO(mrtracy): This currently always links back to the main cluster
-        // page, when it should link back to the dashboard previously visible.
-      }
-      <section className="section parent-link">
-        <Link to="/cluster">&lt; Back to Cluster</Link>
-      </section>
-      <section className="header header--subsection">
-        Events
+      <Helmet>
+        <title>Events</title>
+      </Helmet>
+      <section className="section section--heading">
+        <h1>Events</h1>
       </section>
       <section className="section l-columns">
         <div className="l-columns__left events-table">
@@ -228,14 +173,6 @@ export class EventPageUnconnected extends React.Component<EventPageProps, {}> {
     </div>;
   }
 }
-
-const eventsSelector = (state: AdminUIState) => {
-  return state.cachedData.events.data && state.cachedData.events.data.events;
-};
-
-const eventsValidSelector = (state: AdminUIState) => {
-  return state.cachedData.events.valid;
-};
 
 // Connect the EventsList class with our redux store.
 const eventBoxConnected = connect(

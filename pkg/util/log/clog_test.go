@@ -1,6 +1,5 @@
 // Copyright 2013 Google Inc. All Rights Reserved.
-//
-// Go support for leveled logs, analogous to https://code.google.com/p/google-clog/
+// Copyright 2017 The Cockroach Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,11 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// This code originated in the github.com/golang/glog package.
+
 package log
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -28,15 +30,14 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
-
-	"github.com/kr/pretty"
-
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/kr/pretty"
 )
 
 // Test that shortHostname works as advertised.
@@ -90,10 +91,9 @@ func contains(str string, t *testing.T) bool {
 	return strings.Contains(c, str)
 }
 
-// setFlags configures the logging flags and exitFunc how the test expects
-// them.
+// setFlags resets the logging flags and exit function to what tests expect.
 func setFlags() {
-	SetExitFunc(os.Exit)
+	ResetExitFunc()
 	logging.mu.Lock()
 	defer logging.mu.Unlock()
 	logging.noStderrRedirect = false
@@ -151,7 +151,7 @@ func TestEntryDecoder(t *testing.T) {
 		return buf.String()
 	}
 
-	t1 := time.Now().Round(time.Microsecond)
+	t1 := timeutil.Now().Round(time.Microsecond)
 	t2 := t1.Add(time.Microsecond)
 	t3 := t2.Add(time.Microsecond)
 	t4 := t3.Add(time.Microsecond)
@@ -452,7 +452,7 @@ func TestGetLogReader(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dir, err := logDir.get()
+	dir, err := logging.logDir.get()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +594,7 @@ func TestGC(t *testing.T) {
 	if e, a := 1, len(allFilesOriginal); e != a {
 		t.Fatalf("expected %d files, but found %d", e, a)
 	}
-	dir, err := logDir.get()
+	dir, err := logging.logDir.get()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -620,7 +620,7 @@ func TestGC(t *testing.T) {
 	defer func(previous int64) {
 		atomic.StoreInt64(&LogFilesCombinedMaxSize, previous)
 	}(LogFilesCombinedMaxSize)
-	atomic.StoreInt64(&LogFilesCombinedMaxSize, int64(maxTotalLogFileSize))
+	atomic.StoreInt64(&LogFilesCombinedMaxSize, maxTotalLogFileSize)
 
 	for i := 1; i < newLogFiles; i++ {
 		Infof(context.Background(), "%d", i)
@@ -697,7 +697,7 @@ func TestFatalStacktraceStderr(t *testing.T) {
 
 	setFlags()
 	logging.stderrThreshold = Severity_NONE
-	SetExitFunc(func(int) {})
+	SetExitFunc(false /* hideStack */, func(int) {})
 
 	defer setFlags()
 	defer logging.swap(logging.newBuffers())
@@ -755,6 +755,7 @@ func TestFileSeverityFilter(t *testing.T) {
 	defer s.Close(t)
 
 	setFlags()
+	defer func(save Severity) { logging.fileThreshold = save }(logging.fileThreshold)
 	logging.fileThreshold = Severity_ERROR
 
 	Infof(context.Background(), "test1")
@@ -774,9 +775,50 @@ func TestFileSeverityFilter(t *testing.T) {
 	}
 }
 
+type outOfSpaceWriter struct{}
+
+func (w *outOfSpaceWriter) Write([]byte) (int, error) {
+	return 0, fmt.Errorf("no space left on device")
+}
+
+func TestExitOnFullDisk(t *testing.T) {
+	oldLogExitFunc := logExitFunc
+	logExitFunc = nil
+	defer func() { logExitFunc = oldLogExitFunc }()
+
+	var exited sync.WaitGroup
+	exited.Add(1)
+	l := &loggingT{}
+	l.exitOverride.f = func(int) {
+		exited.Done()
+	}
+
+	l.file = &syncBuffer{
+		logger: l,
+		Writer: bufio.NewWriterSize(&outOfSpaceWriter{}, 1),
+	}
+
+	l.mu.Lock()
+	l.exitLocked(fmt.Errorf("out of space"))
+	l.mu.Unlock()
+
+	exited.Wait()
+}
+
 func BenchmarkHeader(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		buf := formatHeader(Severity_INFO, time.Now(), 200, "file.go", 100, nil)
+		buf := formatHeader(Severity_INFO, timeutil.Now(), 200, "file.go", 100, nil)
 		logging.putBuffer(buf)
 	}
+}
+
+func BenchmarkVDepthWithVModule(b *testing.B) {
+	if err := SetVModule("craigthecockroach=5"); err != nil {
+		b.Fatal(err)
+	}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = VDepth(1, 1)
+		}
+	})
 }

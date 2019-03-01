@@ -1,10 +1,25 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import React from "react";
 import _ from "lodash";
 
+import * as docsURL from "src/util/docs";
 import { LineGraph } from "src/views/cluster/components/linegraph";
 import { Metric, Axis, AxisUnits } from "src/views/shared/components/metricQuery";
 
-import { GraphDashboardProps, nodeAddress, storeIDsForNode } from "./dashboardUtils";
+import { GraphDashboardProps, nodeDisplayName, storeIDsForNode } from "./dashboardUtils";
 
 export default function (props: GraphDashboardProps) {
   const { nodeIDs, nodesSummary, nodeSources, storeSources, tooltipSelection } = props;
@@ -14,13 +29,12 @@ export default function (props: GraphDashboardProps) {
       title="SQL Queries"
       sources={nodeSources}
       tooltip={
-        `The average number of SELECT, INSERT, UPDATE,
-           and DELETE statements per second ${tooltipSelection}.`
+        `A ten-second moving average of the # of SELECT, INSERT, UPDATE, and DELETE statements
+        started per second ${tooltipSelection}.`
       }
     >
-      <Axis>
-        <Metric name="cr.node.sql.select.count" title="Total Reads" nonNegativeRate />
-        <Metric name="cr.node.sql.distsql.select.count" title="DistSQL Reads" nonNegativeRate />
+      <Axis label="queries">
+        <Metric name="cr.node.sql.select.count" title="Selects" nonNegativeRate />
         <Metric name="cr.node.sql.update.count" title="Updates" nonNegativeRate />
         <Metric name="cr.node.sql.insert.count" title="Inserts" nonNegativeRate />
         <Metric name="cr.node.sql.delete.count" title="Deletes" nonNegativeRate />
@@ -36,13 +50,13 @@ export default function (props: GraphDashboardProps) {
         </div>
       )}
     >
-      <Axis units={AxisUnits.Duration}>
+      <Axis units={AxisUnits.Duration} label="latency">
         {
           _.map(nodeIDs, (node) => (
             <Metric
               key={node}
               name="cr.node.sql.service.latency-p99"
-              title={nodeAddress(nodesSummary, node)}
+              title={nodeDisplayName(nodesSummary, node)}
               sources={[node]}
               downsampleMax
             />
@@ -55,18 +69,19 @@ export default function (props: GraphDashboardProps) {
       title="Replicas per Node"
       tooltip={(
         <div>
-          The number of range replicas stored on this node.&nbsp;
-            <em>Ranges are subsets of your data, which are replicated to ensure survivability.</em>
+          The number of range replicas stored on this node.
+          {" "}
+          <em>Ranges are subsets of your data, which are replicated to ensure survivability.</em>
         </div>
       )}
     >
-      <Axis>
+      <Axis label="replicas">
         {
           _.map(nodeIDs, (nid) => (
             <Metric
               key={nid}
               name="cr.store.replicas"
-              title={nodeAddress(nodesSummary, nid)}
+              title={nodeDisplayName(nodesSummary, nid)}
               sources={storeIDsForNode(nodesSummary, nid)}
             />
           ))
@@ -83,34 +98,31 @@ export default function (props: GraphDashboardProps) {
             <dt>Capacity</dt>
             <dd>
               Total disk space available {tooltipSelection} to CockroachDB.
-                <em>
+              {" "}
+              <em>
                 Control this value per node with the
-                  <code>
-                  <a
-                    href="https://www.cockroachlabs.com/docs/stable/start-a-node.html#flags"
-                    target="_blank"
-                  >
+                {" "}
+                <code>
+                  <a href={docsURL.startFlags} target="_blank">
                     --store
-                    </a>
+                  </a>
                 </code>
+                {" "}
                 flag.
-                </em>
+              </em>
             </dd>
             <dt>Available</dt>
             <dd>Free disk space available {tooltipSelection} to CockroachDB.</dd>
+            <dt>Used</dt>
+            <dd>Disk space used {tooltipSelection} by CockroachDB.</dd>
           </dl>
         </div>
       )}
     >
-      <Axis units={AxisUnits.Bytes}>
+      <Axis units={AxisUnits.Bytes} label="capacity">
         <Metric name="cr.store.capacity" title="Capacity" />
-        {
-          // TODO(mrtracy): We really want to display a used capacity
-          // stat, but that is not directly recorded. We either need to
-          // start directly recording it, or add the ability to create
-          // derived series.
-        }
         <Metric name="cr.store.capacity.available" title="Available" />
+        <Metric name="cr.store.capacity.used" title="Used" />
       </Axis>
     </LineGraph>,
 

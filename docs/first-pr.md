@@ -47,7 +47,7 @@ reading [CONTRIBUTING.md] in full. This file covers how to set up a new
 development machine to build CockroachDB from source and the basics of the code
 review workflow.
 
-Then, look at [STYLE.md] and the [Google Go Code
+Then, look at [docs/style.md] and the [Google Go Code
 Review](https://code.google.com/p/go-wiki/wiki/CodeReviewComments) guide it
 links to. These are linked to from [CONTRIBUTING.md], but they're easy to miss.
 If you haven't written any Go before CockroachDB, you may want to hold off on
@@ -57,37 +57,36 @@ reviewing the style guide until you've written your first few functions in go.
 
 Here's what's in each top-level directory in this repository:
 
-  + **`build/`**  
+  + **`build/`**
     Build support scripts. You'll likely only need to
     interact with [build/builder.sh]. See ["Building on Linux"] below.
 
-  + **`c-deps/`**  
+  + **`c-deps/`**
     Glue to convince our build system to build non-Go dependencies. At the time
     of writing, "non-Go dependencies" means C or C++ dependencies. The most
     important of these is [RocksDB], our underlying persistent key-value store.
 
-  + **`cloud/`**  
-    Terraform and Kubernetes configuration to auto-launch CockroachDB clusters
-    on several popular cloud IaaS providers.
+  + **`cloud/kubernetes/`**
+    Kubernetes configuration to auto-launch CockroachDB clusters.
 
-  + **`docs/`**  
+  + **`docs/`**
     Documentation for CockroachDB developers. See ["Internal
     documentation"] below.
 
-  + **`monitoring/`**  
+  + **`monitoring/`**
     Configuration to integrate monitoring frameworks, namely Prometheus and
     Grafana, with CockroachDB. This configuration powers our internal monitoring
     dashboard as well.
 
-  + **`pkg/`**  
+  + **`pkg/`**
     First-party Go code. See ["Internal documentation"] below for details.
 
-  + **`scripts/`**  
+  + **`scripts/`**
     Handy shell scripts that aren't part of the build process. You'll likely
     interact with [scripts/azworker.sh] most, which spins up a personal Linux VM
     for you to develop on in the Azure cloud.
 
-  + **`vendor/`**  
+  + **`vendor/`**
     A Git submodule that contains the right version of our dependent libraries.
     For many years, the Go answer to dependency management was "write
     backwards-compatible code." That strategy is as dangerous as it sounds, so
@@ -215,15 +214,6 @@ You'll notice that all source files in this repository have a license
 notification at the top. Be sure to copy this license into any files that you
 create.
 
-At the end of a license block is a line that begins with `Author:`, followed by
-someone's name and email address. The "author" is somewhat of a misnomer—it
-should really be `Maintainer`. List yourself when you create a new file, so that
-people know who to contact with questions and who to CC on code reviews!
-
-Though many employees list their personal email in the `Author` comment, this is
-largely historic happenstance. New employees are encouraged to use their company
-email.
-
 ## When to submit
 
 Code at Cockroach Labs is not about perfection. It's too easy to misinterpret
@@ -306,7 +296,7 @@ for ~slaughter~ review.
 
 ### Fix your style violations
 
-First, read [STYLE.md] again, looking for any style violations. It's easier to
+First, read [docs/style.md] again, looking for any style violations. It's easier to
 remember a style rule once you've violated it.
 
 Then, run our suite of linters:
@@ -466,6 +456,15 @@ for [production-ready code].
 No one is expected to write perfect code on the first try. That's why we have
 code reviews in the first place!
 
+## By humans for humans
+
+Probably everyone has at some time had an unpleasant interaction during a code
+review, and with code reviews being [by humans for humans], one or both of these
+humans could be having a bad day. As if that weren't enough already, text-based
+communication is fraught with miscommunication. Consider being a [minimally nice maintainer]),
+reflect upon mistakes that will inevitably be made, and take inspiration from the
+constructive and friendly reviews that are the daily staple of our repository.
+
 ### Reviewable
 
 Except for the smallest of PRs, we eschew GitHub reviews in favor of a
@@ -554,7 +553,7 @@ These are the acronyms you'll frequently encounter during code reviews.
 * **TF[YT]R**, "thanks for your/the review"
 
 A list of even more Cockroach jargon lives on [this repository's wiki].
- 
+
 ### Merging
 
 *External contributors: you don't need to worry about this section. We'll merge
@@ -574,21 +573,16 @@ in doubt, ask!
 
 Once you've gotten an LGTM from who you think is the right person, don't be
 afraid to merge. The git revert command exists for a reason. You can expect to
-revert at least PR that you land in your first three months.
+revert at least one PR that you land in your first three months.
 
-You should always use the big green "Merge pull request" button in GitHub to
-merge  your code or its equivalent in the Reviewable interface. This limits your
-exposure by ensuring you don't accidentally merge a commit with obviously an
-obviously broken build. Once your commit lands on master, TeamCity will do
-another test run; this can occasionally fail for legitimate reasons due to merge
-skew.
-
-Make sure to use the default "Create a merge commit" mode when you hit the merge
-button. If you instead use "Squash and merge," you'll end up with one commit
-that "squashes" together the nicely-curated logical changes and messages from
-the PR's constituent commits. If your PR has fixup commits to address review
-feedback, or generally sloppy commits, you should rebase those into a more
-logical commit series locally and force-push.
+When your PR is ready to go, request a merge from our build bot Craig. Craig is
+a [Bors merge bot], whose only job is to be gatekeeper to the repository. Add a
+comment on the PR of the form `bors r=<reviewer>`, replacing `<reviewer>` with
+the GitHub username of the person who gave you the LGTM. Once approved, your PR
+will be batched up with other PRs approved around the same time. Craig will try
+to build them as though they were merged to the target branch, and if
+successful, will merge them. This limits your exposure by ensuring you don't
+accidentally merge a commit with an obviously broken build or merge skew.
 
 We call merging locally and pushing to master the "nuclear option" or "god
 merging." It's not disabled, but you shouldn't do it unless the repo is on fire.
@@ -605,7 +599,7 @@ Here's a checklist of action items to keep you sane:
 + [ ] Submitting your first PR
     + [ ] Push to a feature branch on your personal fork
     + [ ] Verify you've followed [CONTRIBUTING.md]
-    + [ ] Verify you've followed [STYLE.md]
+    + [ ] Verify you've followed [docs/style.md]
     + [ ] Ensure files you've added, if any, have a license block
     + [ ] Run make check
     + [ ] Split your change into logical commits with good messages
@@ -614,7 +608,7 @@ Here's a checklist of action items to keep you sane:
     + [ ] Amend the appropriate commits and force-push
     + [ ] Respond to all feedback with "Done" or a counterargument
 + [ ] Merging
-    + [ ] Use the big green button in the GitHub UI to land your change
+    + [ ] Comment `bors r=reviewer` to ask Craig to merge
 
 ["Building on Linux"]: #building-on-linux
 ["Internal documentation"]: #internal-documentation
@@ -638,5 +632,8 @@ Here's a checklist of action items to keep you sane:
 [production-ready code]: #production-ready-code
 [Reviewable]: https://reviewable.io
 [RocksDB]: http://rocksdb.org
-[STYLE.md]: /STYLE.md
+[docs/style.md]: /docs/style.md
 [this repository's wiki]: https://github.com/cockroachdb/cockroach/wiki/Jargon
+[by humans for humans]: https://mtlynch.io/human-code-reviews-1/
+[minimally nice maintainer]: https://brson.github.io/2017/04/05/minimally-nice-maintainer
+[Bors merge bot]: https://github.com/cockroachdb/cockroach/wiki/Bors-merge-bot

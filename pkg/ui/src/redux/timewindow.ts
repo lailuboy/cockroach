@@ -1,3 +1,17 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 /**
  * This module maintains a globally-available time window, currently used by all
  * metrics graphs in the ui.
@@ -86,10 +100,13 @@ export let availableTimeScales: TimeScaleCollection = _.mapValues(
       sampleSize: moment.duration(1, "hour"),
     },
   },
-  (v: TimeScale, k) => {
+  (v, k) => {
+    // This weirdness is to work around an apparent issue in TypeScript:
+    // https://github.com/Microsoft/TypeScript/issues/20305
+    const result: TimeScale = v;
     // Set the "key" attribute.
-    v.key = k;
-    return v;
+    result.key = k;
+    return result;
   },
 );
 
@@ -105,7 +122,7 @@ export class TimeWindowState {
   }
 }
 
-export default function(state = new TimeWindowState(), action: Action): TimeWindowState {
+export function timeWindowReducer(state = new TimeWindowState(), action: Action): TimeWindowState {
   switch (action.type) {
     case SET_WINDOW:
       const { payload: tw } = action as PayloadAction<TimeWindow>;

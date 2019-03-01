@@ -22,7 +22,7 @@ end_test
 
 proc start_secure_server {argv certs_dir} {
     report "BEGIN START SECURE SERVER"
-    system "mkfifo pid_fifo || true; $argv start --certs-dir=$certs_dir --pid-file=pid_fifo -s=path=logs/db >>expect-cmd.log 2>&1 & cat pid_fifo > server_pid"
+    system "mkfifo url_fifo || true; $argv start --certs-dir=$certs_dir --pid-file=server_pid --listening-url-file=url_fifo -s=path=logs/db >>expect-cmd.log 2>&1 & cat url_fifo > server_url"
     report "END START SECURE SERVER"
 }
 
@@ -50,13 +50,19 @@ eexpect "empty passwords are not permitted"
 eexpect $prompt
 end_test
 
+start_test "Make the user without password."
+send "$argv user set carl --certs-dir=$certs_dir\r"
+eexpect "CREATE USER"
+eexpect $prompt
+end_test
+
 start_test "Check a password can be changed."
 send "$argv user set carl --password --certs-dir=$certs_dir\r"
 eexpect "Enter password:"
 send "woof\r"
 eexpect "Confirm password:"
 send "woof\r"
-eexpect "INSERT 1\r\n"
+eexpect "ALTER USER"
 eexpect $prompt
 end_test
 
@@ -69,9 +75,21 @@ send "\\q\r"
 eexpect $prompt
 end_test
 
+start_test "Can create users without passwords."
+send "$argv user set testuser --certs-dir=$certs_dir\r"
+eexpect $prompt
+end_test
+
+start_test "Passwords are not requested when a certificate for the user exists"
+send "$argv sql --user=testuser --certs-dir=$certs_dir\r"
+eexpect "testuser@"
+send "\\q\r"
+eexpect $prompt
+end_test
+
 start_test "Check that root cannot use password."
 # Run as root but with a non-existent certs directory.
-send "$argv sql --certs-dir=non-existent-dir\r"
+send "$argv sql --url='postgresql://root@localhost:26257?sslmode=verify-full&sslrootcert=$certs_dir/ca.crt'\r"
 eexpect "Error: connections with user root must use a client certificate"
 eexpect "Failed running \"sql\""
 end_test
@@ -99,14 +117,11 @@ eexpect $prompt
 send "$argv sql --certs-dir=$certs_dir --user=eisen\r"
 eexpect "Enter password:"
 send "*****\r"
-eexpect "Error: pq: invalid password"
+eexpect "Error: pq: password authentication failed for user eisen"
 eexpect "Failed running \"sql\""
 # Check that history is scrubbed.
 send "$argv sql --certs-dir=$certs_dir\r"
 eexpect "root@"
-# Ctrl+R eisen
-send "\022eisen"
-eexpect "CREATE USER eisen WITH PASSWORD \\*\\*\\*\\*\\*;"
 interrupt
 end_test
 

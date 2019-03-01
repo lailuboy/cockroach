@@ -11,26 +11,27 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sqlbase
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
 	"testing"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 // Makes an IndexDescriptor with all columns being ascending.
@@ -51,9 +52,9 @@ func makeIndexDescriptor(name string, columnNames []string) IndexDescriptor {
 func TestAllocateIDs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	desc := TableDescriptor{
-		ID:       keys.MaxReservedDescID + 2,
-		ParentID: keys.MaxReservedDescID + 1,
+	desc := NewMutableCreatedTableDescriptor(TableDescriptor{
+		ParentID: keys.MinUserDescID,
+		ID:       keys.MinUserDescID + 1,
 		Name:     "foo",
 		Columns: []ColumnDescriptor{
 			{Name: "a"},
@@ -67,14 +68,14 @@ func TestAllocateIDs(t *testing.T) {
 		},
 		Privileges:    NewDefaultPrivilegeDescriptor(),
 		FormatVersion: FamilyFormatVersion,
-	}
+	})
 	if err := desc.AllocateIDs(); err != nil {
 		t.Fatal(err)
 	}
 
-	expected := TableDescriptor{
-		ID:       keys.MaxReservedDescID + 2,
-		ParentID: keys.MaxReservedDescID + 1,
+	expected := NewMutableCreatedTableDescriptor(TableDescriptor{
+		ParentID: keys.MinUserDescID,
+		ID:       keys.MinUserDescID + 1,
 		Version:  1,
 		Name:     "foo",
 		Columns: []ColumnDescriptor{
@@ -109,7 +110,7 @@ func TestAllocateIDs(t *testing.T) {
 		NextIndexID:    4,
 		NextMutationID: 1,
 		FormatVersion:  FamilyFormatVersion,
-	}
+	})
 	if !reflect.DeepEqual(expected, desc) {
 		a, _ := json.MarshalIndent(expected, "", "  ")
 		b, _ := json.MarshalIndent(desc, "", "  ")
@@ -588,9 +589,34 @@ func TestValidateTableDesc(t *testing.T) {
 				NextFamilyID: 1,
 				NextIndexID:  2,
 			}},
+		{`at least one of LIST or RANGE partitioning must be used`,
+			// Verify that validatePartitioning is hooked up. The rest of these
+			// tests are in TestValidatePartitionion.
+			TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: FamilyFormatVersion,
+				Columns: []ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+				},
+				Families: []ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary", ColumnIDs: []ColumnID{1}, ColumnNames: []string{"bar"}},
+				},
+				PrimaryIndex: IndexDescriptor{
+					ID: 1, Name: "primary", ColumnIDs: []ColumnID{1}, ColumnNames: []string{"bar"},
+					ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+					},
+				},
+				NextColumnID: 2,
+				NextFamilyID: 1,
+				NextIndexID:  3,
+			}},
 	}
 	for i, d := range testData {
-		if err := d.desc.ValidateTable(); err == nil {
+		if err := d.desc.ValidateTable(cluster.MakeTestingClusterSettings()); err == nil {
 			t.Errorf("%d: expected \"%s\", but found success: %+v", i, d.err, d.desc)
 		} else if d.err != err.Error() {
 			t.Errorf("%d: expected \"%s\", but found \"%+v\"", i, d.err, err)
@@ -600,8 +626,10 @@ func TestValidateTableDesc(t *testing.T) {
 
 func TestValidateCrossTableReferences(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
 	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(ctx)
 
 	tests := []struct {
 		err        string
@@ -803,7 +831,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 		if err := v.SetProto(desc); err != nil {
 			t.Fatal(err)
 		}
-		if err := kvDB.Put(context.TODO(), MakeDescMetadataKey(0), &v); err != nil {
+		if err := kvDB.Put(ctx, MakeDescMetadataKey(0), &v); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -815,20 +843,226 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			if err := v.SetProto(desc); err != nil {
 				t.Fatal(err)
 			}
-			if err := kvDB.Put(context.TODO(), MakeDescMetadataKey(referencedDesc.ID), &v); err != nil {
+			if err := kvDB.Put(ctx, MakeDescMetadataKey(referencedDesc.ID), &v); err != nil {
 				t.Fatal(err)
 			}
 		}
-		txn := client.NewTxn(kvDB)
-		if err := test.desc.validateCrossReferences(context.TODO(), txn); err == nil {
+		txn := client.NewTxn(ctx, kvDB, s.NodeID(), client.RootTxn)
+		if err := test.desc.validateCrossReferences(ctx, txn); err == nil {
 			t.Errorf("%d: expected \"%s\", but found success: %+v", i, test.err, test.desc)
 		} else if test.err != err.Error() {
 			t.Errorf("%d: expected \"%s\", but found \"%s\"", i, test.err, err.Error())
 		}
 		for _, referencedDesc := range test.referenced {
-			if err := kvDB.Del(context.TODO(), MakeDescMetadataKey(referencedDesc.ID)); err != nil {
+			if err := kvDB.Del(ctx, MakeDescMetadataKey(referencedDesc.ID)); err != nil {
 				t.Fatal(err)
 			}
+		}
+	}
+}
+
+func TestValidatePartitioning(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	tests := []struct {
+		err  string
+		desc TableDescriptor
+	}{
+		{"at least one of LIST or RANGE partitioning must be used",
+			TableDescriptor{
+				PrimaryIndex: IndexDescriptor{
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+					},
+				},
+			},
+		},
+		{"PARTITION p1: must contain values",
+			TableDescriptor{
+				PrimaryIndex: IndexDescriptor{
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List:       []PartitioningDescriptor_List{{Name: "p1"}},
+					},
+				},
+			},
+		},
+		{"not enough columns in index for this partitioning",
+			TableDescriptor{
+				PrimaryIndex: IndexDescriptor{
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List:       []PartitioningDescriptor_List{{Name: "p1", Values: [][]byte{{}}}},
+					},
+				},
+			},
+		},
+		{"only one LIST or RANGE partitioning may used",
+			TableDescriptor{
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs:        []ColumnID{1},
+					ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List:       []PartitioningDescriptor_List{{}},
+						Range:      []PartitioningDescriptor_Range{{}},
+					},
+				},
+			},
+		},
+		{"PARTITION name must be non-empty",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs:        []ColumnID{1},
+					ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List:       []PartitioningDescriptor_List{{}},
+					},
+				},
+			},
+		},
+		{"PARTITION p1: must contain values",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs:        []ColumnID{1},
+					ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List:       []PartitioningDescriptor_List{{Name: "p1"}},
+					},
+				},
+			},
+		},
+		{"PARTITION p1: decoding: empty array",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs:        []ColumnID{1},
+					ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{{
+							Name: "p1", Values: [][]byte{{}},
+						}},
+					},
+				},
+			},
+		},
+		{"PARTITION p1: decoding: int64 varint decoding failed: 0",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs:        []ColumnID{1},
+					ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{
+							{Name: "p1", Values: [][]byte{{0x03}}},
+						},
+					},
+				},
+			},
+		},
+		{"PARTITION p1: superfluous data in encoded value",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs:        []ColumnID{1},
+					ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{
+							{Name: "p1", Values: [][]byte{{0x03, 0x02, 0x00}}},
+						},
+					},
+				},
+			},
+		},
+		{"partitions p1 and p2 overlap",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs:        []ColumnID{1, 1},
+					ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						Range: []PartitioningDescriptor_Range{
+							{Name: "p1", FromInclusive: []byte{0x03, 0x02}, ToExclusive: []byte{0x03, 0x04}},
+							{Name: "p2", FromInclusive: []byte{0x03, 0x02}, ToExclusive: []byte{0x03, 0x04}},
+						},
+					},
+				},
+			},
+		},
+		{"PARTITION p1: name must be unique",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs:        []ColumnID{1},
+					ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{
+							{Name: "p1", Values: [][]byte{{0x03, 0x02}}},
+							{Name: "p1", Values: [][]byte{{0x03, 0x04}}},
+						},
+					},
+				},
+			},
+		},
+		{"not enough columns in index for this partitioning",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs:        []ColumnID{1},
+					ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{{
+							Name:   "p1",
+							Values: [][]byte{{0x03, 0x02}},
+							Subpartitioning: PartitioningDescriptor{
+								NumColumns: 1,
+								List:       []PartitioningDescriptor_List{{Name: "p1_1", Values: [][]byte{{}}}},
+							},
+						}},
+					},
+				},
+			},
+		},
+		{"PARTITION p1: name must be unique",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs:        []ColumnID{1, 1},
+					ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{
+							{Name: "p1", Values: [][]byte{{0x03, 0x02}}},
+							{
+								Name:   "p2",
+								Values: [][]byte{{0x03, 0x04}},
+								Subpartitioning: PartitioningDescriptor{
+									NumColumns: 1,
+									List: []PartitioningDescriptor_List{
+										{Name: "p1", Values: [][]byte{{0x03, 0x02}}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	for i, test := range tests {
+		err := test.desc.validatePartitioning()
+		if !testutils.IsError(err, test.err) {
+			t.Errorf(`%d: got "%v" expected "%v"`, i, err, test.err)
 		}
 	}
 }
@@ -840,10 +1074,16 @@ func TestColumnTypeSQLString(t *testing.T) {
 		colType     ColumnType
 		expectedSQL string
 	}{
+		{ColumnType{SemanticType: ColumnType_BIT, Width: 2}, "BIT(2)"},
+		{ColumnType{SemanticType: ColumnType_BIT, VisibleType: ColumnType_VARBIT, Width: 2}, "VARBIT(2)"},
 		{ColumnType{SemanticType: ColumnType_INT}, "INT"},
-		{ColumnType{SemanticType: ColumnType_INT, VisibleType: ColumnType_BIT, Width: 2}, "BIT(2)"},
-		{ColumnType{SemanticType: ColumnType_FLOAT}, "FLOAT"},
-		{ColumnType{SemanticType: ColumnType_FLOAT, Precision: 3}, "FLOAT(3)"},
+		{ColumnType{SemanticType: ColumnType_FLOAT}, "FLOAT8"},
+		{ColumnType{SemanticType: ColumnType_FLOAT, VisibleType: ColumnType_REAL}, "FLOAT4"},
+		{ColumnType{SemanticType: ColumnType_FLOAT, VisibleType: ColumnType_DOUBLE_PRECISION}, "FLOAT8"}, // Pre-2.1.
+		{ColumnType{SemanticType: ColumnType_FLOAT, Precision: -1}, "FLOAT8"},                            // Pre-2.1.
+		{ColumnType{SemanticType: ColumnType_FLOAT, Precision: 20}, "FLOAT4"},                            // Pre-2.1.
+		{ColumnType{SemanticType: ColumnType_FLOAT, Precision: 40}, "FLOAT8"},                            // Pre-2.1.
+		{ColumnType{SemanticType: ColumnType_FLOAT, Precision: 120}, "FLOAT8"},                           // Pre-2.1.
 		{ColumnType{SemanticType: ColumnType_DECIMAL}, "DECIMAL"},
 		{ColumnType{SemanticType: ColumnType_DECIMAL, Precision: 6}, "DECIMAL(6)"},
 		{ColumnType{SemanticType: ColumnType_DECIMAL, Precision: 7, Width: 8}, "DECIMAL(7,8)"},
@@ -855,59 +1095,19 @@ func TestColumnTypeSQLString(t *testing.T) {
 		{ColumnType{SemanticType: ColumnType_BYTES}, "BYTES"},
 	}
 	for i, d := range testData {
-		sql := d.colType.SQLString()
-		if d.expectedSQL != sql {
-			t.Errorf("%d: expected %s, but got %s", i, d.expectedSQL, sql)
-		}
-	}
-}
-
-func TestColumnValueEncodedSize(t *testing.T) {
-	tests := []struct {
-		colType ColumnType
-		size    int // -1 means unbounded
-	}{
-		{ColumnType{SemanticType: ColumnType_BOOL}, 1},
-		{ColumnType{SemanticType: ColumnType_INT}, 10},
-		{ColumnType{SemanticType: ColumnType_INT, Width: 2}, 10},
-		{ColumnType{SemanticType: ColumnType_FLOAT}, 9},
-		{ColumnType{SemanticType: ColumnType_FLOAT, Precision: 100}, 9},
-		{ColumnType{SemanticType: ColumnType_DECIMAL}, -1},
-		{ColumnType{SemanticType: ColumnType_DECIMAL, Precision: 100}, 69},
-		{ColumnType{SemanticType: ColumnType_DECIMAL, Precision: 100, Width: 100}, 69},
-		{ColumnType{SemanticType: ColumnType_DATE}, 10},
-		{ColumnType{SemanticType: ColumnType_TIMESTAMP}, 10},
-		{ColumnType{SemanticType: ColumnType_INTERVAL}, 28},
-		{ColumnType{SemanticType: ColumnType_STRING}, -1},
-		{ColumnType{SemanticType: ColumnType_STRING, Width: 100}, 110},
-		{ColumnType{SemanticType: ColumnType_BYTES}, -1},
-	}
-	for i, test := range tests {
-		testIsBounded := test.size != -1
-		size, isBounded := upperBoundColumnValueEncodedSize(ColumnDescriptor{
-			Type: test.colType,
-		})
-		if isBounded != testIsBounded {
-			if isBounded {
-				t.Errorf("%d: expected unbounded but got bounded", i)
-			} else {
-				t.Errorf("%d: expected bounded but got unbounded", i)
+		t.Run(d.colType.String(), func(t *testing.T) {
+			sql := d.colType.SQLString()
+			if d.expectedSQL != sql {
+				t.Errorf("%d: expected %s, but got %s", i, d.expectedSQL, sql)
 			}
-			continue
-		}
-		if isBounded && size != test.size {
-			t.Errorf("%d: got size %d but expected %d", i, size, test.size)
-		}
+		})
 	}
 }
 
 func TestFitColumnToFamily(t *testing.T) {
-	intEncodedSize, _ := upperBoundColumnValueEncodedSize(ColumnDescriptor{
-		ID:   8,
-		Type: ColumnType{SemanticType: ColumnType_INT},
-	})
+	intEncodedSize := 10 // 1 byte tag + 9 bytes max varint encoded size
 
-	makeTestTableDescriptor := func(familyTypes [][]ColumnType) TableDescriptor {
+	makeTestTableDescriptor := func(familyTypes [][]ColumnType) *MutableTableDescriptor {
 		nextColumnID := ColumnID(8)
 		var desc TableDescriptor
 		for _, fTypes := range familyTypes {
@@ -922,7 +1122,7 @@ func TestFitColumnToFamily(t *testing.T) {
 			}
 			desc.Families = append(desc.Families, family)
 		}
-		return desc
+		return NewMutableCreatedTableDescriptor(desc)
 	}
 
 	emptyFamily := []ColumnType{}
@@ -1020,7 +1220,7 @@ func TestMaybeUpgradeFormatVersion(t *testing.T) {
 	}
 	for i, test := range tests {
 		desc := test.desc
-		upgraded := desc.MaybeUpgradeFormatVersion()
+		upgraded := desc.maybeUpgradeFormatVersion()
 		if upgraded != test.expUpgrade {
 			t.Fatalf("%d: expected upgraded=%t, but got upgraded=%t", i, test.expUpgrade, upgraded)
 		}
@@ -1031,14 +1231,14 @@ func TestMaybeUpgradeFormatVersion(t *testing.T) {
 }
 
 func TestUnvalidateConstraints(t *testing.T) {
-	desc := TableDescriptor{
+	desc := NewMutableCreatedTableDescriptor(TableDescriptor{
 		Name:          "test",
 		ParentID:      ID(1),
 		Columns:       []ColumnDescriptor{{Name: "a"}, {Name: "b"}, {Name: "c"}},
 		FormatVersion: FamilyFormatVersion,
 		Indexes:       []IndexDescriptor{makeIndexDescriptor("d", []string{"b", "a"})},
 		Privileges:    NewDefaultPrivilegeDescriptor(),
-	}
+	})
 	desc.Indexes[0].ForeignKey = ForeignKeyReference{
 		Name:     "fk",
 		Table:    ID(1),
@@ -1049,7 +1249,7 @@ func TestUnvalidateConstraints(t *testing.T) {
 		t.Fatal(err)
 	}
 	lookup := func(_ ID) (*TableDescriptor, error) {
-		return &desc, nil
+		return desc.TableDesc(), nil
 	}
 
 	before, err := desc.GetConstraintInfoWithLookup(lookup)
@@ -1087,25 +1287,25 @@ func TestKeysPerRow(t *testing.T) {
 		indexID     IndexID
 		expected    int
 	}{
-		{"(a SERIAL PRIMARY KEY, b INT, INDEX (b))", 1, 1},                         // Primary index
-		{"(a SERIAL PRIMARY KEY, b INT, INDEX (b))", 2, 1},                         // 'b' index
-		{"(a SERIAL PRIMARY KEY, b INT, FAMILY (a), FAMILY (b), INDEX (b))", 1, 2}, // Primary index
-		{"(a SERIAL PRIMARY KEY, b INT, FAMILY (a), FAMILY (b), INDEX (b))", 2, 1}, // 'b' index
+		{"(a INT PRIMARY KEY, b INT, INDEX (b))", 1, 1},                         // Primary index
+		{"(a INT PRIMARY KEY, b INT, INDEX (b))", 2, 1},                         // 'b' index
+		{"(a INT PRIMARY KEY, b INT, FAMILY (a), FAMILY (b), INDEX (b))", 1, 2}, // Primary index
+		{"(a INT PRIMARY KEY, b INT, FAMILY (a), FAMILY (b), INDEX (b))", 2, 1}, // 'b' index
 	}
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("%s - %d", test.createTable, test.indexID), func(t *testing.T) {
-			sqlDB := sqlutils.MakeSQLRunner(t, conn)
+			sqlDB := sqlutils.MakeSQLRunner(conn)
 			tableName := fmt.Sprintf("t%d", i)
-			sqlDB.Exec(fmt.Sprintf(`CREATE TABLE d.%s %s`, tableName, test.createTable))
+			sqlDB.Exec(t, fmt.Sprintf(`CREATE TABLE d.%s %s`, tableName, test.createTable))
 
 			var descBytes []byte
 			// Grab the most recently created descriptor.
-			row := sqlDB.QueryRow(
+			row := sqlDB.QueryRow(t,
 				`SELECT descriptor FROM system.descriptor ORDER BY id DESC LIMIT 1`)
 			row.Scan(&descBytes)
 			var desc Descriptor
-			if err := desc.Unmarshal(descBytes); err != nil {
+			if err := protoutil.Unmarshal(descBytes, &desc); err != nil {
 				t.Fatalf("%+v", err)
 			}
 
@@ -1114,5 +1314,16 @@ func TestKeysPerRow(t *testing.T) {
 				t.Errorf("expected %d keys got %d", test.expected, keys)
 			}
 		})
+	}
+}
+
+func TestDatumTypeToColumnSemanticType(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	for _, typ := range types.AnyNonArray {
+		_, err := datumTypeToColumnSemanticType(typ)
+		if err != nil {
+			t.Errorf("couldn't get semantic type: %s", err)
+		}
 	}
 }

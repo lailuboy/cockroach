@@ -18,30 +18,55 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/golang-commonmark/markdown"
+	"github.com/pkg/errors"
+	"github.com/spf13/cobra"
 )
 
-func generateFuncsAndOps(outDir string) {
-	if err := ioutil.WriteFile(
-		filepath.Join(outDir, "functions.md"), generateFunctions(parser.Builtins, true), 0644,
-	); err != nil {
-		panic(err)
-	}
-	if err := ioutil.WriteFile(
-		filepath.Join(outDir, "aggregates.md"), generateFunctions(parser.Aggregates, false), 0644,
-	); err != nil {
-		panic(err)
-	}
-	if err := ioutil.WriteFile(
-		filepath.Join(outDir, "operators.md"), generateOperators(), 0644,
-	); err != nil {
-		panic(err)
-	}
+func init() {
+	cmds = append(cmds, &cobra.Command{
+		Use:   "functions <output-dir>",
+		Short: "generate markdown documentation of functions and operators",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			outDir := filepath.Join("docs", "generated", "sql")
+			if len(args) > 0 {
+				outDir = args[0]
+			}
+
+			if stat, err := os.Stat(outDir); err != nil {
+				return err
+			} else if !stat.IsDir() {
+				return errors.Errorf("%q is not a directory", outDir)
+			}
+
+			if err := ioutil.WriteFile(
+				filepath.Join(outDir, "functions.md"), generateFunctions(builtins.AllBuiltinNames, true), 0644,
+			); err != nil {
+				return err
+			}
+			if err := ioutil.WriteFile(
+				filepath.Join(outDir, "aggregates.md"), generateFunctions(builtins.AllAggregateBuiltinNames, false), 0644,
+			); err != nil {
+				return err
+			}
+			if err := ioutil.WriteFile(
+				filepath.Join(outDir, "window_functions.md"), generateFunctions(builtins.AllWindowBuiltinNames, false), 0644,
+			); err != nil {
+				return err
+			}
+			return ioutil.WriteFile(
+				filepath.Join(outDir, "operators.md"), generateOperators(), 0644,
+			)
+		},
+	})
 }
 
 type operation struct {
@@ -80,10 +105,10 @@ func (p operations) Less(i, j int) bool {
 
 func generateOperators() []byte {
 	ops := make(map[string]operations)
-	for optyp, overloads := range parser.UnaryOps {
+	for optyp, overloads := range tree.UnaryOps {
 		op := optyp.String()
 		for _, untyped := range overloads {
-			v := untyped.(parser.UnaryOp)
+			v := untyped.(*tree.UnaryOp)
 			ops[op] = append(ops[op], operation{
 				left: v.Typ.String(),
 				ret:  v.ReturnType.String(),
@@ -91,10 +116,10 @@ func generateOperators() []byte {
 			})
 		}
 	}
-	for optyp, overloads := range parser.BinOps {
+	for optyp, overloads := range tree.BinOps {
 		op := optyp.String()
 		for _, untyped := range overloads {
-			v := untyped.(parser.BinOp)
+			v := untyped.(*tree.BinOp)
 			left := v.LeftType.String()
 			right := v.RightType.String()
 			ops[op] = append(ops[op], operation{
@@ -105,10 +130,10 @@ func generateOperators() []byte {
 			})
 		}
 	}
-	for optyp, overloads := range parser.CmpOps {
+	for optyp, overloads := range tree.CmpOps {
 		op := optyp.String()
 		for _, untyped := range overloads {
-			v := untyped.(parser.CmpOp)
+			v := untyped.(*tree.CmpOp)
 			left := v.LeftType.String()
 			right := v.RightType.String()
 			ops[op] = append(ops[op], operation{
@@ -126,12 +151,18 @@ func generateOperators() []byte {
 	}
 	sort.Strings(opstrs)
 	b := new(bytes.Buffer)
+	seen := map[string]bool{}
 	for _, op := range opstrs {
 		fmt.Fprintf(b, "<table><thead>\n")
 		fmt.Fprintf(b, "<tr><td><code>%s</code></td><td>Return</td></tr>\n", op)
 		fmt.Fprintf(b, "</thead><tbody>\n")
 		for _, v := range ops[op] {
-			fmt.Fprintf(b, "<tr><td>%s</td><td>%s</td></tr>\n", v.String(), linkTypeName(v.ret))
+			s := fmt.Sprintf("<tr><td>%s</td><td>%s</td></tr>\n", v.String(), linkTypeName(v.ret))
+			if seen[s] {
+				continue
+			}
+			seen[s] = true
+			b.WriteString(s)
 		}
 		fmt.Fprintf(b, "</tbody></table>")
 		fmt.Fprintln(b)
@@ -142,38 +173,53 @@ func generateOperators() []byte {
 // TODO(mjibson): use the exported value from sql/parser/pg_builtins.go.
 const notUsableInfo = "Not usable; exposed only for compatibility with PostgreSQL."
 
-func generateFunctions(from map[string][]parser.Builtin, categorize bool) []byte {
+func generateFunctions(from []string, categorize bool) []byte {
 	functions := make(map[string][]string)
 	seen := make(map[string]struct{})
-	for name, fns := range from {
-		// NB: funcs can appear more than once i.e. upper/lowercase varients for
+	md := markdown.New(markdown.XHTMLOutput(true), markdown.Nofollow(true))
+	for _, name := range from {
+		// NB: funcs can appear more than once i.e. upper/lowercase variants for
 		// faster lookups, so normalize to lowercase and de-dupe using a set.
 		name = strings.ToLower(name)
 		if _, ok := seen[name]; ok {
 			continue
 		}
 		seen[name] = struct{}{}
+		props, fns := builtins.GetBuiltinProperties(name)
+		if props.Private {
+			continue
+		}
 		for _, fn := range fns {
 			if fn.Info == notUsableInfo {
 				continue
 			}
-			if categorize && fn.WindowFunc != nil {
+			// We generate docs for both aggregates and window functions in separate
+			// files, so we want to omit them when processing all builtins.
+			if categorize && (props.Class == tree.AggregateClass || props.Class == tree.WindowClass) {
 				continue
 			}
 			args := fn.Types.String()
-			ret := fn.FixedReturnType().String()
-			cat := ret
-			if c := fn.Category(); c != "" {
-				cat = c
+
+			retType := fn.FixedReturnType()
+			ret := retType.String()
+
+			cat := props.Category
+			if cat == "" {
+				cat = strings.ToUpper(ret)
 			}
 			if !categorize {
 				cat = ""
 			}
 			extra := ""
 			if fn.Info != "" {
-				extra = fmt.Sprintf("<span class=\"funcdesc\">%s</span>", fn.Info)
+				// Render the info field to HTML upfront, because Markdown
+				// won't do it automatically in a table context.
+				// Boo Markdown, bad Markdown.
+				// TODO(knz): Do not use Markdown.
+				info := md.RenderToString([]byte(fn.Info))
+				extra = fmt.Sprintf("<span class=\"funcdesc\">%s</span>", info)
 			}
-			s := fmt.Sprintf("<code>%s(%s) &rarr; %s</code> | %s", name, linkArguments(args), linkArguments(ret), extra)
+			s := fmt.Sprintf("<tr><td><code>%s(%s) &rarr; %s</code></td><td>%s</td></tr>", name, linkArguments(args), linkArguments(ret), extra)
 			functions[cat] = append(functions[cat], s)
 		}
 	}
@@ -195,12 +241,12 @@ func generateFunctions(from map[string][]parser.Builtin, categorize bool) []byte
 	b := new(bytes.Buffer)
 	for _, cat := range cats {
 		if categorize {
-			fmt.Fprintf(b, "### %s Functions\n\n", cat)
+			fmt.Fprintf(b, "### %s functions\n\n", cat)
 		}
-		b.WriteString("Function &rarr; Returns | Description\n")
-		b.WriteString("--- | ---\n")
+		b.WriteString("<table>\n<thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>\n")
+		b.WriteString("<tbody>\n")
 		b.WriteString(strings.Join(functions[cat], "\n"))
-		b.WriteString("\n\n")
+		b.WriteString("</tbody>\n</table>\n\n")
 	}
 	return b.Bytes()
 }
@@ -220,13 +266,16 @@ func linkArguments(t string) string {
 }
 
 func linkTypeName(s string) string {
+	s = strings.TrimSuffix(s, "{}")
 	name := s
 	switch s {
 	case "timestamptz":
 		s = "timestamp"
 	}
+	s = strings.TrimSuffix(s, "[]")
 	switch s {
-	case "int", "decimal", "float", "bool", "date", "timestamp", "interval", "string", "bytes":
+	case "int", "decimal", "float", "bool", "date", "timestamp", "interval", "string", "bytes",
+		"inet", "uuid", "collatedstring", "time":
 		s = fmt.Sprintf("<a href=\"%s.html\">%s</a>", s, name)
 	}
 	return s

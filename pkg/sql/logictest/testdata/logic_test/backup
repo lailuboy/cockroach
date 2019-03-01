@@ -1,4 +1,4 @@
-# LogicTest: default distsql
+# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata
 
 query error unknown statement type
 BACKUP DATABASE foo TO '/bar' INCREMENTAL FROM '/baz'

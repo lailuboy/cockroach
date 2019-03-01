@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package kv
 
@@ -135,21 +133,22 @@ func TestTruncate(t *testing.T) {
 		goldenOriginal := roachpb.BatchRequest{}
 		for _, ks := range test.keys {
 			if len(ks[1]) > 0 {
-				u := uuid.MakeV4()
 				goldenOriginal.Add(&roachpb.ResolveIntentRangeRequest{
-					Span:      roachpb.Span{Key: roachpb.Key(ks[0]), EndKey: roachpb.Key(ks[1])},
-					IntentTxn: enginepb.TxnMeta{ID: &u},
+					RequestHeader: roachpb.RequestHeader{
+						Key: roachpb.Key(ks[0]), EndKey: roachpb.Key(ks[1]),
+					},
+					IntentTxn: enginepb.TxnMeta{ID: uuid.MakeV4()},
 				})
 			} else {
 				goldenOriginal.Add(&roachpb.GetRequest{
-					Span: roachpb.Span{Key: roachpb.Key(ks[0])},
+					RequestHeader: roachpb.RequestHeader{Key: roachpb.Key(ks[0])},
 				})
 			}
 		}
 
 		original := roachpb.BatchRequest{Requests: make([]roachpb.RequestUnion, len(goldenOriginal.Requests))}
 		for i, request := range goldenOriginal.Requests {
-			original.Requests[i].SetValue(request.GetInner().ShallowCopy())
+			original.Requests[i].MustSetInner(request.GetInner().ShallowCopy())
 		}
 
 		desc := &roachpb.RangeDescriptor{

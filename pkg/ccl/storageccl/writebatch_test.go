@@ -4,21 +4,20 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
 package storageccl
 
 import (
 	"bytes"
+	"context"
 	"reflect"
 	"testing"
-
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -133,11 +132,11 @@ func TestWriteBatchMVCCStats(t *testing.T) {
 		}
 	}
 
-	cArgs := storage.CommandArgs{
+	cArgs := batcheval.CommandArgs{
 		Args: &roachpb.WriteBatchRequest{
-			Span:     span,
-			DataSpan: span,
-			Data:     data,
+			RequestHeader: roachpb.RequestHeaderFromSpan(span),
+			DataSpan:      span,
+			Data:          data,
 		},
 		// Start with some stats to represent data throughout the replica's
 		// keyrange.

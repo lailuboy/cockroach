@@ -1,6 +1,21 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import _ from "lodash";
 import React from "react";
 import PropTypes from "prop-types";
+import { Helmet } from "react-helmet";
 import { InjectedRouter, RouterState } from "react-router";
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
@@ -16,7 +31,8 @@ import ClusterSummaryBar from "./summaryBar";
 
 import { AdminUIState } from "src/redux/state";
 import { refreshNodes, refreshLiveness } from "src/redux/apiReducers";
-import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
+import { hoverStateSelector, HoverState, hoverOn, hoverOff } from "src/redux/hover";
+import { nodesSummarySelector, NodesSummary, LivenessStatus } from "src/redux/nodes";
 import Alerts from "src/views/shared/containers/alerts";
 import { MetricsDataProvider } from "src/views/shared/containers/metricDataProvider";
 
@@ -32,6 +48,8 @@ import replicationDashboard from "./dashboards/replication";
 import distributedDashboard from "./dashboards/distributed";
 import queuesDashboard from "./dashboards/queues";
 import requestsDashboard from "./dashboards/requests";
+import hardwareDashboard from "./dashboards/hardware";
+import changefeedsDashboard from "./dashboards/changefeeds";
 
 interface GraphDashboard {
   label: string;
@@ -40,13 +58,15 @@ interface GraphDashboard {
 
 const dashboards: {[key: string]: GraphDashboard} = {
   "overview" : { label: "Overview", component: overviewDashboard },
+  "hardware": { label: "Hardware", component: hardwareDashboard },
   "runtime" : { label: "Runtime", component: runtimeDashboard },
   "sql": { label: "SQL", component: sqlDashboard },
   "storage": { label: "Storage", component: storageDashboard },
   "replication": { label: "Replication", component: replicationDashboard },
   "distributed": { label: "Distributed", component: distributedDashboard },
   "queues": { label: "Queues", component: queuesDashboard },
-  "requests": { label: "Slow Requests", component: requestsDashboard},
+  "requests": { label: "Slow Requests", component: requestsDashboard },
+  "changefeeds": { label: "Changefeeds", component: changefeedsDashboard },
 };
 
 const defaultDashboard = "overview";
@@ -62,9 +82,12 @@ const dashboardDropdownOptions = _.map(dashboards, (dashboard, key) => {
 interface NodeGraphsOwnProps {
   refreshNodes: typeof refreshNodes;
   refreshLiveness: typeof refreshLiveness;
+  hoverOn: typeof hoverOn;
+  hoverOff: typeof hoverOff;
   nodesQueryValid: boolean;
   livenessQueryValid: boolean;
   nodesSummary: NodesSummary;
+  hoverState: HoverState;
 }
 
 type NodeGraphsProps = NodeGraphsOwnProps & RouterState;
@@ -88,20 +111,21 @@ class NodeGraphs extends React.Component<NodeGraphsProps, {}> {
    */
   private nodeDropdownOptions = createSelector(
     (summary: NodesSummary) => summary.nodeStatuses,
-    (nodeStatuses): DropdownOption[] => {
+    (summary: NodesSummary) => summary.nodeDisplayNameByID,
+    (summary: NodesSummary) => summary.livenessStatusByNodeID,
+    (nodeStatuses, nodeDisplayNameByID, livenessStatusByNodeID): DropdownOption[] => {
       const base = [{value: "", label: "Cluster"}];
-      return base.concat(_.map(nodeStatuses, (ns) => {
-        return {
-          value: ns.desc.node_id.toString(),
-          label: ns.desc.address.address_field,
-        };
-      }));
+      return base.concat(
+        _.chain(nodeStatuses)
+          .filter(ns => livenessStatusByNodeID[ns.desc.node_id] !== LivenessStatus.DECOMMISSIONED)
+          .map(ns => ({
+            value: ns.desc.node_id.toString(),
+            label: nodeDisplayNameByID[ns.desc.node_id],
+          }))
+          .value(),
+      );
     },
   );
-
-  static title() {
-    return "Cluster Overview";
-  }
 
   refresh(props = this.props) {
     if (!props.nodesQueryValid) {
@@ -114,9 +138,9 @@ class NodeGraphs extends React.Component<NodeGraphsProps, {}> {
 
   setClusterPath(nodeID: string, dashboardName: string) {
     if (!_.isString(nodeID) || nodeID === "") {
-      this.context.router.push(`/cluster/all/${dashboardName}`);
+      this.context.router.push(`/metrics/${dashboardName}/cluster`);
     } else {
-      this.context.router.push(`/cluster/node/${nodeID}/${dashboardName}`);
+      this.context.router.push(`/metrics/${dashboardName}/node/${nodeID}`);
     }
   }
 
@@ -143,6 +167,7 @@ class NodeGraphs extends React.Component<NodeGraphsProps, {}> {
       ? selectedDashboard
       : defaultDashboard;
 
+    const title = dashboards[dashboard].label + " Dashboard";
     const selectedNode = params[nodeIDAttr] || "";
     const nodeSources = (selectedNode !== "") ? [selectedNode] : null;
 
@@ -172,6 +197,12 @@ class NodeGraphs extends React.Component<NodeGraphsProps, {}> {
       tooltipSelection,
     };
 
+    const forwardParams = {
+      hoverOn: this.props.hoverOn,
+      hoverOff: this.props.hoverOff,
+      hoverState: this.props.hoverState,
+    };
+
     // Generate graphs for the current dashboard, wrapping each one in a
     // MetricsDataProvider with a unique key.
     const graphs = dashboards[dashboard].component(dashboardProps);
@@ -180,44 +211,52 @@ class NodeGraphs extends React.Component<NodeGraphsProps, {}> {
       return (
         <div key={key}>
           <MetricsDataProvider id={key}>
-            {graph}
+            { React.cloneElement(graph, forwardParams) }
           </MetricsDataProvider>
         </div>
       );
     });
 
-    return <div>
-      <PageConfig>
-        <PageConfigItem>
-          <Dropdown
-            title="Graph"
-            options={this.nodeDropdownOptions(this.props.nodesSummary)}
-            selected={selectedNode}
-            onChange={this.nodeChange}
-          />
-        </PageConfigItem>
-        <PageConfigItem>
-          <Dropdown
-            title="Dashboard"
-            options={dashboardDropdownOptions}
-            selected={dashboard}
-            onChange={this.dashChange}
-          />
-        </PageConfigItem>
-        <PageConfigItem>
-          <TimeScaleDropdown />
-        </PageConfigItem>
-      </PageConfig>
-      <div className="section l-columns">
-        <div className="chart-group l-columns__left">
-          { graphComponents }
-        </div>
-        <div className="l-columns__right">
-          <Alerts />
-          <ClusterSummaryBar nodesSummary={this.props.nodesSummary} nodeSources={nodeSources} />
-        </div>
+    return (
+      <div>
+        <Helmet>
+          <title>{ title }</title>
+        </Helmet>
+        <section className="section"><h1>{ title }</h1></section>
+        <PageConfig>
+          <PageConfigItem>
+            <Dropdown
+              title="Graph"
+              options={this.nodeDropdownOptions(this.props.nodesSummary)}
+              selected={selectedNode}
+              onChange={this.nodeChange}
+            />
+          </PageConfigItem>
+          <PageConfigItem>
+            <Dropdown
+              title="Dashboard"
+              options={dashboardDropdownOptions}
+              selected={dashboard}
+              onChange={this.dashChange}
+            />
+          </PageConfigItem>
+          <PageConfigItem>
+            <TimeScaleDropdown />
+          </PageConfigItem>
+        </PageConfig>
+        <section className="section">
+          <div className="l-columns">
+            <div className="chart-group l-columns__left">
+              { graphComponents }
+            </div>
+            <div className="l-columns__right">
+              <Alerts />
+              <ClusterSummaryBar nodesSummary={this.props.nodesSummary} nodeSources={nodeSources} />
+            </div>
+          </div>
+        </section>
       </div>
-    </div>;
+    );
   }
 }
 
@@ -227,10 +266,13 @@ export default connect(
       nodesSummary: nodesSummarySelector(state),
       nodesQueryValid: state.cachedData.nodes.valid,
       livenessQueryValid: state.cachedData.nodes.valid,
+      hoverState: hoverStateSelector(state),
     };
   },
   {
     refreshNodes,
     refreshLiveness,
+    hoverOn,
+    hoverOff,
   },
 )(NodeGraphs);

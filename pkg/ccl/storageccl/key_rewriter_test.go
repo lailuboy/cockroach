@@ -4,7 +4,7 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
 package storageccl
 
@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 func TestPrefixRewriter(t *testing.T) {
@@ -66,7 +67,7 @@ func TestKeyRewriter(t *testing.T) {
 		},
 	}
 
-	kr, err := MakeKeyRewriter(rekeys)
+	kr, err := MakeKeyRewriterFromRekeys(rekeys)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,22 +112,16 @@ func TestKeyRewriter(t *testing.T) {
 		desc.ID = oldID + 10
 		desc2 := sqlbase.DescriptorTable
 		desc2.ID += 10
-		kr, err := MakeKeyRewriter([]roachpb.ImportRequest_TableRekey{
-			{
-				OldID:   uint32(oldID),
-				NewDesc: mustMarshalDesc(t, &desc),
-			},
-			{
-				OldID:   uint32(sqlbase.DescriptorTable.ID),
-				NewDesc: mustMarshalDesc(t, &desc2),
-			},
+		newKr, err := MakeKeyRewriterFromRekeys([]roachpb.ImportRequest_TableRekey{
+			{OldID: uint32(oldID), NewDesc: mustMarshalDesc(t, &desc)},
+			{OldID: uint32(sqlbase.DescriptorTable.ID), NewDesc: mustMarshalDesc(t, &desc2)},
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		key := sqlbase.MakeIndexKeyPrefix(&sqlbase.NamespaceTable, desc.PrimaryIndex.ID)
-		newKey, ok, err := kr.RewriteKey(key)
+		newKey, ok, err := newKr.RewriteKey(key)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -144,10 +139,7 @@ func TestKeyRewriter(t *testing.T) {
 }
 
 func mustMarshalDesc(t *testing.T, desc *sqlbase.TableDescriptor) []byte {
-	baseDesc := sqlbase.Descriptor{
-		Union: &sqlbase.Descriptor_Table{Table: desc},
-	}
-	bytes, err := baseDesc.Marshal()
+	bytes, err := protoutil.Marshal(sqlbase.WrapDescriptor(desc))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,3 +1,17 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import React from "react";
 import { connect } from "react-redux";
 
@@ -14,16 +28,10 @@ import {
 } from "src/redux/apiReducers";
 
 import {
-    DatabaseSummaryBase, DatabaseSummaryExplicitData, databaseDetails, tableInfos, grants,
+    DatabaseSummaryBase, DatabaseSummaryExplicitData, databaseDetails, tableInfos, grants as selectGrants,
 } from "src/views/databases/containers/databaseSummary";
 
-// Specialization of generic SortedTable component:
-//   https://github.com/Microsoft/TypeScript/issues/3960
-//
-// The variable name must start with a capital letter or TSX will not recognize
-// it as a component.
-// tslint:disable-next-line:variable-name
-export const DatabaseGrantsSortedTable = SortedTable as new () => SortedTable<protos.cockroach.server.serverpb.DatabaseDetailsResponse.Grant>;
+class DatabaseGrantsSortedTable extends SortedTable<protos.cockroach.server.serverpb.DatabaseDetailsResponse.Grant> {}
 
 const grantsSortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "databases/sort_setting/grants", (s) => s.localSettings,
@@ -43,41 +51,45 @@ class DatabaseSummaryGrants extends DatabaseSummaryBase {
 
     const numTables = tableInfos && tableInfos.length || 0;
 
-    return <div className="database-summary l-columns">
-      <div className="database-summary-title">
-        { dbID }
-      </div>
-      <div className="l-columns__left">
-        <div className="database-summary-table sql-table">
-        {
-          (numTables === 0) ? "" :
-          <DatabaseGrantsSortedTable
-              data={grants}
-              sortSetting={sortSetting}
-              onChangeSortSetting={(setting) => this.props.setSort(setting) }
-              columns={[
-                {
-                    title: "User",
-                    cell: (grant) => grant.user,
-                    sort: (grant) => grant.user,
-                },
-                {
-                    title: "Grants",
-                    cell: (grant) => grant.privileges.join(", "),
-                },
-              ]}/>
-        }
+    return (
+      <div className="database-summary">
+        <div className="database-summary-title">
+          <h2>{dbID}</h2>
+        </div>
+        <div className="l-columns">
+          <div className="l-columns__left">
+            <div className="database-summary-table sql-table">
+              {
+                (numTables === 0) ? "" :
+                  <DatabaseGrantsSortedTable
+                    data={grants}
+                    sortSetting={sortSetting}
+                    onChangeSortSetting={(setting) => this.props.setSort(setting)}
+                    columns={[
+                      {
+                        title: "User",
+                        cell: (grant) => grant.user,
+                        sort: (grant) => grant.user,
+                      },
+                      {
+                        title: "Grants",
+                        cell: (grant) => grant.privileges.join(", "),
+                      },
+                    ]} />
+              }
+            </div>
+          </div>
+          <div className="l-columns__right">
+            <SummaryBar>
+              <SummaryHeadlineStat
+                title="Total Users"
+                tooltip="Total users that have been granted permissions on this table."
+                value={this.totalUsers()} />
+            </SummaryBar>
+          </div>
         </div>
       </div>
-      <div className="l-columns__right">
-        <SummaryBar>
-          <SummaryHeadlineStat
-            title="Total Users"
-            tooltip="Total users that have been granted permissions on this table."
-            value={ this.totalUsers() }/>
-        </SummaryBar>
-      </div>
-    </div>;
+    );
   }
 }
 
@@ -88,7 +100,7 @@ export default connect(
       tableInfos: tableInfos(state, ownProps.name),
       sortSetting: grantsSortSetting.selector(state),
       dbResponse: databaseDetails(state)[ownProps.name] && databaseDetails(state)[ownProps.name].data,
-      grants: grants(state, ownProps.name),
+      grants: selectGrants(state, ownProps.name),
     };
   },
   {

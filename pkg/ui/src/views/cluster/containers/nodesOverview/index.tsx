@@ -1,3 +1,17 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import React from "react";
 import { Link } from "react-router";
 import { connect } from "react-redux";
@@ -6,16 +20,24 @@ import { createSelector } from "reselect";
 import _ from "lodash";
 
 import {
-  NodesSummary, nodesSummarySelector, LivenessStatus, deadTimeout,
+  livenessNomenclature,
+  LivenessStatus,
+  nodeCapacityStats,
+  NodesSummary,
+  nodesSummarySelector,
+  selectNodesSummaryValid,
 } from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
 import { refreshNodes, refreshLiveness } from "src/redux/apiReducers";
 import { LocalSetting } from "src/redux/localsettings";
 import { SortSetting } from "src/views/shared/components/sortabletable";
 import { SortedTable } from "src/views/shared/components/sortedtable";
-import { NanoToMilli, LongToMoment } from "src/util/convert";
-import { Bytes } from "src/util/format";
-import { NodeStatus$Properties, MetricConstants, BytesUsed } from "src/util/proto";
+import { LongToMoment } from "src/util/convert";
+import { INodeStatus, MetricConstants, BytesUsed } from "src/util/proto";
+import { FixLong } from "src/util/fixLong";
+
+import { BytesBarChart } from "./barChart";
+import "./nodes.styl";
 
 const liveNodesSortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "nodes/live_sort_setting", (s) => s.localSettings,
@@ -25,22 +47,20 @@ const deadNodesSortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "nodes/dead_sort_setting", (s) => s.localSettings,
 );
 
-// Specialization of generic SortedTable component:
-//   https://github.com/Microsoft/TypeScript/issues/3960
-//
-// The variable name must start with a capital letter or TSX will not recognize
-// it as a component.
-// tslint:disable-next-line:variable-name
-const NodeSortedTable = SortedTable as new () => SortedTable<NodeStatus$Properties>;
+const decommissionedNodesSortSetting = new LocalSetting<AdminUIState, SortSetting>(
+  "nodes/decommissioned_sort_setting", (s) => s.localSettings,
+);
+
+class NodeSortedTable extends SortedTable<INodeStatus> {}
 
 /**
  * NodeCategoryListProps are the properties shared by both LiveNodeList and
- * DeadNodeList.
+ * NotLiveNodeList.
  */
 interface NodeCategoryListProps {
   sortSetting: SortSetting;
   setSort: typeof liveNodesSortSetting.set;
-  statuses: NodeStatus$Properties[];
+  statuses: INodeStatus[];
   nodesSummary: NodesSummary;
 }
 
@@ -56,11 +76,11 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
       return null;
     }
 
-    return <div>
-      <div className="header header--subsection">
-        Live Nodes
-      </div>
-      <section className="section">
+    return (
+      <div className="embedded-table">
+        <section className="section section--heading">
+          <h2>Live Nodes</h2>
+        </section>
         <NodeSortedTable
           data={statuses}
           sortSetting={sortSetting}
@@ -69,7 +89,7 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
             // Node ID column.
             {
               title: "ID",
-              cell: (ns) => ns.desc.node_id,
+              cell: (ns) => `n${ns.desc.node_id}`,
               sort: (ns) => ns.desc.node_id,
             },
             // Node address column - displays the node address, links to the
@@ -77,16 +97,24 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
             {
               title: "Address",
               cell: (ns) => {
-                const status = nodesSummary.livenessStatusByNodeID[ns.desc.node_id] || 0;
-                const s = LivenessStatus[status].toLowerCase();
-                const tooltip = (status === LivenessStatus.HEALTHY) ?
-                  "This node is currently healthy." :
-                  "This node has not recently reported as being live. " +
-                  "It may not be functioning correctly, but no automatic action has yet been taken.";
+                const status = nodesSummary.livenessStatusByNodeID[ns.desc.node_id] || LivenessStatus.LIVE;
+                const s = livenessNomenclature(status);
+                let tooltip: string;
+                switch (status) {
+                  case LivenessStatus.LIVE:
+                    tooltip = "This node is currently healthy.";
+                    break;
+                  case LivenessStatus.DECOMMISSIONING:
+                    tooltip = "This node is currently being decommissioned.";
+                    break;
+                  default:
+                    tooltip = "This node has not recently reported as being live. " +
+                      "It may not be functioning correctly, but no automatic action has yet been taken.";
+                }
                 return (
                   <div className="sort-table__unbounded-column">
-                    <div className={"icon-circle-filled node-status-icon node-status-icon--" + s} title={tooltip} />
-                    <Link to={`/cluster/nodes/${ns.desc.node_id}`}>{ns.desc.address.address_field}</Link>
+                    <div className={"node-status-icon node-status-icon--" + s} title={tooltip} />
+                    <Link to={`/node/${ns.desc.node_id}`}>{ns.desc.address.address_field}</Link>
                   </div>
                 );
               },
@@ -101,28 +129,44 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
             {
               title: "Uptime",
               cell: (ns) => {
-                const startTime = moment(NanoToMilli(ns.started_at.toNumber()));
+                const startTime = LongToMoment(ns.started_at);
                 return moment.duration(startTime.diff(moment())).humanize();
               },
               sort: (ns) => ns.started_at,
-            },
-            // Bytes - displays the total persisted bytes maintained by the node.
-            {
-              title: "Bytes",
-              cell: (ns) => Bytes(BytesUsed(ns)),
-              sort: (ns) => BytesUsed(ns),
+              className: "sort-table__cell--right-aligned-stats",
             },
             // Replicas - displays the total number of replicas on the node.
             {
               title: "Replicas",
               cell: (ns) => ns.metrics[MetricConstants.replicas].toString(),
               sort: (ns) => ns.metrics[MetricConstants.replicas],
+              className: "sort-table__cell--right-aligned-stat",
+            },
+            // CPUs - the number of CPUs on this node
+            {
+              title: "CPUs",
+              cell: (ns) => ns.num_cpus,
+              className: "sort-table__cell--right-aligned-stat",
+            },
+            // Used Capacity - displays the total persisted bytes maintained by the node.
+            {
+              title: "Capacity Usage",
+              cell: (ns) => {
+                const { usable } = nodeCapacityStats(ns);
+                const used = BytesUsed(ns);
+                return <BytesBarChart used={used} usable={usable} />;
+              },
+              sort: (ns) => BytesUsed(ns) / nodeCapacityStats(ns).usable,
             },
             // Mem Usage - total memory being used on this node.
             {
               title: "Mem Usage",
-              cell: (ns) => Bytes(ns.metrics[MetricConstants.rss]),
-              sort: (ns) => ns.metrics[MetricConstants.rss],
+              cell: (ns) => {
+                const used = ns.metrics[MetricConstants.rss];
+                const available = FixLong(ns.total_system_memory).toNumber();
+                return <BytesBarChart used={used} usable={available} />;
+              },
+              sort: (ns) => ns.metrics[MetricConstants.rss] / FixLong(ns.total_system_memory).toNumber(),
             },
             // Version - the currently running version of cockroach.
             {
@@ -133,30 +177,40 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
             // Logs - a link to the logs data for this node.
             {
               title: "Logs",
-              cell: (ns) => <Link to={`/cluster/nodes/${ns.desc.node_id}/logs`}>Logs</Link>,
+              cell: (ns) => <Link to={`/node/${ns.desc.node_id}/logs`}>Logs</Link>,
               className: "expand-link",
             },
           ]} />
-      </section>
-    </div>;
+      </div>
+    );
   }
 }
 
 /**
- * DeadNodeList renders a sortable table of all "dead" nodes on the cluster.
+ * NotLiveNodeListProps are the properties of NotLiveNodeList.
  */
-class DeadNodeList extends React.Component<NodeCategoryListProps, {}> {
+interface NotLiveNodeListProps extends NodeCategoryListProps {
+  status: LivenessStatus.DECOMMISSIONING | LivenessStatus.DEAD;
+}
+
+/**
+ * NotLiveNodeList renders a sortable table of all "dead" or "decommissioned"
+ * nodes on the cluster.
+ */
+class NotLiveNodeList extends React.Component<NotLiveNodeListProps, {}> {
   render() {
-    const { statuses, nodesSummary, sortSetting } = this.props;
+    const { status, statuses, nodesSummary, sortSetting } = this.props;
     if (!statuses || statuses.length === 0) {
       return null;
     }
 
-    return <div>
-      <section className="header header--subsection">
-        Dead Nodes
-      </section>
-      <section className="section">
+    const statusName = _.capitalize(LivenessStatus[status]);
+
+    return (
+      <div className="embedded-table">
+        <section className="section section--heading">
+          <h2>{`${statusName} Nodes`}</h2>
+        </section>
         <NodeSortedTable
           data={statuses}
           sortSetting={sortSetting}
@@ -165,7 +219,7 @@ class DeadNodeList extends React.Component<NodeCategoryListProps, {}> {
             // Node ID column.
             {
               title: "ID",
-              cell: (ns) => ns.desc.node_id,
+              cell: (ns) => `n${ns.desc.node_id}`,
               sort: (ns) => ns.desc.node_id,
             },
             // Node address column - displays the node address, links to the
@@ -177,9 +231,13 @@ class DeadNodeList extends React.Component<NodeCategoryListProps, {}> {
                   <div>
                     <div
                       className="icon-circle-filled node-status-icon node-status-icon--dead"
-                      title={`This node has not reported as live for over ${deadTimeout.humanize()} and is considered dead.`}
+                      title={
+                        "This node has not reported as live for a significant period and is considered dead. " +
+                        "The cut-off period for dead nodes is configurable as cluster setting " +
+                        "'server.time_until_store_dead'"
+                      }
                     />
-                    <Link to={`/cluster/nodes/${ns.desc.node_id}`}>{ns.desc.address.address_field}</Link>
+                    <Link to={`/node/${ns.desc.node_id}`}>{ns.desc.address.address_field}</Link>
                   </div>
                 );
               },
@@ -190,25 +248,30 @@ class DeadNodeList extends React.Component<NodeCategoryListProps, {}> {
               // construct the full BEM class in the table component itself.
               className: "sort-table__cell--link",
             },
-            // Down since - displays the time that the node started.
+            // Down/decommissioned since - displays how long the node has been
+            // considered dead.
             {
-              title: "Downtime",
+              title: `${statusName} Since`,
               cell: (ns) => {
                 const liveness = nodesSummary.livenessByNodeID[ns.desc.node_id];
+                if (!liveness) {
+                  return "no information";
+                }
+
                 const deadTime = liveness.expiration.wall_time;
                 const deadMoment = LongToMoment(deadTime);
-                return moment.duration(deadMoment.diff(moment())).humanize();
+                return `${moment.duration(deadMoment.diff(moment())).humanize()} ago`;
               },
-              sort: (ns) => ns.started_at,
+              sort: (ns) => {
+                const liveness = nodesSummary.livenessByNodeID[ns.desc.node_id];
+                return liveness.expiration.wall_time;
+              },
             },
           ]} />
-      </section>
-    </div>;
+      </div>
+    );
   }
 }
-
-// Base selectors to extract data from redux state.
-const nodeQueryValid = (state: AdminUIState): boolean => state.cachedData.nodes.valid && state.cachedData.liveness.valid;
 
 /**
  * partitionedStatuses divides the list of node statuses into "live" and "dead".
@@ -216,19 +279,27 @@ const nodeQueryValid = (state: AdminUIState): boolean => state.cachedData.nodes.
 const partitionedStatuses = createSelector(
   nodesSummarySelector,
   (summary) => {
-    const liveOrDead = _.partition(
+    return _.groupBy(
       summary.nodeStatuses,
-      (ns) => summary.livenessStatusByNodeID[ns.desc.node_id] !== LivenessStatus.DEAD,
+      (ns) => {
+        switch (summary.livenessStatusByNodeID[ns.desc.node_id]) {
+          case LivenessStatus.LIVE:
+          case LivenessStatus.UNAVAILABLE:
+          case LivenessStatus.DECOMMISSIONING:
+            return "live";
+          case LivenessStatus.DECOMMISSIONED:
+            return "decommissioned";
+          case LivenessStatus.DEAD:
+          default:
+            return "dead";
+        }
+      },
     );
-    return {
-      live: liveOrDead[0],
-      dead: liveOrDead[1],
-    };
   },
 );
 
 /**
- * LiveNodesConnected is a redux-connected HOC of LiveNodes.
+ * LiveNodesConnected is a redux-connected HOC of LiveNodeList.
  */
 // tslint:disable-next-line:variable-name
 const LiveNodesConnected = connect(
@@ -246,7 +317,7 @@ const LiveNodesConnected = connect(
 )(LiveNodeList);
 
 /**
- * DeadNodesConnected is a redux-connected HOC of DeadNodes.
+ * DeadNodesConnected is a redux-connected HOC of NotLiveNodeList.
  */
 // tslint:disable-next-line:variable-name
 const DeadNodesConnected = connect(
@@ -254,6 +325,7 @@ const DeadNodesConnected = connect(
     const statuses = partitionedStatuses(state);
     return {
       sortSetting: deadNodesSortSetting.selector(state),
+      status: LivenessStatus.DEAD,
       statuses: statuses.dead,
       nodesSummary: nodesSummarySelector(state),
     };
@@ -261,7 +333,26 @@ const DeadNodesConnected = connect(
   {
     setSort: deadNodesSortSetting.set,
   },
-)(DeadNodeList);
+)(NotLiveNodeList);
+
+/**
+ * DecommissionedNodesConnected is a redux-connected HOC of NotLiveNodeList.
+ */
+// tslint:disable-next-line:variable-name
+const DecommissionedNodesConnected = connect(
+  (state: AdminUIState) => {
+    const statuses = partitionedStatuses(state);
+    return {
+      sortSetting: decommissionedNodesSortSetting.selector(state),
+      status: LivenessStatus.DECOMMISSIONED,
+      statuses: statuses.decommissioned,
+      nodesSummary: nodesSummarySelector(state),
+    };
+  },
+  {
+    setSort: decommissionedNodesSortSetting.set,
+  },
+)(NotLiveNodeList);
 
 /**
  * NodesMainProps is the type of the props object that must be passed to
@@ -274,7 +365,7 @@ interface NodesMainProps {
   refreshLiveness: typeof refreshLiveness;
   // True if current status results are still valid. Needed so that this
   // component refreshes status query when it becomes invalid.
-  statusesValid: boolean;
+  nodesSummaryValid: boolean;
 }
 
 /**
@@ -296,23 +387,24 @@ class NodesMain extends React.Component<NodesMainProps, {}> {
   }
 
   render() {
-    return <div>
-      <section className="section parent-link">
-        <Link to="/cluster">&lt; Back to Cluster</Link>
-      </section>
-      <LiveNodesConnected />
-      <DeadNodesConnected />
-    </div>;
+    return (
+      <div>
+        <DeadNodesConnected />
+        <LiveNodesConnected />
+        <DecommissionedNodesConnected />
+      </div>
+    );
   }
 }
 
 /**
- * nodesMainConnected is a redux-connected HOC of NodesMain.
+ * NodesMainConnected is a redux-connected HOC of NodesMain.
  */
-const nodesMainConnected = connect(
+// tslint:disable-next-line:variable-name
+const NodesMainConnected = connect(
   (state: AdminUIState) => {
     return {
-      statusesValid: nodeQueryValid(state),
+      nodesSummaryValid: selectNodesSummaryValid(state),
     };
   },
   {
@@ -321,4 +413,4 @@ const nodesMainConnected = connect(
   },
 )(NodesMain);
 
-export { nodesMainConnected as default };
+export { NodesMainConnected as NodesOverview };

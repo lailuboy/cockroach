@@ -11,27 +11,31 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package sql
 
 import (
+	"context"
+	"fmt"
 	"sort"
 	"time"
 
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
-	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -48,17 +52,23 @@ const (
 	// DeleteRange().
 	indexTruncateChunkSize = 600
 
-	// indexBackfillChunkSize is the maximum number index entries backfilled
-	// per chunk during an index backfill. The index backfill involves a table
-	// scan, and a number of individual ops presented in a batch. This value
-	// is smaller than ColumnTruncateAndBackfillChunkSize, because it involves
-	// a number of individual index row updates that can be scattered over
-	// many ranges.
-	indexBackfillChunkSize = 100
+	// indexTxnBackfillChunkSize is the maximum number index entries backfilled
+	// per chunk during an index backfill done in a txn. The index backfill
+	// involves a table scan, and a number of individual ops presented in a batch.
+	// This value is smaller than ColumnTruncateAndBackfillChunkSize, because it
+	// involves a number of individual index row updates that can be scattered
+	// over many ranges.
+	indexTxnBackfillChunkSize = 100
 
 	// checkpointInterval is the interval after which a checkpoint of the
 	// schema change is posted.
-	checkpointInterval = 10 * time.Second
+	checkpointInterval = 1 * time.Minute
+)
+
+var indexBulkBackfillChunkSize = settings.RegisterIntSetting(
+	"schemachanger.bulk_index_backfill.batch_size",
+	"number of rows to process at a time during bulk index backfill",
+	5000000,
 )
 
 var _ sort.Interface = columnsByID{}
@@ -97,7 +107,9 @@ func (sc *SchemaChanger) getChunkSize(chunkSize int64) int64 {
 
 // runBackfill runs the backfill for the schema changer.
 func (sc *SchemaChanger) runBackfill(
-	ctx context.Context, lease *sqlbase.TableDescriptor_SchemaChangeLease, evalCtx parser.EvalContext,
+	ctx context.Context,
+	lease *sqlbase.TableDescriptor_SchemaChangeLease,
+	evalCtx *extendedEvalContext,
 ) error {
 	if sc.testingKnobs.RunBeforeBackfill != nil {
 		if err := sc.testingKnobs.RunBeforeBackfill(); err != nil {
@@ -112,9 +124,8 @@ func (sc *SchemaChanger) runBackfill(
 	// mutations. Collect the elements that are part of the mutation.
 	var droppedIndexDescs []sqlbase.IndexDescriptor
 	var addedIndexDescs []sqlbase.IndexDescriptor
-	// Indexes within the Mutations slice for checkpointing.
-	mutationSentinel := -1
-	var droppedIndexMutationIdx int
+
+	var checksToValidate []sqlbase.ConstraintToValidate
 
 	var tableDesc *sqlbase.TableDescriptor
 	if err := sc.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
@@ -130,11 +141,11 @@ func (sc *SchemaChanger) runBackfill(
 	}
 	version := tableDesc.Version
 
-	log.VEventf(ctx, 0, "Running backfill for %q, v=%d, m=%d",
+	log.Infof(ctx, "Running backfill for %q, v=%d, m=%d",
 		tableDesc.Name, tableDesc.Version, sc.mutationID)
 
 	needColumnBackfill := false
-	for i, m := range tableDesc.Mutations {
+	for _, m := range tableDesc.Mutations {
 		if m.MutationID != sc.mutationID {
 			break
 		}
@@ -142,12 +153,18 @@ func (sc *SchemaChanger) runBackfill(
 		case sqlbase.DescriptorMutation_ADD:
 			switch t := m.Descriptor_.(type) {
 			case *sqlbase.DescriptorMutation_Column:
-				desc := m.GetColumn()
-				if desc.DefaultExpr != nil || !desc.Nullable {
+				if sqlbase.ColumnNeedsBackfill(m.GetColumn()) {
 					needColumnBackfill = true
 				}
 			case *sqlbase.DescriptorMutation_Index:
 				addedIndexDescs = append(addedIndexDescs, *t.Index)
+			case *sqlbase.DescriptorMutation_Constraint:
+				switch t.Constraint.ConstraintType {
+				case sqlbase.ConstraintToValidate_CHECK:
+					checksToValidate = append(checksToValidate, *t.Constraint)
+				default:
+					return errors.Errorf("unsupported constraint type: %d", t.Constraint.ConstraintType)
+				}
 			default:
 				return errors.Errorf("unsupported mutation: %+v", m)
 			}
@@ -157,10 +174,11 @@ func (sc *SchemaChanger) runBackfill(
 			case *sqlbase.DescriptorMutation_Column:
 				needColumnBackfill = true
 			case *sqlbase.DescriptorMutation_Index:
-				droppedIndexDescs = append(droppedIndexDescs, *t.Index)
-				if droppedIndexMutationIdx == mutationSentinel {
-					droppedIndexMutationIdx = i
+				if !sc.canClearRangeForDrop(t.Index) {
+					droppedIndexDescs = append(droppedIndexDescs, *t.Index)
 				}
+			case *sqlbase.DescriptorMutation_Constraint:
+				// no-op
 			default:
 				return errors.Errorf("unsupported mutation: %+v", m)
 			}
@@ -169,11 +187,11 @@ func (sc *SchemaChanger) runBackfill(
 
 	// First drop indexes, then add/drop columns, and only then add indexes.
 
-	// Drop indexes.
-	if err := sc.truncateIndexes(
-		ctx, lease, version, droppedIndexDescs, droppedIndexMutationIdx,
-	); err != nil {
-		return err
+	// Drop indexes not to be removed by `ClearRange`.
+	if len(droppedIndexDescs) > 0 {
+		if err := sc.truncateIndexes(ctx, lease, version, droppedIndexDescs); err != nil {
+			return err
+		}
 	}
 
 	// Add and drop columns.
@@ -185,64 +203,110 @@ func (sc *SchemaChanger) runBackfill(
 
 	// Add new indexes.
 	if len(addedIndexDescs) > 0 {
+		// Check if bulk-adding is enabled and supported by indexes (ie non-unique).
 		if err := sc.backfillIndexes(ctx, evalCtx, lease, version); err != nil {
 			return err
 		}
 	}
 
+	// Validate check constraints.
+	if len(checksToValidate) > 0 {
+		if err := sc.validateChecks(ctx, evalCtx, lease, checksToValidate); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func (sc *SchemaChanger) maybeWriteResumeSpan(
+func (sc *SchemaChanger) validateChecks(
 	ctx context.Context,
-	txn *client.Txn,
-	version sqlbase.DescriptorVersion,
-	resume roachpb.Span,
-	mutationIdx int,
-	lastCheckpoint *time.Time,
+	evalCtx *extendedEvalContext,
+	lease *sqlbase.TableDescriptor_SchemaChangeLease,
+	checks []sqlbase.ConstraintToValidate,
 ) error {
-	checkpointInterval := checkpointInterval
-	if sc.testingKnobs.WriteCheckpointInterval > 0 {
-		checkpointInterval = sc.testingKnobs.WriteCheckpointInterval
-	}
-	if timeutil.Since(*lastCheckpoint) < checkpointInterval {
+	if testDisableTableLeases {
 		return nil
 	}
-	tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.tableID)
-	if err != nil {
-		return err
-	}
-	if tableDesc.Version != version {
-		return errors.Errorf("table version mismatch: %d, expected: %d", tableDesc.Version, version)
-	}
-	if len(tableDesc.Mutations[mutationIdx].ResumeSpans) > 0 {
-		tableDesc.Mutations[mutationIdx].ResumeSpans[0] = resume
-	} else {
-		tableDesc.Mutations[mutationIdx].ResumeSpans = append(tableDesc.Mutations[mutationIdx].ResumeSpans, resume)
-	}
-	if err := txn.SetSystemConfigTrigger(); err != nil {
-		return err
-	}
-	if err := txn.Put(
-		ctx,
-		sqlbase.MakeDescMetadataKey(tableDesc.GetID()),
-		sqlbase.WrapDescriptor(tableDesc),
-	); err != nil {
-		return err
-	}
-	*lastCheckpoint = timeutil.Now()
-	return nil
+	readAsOf := sc.clock.Now()
+	return sc.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		txn.SetFixedTimestamp(ctx, readAsOf)
+		tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.tableID)
+		if err != nil {
+			return err
+		}
+
+		if err := sc.ExtendLease(ctx, lease); err != nil {
+			return err
+		}
+
+		grp := ctxgroup.WithContext(ctx)
+
+		// Notify when validation is finished (or has returned an error) for a check.
+		countDone := make(chan struct{}, len(checks))
+
+		for _, c := range checks {
+			grp.GoCtx(func(ctx context.Context) error {
+				defer func() { countDone <- struct{}{} }()
+
+				// Make the mutations public in a private copy of the descriptor
+				// and add it to the TableCollection, so that we can use SQL below to perform
+				// the validation. We wouldn't have needed to do this if we could have
+				// updated the descriptor and run validation in the same transaction. However,
+				// our current system is incapable of running long running schema changes
+				// (the validation can take many minutes). So we pretend that the schema
+				// has been updated and actually update it in a separate transaction that
+				// follows this one.
+				desc, err := sqlbase.NewImmutableTableDescriptor(*tableDesc).MakeFirstMutationPublic()
+				if err != nil {
+					return err
+				}
+				// Create a new eval context only because the eval context cannot be shared across many
+				// goroutines.
+				newEvalCtx := createSchemaChangeEvalCtx(ctx, readAsOf, evalCtx.Tracing, sc.ieFactory)
+				return validateCheckInTxn(ctx, sc.leaseMgr, &newEvalCtx.EvalContext, desc, txn, &c.Name)
+			})
+		}
+
+		// Periodic schema change lease extension.
+		grp.GoCtx(func(ctx context.Context) error {
+			count := len(checks)
+			refreshTimer := timeutil.NewTimer()
+			defer refreshTimer.Stop()
+			refreshTimer.Reset(checkpointInterval)
+			for {
+				select {
+				case <-countDone:
+					count--
+					if count == 0 {
+						// Stop.
+						return nil
+					}
+
+				case <-refreshTimer.C:
+					refreshTimer.Read = true
+					refreshTimer.Reset(checkpointInterval)
+					if err := sc.ExtendLease(ctx, lease); err != nil {
+						return err
+					}
+
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		})
+		return grp.Wait()
+	})
 }
 
 func (sc *SchemaChanger) getTableVersion(
 	ctx context.Context, txn *client.Txn, tc *TableCollection, version sqlbase.DescriptorVersion,
-) (*sqlbase.TableDescriptor, error) {
-	tableDesc, err := tc.getTableVersionByID(ctx, txn, sc.tableID)
+) (*sqlbase.ImmutableTableDescriptor, error) {
+	tableDesc, err := tc.getTableVersionByID(ctx, txn, sc.tableID, ObjectLookupFlags{})
 	if err != nil {
 		return nil, err
 	}
 	if version != tableDesc.Version {
-		return nil, errors.Errorf("table version mismatch: %d, expected=%d", tableDesc.Version, version)
+		return nil, makeErrTableVersionMismatch(tableDesc.Version, version)
 	}
 	return tableDesc, nil
 }
@@ -252,7 +316,6 @@ func (sc *SchemaChanger) truncateIndexes(
 	lease *sqlbase.TableDescriptor_SchemaChangeLease,
 	version sqlbase.DescriptorVersion,
 	dropped []sqlbase.IndexDescriptor,
-	mutationIdx int,
 ) error {
 	chunkSize := sc.getChunkSize(indexTruncateChunkSize)
 	if sc.testingKnobs.BackfillChunkSize > 0 {
@@ -261,8 +324,7 @@ func (sc *SchemaChanger) truncateIndexes(
 	alloc := &sqlbase.DatumAlloc{}
 	for _, desc := range dropped {
 		var resume roachpb.Span
-		lastCheckpoint := timeutil.Now()
-		for row, done := int64(0), false; !done; row += chunkSize {
+		for rowIdx, done := int64(0), false; !done; rowIdx += chunkSize {
 			// First extend the schema change lease.
 			if err := sc.ExtendLease(ctx, lease); err != nil {
 				return err
@@ -271,21 +333,16 @@ func (sc *SchemaChanger) truncateIndexes(
 			resumeAt := resume
 			if log.V(2) {
 				log.Infof(ctx, "drop index (%d, %d) at row: %d, span: %s",
-					sc.tableID, sc.mutationID, row, resume)
+					sc.tableID, sc.mutationID, rowIdx, resume)
 			}
 			if err := sc.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-				if sc.testingKnobs.RunBeforeBackfillChunk != nil {
-					if err := sc.testingKnobs.RunBeforeBackfillChunk(resume); err != nil {
+				if fn := sc.execCfg.DistSQLRunTestingKnobs.RunBeforeBackfillChunk; fn != nil {
+					if err := fn(resume); err != nil {
 						return err
 					}
 				}
-				if sc.testingKnobs.RunAfterBackfillChunk != nil {
-					defer sc.testingKnobs.RunAfterBackfillChunk()
-				}
-
-				// TODO(vivek): See comment in backfillIndexesChunk.
-				if err := txn.SetSystemConfigTrigger(); err != nil {
-					return err
+				if fn := sc.execCfg.DistSQLRunTestingKnobs.RunAfterBackfillChunk; fn != nil {
+					defer fn()
 				}
 
 				tc := &TableCollection{leaseMgr: sc.leaseMgr}
@@ -295,28 +352,37 @@ func (sc *SchemaChanger) truncateIndexes(
 					return err
 				}
 
-				rd, err := sqlbase.MakeRowDeleter(txn, tableDesc, nil, nil, false, alloc)
-				if err != nil {
-					return err
-				}
-				td := tableDeleter{rd: rd, alloc: alloc}
-				if err := td.init(txn); err != nil {
-					return err
-				}
-				resume, err = td.deleteIndex(
-					ctx, &desc, resumeAt, chunkSize, false, /* traceKV */
+				rd, err := row.MakeDeleter(
+					txn, tableDesc, nil, nil, row.SkipFKs, nil /* *tree.EvalContext */, alloc,
 				)
 				if err != nil {
 					return err
 				}
-				if err := sc.maybeWriteResumeSpan(ctx, txn, version, resume, mutationIdx, &lastCheckpoint); err != nil {
+				td := tableDeleter{rd: rd, alloc: alloc}
+				if err := td.init(txn, nil /* *tree.EvalContext */); err != nil {
 					return err
 				}
-				done = resume.Key == nil
-				return nil
+				if !sc.canClearRangeForDrop(&desc) {
+					resume, err = td.deleteIndex(
+						ctx,
+						&desc,
+						resumeAt,
+						chunkSize,
+						false, /* traceKV */
+					)
+					done = resume.Key == nil
+					return err
+				}
+				done = true
+				return td.clearIndex(ctx, &desc)
 			}); err != nil {
 				return err
 			}
+		}
+		if err := sc.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+			return removeIndexZoneConfigs(ctx, txn, sc.execCfg, sc.tableID, dropped)
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -330,41 +396,18 @@ const (
 	indexBackfill
 )
 
-// getMutationToBackfill returns the the first mutation enqueued on the table
-// descriptor that passes the input mutationFilter.
-//
-// Returns nil if the backfill is complete.
-func (sc *SchemaChanger) getMutationToBackfill(
-	ctx context.Context,
-	version sqlbase.DescriptorVersion,
-	backfillType backfillType,
-	filter distsqlrun.MutationFilter,
-) (*sqlbase.DescriptorMutation, error) {
-	var mutation *sqlbase.DescriptorMutation
-	err := sc.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		mutation = nil
-		tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.tableID)
-		if err != nil {
-			return err
+// getJobIDForMutationWithDescriptor returns a job id associated with a mutation given
+// a table descriptor. Unlike getJobIDForMutation this doesn't need transaction.
+func getJobIDForMutationWithDescriptor(
+	ctx context.Context, tableDesc *sqlbase.TableDescriptor, mutationID sqlbase.MutationID,
+) (int64, error) {
+	for _, job := range tableDesc.MutationJobs {
+		if job.MutationID == mutationID {
+			return job.JobID, nil
 		}
-		if tableDesc.Version != version {
-			return errors.Errorf("table version mismatch: %d, expected: %d", tableDesc.Version, version)
-		}
-		if len(tableDesc.Mutations) > 0 {
-			mutationID := tableDesc.Mutations[0].MutationID
-			for i := range tableDesc.Mutations {
-				if tableDesc.Mutations[i].MutationID != mutationID {
-					break
-				}
-				if filter(tableDesc.Mutations[i]) {
-					mutation = &tableDesc.Mutations[i]
-					break
-				}
-			}
-		}
-		return nil
-	})
-	return mutation, err
+	}
+
+	return 0, errors.Errorf("job not found for table id %d, mutation %d", tableDesc.ID, mutationID)
 }
 
 // nRanges returns the number of ranges that cover a set of spans.
@@ -397,12 +440,12 @@ func (sc *SchemaChanger) nRanges(
 // MutationFilter.
 func (sc *SchemaChanger) distBackfill(
 	ctx context.Context,
-	evalCtx parser.EvalContext,
+	evalCtx *extendedEvalContext,
 	lease *sqlbase.TableDescriptor_SchemaChangeLease,
 	version sqlbase.DescriptorVersion,
 	backfillType backfillType,
 	backfillChunkSize int64,
-	filter distsqlrun.MutationFilter,
+	filter backfill.MutationFilter,
 ) error {
 	duration := checkpointInterval
 	if sc.testingKnobs.WriteCheckpointInterval > 0 {
@@ -411,19 +454,20 @@ func (sc *SchemaChanger) distBackfill(
 	chunkSize := sc.getChunkSize(backfillChunkSize)
 
 	origNRanges := -1
-	origFractionCompleted := sc.job.Payload().FractionCompleted
+	origFractionCompleted := sc.job.FractionCompleted()
 	fractionLeft := 1 - origFractionCompleted
+	readAsOf := sc.clock.Now()
 	for {
-		// Repeat until getMutationToBackfill returns a mutation with no remaining
-		// ResumeSpans, indicating that the backfill is complete.
-		mutation, err := sc.getMutationToBackfill(ctx, version, backfillType, filter)
-		if err != nil {
+		var spans []roachpb.Span
+		if err := sc.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+			var err error
+			spans, _, _, err = distsqlrun.GetResumeSpans(
+				ctx, sc.jobRegistry, txn, sc.tableID, sc.mutationID, filter)
+			return err
+		}); err != nil {
 			return err
 		}
-		if mutation == nil {
-			break
-		}
-		spans := mutation.ResumeSpans
+
 		if len(spans) <= 0 {
 			break
 		}
@@ -451,8 +495,8 @@ func (sc *SchemaChanger) distBackfill(
 			if nRanges < origNRanges {
 				fractionRangesFinished := float32(origNRanges-nRanges) / float32(origNRanges)
 				fractionCompleted := origFractionCompleted + fractionLeft*fractionRangesFinished
-				if err := sc.job.Progressed(ctx, fractionCompleted, jobs.Noop); err != nil {
-					log.Infof(ctx, "Ignoring error reporting progress %f for job %d: %v", fractionCompleted, *sc.job.ID(), err)
+				if err := sc.job.FractionProgressed(ctx, jobs.FractionUpdater(fractionCompleted)); err != nil {
+					return jobs.SimplifyInvalidStatusError(err)
 				}
 			}
 
@@ -467,43 +511,55 @@ func (sc *SchemaChanger) distBackfill(
 			// backfiller processor.
 			var otherTableDescs []sqlbase.TableDescriptor
 			if backfillType == columnBackfill {
-				fkTables := sqlbase.TablesNeededForFKs(*tableDesc, sqlbase.CheckUpdates)
+				fkTables, err := row.MakeFkMetadata(
+					ctx,
+					tableDesc,
+					row.CheckUpdates,
+					row.NoLookup,
+					row.NoCheckPrivilege,
+					nil, /* AnalyzeExprFunction */
+					nil, /* CheckHelper */
+				)
+				if err != nil {
+					return err
+				}
+
 				for k := range fkTables {
-					table, err := tc.getTableVersionByID(ctx, txn, k)
+					table, err := tc.getTableVersionByID(ctx, txn, k, ObjectLookupFlags{})
 					if err != nil {
 						return err
 					}
-					otherTableDescs = append(otherTableDescs, *table)
+					otherTableDescs = append(otherTableDescs, *table.TableDesc())
 				}
 			}
-			// TODO(andrei): pass the right caches. I think this will crash without
-			// them.
-			recv, err := makeDistSQLReceiver(
+			rw := &errOnlyResultWriter{}
+			recv := MakeDistSQLReceiver(
 				ctx,
-				nil, /* sink */
-				nil, /* rangeCache */
-				nil, /* leaseCache */
+				rw,
+				tree.Rows, /* stmtType - doesn't matter here since no result are produced */
+				sc.rangeDescriptorCache,
+				sc.leaseHolderCache,
 				nil, /* txn - the flow does not run wholly in a txn */
-				// updateClock - the flow will not generate errors with time signal.
-				// TODO(andrei): plumb a clock update handler here regardless of whether
-				// it will actually be used or not.
-				nil,
+				func(ts hlc.Timestamp) {
+					_ = sc.clock.Update(ts)
+				},
+				evalCtx.Tracing,
+			)
+			defer recv.Release()
+			planCtx := sc.distSQLPlanner.NewPlanningCtx(ctx, evalCtx, txn)
+			plan, err := sc.distSQLPlanner.createBackfiller(
+				planCtx, backfillType, *tableDesc.TableDesc(), duration, chunkSize, spans, otherTableDescs, readAsOf,
 			)
 			if err != nil {
 				return err
 			}
-			planCtx := sc.distSQLPlanner.NewPlanningCtx(ctx, txn)
-			plan, err := sc.distSQLPlanner.CreateBackfiller(
-				&planCtx, backfillType, *tableDesc, duration, chunkSize, spans, otherTableDescs,
+			sc.distSQLPlanner.Run(
+				planCtx,
+				nil, /* txn - the processors manage their own transactions */
+				&plan, recv, evalCtx,
+				nil, /* finishedSetupFn */
 			)
-			if err != nil {
-				return err
-			}
-			if err := sc.distSQLPlanner.Run(&planCtx, txn, &plan, &recv, evalCtx); err != nil {
-				return err
-			}
-
-			return recv.err
+			return rw.Err()
 		}); err != nil {
 			return err
 		}
@@ -511,25 +567,561 @@ func (sc *SchemaChanger) distBackfill(
 	return nil
 }
 
+// validate the new indexes being added
+func (sc *SchemaChanger) validateIndexes(
+	ctx context.Context,
+	evalCtx *extendedEvalContext,
+	lease *sqlbase.TableDescriptor_SchemaChangeLease,
+) error {
+	if testDisableTableLeases {
+		return nil
+	}
+	readAsOf := sc.clock.Now()
+	return sc.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		txn.SetFixedTimestamp(ctx, readAsOf)
+		tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.tableID)
+		if err != nil {
+			return err
+		}
+
+		if err := sc.ExtendLease(ctx, lease); err != nil {
+			return err
+		}
+
+		var forwardIndexes []*sqlbase.IndexDescriptor
+		var invertedIndexes []*sqlbase.IndexDescriptor
+
+		for _, m := range tableDesc.Mutations {
+			if sc.mutationID != m.MutationID {
+				break
+			}
+			idx := m.GetIndex()
+			if idx == nil || m.Direction == sqlbase.DescriptorMutation_DROP {
+				continue
+			}
+			switch idx.Type {
+			case sqlbase.IndexDescriptor_FORWARD:
+				forwardIndexes = append(forwardIndexes, idx)
+			case sqlbase.IndexDescriptor_INVERTED:
+				invertedIndexes = append(invertedIndexes, idx)
+			}
+		}
+		if len(forwardIndexes) == 0 && len(invertedIndexes) == 0 {
+			return nil
+		}
+
+		grp := ctxgroup.WithContext(ctx)
+
+		forwardIndexesDone := make(chan struct{})
+		invertedIndexesDone := make(chan struct{})
+
+		grp.GoCtx(func(ctx context.Context) error {
+			defer close(forwardIndexesDone)
+			if len(forwardIndexes) > 0 {
+				return sc.validateForwardIndexes(ctx, evalCtx, txn, tableDesc, readAsOf, forwardIndexes)
+			}
+			return nil
+		})
+
+		grp.GoCtx(func(ctx context.Context) error {
+			defer close(invertedIndexesDone)
+			if len(invertedIndexes) > 0 {
+				return sc.validateInvertedIndexes(ctx, evalCtx, txn, tableDesc, readAsOf, invertedIndexes)
+			}
+			return nil
+		})
+
+		// Periodic schema change lease extension.
+		grp.GoCtx(func(ctx context.Context) error {
+			forwardDone := false
+			invertedDone := false
+
+			refreshTimer := timeutil.NewTimer()
+			defer refreshTimer.Stop()
+			refreshTimer.Reset(checkpointInterval)
+			for {
+				if forwardDone && invertedDone {
+					return nil
+				}
+				select {
+				case <-forwardIndexesDone:
+					forwardDone = true
+
+				case <-invertedIndexesDone:
+					invertedDone = true
+
+				case <-refreshTimer.C:
+					refreshTimer.Read = true
+					refreshTimer.Reset(checkpointInterval)
+					if err := sc.ExtendLease(ctx, lease); err != nil {
+						return err
+					}
+
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		})
+		return grp.Wait()
+	})
+}
+
+func (sc *SchemaChanger) validateInvertedIndexes(
+	ctx context.Context,
+	evalCtx *extendedEvalContext,
+	txn *client.Txn,
+	tableDesc *TableDescriptor,
+	readAsOf hlc.Timestamp,
+	indexes []*sqlbase.IndexDescriptor,
+) error {
+	grp := ctxgroup.WithContext(ctx)
+
+	expectedCount := make([]int64, len(indexes))
+	countReady := make([]chan struct{}, len(indexes))
+
+	for i, idx := range indexes {
+		i, idx := i, idx
+		countReady[i] = make(chan struct{})
+
+		grp.GoCtx(func(ctx context.Context) error {
+			// Inverted indexes currently can't be interleaved, so a KV scan can be
+			// used to get the index length.
+			// TODO (lucy): Switch to using DistSQL to get the count, so that we get
+			// distributed execution and avoid bypassing the SQL decoding
+			start := timeutil.Now()
+			var idxLen int64
+			key := tableDesc.IndexSpan(idx.ID).Key
+			endKey := tableDesc.IndexSpan(idx.ID).EndKey
+			for {
+				kvs, err := txn.Scan(ctx, key, endKey, 1000000)
+				if err != nil {
+					return err
+				}
+				if len(kvs) == 0 {
+					break
+				}
+				idxLen += int64(len(kvs))
+				key = kvs[len(kvs)-1].Key.PrefixEnd()
+			}
+			log.Infof(ctx, "inverted index %s/%s count = %d, took %s",
+				tableDesc.Name, idx.Name, idxLen, timeutil.Since(start))
+			select {
+			case <-countReady[i]:
+				if idxLen != expectedCount[i] {
+					// JSON columns cannot have unique indexes, so if the expected and
+					// actual counts do not match, it's always a bug rather than a
+					// uniqueness violation.
+					return errors.Errorf("validation of index %s failed: expected %d rows, found %d",
+						idx.Name, expectedCount[i], idxLen)
+				}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return nil
+		})
+
+		grp.GoCtx(func(ctx context.Context) error {
+			defer close(countReady[i])
+
+			start := timeutil.Now()
+			if len(idx.ColumnNames) != 1 {
+				panic(fmt.Sprintf("expected inverted index %s to have exactly 1 column, but found columns %+v",
+					idx.Name, idx.ColumnNames))
+			}
+			col := idx.ColumnNames[0]
+			row, err := evalCtx.InternalExecutor.QueryRow(ctx, "verify-inverted-idx-count", txn,
+				fmt.Sprintf(
+					`SELECT coalesce(sum_int(crdb_internal.json_num_index_entries(%s)), 0) FROM [%d AS t]`,
+					col, tableDesc.ID,
+				),
+			)
+			if err != nil {
+				return err
+			}
+			expectedCount[i] = int64(tree.MustBeDInt(row[0]))
+			log.Infof(ctx, "JSON column %s/%s expected inverted index count = %d, took %s",
+				tableDesc.Name, col, expectedCount[i], timeutil.Since(start))
+			return nil
+		})
+	}
+
+	return grp.Wait()
+}
+
+func (sc *SchemaChanger) validateForwardIndexes(
+	ctx context.Context,
+	evalCtx *extendedEvalContext,
+	txn *client.Txn,
+	tableDesc *TableDescriptor,
+	readAsOf hlc.Timestamp,
+	indexes []*sqlbase.IndexDescriptor,
+) error {
+	grp := ctxgroup.WithContext(ctx)
+
+	var tableRowCount int64
+	// Close when table count is ready.
+	tableCountReady := make(chan struct{})
+	// Compute the size of each index.
+	for _, idx := range indexes {
+		idx := idx
+		grp.GoCtx(func(ctx context.Context) error {
+			start := timeutil.Now()
+			// Make the mutations public in a private copy of the descriptor
+			// and add it to the TableCollection, so that we can use SQL below to perform
+			// the validation. We wouldn't have needed to do this if we could have
+			// updated the descriptor and run validation in the same transaction. However,
+			// our current system is incapable of running long running schema changes
+			// (the validation can take many minutes). So we pretend that the schema
+			// has been updated and actually update it in a separate transaction that
+			// follows this one.
+			desc, err := sqlbase.NewImmutableTableDescriptor(*tableDesc).MakeFirstMutationPublic()
+			if err != nil {
+				return err
+			}
+			tc := &TableCollection{leaseMgr: sc.leaseMgr}
+			// pretend that the schema has been modified.
+			if err := tc.addUncommittedTable(*desc); err != nil {
+				return err
+			}
+
+			// Create a new eval context only because the eval context cannot be shared across many
+			// goroutines.
+			newEvalCtx := createSchemaChangeEvalCtx(ctx, readAsOf, evalCtx.Tracing, sc.ieFactory)
+			// TODO(vivek): This is not a great API. Leaving #34304 open.
+			ie := newEvalCtx.InternalExecutor.(*SessionBoundInternalExecutor)
+			ie.impl.tcModifier = tc
+			defer func() {
+				ie.impl.tcModifier = nil
+			}()
+
+			row, err := newEvalCtx.InternalExecutor.QueryRow(ctx, "verify-idx-count", txn,
+				fmt.Sprintf(`SELECT count(*) FROM [%d AS t]@[%d]`, tableDesc.ID, idx.ID))
+			if err != nil {
+				return err
+			}
+			idxLen := int64(tree.MustBeDInt(row[0]))
+
+			log.Infof(ctx, "index %s/%s row count = %d, took %s",
+				tableDesc.Name, idx.Name, idxLen, timeutil.Since(start))
+
+			select {
+			case <-tableCountReady:
+				if idxLen != tableRowCount {
+					// TODO(vivek): find the offending row and include it in the error.
+					return pgerror.NewErrorf(
+						pgerror.CodeUniqueViolationError,
+						"%d entries, expected %d violates unique constraint %q",
+						idxLen, tableRowCount, idx.Name,
+					)
+				}
+
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+
+			return nil
+		})
+	}
+
+	grp.GoCtx(func(ctx context.Context) error {
+		defer close(tableCountReady)
+		var tableRowCountTime time.Duration
+		start := timeutil.Now()
+		// Count the number of rows in the table.
+		cnt, err := evalCtx.InternalExecutor.QueryRow(ctx, "VERIFY INDEX", txn,
+			fmt.Sprintf(`SELECT count(1) FROM [%d AS t]`, tableDesc.ID))
+		if err != nil {
+			return err
+		}
+		tableRowCount = int64(tree.MustBeDInt(cnt[0]))
+		tableRowCountTime = timeutil.Since(start)
+		log.Infof(ctx, "table %s row count = %d, took %s",
+			tableDesc.Name, tableRowCount, tableRowCountTime)
+		return nil
+	})
+
+	return grp.Wait()
+}
+
 func (sc *SchemaChanger) backfillIndexes(
 	ctx context.Context,
-	evalCtx parser.EvalContext,
+	evalCtx *extendedEvalContext,
 	lease *sqlbase.TableDescriptor_SchemaChangeLease,
 	version sqlbase.DescriptorVersion,
 ) error {
-	return sc.distBackfill(
-		ctx, evalCtx, lease, version, indexBackfill, indexBackfillChunkSize,
-		distsqlrun.IndexMutationFilter)
+	if fn := sc.testingKnobs.RunBeforeIndexBackfill; fn != nil {
+		fn()
+	}
+
+	chunkSize := int64(indexTxnBackfillChunkSize)
+	bulk := backfill.BulkWriteIndex.Get(&sc.settings.SV)
+	if bulk {
+		chunkSize = indexBulkBackfillChunkSize.Get(&sc.settings.SV)
+	}
+
+	if err := sc.distBackfill(
+		ctx, evalCtx, lease, version, indexBackfill, chunkSize,
+		backfill.IndexMutationFilter); err != nil {
+		return err
+	}
+	return sc.validateIndexes(ctx, evalCtx, lease)
 }
 
 func (sc *SchemaChanger) truncateAndBackfillColumns(
 	ctx context.Context,
-	evalCtx parser.EvalContext,
+	evalCtx *extendedEvalContext,
 	lease *sqlbase.TableDescriptor_SchemaChangeLease,
 	version sqlbase.DescriptorVersion,
 ) error {
 	return sc.distBackfill(
 		ctx, evalCtx,
 		lease, version, columnBackfill, columnTruncateAndBackfillChunkSize,
-		distsqlrun.ColumnMutationFilter)
+		backfill.ColumnMutationFilter)
+}
+
+// runSchemaChangesInTxn runs all the schema changes immediately in a
+// transaction. This is called when a CREATE TABLE is followed by
+// schema changes in the same transaction. The CREATE TABLE is
+// invisible to the rest of the cluster, so the schema changes
+// can be executed immediately on the same version of the table.
+func runSchemaChangesInTxn(
+	ctx context.Context,
+	txn *client.Txn,
+	tc *TableCollection,
+	execCfg *ExecutorConfig,
+	evalCtx *tree.EvalContext,
+	tableDesc *sqlbase.MutableTableDescriptor,
+	traceKV bool,
+) error {
+	if len(tableDesc.DrainingNames) > 0 {
+		// Reclaim all the old names. Leave the data and descriptor
+		// cleanup for later.
+		b := txn.NewBatch()
+		for _, drain := range tableDesc.DrainingNames {
+			tbKey := tableKey{drain.ParentID, drain.Name}.Key()
+			b.Del(tbKey)
+		}
+		tableDesc.DrainingNames = nil
+		if err := txn.Run(ctx, b); err != nil {
+			return err
+		}
+	}
+
+	if tableDesc.Dropped() {
+		return nil
+	}
+
+	// Only needed because columnBackfillInTxn() backfills
+	// all column mutations.
+	doneColumnBackfill := false
+	// Checks are validated after all other mutations have been applied.
+	var checksToValidate []sqlbase.ConstraintToValidate
+
+	for _, m := range tableDesc.Mutations {
+		immutDesc := sqlbase.NewImmutableTableDescriptor(*tableDesc.TableDesc())
+		switch m.Direction {
+		case sqlbase.DescriptorMutation_ADD:
+			switch t := m.Descriptor_.(type) {
+			case *sqlbase.DescriptorMutation_Column:
+				if doneColumnBackfill || !sqlbase.ColumnNeedsBackfill(m.GetColumn()) {
+					break
+				}
+				if err := columnBackfillInTxn(ctx, txn, tc, evalCtx, immutDesc, traceKV); err != nil {
+					return err
+				}
+				doneColumnBackfill = true
+
+			case *sqlbase.DescriptorMutation_Index:
+				if err := indexBackfillInTxn(ctx, txn, immutDesc, traceKV); err != nil {
+					return err
+				}
+
+			case *sqlbase.DescriptorMutation_Constraint:
+				switch t.Constraint.ConstraintType {
+				case sqlbase.ConstraintToValidate_CHECK:
+					checksToValidate = append(checksToValidate, *t.Constraint)
+				default:
+					return errors.Errorf("unsupported constraint type: %d", t.Constraint.ConstraintType)
+				}
+
+			default:
+				return errors.Errorf("unsupported mutation: %+v", m)
+			}
+
+		case sqlbase.DescriptorMutation_DROP:
+			// Drop the name and drop the associated data later.
+			switch m.Descriptor_.(type) {
+			case *sqlbase.DescriptorMutation_Column:
+				if doneColumnBackfill {
+					break
+				}
+				if err := columnBackfillInTxn(ctx, txn, tc, evalCtx, immutDesc, traceKV); err != nil {
+					return err
+				}
+				doneColumnBackfill = true
+
+			case *sqlbase.DescriptorMutation_Index:
+				if err := indexTruncateInTxn(ctx, txn, execCfg, immutDesc, traceKV); err != nil {
+					return err
+				}
+
+			case *sqlbase.DescriptorMutation_Constraint:
+				return errors.Errorf("constraint validation mutation cannot be in the DROP state within the same transaction: %+v", m)
+
+			default:
+				return errors.Errorf("unsupported mutation: %+v", m)
+			}
+
+		}
+		if err := tableDesc.MakeMutationComplete(m); err != nil {
+			return err
+		}
+	}
+	tableDesc.Mutations = nil
+
+	// Now that the table descriptor is in a valid state with all column and index
+	// mutations applied, it can be used for validating check constraints
+	for _, c := range checksToValidate {
+		if err := validateCheckInTxn(ctx, tc.leaseMgr, evalCtx, tableDesc, txn, &c.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateCheckInTxn validates check constraints within the provided
+// transaction. The table descriptor that is passed in will be used for the
+// InternalExecutor that performs the validation query.
+func validateCheckInTxn(
+	ctx context.Context,
+	leaseMgr *LeaseManager,
+	evalCtx *tree.EvalContext,
+	tableDesc *MutableTableDescriptor,
+	txn *client.Txn,
+	checkName *string,
+) error {
+	newTc := &TableCollection{leaseMgr: leaseMgr}
+	// pretend that the schema has been modified.
+	if err := newTc.addUncommittedTable(*tableDesc); err != nil {
+		return err
+	}
+
+	ie := evalCtx.InternalExecutor.(*SessionBoundInternalExecutor)
+	ie.impl.tcModifier = newTc
+	defer func() {
+		ie.impl.tcModifier = nil
+	}()
+
+	check, err := tableDesc.FindCheckByName(*checkName)
+	if err != nil {
+		return err
+	}
+	return validateCheckExpr(ctx, check.Expr, tableDesc.TableDesc(), ie, txn)
+}
+
+// columnBackfillInTxn backfills columns for all mutation columns in
+// the mutation list.
+func columnBackfillInTxn(
+	ctx context.Context,
+	txn *client.Txn,
+	tc *TableCollection,
+	evalCtx *tree.EvalContext,
+	tableDesc *sqlbase.ImmutableTableDescriptor,
+	traceKV bool,
+) error {
+	// A column backfill in the ADD state is a noop.
+	if tableDesc.Adding() {
+		return nil
+	}
+	var backfiller backfill.ColumnBackfiller
+	if err := backfiller.Init(evalCtx, tableDesc); err != nil {
+		return err
+	}
+	// otherTableDescs contains any other table descriptors required by the
+	// backfiller processor.
+	var otherTableDescs []*sqlbase.ImmutableTableDescriptor
+	fkTables, err := row.MakeFkMetadata(
+		ctx,
+		tableDesc,
+		row.CheckUpdates,
+		row.NoLookup,
+		row.NoCheckPrivilege,
+		nil, /* AnalyzeExprFunction */
+		nil, /* CheckHelper */
+	)
+	if err != nil {
+		return err
+	}
+	// All the FKs here are guaranteed to be created in the same transaction
+	// or else this table would be created in the ADD state.
+	for k := range fkTables {
+		t := tc.getUncommittedTableByID(k)
+		if (uncommittedTable{}) == t || !t.IsNewTable() {
+			return errors.Errorf(
+				"table %s not created in the same transaction as id = %d", tableDesc.Name, k)
+		}
+		otherTableDescs = append(otherTableDescs, t.ImmutableTableDescriptor)
+	}
+	sp := tableDesc.PrimaryIndexSpan()
+	for sp.Key != nil {
+		var err error
+		sp.Key, err = backfiller.RunColumnBackfillChunk(ctx,
+			txn, tableDesc, otherTableDescs, sp, columnTruncateAndBackfillChunkSize,
+			false /*alsoCommit*/, traceKV)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func indexBackfillInTxn(
+	ctx context.Context, txn *client.Txn, tableDesc *sqlbase.ImmutableTableDescriptor, traceKV bool,
+) error {
+	var backfiller backfill.IndexBackfiller
+	if err := backfiller.Init(tableDesc); err != nil {
+		return err
+	}
+	sp := tableDesc.PrimaryIndexSpan()
+	for sp.Key != nil {
+		var err error
+		sp.Key, err = backfiller.RunIndexBackfillChunk(ctx,
+			txn, tableDesc, sp, indexTxnBackfillChunkSize, false /* alsoCommit */, traceKV)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func indexTruncateInTxn(
+	ctx context.Context,
+	txn *client.Txn,
+	execCfg *ExecutorConfig,
+	tableDesc *sqlbase.ImmutableTableDescriptor,
+	traceKV bool,
+) error {
+	alloc := &sqlbase.DatumAlloc{}
+	idx := tableDesc.Mutations[0].GetIndex()
+	var sp roachpb.Span
+	for done := false; !done; done = sp.Key == nil {
+		rd, err := row.MakeDeleter(
+			txn, tableDesc, nil, nil, row.SkipFKs, nil /* *tree.EvalContext */, alloc,
+		)
+		if err != nil {
+			return err
+		}
+		td := tableDeleter{rd: rd, alloc: alloc}
+		if err := td.init(txn, nil /* *tree.EvalContext */); err != nil {
+			return err
+		}
+		sp, err = td.deleteIndex(
+			ctx, idx, sp, indexTruncateChunkSize, traceKV,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	// Remove index zone configs.
+	return removeIndexZoneConfigs(ctx, txn, execCfg, tableDesc.ID, []sqlbase.IndexDescriptor{*idx})
 }

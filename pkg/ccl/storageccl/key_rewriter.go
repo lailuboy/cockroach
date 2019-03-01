@@ -4,7 +4,7 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
 package storageccl
 
@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/pkg/errors"
 )
 
@@ -54,15 +55,12 @@ type KeyRewriter struct {
 	descs    map[sqlbase.ID]*sqlbase.TableDescriptor
 }
 
-// MakeKeyRewriter creates a KeyRewriter. This includes a simple []byte
-// prefix rewriter to rewrite table IDs including prefix ends, and table
-// descriptor data to traverse interleaved keys to child tables.
-func MakeKeyRewriter(rekeys []roachpb.ImportRequest_TableRekey) (*KeyRewriter, error) {
-	var prefixes prefixRewriter
+// MakeKeyRewriterFromRekeys makes a KeyRewriter from Rekey protos.
+func MakeKeyRewriterFromRekeys(rekeys []roachpb.ImportRequest_TableRekey) (*KeyRewriter, error) {
 	descs := make(map[sqlbase.ID]*sqlbase.TableDescriptor)
 	for _, rekey := range rekeys {
 		var desc sqlbase.Descriptor
-		if err := desc.Unmarshal(rekey.NewDesc); err != nil {
+		if err := protoutil.Unmarshal(rekey.NewDesc, &desc); err != nil {
 			return nil, errors.Wrapf(err, "unmarshalling rekey descriptor for old table id %d", rekey.OldID)
 		}
 		table := desc.GetTable()
@@ -71,6 +69,12 @@ func MakeKeyRewriter(rekeys []roachpb.ImportRequest_TableRekey) (*KeyRewriter, e
 		}
 		descs[sqlbase.ID(rekey.OldID)] = table
 	}
+	return MakeKeyRewriter(descs)
+}
+
+// MakeKeyRewriter makes a KeyRewriter from a map of descs keyed by original ID.
+func MakeKeyRewriter(descs map[sqlbase.ID]*sqlbase.TableDescriptor) (*KeyRewriter, error) {
+	var prefixes prefixRewriter
 	seenPrefixes := make(map[string]bool)
 	for oldID, desc := range descs {
 		// The PrefixEnd() of index 1 is the same as the prefix of index 2, so use a
@@ -117,13 +121,15 @@ func makeKeyRewriterPrefixIgnoringInterleaved(tableID sqlbase.ID, indexID sqlbas
 	return key
 }
 
-// RewriteKey modifies key (possibly in place), changing all table IDs to
-// their new value, including any interleaved table children and prefix
-// ends. This function works by inspecting the key for table and index IDs,
-// then uses the corresponding table and index descriptors to determine if
-// interleaved data is present and if it is, to find the next prefix of an
-// interleaved child, then calls itself recursively until all interleaved
-// children have been rekeyed.
+// RewriteKey modifies key (possibly in place), changing all table IDs to their
+// new value, including any interleaved table children and prefix ends. This
+// function works by inspecting the key for table and index IDs, then uses the
+// corresponding table and index descriptors to determine if interleaved data is
+// present and if it is, to find the next prefix of an interleaved child, then
+// calls itself recursively until all interleaved children have been rekeyed. If
+// it encounters a table ID for which it does not have a configured rewrite, it
+// returns the prefix of the key that was rewritten key. The returned boolean
+// is true if and only if all of the table IDs found in the key were rewritten.
 func (kr *KeyRewriter) RewriteKey(key []byte) ([]byte, bool, error) {
 	// Fetch the original table ID for descriptor lookup. Ignore errors because
 	// they will be caught later on if tableID isn't in descs or kr doesn't
@@ -132,7 +138,7 @@ func (kr *KeyRewriter) RewriteKey(key []byte) ([]byte, bool, error) {
 	// Rewrite the first table ID.
 	key, ok := kr.prefixes.rewriteKey(key)
 	if !ok {
-		return key, false, nil
+		return nil, false, nil
 	}
 	desc := kr.descs[sqlbase.ID(tableID)]
 	if desc == nil {
@@ -171,8 +177,8 @@ func (kr *KeyRewriter) RewriteKey(key []byte) ([]byte, bool, error) {
 		}
 		k = k[n:]
 	}
-	// If we get a NotNULL, it's interleaved.
-	k, ok = encoding.DecodeIfNotNull(k)
+	// We might have an interleaved key.
+	k, ok = encoding.DecodeIfInterleavedSentinel(k)
 	if !ok {
 		return key, true, nil
 	}
@@ -183,7 +189,7 @@ func (kr *KeyRewriter) RewriteKey(key []byte) ([]byte, bool, error) {
 	}
 	if !ok {
 		// The interleaved child was not rewritten, skip this row.
-		return key, false, nil
+		return prefix, false, nil
 	}
 	key = append(prefix, k...)
 	return key, true, nil

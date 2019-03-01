@@ -15,77 +15,29 @@
 package storage
 
 import (
-	"math"
-	"runtime/debug"
-	"time"
-
-	"golang.org/x/net/context"
-	"golang.org/x/time/rate"
+	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/storage/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/coreos/etcd/raft/raftpb"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/pkg/errors"
+	"go.etcd.io/etcd/raft/raftpb"
 )
-
-var bulkIOWriteLimit = settings.RegisterByteSizeSetting(
-	"kv.bulk_io_write.max_rate",
-	"the rate limit (bytes/sec) to use for writes to disk on behalf of bulk io ops",
-	math.MaxInt64,
-)
-
-const (
-	bulkIOWriteLimiterBurst    = 2 * 1024 * 1024 // 2MB
-	bulkIOWriteLimiterLongWait = 500 * time.Millisecond
-)
-
-// TODO(dan): This limiting should be per-store and shared between any
-// operations that need lots of disk throughput.
-var bulkIOWriteLimiter = rate.NewLimiter(
-	rate.Limit(bulkIOWriteLimit.Get()),
-	bulkIOWriteLimiterBurst,
-)
-
-func limitBulkIOWrite(ctx context.Context, cost int) {
-	// TODO(dan): Investigate instead using bulkIOWriteLimit.OnChange to update
-	// the limiter.
-	bulkIOWriteLimiter.SetLimit(rate.Limit(bulkIOWriteLimit.Get()))
-
-	// The limiter disallows anything greater than its burst (set to
-	// bulkIOWriteLimiterBurst), so cap the batch size if it would overflow.
-	//
-	// TODO(dan): This obviously means the limiter is no longer accounting for
-	// the full cost. I've tried calling WaitN in a loop to fully cover the
-	// cost, but that doesn't seem to be as smooth in practice (TPCH-10 restores
-	// on azure local disks), I think because the file is written all at once at
-	// the end. This could be fixed by writing the file in chunks, which also
-	// would likely help the overall smoothness, too.
-	if cost > bulkIOWriteLimiterBurst {
-		cost = bulkIOWriteLimiterBurst
-	}
-
-	begin := timeutil.Now()
-	if err := bulkIOWriteLimiter.WaitN(ctx, cost); err != nil {
-		log.Errorf(ctx, "error rate limiting bulk io write: %+v", err)
-	}
-
-	if d := timeutil.Since(begin); d > bulkIOWriteLimiterLongWait {
-		log.Warningf(ctx, "bulk io write limiter took %s (>%s):\n%s",
-			d, bulkIOWriteLimiterLongWait, debug.Stack())
-	}
-}
 
 var errSideloadedFileNotFound = errors.New("sideloaded file not found")
 
 // sideloadStorage is the interface used for Raft SSTable sideloading.
 // Implementations do not need to be thread safe.
 type sideloadStorage interface {
+	// The directory in which the sideloaded files are stored. May or may not
+	// exist.
+	Dir() string
 	// Writes the given contents to the file specified by the given index and
-	// term. Does not perform the write if the file exists.
-	PutIfNotExists(_ context.Context, index, term uint64, contents []byte) error
+	// term. Overwrites the file if it already exists.
+	Put(_ context.Context, index, term uint64, contents []byte) error
 	// Load the file at the given index and term. Return errSideloadedFileNotFound when no
 	// such file is present.
 	Get(_ context.Context, index, term uint64) ([]byte, error)
@@ -93,12 +45,14 @@ type sideloadStorage interface {
 	// remove any leftover files at the same index and earlier terms, but
 	// is not required to do so. When no file at the given index and term
 	// exists, returns errSideloadedFileNotFound.
-	Purge(_ context.Context, index, term uint64) error
+	//
+	// Returns the total size of the purged payloads.
+	Purge(_ context.Context, index, term uint64) (int64, error)
 	// Clear files that may have been written by this sideloadStorage.
 	Clear(context.Context) error
 	// TruncateTo removes all files belonging to an index strictly smaller than
-	// the given one.
-	TruncateTo(_ context.Context, index uint64) error
+	// the given one. Returns the number of bytes freed.
+	TruncateTo(_ context.Context, index uint64) (int64, error)
 	// Returns an absolute path to the file that Get() would return the contents
 	// of. Does not check whether the file actually exists.
 	Filename(_ context.Context, index, term uint64) (string, error)
@@ -114,17 +68,17 @@ type sideloadStorage interface {
 // The passed-in slice is not mutated.
 func (r *Replica) maybeSideloadEntriesRaftMuLocked(
 	ctx context.Context, entriesToAppend []raftpb.Entry,
-) ([]raftpb.Entry, error) {
+) (_ []raftpb.Entry, sideloadedEntriesSize int64, _ error) {
 	// TODO(tschottdorf): allocating this closure could be expensive. If so make
 	// it a method on Replica.
-	maybeRaftCommand := func(cmdID storagebase.CmdIDKey) (storagebase.RaftCommand, bool) {
+	maybeRaftCommand := func(cmdID storagebase.CmdIDKey) (storagepb.RaftCommand, bool) {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		cmd, ok := r.mu.proposals[cmdID]
 		if ok {
-			return cmd.command, true
+			return *cmd.command, true
 		}
-		return storagebase.RaftCommand{}, false
+		return storagepb.RaftCommand{}, false
 	}
 	return maybeSideloadEntriesImpl(ctx, entriesToAppend, r.raftMu.sideloaded, maybeRaftCommand)
 }
@@ -139,8 +93,8 @@ func maybeSideloadEntriesImpl(
 	ctx context.Context,
 	entriesToAppend []raftpb.Entry,
 	sideloaded sideloadStorage,
-	maybeRaftCommand func(storagebase.CmdIDKey) (storagebase.RaftCommand, bool),
-) ([]raftpb.Entry, error) {
+	maybeRaftCommand func(storagebase.CmdIDKey) (storagepb.RaftCommand, bool),
+) (_ []raftpb.Entry, sideloadedEntriesSize int64, _ error) {
 
 	cow := false
 	for i := range entriesToAppend {
@@ -174,8 +128,8 @@ func maybeSideloadEntriesImpl(
 				// Bad luck: we didn't have the proposal in-memory, so we'll
 				// have to unmarshal it.
 				log.Event(ctx, "proposal not already in memory; unmarshaling")
-				if err := strippedCmd.Unmarshal(data); err != nil {
-					return nil, err
+				if err := protoutil.Unmarshal(data, &strippedCmd); err != nil {
+					return nil, 0, err
 				}
 			}
 
@@ -193,20 +147,21 @@ func maybeSideloadEntriesImpl(
 
 			{
 				var err error
-				data, err = strippedCmd.Marshal()
+				data, err = protoutil.Marshal(&strippedCmd)
 				if err != nil {
-					return nil, errors.Wrap(err, "while marshalling stripped sideloaded command")
+					return nil, 0, errors.Wrap(err, "while marshaling stripped sideloaded command")
 				}
 			}
 
 			ent.Data = encodeRaftCommandV2(cmdID, data)
 			log.Eventf(ctx, "writing payload at index=%d term=%d", ent.Index, ent.Term)
-			if err = sideloaded.PutIfNotExists(ctx, ent.Index, ent.Term, dataToSideload); err != nil {
-				return nil, err
+			if err = sideloaded.Put(ctx, ent.Index, ent.Term, dataToSideload); err != nil {
+				return nil, 0, err
 			}
+			sideloadedEntriesSize += int64(len(dataToSideload))
 		}
 	}
-	return entriesToAppend, nil
+	return entriesToAppend, sideloadedEntriesSize, nil
 }
 
 func sniffSideloadedRaftCommand(data []byte) (sideloaded bool) {
@@ -225,7 +180,7 @@ func maybeInlineSideloadedRaftCommand(
 	rangeID roachpb.RangeID,
 	ent raftpb.Entry,
 	sideloaded sideloadStorage,
-	entryCache *raftEntryCache,
+	entryCache *raftentry.Cache,
 ) (*raftpb.Entry, error) {
 	if !sniffSideloadedRaftCommand(ent.Data) {
 		return nil, nil
@@ -234,7 +189,7 @@ func maybeInlineSideloadedRaftCommand(
 	// We could unmarshal this yet again, but if it's committed we
 	// are very likely to have appended it recently, in which case
 	// we can save work.
-	cachedSingleton, _, _ := entryCache.getEntries(
+	cachedSingleton, _, _, _ := entryCache.Scan(
 		nil, rangeID, ent.Index, ent.Index+1, 1<<20,
 	)
 
@@ -250,23 +205,69 @@ func maybeInlineSideloadedRaftCommand(
 	log.Event(ctx, "inlined entry not cached")
 	// Out of luck, for whatever reason the inlined proposal isn't in the cache.
 	cmdID, data := DecodeRaftCommand(ent.Data)
-	ent.Data = nil // no reuse of potentially shared slice
 
-	var command storagebase.RaftCommand
-	if err := command.Unmarshal(data); err != nil {
+	var command storagepb.RaftCommand
+	if err := protoutil.Unmarshal(data, &command); err != nil {
 		return nil, err
 	}
+
+	if len(command.ReplicatedEvalResult.AddSSTable.Data) > 0 {
+		// The entry we started out with was already "fat". This happens when
+		// the entry reached us through a preemptive snapshot (when we didn't
+		// have a ReplicaID yet).
+		log.Event(ctx, "entry already inlined")
+		return &ent, nil
+	}
+
 	sideloadedData, err := sideloaded.Get(ctx, ent.Index, ent.Term)
 	if err != nil {
 		return nil, errors.Wrap(err, "loading sideloaded data")
 	}
 	command.ReplicatedEvalResult.AddSSTable.Data = sideloadedData
 	{
-		data, err := command.Marshal()
+		data, err := protoutil.Marshal(&command)
 		if err != nil {
 			return nil, err
 		}
 		ent.Data = encodeRaftCommandV2(cmdID, data)
 	}
 	return &ent, nil
+}
+
+// assertSideloadedRaftCommandInlined asserts that if the provided entry is a
+// sideloaded entry, then its payload has already been inlined. Doing so
+// requires unmarshalling the raft command, so this assertion should be kept out
+// of performance critical paths.
+func assertSideloadedRaftCommandInlined(ctx context.Context, ent *raftpb.Entry) {
+	if !sniffSideloadedRaftCommand(ent.Data) {
+		return
+	}
+
+	var command storagepb.RaftCommand
+	_, data := DecodeRaftCommand(ent.Data)
+	if err := protoutil.Unmarshal(data, &command); err != nil {
+		log.Fatal(ctx, err)
+	}
+
+	if len(command.ReplicatedEvalResult.AddSSTable.Data) == 0 {
+		// The entry is "thin", which is what this assertion is checking for.
+		log.Fatalf(ctx, "found thin sideloaded raft command: %+v", command)
+	}
+}
+
+// maybePurgeSideloaded removes [firstIndex, ..., lastIndex] at the given term
+// and returns the total number of bytes removed. Nonexistent entries are
+// silently skipped over.
+func maybePurgeSideloaded(
+	ctx context.Context, ss sideloadStorage, firstIndex, lastIndex uint64, term uint64,
+) (int64, error) {
+	var totalSize int64
+	for i := firstIndex; i <= lastIndex; i++ {
+		size, err := ss.Purge(ctx, i, term)
+		if err != nil && errors.Cause(err) != errSideloadedFileNotFound {
+			return totalSize, err
+		}
+		totalSize += size
+	}
+	return totalSize, nil
 }

@@ -1,3 +1,17 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 import React from "react";
 import { createSelector } from "reselect";
 import { connect } from "react-redux";
@@ -7,7 +21,7 @@ import moment from "moment";
 
 import * as protos from  "src/js/protos";
 import { AdminUIState } from "src/redux/state";
-import { queryMetrics, MetricsQuery } from "src/redux/metrics";
+import { requestMetrics as requestMetricsAction, MetricsQuery } from "src/redux/metrics";
 import {
   Metric, MetricProps, MetricsDataComponentProps, QueryTimeInfo,
 } from "src/views/shared/components/metricQuery";
@@ -21,25 +35,31 @@ import { MilliToNano } from "src/util/convert";
 function queryFromProps(
   metricProps: MetricProps,
   graphProps: MetricsDataComponentProps,
-): protos.cockroach.ts.tspb.Query$Properties {
+): protos.cockroach.ts.tspb.IQuery {
     let derivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative.NONE;
     let sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.SUM;
     let downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.AVG;
 
     // Compute derivative function.
-    if (metricProps.rate) {
+    if (!_.isNil(metricProps.derivative)) {
+      derivative = metricProps.derivative;
+    } else if (metricProps.rate) {
       derivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative.DERIVATIVE;
     } else if (metricProps.nonNegativeRate) {
       derivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative.NON_NEGATIVE_DERIVATIVE;
     }
     // Compute downsample function.
-    if (metricProps.downsampleMax) {
+    if (!_.isNil(metricProps.downsampler)) {
+      downsampler = metricProps.downsampler;
+    } else if (metricProps.downsampleMax) {
       downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MAX;
     } else if (metricProps.downsampleMin) {
       downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MIN;
     }
     // Compute aggregation function.
-    if (metricProps.aggregateMax) {
+    if (!_.isNil(metricProps.aggregator)) {
+      sourceAggregator = metricProps.aggregator;
+    } else if (metricProps.aggregateMax) {
       sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MAX;
     } else if (metricProps.aggregateMin) {
       sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MIN;
@@ -63,7 +83,7 @@ function queryFromProps(
 interface MetricsDataProviderConnectProps {
   metrics: MetricsQuery;
   timeInfo: QueryTimeInfo;
-  queryMetrics: typeof queryMetrics;
+  requestMetrics: typeof requestMetricsAction;
 }
 
 /**
@@ -141,10 +161,10 @@ class MetricsDataProvider extends React.Component<MetricsDataProviderProps, {}> 
     if (!request) {
       return;
     }
-    const { metrics, queryMetrics, id } = props;
+    const { metrics, requestMetrics, id } = props;
     const nextRequest = metrics && metrics.nextRequest;
     if (!nextRequest || !_.isEqual(nextRequest, request)) {
-      queryMetrics(id, request);
+      requestMetrics(id, request);
     }
   }
 
@@ -217,7 +237,7 @@ const metricsDataProviderConnected = connect(
     };
   },
   {
-    queryMetrics,
+    requestMetrics: requestMetricsAction,
   },
 )(MetricsDataProvider);
 
