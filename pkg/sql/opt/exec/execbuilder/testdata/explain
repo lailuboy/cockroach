@@ -101,12 +101,14 @@ drop database  ·  ·
 query TTT
 SELECT * FROM [EXPLAIN SHOW JOBS] WHERE field != 'size'
 ----
-sort                   ·       ·
- │                     order   -"coalesce",-started
- └── render            ·       ·
-      └── filter       ·       ·
-           │           filter  (finished IS NULL) OR (finished > (now() - '12:00:00'))
-           └── values  ·       ·
+render                             ·       ·
+ └── sort                          ·       ·
+      │                            order   -column17,-started
+      └── render                   ·       ·
+           └── filter              ·       ·
+                │                  filter  ((job_type != 'AUTO CREATE STATS') OR (job_type IS NULL)) AND ((finished IS NULL) OR (finished > (now() - '12:00:00')))
+                └── virtual table  ·       ·
+·                                  source  ·
 
 statement ok
 CREATE INDEX a ON foo(x)
@@ -135,152 +137,169 @@ EXPLAIN DROP TABLE foo
 drop table  ·  ·
 
 query TTT
-SELECT * FROM [EXPLAIN SHOW DATABASES] WHERE field != 'size'
+EXPLAIN SHOW DATABASES
 ----
-distinct               ·          ·
- │                     order key  database_name
- └── sort              ·          ·
-      │                order      +database_name
-      └── render       ·          ·
-           └── values  ·          ·
+sort                          ·            ·
+ │                            order        +database_name
+ └── distinct                 ·            ·
+      │                       distinct on  database_name
+      └── render              ·            ·
+           └── virtual table  ·            ·
+·                             source       ·
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW TABLES] WHERE field != 'size'
 ----
-sort                   ·       ·
- │                     order   +table_schema,+table_name
- └── render            ·       ·
-      └── filter       ·       ·
-           │           filter  table_schema = 'public'
-           └── values  ·       ·
+sort                          ·       ·
+ │                            order   +table_name
+ └── render                   ·       ·
+      └── filter              ·       ·
+           │                  filter  table_schema = 'public'
+           └── virtual table  ·       ·
+·                             source  ·
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW TABLES WITH COMMENT] WHERE field != 'size'
 ----
-sort                                  ·         ·
- │                                    order     +table_schema,+table_name
- └── render                           ·         ·
-      └── join                        ·         ·
-           │                          type      left outer
-           │                          equality  (table_id) = (object_id)
-           ├── filter                 ·         ·
-           │    │                     filter    ((state = 'PUBLIC') OR (state IS NULL)) AND ((database_name = 'test') OR (database_name IS NULL))
-           │    └── join              ·         ·
-           │         │                type      left outer
-           │         │                equality  (table_name, table_catalog) = (name, database_name)
-           │         ├── filter       ·         ·
-           │         │    │           filter    table_schema = 'public'
-           │         │    └── values  ·         ·
-           │         └── values       ·         ·
-           └── scan                   ·         ·
-·                                     table     comments@primary
-·                                     spans     ALL
+render                             ·         ·
+ └── hash-join                     ·         ·
+      │                            type      left outer
+      │                            equality  (oid) = (objoid)
+      ├── hash-join                ·         ·
+      │    │                       type      inner
+      │    │                       equality  (relnamespace) = (oid)
+      │    ├── filter              ·         ·
+      │    │    │                  filter    relkind IN ('r', 'v')
+      │    │    └── virtual table  ·         ·
+      │    │                       source    ·
+      │    └── filter              ·         ·
+      │         │                  filter    nspname = 'public'
+      │         └── virtual table  ·         ·
+      │                            source    ·
+      └── filter                   ·         ·
+           │                       filter    objsubid = 0
+           └── virtual table       ·         ·
+·                                  source    ·
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW DATABASE] WHERE field != 'size'
 ----
-render            ·       ·
- └── filter       ·       ·
-      │           filter  variable = 'database'
-      └── values  ·       ·
+render                   ·       ·
+ └── filter              ·       ·
+      │                  filter  variable = 'database'
+      └── virtual table  ·       ·
+·                        source  ·
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW TIME ZONE] WHERE field != 'size'
 ----
-render            ·       ·
- └── filter       ·       ·
-      │           filter  variable = 'timezone'
-      └── values  ·       ·
+render                   ·       ·
+ └── filter              ·       ·
+      │                  filter  variable = 'timezone'
+      └── virtual table  ·       ·
+·                        source  ·
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW DEFAULT_TRANSACTION_ISOLATION] WHERE field != 'size'
 ----
-render            ·       ·
- └── filter       ·       ·
-      │           filter  variable = 'default_transaction_isolation'
-      └── values  ·       ·
+render                   ·       ·
+ └── filter              ·       ·
+      │                  filter  variable = 'default_transaction_isolation'
+      └── virtual table  ·       ·
+·                        source  ·
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW TRANSACTION ISOLATION LEVEL] WHERE field != 'size'
 ----
-render            ·       ·
- └── filter       ·       ·
-      │           filter  variable = 'transaction_isolation'
-      └── values  ·       ·
+render                   ·       ·
+ └── filter              ·       ·
+      │                  filter  variable = 'transaction_isolation'
+      └── virtual table  ·       ·
+·                        source  ·
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW TRANSACTION PRIORITY] WHERE field != 'size'
 ----
-render            ·       ·
- └── filter       ·       ·
-      │           filter  variable = 'transaction_priority'
-      └── values  ·       ·
+render                   ·       ·
+ └── filter              ·       ·
+      │                  filter  variable = 'transaction_priority'
+      └── virtual table  ·       ·
+·                        source  ·
 
 query TTT
-SELECT * FROM [EXPLAIN SHOW COLUMNS FROM foo] WHERE field != 'size'
+EXPLAIN SHOW COLUMNS FROM foo
 ----
-sort                                       ·            ·
- │                                         order        +ordinal_position
- └── render                                ·            ·
-      └── group                            ·            ·
-           │                               aggregate 0  column_name
-           │                               aggregate 1  crdb_sql_type
-           │                               aggregate 2  is_nullable
-           │                               aggregate 3  column_default
-           │                               aggregate 4  generation_expression
-           │                               aggregate 5  ordinal_position
-           │                               aggregate 6  is_hidden
-           │                               aggregate 7  array_agg(index_name)
-           │                               group by     @1-@7
-           └── render                      ·            ·
-                └── join                   ·            ·
-                     │                     type         left outer
-                     │                     equality     (column_name) = (column_name)
-                     ├── render            ·            ·
-                     │    └── filter       ·            ·
-                     │         │           filter       ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
-                     │         └── values  ·            ·
-                     └── render            ·            ·
-                          └── filter       ·            ·
-                               │           filter       ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
-                               └── values  ·            ·
+render                                       ·            ·
+ └── group                                   ·            ·
+      │                                      aggregate 0  column_name
+      │                                      aggregate 1  ordinal_position
+      │                                      aggregate 2  column_default
+      │                                      aggregate 3  is_nullable
+      │                                      aggregate 4  generation_expression
+      │                                      aggregate 5  is_hidden
+      │                                      aggregate 6  crdb_sql_type
+      │                                      aggregate 7  array_agg(index_name)
+      │                                      group by     column_name, ordinal_position, column_default, is_nullable, generation_expression, is_hidden, crdb_sql_type
+      │                                      ordered      +ordinal_position
+      └── render                             ·            ·
+           └── sort                          ·            ·
+                │                            order        +ordinal_position
+                └── hash-join                ·            ·
+                     │                       type         left outer
+                     │                       equality     (column_name) = (column_name)
+                     ├── filter              ·            ·
+                     │    │                  filter       ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+                     │    └── virtual table  ·            ·
+                     │                       source       ·
+                     └── filter              ·            ·
+                          │                  filter       ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+                          └── virtual table  ·            ·
+·                                            source       ·
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW GRANTS ON foo] WHERE field != 'size'
 ----
-sort                   ·       ·
- │                     order   +database_name,+schema_name,+table_name,+grantee,+privilege_type
- └── render            ·       ·
-      └── filter       ·       ·
-           │           filter  (table_catalog, table_schema, table_name) IN (('test', 'public', 'foo'),)
-           └── values  ·       ·
+render                             ·       ·
+ └── sort                          ·       ·
+      │                            order   +grantee,+privilege_type
+      └── render                   ·       ·
+           └── filter              ·       ·
+                │                  filter  (table_catalog, table_schema, table_name) IN (('test', 'public', 'foo'),)
+                └── virtual table  ·       ·
+·                                  source  ·
 
 query TTT
-SELECT * FROM [EXPLAIN SHOW INDEX FROM foo] WHERE field != 'size'
+EXPLAIN SHOW INDEX FROM foo
 ----
-render            ·       ·
- └── filter       ·       ·
-      │           filter  ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
-      └── values  ·       ·
+render                   ·       ·
+ └── filter              ·       ·
+      │                  filter  ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+      └── virtual table  ·       ·
+·                        source  ·
 
 query TTT
-SELECT * FROM [EXPLAIN SHOW CONSTRAINTS FROM foo] WHERE field != 'size'
+EXPLAIN SHOW CONSTRAINTS FROM foo
 ----
-sort                             ·         ·
- │                               order     +table_name,+constraint_name
- └── render                      ·         ·
-      └── join                   ·         ·
-           │                     type      inner
-           │                     equality  (relnamespace, oid) = (oid, conrelid)
-           ├── filter            ·         ·
-           │    │                filter    relname = 'foo'
-           │    └── values       ·         ·
-           └── join              ·         ·
-                │                type      cross
-                ├── filter       ·         ·
-                │    │           filter    nspname = 'public'
-                │    └── values  ·         ·
-                └── values       ·         ·
+render                                       ·         ·
+ └── sort                                    ·         ·
+      │                                      order     +conname
+      └── render                             ·         ·
+           └── hash-join                     ·         ·
+                │                            type      inner
+                │                            equality  (conrelid) = (oid)
+                ├── virtual table            ·         ·
+                │                            source    ·
+                └── hash-join                ·         ·
+                     │                       type      inner
+                     │                       equality  (oid) = (relnamespace)
+                     ├── filter              ·         ·
+                     │    │                  filter    nspname = 'public'
+                     │    └── virtual table  ·         ·
+                     │                       source    ·
+                     └── filter              ·         ·
+                          │                  filter    relname = 'foo'
+                          └── virtual table  ·         ·
+·                                            source    ·
 
 query TTT
 EXPLAIN SHOW USERS
@@ -482,23 +501,13 @@ values  ·              ·                  (column1 int, column2 int, column3 i
 ·       row 1, expr 1  (5)[int]           ·                                        ·
 ·       row 1, expr 2  (6)[int]           ·                                        ·
 
-# TODO(rytaft): range operator needed to detect contradiction
 query TTTTT
 EXPLAIN (TYPES) SELECT 2*count(k) as z, v FROM t WHERE v>123 GROUP BY v HAVING v<2 AND count(k)>1
 ----
-render               ·            ·                                                                          (z int, v int)     ·
- │                   render 0     ((agg0)[int] * (2)[int])[int]                                              ·                  ·
- │                   render 1     (v)[int]                                                                   ·                  ·
- └── filter          ·            ·                                                                          (v int, agg0 int)  ·
-      │              filter       ((agg0)[int] > (1)[int])[bool]                                             ·                  ·
-      └── group      ·            ·                                                                          (v int, agg0 int)  ·
-           │         aggregate 0  v                                                                          ·                  ·
-           │         aggregate 1  count(k)                                                                   ·                  ·
-           │         group by     @2                                                                         ·                  ·
-           └── scan  ·            ·                                                                          (k int, v int)     ·
-·                    table        t@primary                                                                  ·                  ·
-·                    spans        ALL                                                                        ·                  ·
-·                    filter       ((((v)[int] > (123)[int])[bool]) AND (((v)[int] < (2)[int])[bool]))[bool]  ·                  ·
+render       ·         ·         (z int, v int)  ·
+ │           render 0  (z)[int]  ·               ·
+ │           render 1  (v)[int]  ·               ·
+ └── norows  ·         ·         (v int, z int)  ·
 
 query TTTTT
 EXPLAIN (TYPES) DELETE FROM t WHERE v > 1
@@ -647,21 +656,21 @@ EXPLAIN (OPT,VERBOSE) SELECT * FROM tc WHERE a = 10 ORDER BY b
 sort
  ├── columns: a:1 b:2
  ├── stats: [rows=9.9, distinct(1)=1, null(1)=0]
- ├── cost: 51.3728708
+ ├── cost: 52.2638708
  ├── fd: ()-->(1)
  ├── ordering: +2 opt(1) [actual: +2]
  ├── prune: (2)
  └── index-join tc
       ├── columns: a:1 b:2
       ├── stats: [rows=9.9, distinct(1)=1, null(1)=0]
-      ├── cost: 50.51
+      ├── cost: 51.401
       ├── fd: ()-->(1)
       ├── prune: (2)
       └── scan tc@c
            ├── columns: a:1 rowid:3
            ├── constraint: /1/3: [/10 - /10]
            ├── stats: [rows=9.9, distinct(1)=1, null(1)=0, distinct(3)=9.9, null(3)=0]
-           ├── cost: 10.306
+           ├── cost: 10.702
            ├── key: (3)
            └── fd: ()-->(1)
 
@@ -671,21 +680,21 @@ EXPLAIN (OPT,TYPES) SELECT * FROM tc WHERE a = 10 ORDER BY b
 sort
  ├── columns: a:1(int!null) b:2(int)
  ├── stats: [rows=9.9, distinct(1)=1, null(1)=0]
- ├── cost: 51.3728708
+ ├── cost: 52.2638708
  ├── fd: ()-->(1)
  ├── ordering: +2 opt(1) [actual: +2]
  ├── prune: (2)
  └── index-join tc
       ├── columns: a:1(int!null) b:2(int)
       ├── stats: [rows=9.9, distinct(1)=1, null(1)=0]
-      ├── cost: 50.51
+      ├── cost: 51.401
       ├── fd: ()-->(1)
       ├── prune: (2)
       └── scan tc@c
            ├── columns: a:1(int!null) rowid:3(int!null)
            ├── constraint: /1/3: [/10 - /10]
            ├── stats: [rows=9.9, distinct(1)=1, null(1)=0, distinct(3)=9.9, null(3)=0]
-           ├── cost: 10.306
+           ├── cost: 10.702
            ├── key: (3)
            └── fd: ()-->(1)
 
@@ -707,24 +716,24 @@ EXPLAIN (OPT, VERBOSE) SELECT * FROM tc WHERE a + 2 * b > 1 ORDER BY a*b
 sort
  ├── columns: a:1 b:2  [hidden: column4:4]
  ├── stats: [rows=333.333333]
- ├── cost: 1129.24548
+ ├── cost: 1179.25548
  ├── fd: (1,2)-->(4)
  ├── ordering: +4
  ├── prune: (1,2,4)
  └── project
       ├── columns: column4:4 a:1 b:2
       ├── stats: [rows=333.333333]
-      ├── cost: 1066.69667
+      ├── cost: 1116.70667
       ├── fd: (1,2)-->(4)
       ├── prune: (1,2,4)
       ├── select
       │    ├── columns: a:1 b:2
       │    ├── stats: [rows=333.333333]
-      │    ├── cost: 1060.02
+      │    ├── cost: 1110.03
       │    ├── scan tc
       │    │    ├── columns: a:1 b:2
       │    │    ├── stats: [rows=1000]
-      │    │    ├── cost: 1050.01
+      │    │    ├── cost: 1100.02
       │    │    └── prune: (1,2)
       │    └── filters
       │         └── (a + (b * 2)) > 1 [outer=(1,2)]
@@ -737,24 +746,24 @@ EXPLAIN (OPT, TYPES) SELECT * FROM tc WHERE a + 2 * b > 1 ORDER BY a*b
 sort
  ├── columns: a:1(int) b:2(int)  [hidden: column4:4(int)]
  ├── stats: [rows=333.333333]
- ├── cost: 1129.24548
+ ├── cost: 1179.25548
  ├── fd: (1,2)-->(4)
  ├── ordering: +4
  ├── prune: (1,2,4)
  └── project
       ├── columns: column4:4(int) a:1(int) b:2(int)
       ├── stats: [rows=333.333333]
-      ├── cost: 1066.69667
+      ├── cost: 1116.70667
       ├── fd: (1,2)-->(4)
       ├── prune: (1,2,4)
       ├── select
       │    ├── columns: a:1(int) b:2(int)
       │    ├── stats: [rows=333.333333]
-      │    ├── cost: 1060.02
+      │    ├── cost: 1110.03
       │    ├── scan tc
       │    │    ├── columns: a:1(int) b:2(int)
       │    │    ├── stats: [rows=1000]
-      │    │    ├── cost: 1050.01
+      │    │    ├── cost: 1100.02
       │    │    └── prune: (1,2)
       │    └── filters
       │         └── gt [type=bool, outer=(1,2)]
@@ -770,5 +779,5 @@ sort
                 └── variable: b [type=int]
 
 # Test with an unsupported statement.
-statement error window functions are not supported
-EXPLAIN (OPT) SELECT avg(x) OVER () FROM (VALUES (1)) AS t(x)
+statement error unsupported window function
+EXPLAIN (OPT) SELECT avg(x) FILTER (WHERE x > 2) OVER (ORDER BY x) FROM (VALUES (1)) AS t(x)

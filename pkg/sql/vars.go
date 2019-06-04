@@ -26,11 +26,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/delegate"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
@@ -155,7 +157,7 @@ var varGen = map[string]sessionVar{
 			case "utf8", "unicode", "cp65001":
 				return nil
 			default:
-				return pgerror.Unimplemented("client_encoding "+encoding,
+				return pgerror.Unimplementedf("client_encoding "+encoding,
 					"unimplemented client encoding: %q", encoding)
 			}
 		},
@@ -178,7 +180,7 @@ var varGen = map[string]sessionVar{
 			}
 
 			if len(dbName) == 0 && evalCtx.SessionData.SafeUpdates {
-				return "", pgerror.NewDangerousStatementErrorf("SET database to empty string")
+				return "", pgerror.DangerousStatementf("SET database to empty string")
 			}
 
 			if len(dbName) != 0 {
@@ -235,7 +237,7 @@ var varGen = map[string]sessionVar{
 				return wrapSetVarError("default_int_size", val, "%v", err)
 			}
 			if i != 4 && i != 8 {
-				return pgerror.NewError(pgerror.CodeInvalidParameterValueError,
+				return pgerror.New(pgerror.CodeInvalidParameterValueError,
 					`only 4 or 8 are supported by default_int_size`)
 			}
 			// Only record when the value has been changed to a non-default
@@ -246,7 +248,7 @@ var varGen = map[string]sessionVar{
 			// set to int4 by a connection string.
 			// TODO(bob): Change to 8 in v2.3: https://github.com/cockroachdb/cockroach/issues/32534
 			if i == 4 {
-				telemetry.Count("sql.default_int_size.4")
+				telemetry.Inc(sqltelemetry.DefaultIntSize4Counter)
 			}
 			m.SetDefaultIntSize(int(i))
 			return nil
@@ -254,6 +256,21 @@ var varGen = map[string]sessionVar{
 		GlobalDefault: func(sv *settings.Values) string {
 			return strconv.FormatInt(defaultIntSize.Get(sv), 10)
 		},
+	},
+	// See https://www.postgresql.org/docs/10/runtime-config-client.html.
+	// Supported only for pg compatibility - CockroachDB has no notion of
+	// tablespaces.
+	`default_tablespace`: {
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			if s != "" {
+				return newVarValueError(`default_tablespace`, s, "")
+			}
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return ""
+		},
+		GlobalDefault: func(sv *settings.Values) string { return "" },
 	},
 	// See https://www.postgresql.org/docs/10/static/runtime-config-client.html#GUC-DEFAULT-TRANSACTION-ISOLATION
 	`default_transaction_isolation`: {
@@ -338,16 +355,20 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext) string {
 			return formatBoolAsPostgresSetting(evalCtx.SessionData.ZigzagJoinEnabled)
 		},
-		GlobalDefault: globalFalse,
+		GlobalDefault: globalTrue,
 	},
 
 	// CockroachDB extension.
-	`experimental_reorder_joins_limit`: {
-		GetStringVal: makeIntGetStringValFn(`experimental_reorder_joins_limit`),
+	`reorder_joins_limit`: {
+		GetStringVal: makeIntGetStringValFn(`reorder_joins_limit`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
 			b, err := strconv.ParseInt(s, 10, 64)
 			if err != nil {
 				return err
+			}
+			if b < 0 {
+				return pgerror.Newf(pgerror.CodeInvalidParameterValueError,
+					"cannot set reorder_joins_limit to a negative value: %d", b)
 			}
 			m.SetReorderJoinsLimit(int(b))
 			return nil
@@ -355,8 +376,8 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext) string {
 			return strconv.FormatInt(int64(evalCtx.SessionData.ReorderJoinsLimit), 10)
 		},
-		GlobalDefault: func(_ *settings.Values) string {
-			return "4"
+		GlobalDefault: func(sv *settings.Values) string {
+			return strconv.FormatInt(ReorderJoinsLimitClusterValue.Get(sv), 10)
 		},
 	},
 
@@ -432,7 +453,7 @@ var varGen = map[string]sessionVar{
 			// See also the documentation around (DataConversionConfig).GetFloatPrec()
 			// in session_data.go.
 			if i < -15 || i > 3 {
-				return pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError,
+				return pgerror.Newf(pgerror.CodeInvalidParameterValueError,
 					`%d is outside the valid range for parameter "extra_float_digits" (-15 .. 3)`, i)
 			}
 			m.SetExtraFloatDigits(int(i))
@@ -456,7 +477,7 @@ var varGen = map[string]sessionVar{
 				return err
 			}
 			if b {
-				telemetry.Count("sql.force_savepoint_restart")
+				telemetry.Inc(sqltelemetry.ForceSavepointRestartCounter)
 			}
 			m.SetForceSavepointRestart(b)
 			return nil
@@ -529,7 +550,7 @@ var varGen = map[string]sessionVar{
 					// TODO(knz): if/when we want to support this, we'll need to change
 					// the interface between GetStringVal() and Set() to take string
 					// arrays instead of a single string.
-					return "", pgerror.Unimplemented("schema names containing commas in search_path",
+					return "", pgerror.Unimplementedf("schema names containing commas in search_path",
 						"schema name %q not supported in search_path", s)
 				}
 				buf.WriteString(comma)
@@ -723,6 +744,26 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: globalFalse,
 	},
+
+	// CockroachDB extension.
+	`save_tables_prefix`: {
+		Hidden: true,
+		Get: func(evalCtx *extendedEvalContext) string {
+			return evalCtx.SessionData.SaveTablesPrefix
+		},
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			m.SetSaveTablesPrefix(s)
+			return nil
+		},
+		GlobalDefault: func(_ *settings.Values) string { return "" },
+	},
+}
+
+func init() {
+	// Initialize delegate.ValidVars.
+	for v := range varGen {
+		delegate.ValidVars[v] = struct{}{}
+	}
 }
 
 func makeBoolGetStringValFn(varName string) getStringValFn {
@@ -749,6 +790,7 @@ func displayPgBool(val bool) func(_ *settings.Values) string {
 	return func(_ *settings.Values) string { return strVal }
 }
 
+var globalTrue = displayPgBool(true)
 var globalFalse = displayPgBool(false)
 
 func makeCompatBoolVar(varName string, displayValue, anyValAllowed bool) sessionVar {
@@ -758,12 +800,12 @@ func makeCompatBoolVar(varName string, displayValue, anyValAllowed bool) session
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
 			b, err := parsePostgresBool(s)
 			if err != nil {
-				return pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError, "%v", err)
+				return pgerror.Wrapf(err, pgerror.CodeInvalidParameterValueError, "")
 			}
 			if anyValAllowed || b == displayValue {
 				return nil
 			}
-			telemetry.Count(fmt.Sprintf("unimplemented.sql.session_var.%s.%s", varName, s))
+			telemetry.Inc(sqltelemetry.UnimplementedSessionVarValueCounter(varName, s))
 			allowedVals := []string{displayValStr}
 			if anyValAllowed {
 				allowedVals = append(allowedVals, formatBoolAsPostgresSetting(!displayValue))
@@ -799,7 +841,7 @@ func makeCompatStringVar(varName, displayValue string, extraAllowed ...string) s
 					return nil
 				}
 			}
-			telemetry.Count(fmt.Sprintf("unimplemented.sql.session_var.%s.%s", varName, s))
+			telemetry.Inc(sqltelemetry.UnimplementedSessionVarValueCounter(varName, s))
 			return newVarValueError(varName, s, allowedVals...).SetDetailf(
 				"this parameter is currently recognized only for compatibility and has no effect in CockroachDB.")
 		},
@@ -848,9 +890,57 @@ func getSingleBool(
 	}
 	b, ok := val.(*tree.DBool)
 	if !ok {
-		return nil, pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError,
+		return nil, pgerror.Newf(pgerror.CodeInvalidParameterValueError,
 			"parameter %q requires a Boolean value", name).SetDetailf(
 			"%s is a %s", values[0], val.ResolvedType())
 	}
 	return b, nil
+}
+
+func getSessionVar(name string, missingOk bool) (bool, sessionVar, error) {
+	if _, ok := UnsupportedVars[name]; ok {
+		return false, sessionVar{}, pgerror.Unimplementedf("set."+name,
+			"the configuration setting %q is not supported", name)
+	}
+
+	v, ok := varGen[name]
+	if !ok {
+		if missingOk {
+			return false, sessionVar{}, nil
+		}
+		return false, sessionVar{}, pgerror.Newf(pgerror.CodeUndefinedObjectError,
+			"unrecognized configuration parameter %q", name)
+	}
+
+	return true, v, nil
+}
+
+// GetSessionVar implements the EvalSessionAccessor interface.
+func (p *planner) GetSessionVar(
+	_ context.Context, varName string, missingOk bool,
+) (bool, string, error) {
+	name := strings.ToLower(varName)
+	ok, v, err := getSessionVar(name, missingOk)
+	if err != nil || !ok {
+		return ok, "", err
+	}
+
+	return true, v.Get(&p.extendedEvalCtx), nil
+}
+
+// SetSessionVar implements the EvalSessionAccessor interface.
+func (p *planner) SetSessionVar(ctx context.Context, varName, newVal string) error {
+	name := strings.ToLower(varName)
+	_, v, err := getSessionVar(name, false /* missingOk */)
+	if err != nil {
+		return err
+	}
+
+	if v.Set == nil && v.RuntimeSet == nil {
+		return newCannotChangeParameterError(name)
+	}
+	if v.RuntimeSet != nil {
+		return v.RuntimeSet(ctx, &p.extendedEvalCtx, newVal)
+	}
+	return v.Set(ctx, p.sessionDataMutator, newVal)
 }

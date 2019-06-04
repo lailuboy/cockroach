@@ -11,21 +11,23 @@ package workloadccl
 import (
 	"context"
 	"fmt"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
-	"github.com/cockroachdb/cockroach/pkg/workload/tpcc"
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2/google"
@@ -71,6 +73,12 @@ func (g fixtureTestGen) Tables() []workload.Table {
 				return []interface{}{rowIdx, g.val}
 			},
 		),
+		Stats: []workload.JSONStatistic{
+			// Use stats that *don't* match reality, so we can test that these
+			// stats were injected and not calculated by CREATE STATISTICS.
+			workload.MakeStat([]string{"key"}, 100, 100, 0),
+			workload.MakeStat([]string{"value"}, 100, 1, 5),
+		},
 	}}
 }
 
@@ -144,7 +152,7 @@ func TestFixture(t *testing.T) {
 	}
 
 	sqlDB.Exec(t, `CREATE DATABASE test`)
-	if err := RestoreFixture(ctx, db, fixture, `test`); err != nil {
+	if _, err := RestoreFixture(ctx, db, fixture, `test`); err != nil {
 		t.Fatalf(`%+v`, err)
 	}
 	sqlDB.CheckQueryResults(t,
@@ -155,7 +163,74 @@ func TestImportFixture(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
+	defer func(oldRefreshInterval, oldAsOf time.Duration) {
+		stats.DefaultRefreshInterval = oldRefreshInterval
+		stats.DefaultAsOfTime = oldAsOf
+	}(stats.DefaultRefreshInterval, stats.DefaultAsOfTime)
+	stats.DefaultRefreshInterval = time.Millisecond
+	stats.DefaultAsOfTime = 10 * time.Millisecond
+
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	sqlDB.Exec(t, `SET CLUSTER SETTING sql.stats.automatic_collection.enabled=true`)
+
+	gen := makeTestWorkload()
+	flag := fmt.Sprintf(`val=%d`, timeutil.Now().UnixNano())
+	if err := gen.Flags().Parse([]string{"--" + flag}); err != nil {
+		t.Fatalf(`%+v`, err)
+	}
+
+	const filesPerNode = 1
+	const noSkipPostLoad = false
+	sqlDB.Exec(t, `CREATE DATABASE distsort`)
+	_, err := ImportFixture(
+		ctx, db, gen, `distsort`, false /* directIngestion */, filesPerNode, true, /* injectStats */
+		noSkipPostLoad, ``, /* csvServer */
+	)
+	require.NoError(t, err)
+	sqlDB.CheckQueryResults(t,
+		`SELECT count(*) FROM distsort.fx`, [][]string{{strconv.Itoa(fixtureTestGenRows)}})
+
+	sqlDB.CheckQueryResults(t,
+		`SELECT statistics_name, column_names, row_count, distinct_count, null_count
+           FROM [SHOW STATISTICS FOR TABLE distsort.fx]`,
+		[][]string{
+			{"__auto__", "{key}", "100", "100", "0"},
+			{"__auto__", "{value}", "100", "1", "5"},
+		})
+
+	sqlDB.Exec(t, `CREATE DATABASE direct`)
+	_, err = ImportFixture(
+		ctx, db, gen, `direct`, true /* directIngestion */, filesPerNode, false, /* injectStats */
+		noSkipPostLoad, ``, /* csvServer */
+	)
+	require.NoError(t, err)
+	sqlDB.CheckQueryResults(t,
+		`SELECT count(*) FROM direct.fx`, [][]string{{strconv.Itoa(fixtureTestGenRows)}})
+
+	fingerprints := sqlDB.QueryStr(t, `SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE distsort.fx`)
+	sqlDB.CheckQueryResults(t, `SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE direct.fx`, fingerprints)
+
+	// Since we did not inject stats, the IMPORT should have triggered
+	// automatic stats collection.
+	sqlDB.CheckQueryResultsRetry(t,
+		`SELECT statistics_name, column_names, row_count, distinct_count, null_count
+           FROM [SHOW STATISTICS FOR TABLE direct.fx]`,
+		[][]string{
+			{"__auto__", "{key}", "10", "10", "0"},
+			{"__auto__", "{value}", "10", "1", "0"},
+		})
+}
+
+func TestImportFixtureCSVServer(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	ts := httptest.NewServer(workload.CSVMux(workload.Registered()))
+	defer ts.Close()
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{UseDatabase: `d`})
 	defer s.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
@@ -166,44 +241,12 @@ func TestImportFixture(t *testing.T) {
 	}
 
 	const filesPerNode = 1
-	sqlDB.Exec(t, `CREATE DATABASE distsort`)
-	_, err := ImportFixture(ctx, db, gen, `distsort`, false /* directIngestion */, filesPerNode)
+	const noDirectIngest, noInjectStats, noSkipPostLoad = false, false, true
+	sqlDB.Exec(t, `CREATE DATABASE d`)
+	_, err := ImportFixture(
+		ctx, db, gen, `d`, noDirectIngest, filesPerNode, noInjectStats, noSkipPostLoad, ts.URL,
+	)
 	require.NoError(t, err)
 	sqlDB.CheckQueryResults(t,
-		`SELECT count(*) FROM distsort.fx`, [][]string{{strconv.Itoa(fixtureTestGenRows)}})
-
-	sqlDB.Exec(t, `CREATE DATABASE direct`)
-	_, err = ImportFixture(ctx, db, gen, `direct`, true /* directIngestion */, filesPerNode)
-	require.NoError(t, err)
-	sqlDB.CheckQueryResults(t,
-		`SELECT count(*) FROM direct.fx`, [][]string{{strconv.Itoa(fixtureTestGenRows)}})
-
-	fingerprints := sqlDB.QueryStr(t, `SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE distsort.fx`)
-	sqlDB.CheckQueryResults(t, `SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE direct.fx`, fingerprints)
-}
-
-func BenchmarkImportFixtureTPCC(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping long benchmark")
-	}
-	ctx := context.Background()
-	gen := tpcc.FromWarehouses(1)
-
-	var bytes int64
-	b.StopTimer()
-	for i := 0; i < b.N; i++ {
-		s, db, _ := serverutils.StartServer(b, base.TestServerArgs{})
-		sqlDB := sqlutils.MakeSQLRunner(db)
-		sqlDB.Exec(b, `CREATE DATABASE d`)
-
-		b.StartTimer()
-		const filesPerNode = 1
-		importBytes, err := ImportFixture(ctx, db, gen, `d`, true /* directIngestion */, filesPerNode)
-		require.NoError(b, err)
-		bytes += importBytes
-		b.StopTimer()
-
-		s.Stopper().Stop(ctx)
-	}
-	b.SetBytes(bytes / int64(b.N))
+		`SELECT count(*) FROM d.fx`, [][]string{{strconv.Itoa(fixtureTestGenRows)}})
 }

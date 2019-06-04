@@ -24,8 +24,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding/csv"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -60,29 +60,29 @@ const exportFilePatternDefault = exportFilePatternPart + ".csv"
 // exportPlanHook implements sql.PlanHook.
 func exportPlanHook(
 	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
-) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, error) {
+) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, bool, error) {
 	exportStmt, ok := stmt.(*tree.Export)
 	if !ok {
-		return nil, nil, nil, nil
+		return nil, nil, nil, false, nil
 	}
 
 	fileFn, err := p.TypeAsString(exportStmt.File, "EXPORT")
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 
 	if exportStmt.FileFormat != "CSV" {
-		return nil, nil, nil, errors.Errorf("unsupported export format: %q", exportStmt.FileFormat)
+		return nil, nil, nil, false, errors.Errorf("unsupported export format: %q", exportStmt.FileFormat)
 	}
 
 	optsFn, err := p.TypeAsStringOpts(exportStmt.Options, exportOptionExpectValues)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 
 	sel, err := p.Select(ctx, exportStmt.Query, nil)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 
 	fn := func(ctx context.Context, plans []sql.PlanNode, resultsCh chan<- tree.Datums) error {
@@ -118,7 +118,7 @@ func exportPlanHook(
 		if override, ok := opts[exportOptionDelimiter]; ok {
 			csvOpts.Comma, err = util.GetSingleRune(override)
 			if err != nil {
-				return pgerror.NewError(pgerror.CodeInvalidParameterValueError, "invalid delimiter")
+				return pgerror.New(pgerror.CodeInvalidParameterValueError, "invalid delimiter")
 			}
 		}
 
@@ -130,10 +130,10 @@ func exportPlanHook(
 		if override, ok := opts[exportOptionChunkSize]; ok {
 			chunk, err = strconv.Atoi(override)
 			if err != nil {
-				return pgerror.NewError(pgerror.CodeInvalidParameterValueError, err.Error())
+				return pgerror.New(pgerror.CodeInvalidParameterValueError, err.Error())
 			}
 			if chunk < 1 {
-				return pgerror.NewError(pgerror.CodeInvalidParameterValueError, "invalid csv chunk size")
+				return pgerror.New(pgerror.CodeInvalidParameterValueError, "invalid csv chunk size")
 			}
 		}
 
@@ -161,7 +161,7 @@ func exportPlanHook(
 		return rw.Err()
 	}
 
-	return fn, exportHeader, []sql.PlanNode{sel}, nil
+	return fn, exportHeader, []sql.PlanNode{sel}, false, nil
 }
 
 func newCSVWriterProcessor(
@@ -195,7 +195,7 @@ type csvWriter struct {
 
 var _ distsqlrun.Processor = &csvWriter{}
 
-func (sp *csvWriter) OutputTypes() []sqlbase.ColumnType {
+func (sp *csvWriter) OutputTypes() []types.T {
 	return sql.ExportPlanResultTypes
 }
 
@@ -209,7 +209,7 @@ func (sp *csvWriter) Run(ctx context.Context) {
 			pattern = sp.spec.NamePattern
 		}
 
-		types := sp.input.OutputTypes()
+		typs := sp.input.OutputTypes()
 		sp.input.Start(ctx)
 		input := distsqlrun.MakeNoMetadataRowSource(sp.input, sp.output)
 
@@ -227,7 +227,7 @@ func (sp *csvWriter) Run(ctx context.Context) {
 		f := tree.NewFmtCtx(tree.FmtExport)
 		defer f.Close()
 
-		csvRow := make([]string, len(types))
+		csvRow := make([]string, len(typs))
 
 		chunk := 0
 		done := false
@@ -253,7 +253,7 @@ func (sp *csvWriter) Run(ctx context.Context) {
 						csvRow[i] = nullsAs
 						continue
 					}
-					if err := ed.EnsureDecoded(&types[i], alloc); err != nil {
+					if err := ed.EnsureDecoded(&typs[i], alloc); err != nil {
 						return err
 					}
 					ed.Datum.Format(f)
@@ -289,15 +289,15 @@ func (sp *csvWriter) Run(ctx context.Context) {
 			}
 			res := sqlbase.EncDatumRow{
 				sqlbase.DatumToEncDatum(
-					sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_STRING},
+					types.String,
 					tree.NewDString(filename),
 				),
 				sqlbase.DatumToEncDatum(
-					sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT},
+					types.Int,
 					tree.NewDInt(tree.DInt(rows)),
 				),
 				sqlbase.DatumToEncDatum(
-					sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT},
+					types.Int,
 					tree.NewDInt(tree.DInt(size)),
 				),
 			}

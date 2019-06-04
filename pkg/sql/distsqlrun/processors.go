@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -36,7 +37,7 @@ import (
 type Processor interface {
 	// OutputTypes returns the column types of the results (that are to be fed
 	// through an output router).
-	OutputTypes() []sqlbase.ColumnType
+	OutputTypes() []types.T
 
 	// Run is the main loop of the processor.
 	Run(context.Context)
@@ -72,7 +73,7 @@ type ProcOutputHelper struct {
 	// If outputCols is set, these types correspond to the types of
 	// those columns.
 	// If neither is set, this is the internal schema of the processor.
-	outputTypes []sqlbase.ColumnType
+	outputTypes []types.T
 
 	// offset is the number of rows that are suppressed.
 	offset uint64
@@ -97,10 +98,7 @@ func (h *ProcOutputHelper) Reset() {
 // Note that the types slice may be stored directly; the caller should not
 // modify it.
 func (h *ProcOutputHelper) Init(
-	post *distsqlpb.PostProcessSpec,
-	types []sqlbase.ColumnType,
-	evalCtx *tree.EvalContext,
-	output RowReceiver,
+	post *distsqlpb.PostProcessSpec, typs []types.T, evalCtx *tree.EvalContext, output RowReceiver,
 ) error {
 	if !post.Projection && len(post.OutputColumns) > 0 {
 		return errors.Errorf("post-processing has projection unset but output columns set: %s", post)
@@ -109,10 +107,10 @@ func (h *ProcOutputHelper) Init(
 		return errors.Errorf("post-processing has both projection and rendering: %s", post)
 	}
 	h.output = output
-	h.numInternalCols = len(types)
+	h.numInternalCols = len(typs)
 	if post.Filter != (distsqlpb.Expression{}) {
 		h.filter = &exprHelper{}
-		if err := h.filter.init(post.Filter, types, evalCtx); err != nil {
+		if err := h.filter.init(post.Filter, typs, evalCtx); err != nil {
 			return err
 		}
 	}
@@ -131,10 +129,10 @@ func (h *ProcOutputHelper) Init(
 		if cap(h.outputTypes) >= nOutputCols {
 			h.outputTypes = h.outputTypes[:nOutputCols]
 		} else {
-			h.outputTypes = make([]sqlbase.ColumnType, nOutputCols)
+			h.outputTypes = make([]types.T, nOutputCols)
 		}
 		for i, c := range h.outputCols {
-			h.outputTypes[i] = types[c]
+			h.outputTypes[i] = typs[c]
 		}
 	} else if nRenders := len(post.RenderExprs); nRenders > 0 {
 		if cap(h.renderExprs) >= nRenders {
@@ -145,27 +143,23 @@ func (h *ProcOutputHelper) Init(
 		if cap(h.outputTypes) >= nRenders {
 			h.outputTypes = h.outputTypes[:nRenders]
 		} else {
-			h.outputTypes = make([]sqlbase.ColumnType, nRenders)
+			h.outputTypes = make([]types.T, nRenders)
 		}
 		for i, expr := range post.RenderExprs {
 			h.renderExprs[i] = exprHelper{}
-			if err := h.renderExprs[i].init(expr, types, evalCtx); err != nil {
+			if err := h.renderExprs[i].init(expr, typs, evalCtx); err != nil {
 				return err
 			}
-			colTyp, err := sqlbase.DatumTypeToColumnType(h.renderExprs[i].expr.ResolvedType())
-			if err != nil {
-				return err
-			}
-			h.outputTypes[i] = colTyp
+			h.outputTypes[i] = *h.renderExprs[i].expr.ResolvedType()
 		}
 	} else {
 		// No rendering or projection.
-		if cap(h.outputTypes) >= len(types) {
-			h.outputTypes = h.outputTypes[:len(types)]
+		if cap(h.outputTypes) >= len(typs) {
+			h.outputTypes = h.outputTypes[:len(typs)]
 		} else {
-			h.outputTypes = make([]sqlbase.ColumnType, len(types))
+			h.outputTypes = make([]types.T, len(typs))
 		}
-		copy(h.outputTypes, types)
+		copy(h.outputTypes, typs)
 	}
 	if h.outputCols != nil || len(h.renderExprs) > 0 {
 		// We're rendering or projecting, so allocate an output row.
@@ -241,7 +235,7 @@ func emitHelper(
 	ctx context.Context,
 	output *ProcOutputHelper,
 	row sqlbase.EncDatumRow,
-	meta *ProducerMetadata,
+	meta *distsqlpb.ProducerMetadata,
 	pushTrailingMeta func(context.Context),
 	inputs ...RowSource,
 ) bool {
@@ -262,7 +256,7 @@ func emitHelper(
 		var err error
 		consumerStatus, err = output.EmitRow(ctx, row)
 		if err != nil {
-			output.output.Push(nil /* row */, &ProducerMetadata{Err: err})
+			output.output.Push(nil /* row */, &distsqlpb.ProducerMetadata{Err: err})
 			consumerStatus = ConsumerClosed
 		}
 	}
@@ -376,7 +370,7 @@ func (h *ProcOutputHelper) ProcessRow(
 			if err != nil {
 				return nil, false, err
 			}
-			h.outputRow[i] = sqlbase.DatumToEncDatum(h.outputTypes[i], datum)
+			h.outputRow[i] = sqlbase.DatumToEncDatum(&h.outputTypes[i], datum)
 		}
 	} else if h.outputCols != nil {
 		// Projection.
@@ -548,10 +542,10 @@ type ProcessorBase struct {
 	// other than what has otherwise been manually put in trailingMeta) and no
 	// closing other than InternalClose is needed, then no callback needs to be
 	// specified.
-	trailingMetaCallback func(context.Context) []ProducerMetadata
+	trailingMetaCallback func(context.Context) []distsqlpb.ProducerMetadata
 	// trailingMeta is scratch space where metadata is stored to be returned
 	// later.
-	trailingMeta []ProducerMetadata
+	trailingMeta []distsqlpb.ProducerMetadata
 
 	// inputsToDrain, if not empty, contains inputs to be drained by
 	// DrainHelper(). MoveToDraining() calls ConsumerDone() on them,
@@ -652,7 +646,7 @@ func (pb *ProcessorBase) MoveToDraining(err error) {
 	}
 
 	if err != nil {
-		pb.trailingMeta = append(pb.trailingMeta, ProducerMetadata{Err: err})
+		pb.trailingMeta = append(pb.trailingMeta, distsqlpb.ProducerMetadata{Err: err})
 	}
 	if len(pb.inputsToDrain) > 0 {
 		// We go to stateDraining here. DrainHelper() will transition to
@@ -670,7 +664,7 @@ func (pb *ProcessorBase) MoveToDraining(err error) {
 // DrainHelper is supposed to be used in states draining and trailingMetadata.
 // It deals with optionally draining an input and returning trailing meta. It
 // also moves from stateDraining to stateTrailingMeta when appropriate.
-func (pb *ProcessorBase) DrainHelper() *ProducerMetadata {
+func (pb *ProcessorBase) DrainHelper() *distsqlpb.ProducerMetadata {
 	if pb.State == StateRunning {
 		log.Fatal(pb.Ctx, "drain helper called in StateRunning")
 	}
@@ -706,6 +700,7 @@ func (pb *ProcessorBase) DrainHelper() *ProducerMetadata {
 				// We only look for UnhandledRetryableErrors. Local reads (which would
 				// be transformed by the Root TxnCoordSender into
 				// TransactionRetryWithProtoRefreshErrors) don't have any uncertainty.
+				err = errors.Cause(err)
 				if ure, ok := err.(*roachpb.UnhandledRetryableError); ok {
 					uncertain := ure.PErr.Detail.GetReadWithinUncertaintyInterval()
 					if uncertain != nil {
@@ -720,7 +715,7 @@ func (pb *ProcessorBase) DrainHelper() *ProducerMetadata {
 
 // popTrailingMeta peels off one piece of trailing metadata or advances to
 // stateExhausted if there's no more trailing metadata.
-func (pb *ProcessorBase) popTrailingMeta() *ProducerMetadata {
+func (pb *ProcessorBase) popTrailingMeta() *distsqlpb.ProducerMetadata {
 	if len(pb.trailingMeta) > 0 {
 		meta := &pb.trailingMeta[0]
 		pb.trailingMeta = pb.trailingMeta[1:]
@@ -753,7 +748,7 @@ func (pb *ProcessorBase) moveToTrailingMeta() {
 	pb.State = stateTrailingMeta
 	if pb.span != nil {
 		if trace := getTraceData(pb.Ctx); trace != nil {
-			pb.trailingMeta = append(pb.trailingMeta, ProducerMetadata{TraceData: trace})
+			pb.trailingMeta = append(pb.trailingMeta, distsqlpb.ProducerMetadata{TraceData: trace})
 		}
 	}
 	// trailingMetaCallback is called after reading the tracing data because it
@@ -788,7 +783,7 @@ func (pb *ProcessorBase) ProcessRowHelper(row sqlbase.EncDatumRow) sqlbase.EncDa
 }
 
 // OutputTypes is part of the processor interface.
-func (pb *ProcessorBase) OutputTypes() []sqlbase.ColumnType {
+func (pb *ProcessorBase) OutputTypes() []types.T {
 	return pb.out.outputTypes
 }
 
@@ -807,7 +802,7 @@ func (pb *ProcessorBase) Run(ctx context.Context) {
 type ProcStateOpts struct {
 	// TrailingMetaCallback, if specified, is a callback to be called by
 	// moveToTrailingMeta(). See ProcessorBase.TrailingMetaCallback.
-	TrailingMetaCallback func(context.Context) []ProducerMetadata
+	TrailingMetaCallback func(context.Context) []distsqlpb.ProducerMetadata
 	// InputsToDrain, if specified, will be drained by DrainHelper().
 	// MoveToDraining() calls ConsumerDone() on them, InternalClose() calls
 	// ConsumerClosed() on them.
@@ -818,7 +813,7 @@ type ProcStateOpts struct {
 func (pb *ProcessorBase) Init(
 	self RowSource,
 	post *distsqlpb.PostProcessSpec,
-	types []sqlbase.ColumnType,
+	types []types.T,
 	flowCtx *FlowCtx,
 	processorID int32,
 	output RowReceiver,
@@ -834,7 +829,7 @@ func (pb *ProcessorBase) Init(
 func (pb *ProcessorBase) InitWithEvalCtx(
 	self RowSource,
 	post *distsqlpb.PostProcessSpec,
-	types []sqlbase.ColumnType,
+	types []types.T,
 	flowCtx *FlowCtx,
 	evalCtx *tree.EvalContext,
 	processorID int32,
@@ -860,7 +855,7 @@ func (pb *ProcessorBase) AddInputToDrain(input RowSource) {
 
 // AppendTrailingMeta appends metadata to the trailing metadata without changing
 // the state to draining (as opposed to MoveToDraining).
-func (pb *ProcessorBase) AppendTrailingMeta(meta ProducerMetadata) {
+func (pb *ProcessorBase) AppendTrailingMeta(meta distsqlpb.ProducerMetadata) {
 	pb.trailingMeta = append(pb.trailingMeta, meta)
 }
 

@@ -24,8 +24,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
@@ -120,6 +121,76 @@ func (c *CustomFuncs) GenerateIndexScans(grp memo.RelExpr, scanPrivate *memo.Sca
 //
 // ----------------------------------------------------------------------
 
+// checkConstraintFilters generates all filters that we can derive from the
+// check constraints. These are constraints that have been validated and are
+// non-nullable. We only use non-nullable check constraints because they
+// behave differently from filters on NULL. Check constraints are satisfied
+// when their expression evaluates to NULL, while filters are not.
+//
+// For example, the check constraint a > 1 is satisfied if a is NULL but the
+// equivalent filter a > 1 is not.
+//
+// These filters do not really filter any rows, they are rather facts or
+// guarantees about the data but treating them as filters may allow some
+// indexes to be constrained and used. Consider the following example:
+//
+// CREATE TABLE abc (
+// 	a INT PRIMARY KEY,
+// 	b INT NOT NULL,
+// 	c STRING NOT NULL,
+// 	CHECK (a < 10 AND a > 1),
+// 	CHECK (b < 10 AND b > 1),
+// 	CHECK (c in ('first', 'second')),
+// 	INDEX secondary (b, a),
+// 	INDEX tertiary (c, b, a))
+//
+// Now consider the query: SELECT a, b WHERE a > 5
+//
+// Notice that the filter provided previously wouldn't let the optimizer use
+// the secondary or tertiary indexes. However, given that we can use the
+// constraints on a, b and c, we can actually use the secondary and tertiary
+// indexes. In fact, for the above query we can do the following:
+//
+// select
+//  ├── columns: a:1(int!null) b:2(int!null)
+//  ├── scan abc@tertiary
+//  │		├── columns: a:1(int!null) b:2(int!null)
+//  │		└── constraint: /3/2/1: [/'first'/2/6 - /'first'/9/9] [/'second'/2/6 - /'second'/9/9]
+//  └── filters
+//        └── gt [type=bool]
+//            ├── variable: a [type=int]
+//            └── const: 5 [type=int]
+//
+// Similarly, the secondary index could also be used. All such index scans
+// will be added to the memo group.
+func (c *CustomFuncs) checkConstraintFilters(tabID opt.TableID) memo.FiltersExpr {
+	md := c.e.mem.Metadata()
+	tab := md.Table(tabID)
+	tabMeta := md.TableMeta(tabID)
+
+	// Maintain a ColSet of non-nullable columns.
+	var notNullCols opt.ColSet
+	for i := 0; i < tab.ColumnCount(); i++ {
+		if !tab.Column(i).IsNullable() {
+			notNullCols.Add(int(tabID.ColumnID(i)))
+		}
+	}
+
+	numCheckConstraints := tabMeta.ConstraintCount()
+	checkFilters := make(memo.FiltersExpr, 0, numCheckConstraints)
+	for i := 0; i < numCheckConstraints; i++ {
+		checkConstraint := tabMeta.Constraint(i)
+
+		// Check constraints that are guaranteed to not evaluate to NULL
+		// are the only ones converted into filters.
+		if memo.ExprIsNeverNull(checkConstraint, notNullCols) {
+			checkFilters = append(checkFilters, memo.FiltersItem{Condition: checkConstraint})
+		}
+	}
+
+	return checkFilters
+}
+
 // GenerateConstrainedScans enumerates all secondary indexes on the Scan
 // operator's table and tries to push the given Select filter into new
 // constrained Scan operators using those indexes. Since this only needs to be
@@ -178,27 +249,49 @@ func (c *CustomFuncs) GenerateIndexScans(grp memo.RelExpr, scanPrivate *memo.Sca
 //        $outerFilter
 //      )
 //
+// GenerateConstrainedScans will further constrain the enumerated index scans
+// by trying to use the check constraints that apply to the table being
+// scanned.
 func (c *CustomFuncs) GenerateConstrainedScans(
-	grp memo.RelExpr, scanPrivate *memo.ScanPrivate, filters memo.FiltersExpr,
+	grp memo.RelExpr, scanPrivate *memo.ScanPrivate, explicitFilters memo.FiltersExpr,
 ) {
 	var sb indexScanBuilder
 	sb.init(c, scanPrivate.Table)
+
+	// Generate appropriate filters from constraints.
+	checkFilters := c.checkConstraintFilters(scanPrivate.Table)
+
+	// Consider the checkFilters as well to constrain each of the indexes.
+	filters := append(explicitFilters, checkFilters...)
 
 	// Iterate over all indexes.
 	var iter scanIndexIter
 	iter.init(c.e.mem, scanPrivate)
 	for iter.next() {
 		// Check whether the filter can constrain the index.
-		constraint, remaining, ok := c.tryConstrainIndex(
+		constraintFilters, remainingFilters, ok := c.tryConstrainIndex(
 			filters, scanPrivate.Table, iter.indexOrdinal, false /* isInverted */)
 		if !ok {
 			continue
 		}
 
+		// If a check constraint filter wasn't able to constrain the index, it
+		// should not be used anymore for this group expression.
+		// TODO(ridwanmsharif): Does it ever make sense for us to continue
+		// using any constraint filter that wasn't able to constrain a scan?
+		// Maybe once we have more information about data distribution, we may
+		// use it to further constrain an index scan. We should revisit this
+		// once we have index skip scans.  A constraint that may not constrain
+		// an index scan may still allow the index to be used more effectively
+		// if an index skip scan is possible.
+		if len(checkFilters) != 0 {
+			remainingFilters.RetainCommonFilters(explicitFilters)
+		}
+
 		// Construct new constrained ScanPrivate.
 		newScanPrivate := *scanPrivate
 		newScanPrivate.Index = iter.indexOrdinal
-		newScanPrivate.Constraint = constraint
+		newScanPrivate.Constraint = constraintFilters
 
 		// If the alternate index includes the set of needed columns, then construct
 		// a new Scan operator using that index.
@@ -208,7 +301,8 @@ func (c *CustomFuncs) GenerateConstrainedScans(
 			// If there are remaining filters, then the constrained Scan operator
 			// will be created in a new group, and a Select operator will be added
 			// to the same group as the original operator.
-			sb.addSelect(remaining)
+			sb.addSelect(remainingFilters)
+
 			sb.build(grp)
 			continue
 		}
@@ -227,9 +321,9 @@ func (c *CustomFuncs) GenerateConstrainedScans(
 
 		// If remaining filter exists, split it into one part that can be pushed
 		// below the IndexJoin, and one part that needs to stay above.
-		remaining = sb.addSelectAfterSplit(remaining, newScanPrivate.Cols)
+		remainingFilters = sb.addSelectAfterSplit(remainingFilters, newScanPrivate.Cols)
 		sb.addIndexJoin(scanPrivate.Cols)
-		sb.addSelect(remaining)
+		sb.addSelect(remainingFilters)
 
 		sb.build(grp)
 	}
@@ -622,6 +716,7 @@ func (c *CustomFuncs) GenerateMergeJoins(
 		}
 
 		merge := memo.MergeJoinExpr{Left: left, Right: right, On: remainingFilters}
+		merge.JoinPrivate = *joinPrivate
 		merge.JoinType = originalOp
 		merge.LeftEq = make(opt.Ordering, n)
 		merge.RightEq = make(opt.Ordering, n)
@@ -717,6 +812,7 @@ func (c *CustomFuncs) GenerateLookupJoins(
 		}
 
 		lookupJoin := memo.LookupJoinExpr{Input: input, On: on}
+		lookupJoin.JoinPrivate = *joinPrivate
 		lookupJoin.JoinType = joinType
 		lookupJoin.Table = scanPrivate.Table
 		lookupJoin.Index = iter.indexOrdinal
@@ -846,8 +942,15 @@ func eqColsForZigzag(
 ) (leftEqPrefix, rightEqPrefix opt.ColList) {
 	leftEqPrefix = make(opt.ColList, 0, len(leftEqCols))
 	rightEqPrefix = make(opt.ColList, 0, len(rightEqCols))
-	i, leftCnt := 0, leftIndex.ColumnCount()
-	j, rightCnt := 0, rightIndex.ColumnCount()
+	// We can only zigzag on columns present in the key component of the index,
+	// so use the LaxKeyColumnCount here because that's the longest prefix of the
+	// columns in the index which is guaranteed to exist in the key component.
+	// Using KeyColumnCount is invalid, because if we have a unique index with
+	// nullable columns, the "key columns" include the primary key of the table,
+	// which is only present in the key component if one of the other columns is
+	// NULL.
+	i, leftCnt := 0, leftIndex.LaxKeyColumnCount()
+	j, rightCnt := 0, rightIndex.LaxKeyColumnCount()
 	for ; i < leftCnt; i++ {
 		colID := tabID.ColumnID(leftIndex.Column(i).Ordinal)
 		if !fixedCols.Contains(int(colID)) {
@@ -901,7 +1004,7 @@ func (c *CustomFuncs) fixedColsForZigzag(
 	index cat.Index, tabID opt.TableID, fixedValMap map[opt.ColumnID]tree.Datum,
 ) (opt.ColList, memo.ScalarListExpr, []types.T) {
 	vals := make(memo.ScalarListExpr, 0, len(fixedValMap))
-	types := make([]types.T, 0, len(fixedValMap))
+	typs := make([]types.T, 0, len(fixedValMap))
 	fixedCols := make(opt.ColList, 0, len(fixedValMap))
 
 	for i, cnt := 0, index.ColumnCount(); i < cnt; i++ {
@@ -912,10 +1015,10 @@ func (c *CustomFuncs) fixedColsForZigzag(
 		}
 		dt := index.Column(i).DatumType()
 		vals = append(vals, c.e.f.ConstructConstVal(val, dt))
-		types = append(types, dt)
+		typs = append(typs, *dt)
 		fixedCols = append(fixedCols, colID)
 	}
-	return fixedCols, vals, types
+	return fixedCols, vals, typs
 }
 
 // GenerateZigzagJoins generates zigzag joins for all pairs of indexes of the
@@ -1060,6 +1163,19 @@ func (c *CustomFuncs) GenerateZigzagJoins(
 			// Fixed values are represented as tuples consisting of the
 			// fixed segment of that side's index.
 			fixedValMap := memo.ExtractValuesFromFilter(filters, fixedCols)
+
+			if len(fixedValMap) != fixedCols.Len() {
+				if util.RaceEnabled {
+					panic(pgerror.AssertionFailedf(
+						"we inferred constant columns whose value we couldn't extract",
+					))
+				}
+
+				// This is a bug, but we don't want to block queries from running because of it.
+				// TODO(justin): remove this when we fix extractConstEquality.
+				continue
+			}
+
 			leftFixedCols, leftVals, leftTypes := c.fixedColsForZigzag(
 				iter.index, scanPrivate.Table, fixedValMap,
 			)
@@ -1070,9 +1186,11 @@ func (c *CustomFuncs) GenerateZigzagJoins(
 			zigzagJoin.LeftFixedCols = leftFixedCols
 			zigzagJoin.RightFixedCols = rightFixedCols
 
+			leftTupleTyp := types.MakeTuple(leftTypes)
+			rightTupleTyp := types.MakeTuple(rightTypes)
 			zigzagJoin.FixedVals = memo.ScalarListExpr{
-				c.e.f.ConstructTuple(leftVals, types.TTuple{Types: leftTypes}),
-				c.e.f.ConstructTuple(rightVals, types.TTuple{Types: rightTypes}),
+				c.e.f.ConstructTuple(leftVals, leftTupleTyp),
+				c.e.f.ConstructTuple(rightVals, rightTupleTyp),
 			}
 
 			zigzagJoin.On = memo.ExtractRemainingJoinFilters(
@@ -1207,15 +1325,18 @@ func (c *CustomFuncs) GenerateInvertedIndexZigzagJoins(
 			rightVal := constraint2.Spans.Get(0).StartKey().Value(i)
 
 			leftVals[i] = c.e.f.ConstructConstVal(leftVal, leftVal.ResolvedType())
-			leftTypes[i] = leftVal.ResolvedType()
+			leftTypes[i] = *leftVal.ResolvedType()
 			rightVals[i] = c.e.f.ConstructConstVal(rightVal, rightVal.ResolvedType())
-			rightTypes[i] = rightVal.ResolvedType()
+			rightTypes[i] = *rightVal.ResolvedType()
 			zigzagJoin.LeftFixedCols[i] = constraint.Columns.Get(i).ID()
 			zigzagJoin.RightFixedCols[i] = constraint.Columns.Get(i).ID()
 		}
+
+		leftTupleTyp := types.MakeTuple(leftTypes)
+		rightTupleTyp := types.MakeTuple(rightTypes)
 		zigzagJoin.FixedVals = memo.ScalarListExpr{
-			c.e.f.ConstructTuple(leftVals, types.TTuple{Types: leftTypes}),
-			c.e.f.ConstructTuple(rightVals, types.TTuple{Types: rightTypes}),
+			c.e.f.ConstructTuple(leftVals, leftTupleTyp),
+			c.e.f.ConstructTuple(rightVals, rightTupleTyp),
 		}
 
 		// Set equality columns - all remaining columns after the fixed prefix

@@ -22,8 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -49,8 +49,10 @@ type groupNode struct {
 
 	// Indices of the group by columns in the source plan.
 	groupCols []int
-	// Indices of the group by columns in the source plan that have an ordering.
-	orderedGroupCols []int
+
+	// Set when we have an input ordering on (a subset of) grouping columns. Only
+	// column indices in groupCols can appear in this ordering.
+	groupColOrdering sqlbase.ColumnOrdering
 
 	// isScalar is set for "scalar groupby", where we want a result
 	// even if there are no input rows, e.g. SELECT MIN(x) FROM t.
@@ -114,7 +116,7 @@ func (p *planner) groupBy(
 		return nil, nil, nil
 	}
 	if n.Having != nil && len(n.From.Tables) == 0 {
-		return nil, nil, pgerror.UnimplementedWithIssueError(26349, "HAVING clause without FROM")
+		return nil, nil, pgerror.UnimplementedWithIssue(26349, "HAVING clause without FROM")
 	}
 
 	groupByExprs := make([]tree.Expr, len(n.GroupBy))
@@ -490,13 +492,13 @@ func (v *extractAggregatesVisitor) VisitPre(expr tree.Expr) (recurse bool, newEx
 					evalContext := v.planner.EvalContext()
 					for i := 1; i < len(t.Exprs); i++ {
 						if !tree.IsConst(evalContext, t.Exprs[i]) {
-							v.err = pgerror.UnimplementedWithIssueError(28417, "aggregate functions with multiple non-constant expressions are not supported")
+							v.err = pgerror.UnimplementedWithIssue(28417, "aggregate functions with multiple non-constant expressions are not supported")
 							return false, expr
 						}
 						var err error
 						arguments[i-1], err = t.Exprs[i].(tree.TypedExpr).Eval(evalContext)
 						if err != nil {
-							v.err = pgerror.NewAssertionErrorf("can't evaluate %s - %v", t.Exprs[i].String(), err)
+							v.err = pgerror.AssertionFailedf("can't evaluate %s - %v", t.Exprs[i].String(), err)
 							return false, expr
 						}
 					}
@@ -569,7 +571,7 @@ func (v *extractAggregatesVisitor) VisitPre(expr tree.Expr) (recurse bool, newEx
 		}
 
 	case *tree.IndexedVar:
-		v.err = pgerror.NewErrorf(pgerror.CodeGroupingError,
+		v.err = pgerror.Newf(pgerror.CodeGroupingError,
 			"column \"%s\" must appear in the GROUP BY clause or be used in an aggregate function",
 			t)
 		return false, expr
@@ -593,7 +595,7 @@ type aggregateFuncHolder struct {
 	// key unchanged.
 	funcName string
 
-	resultType types.T
+	resultType *types.T
 
 	// The argument of the function is a single value produced by the renderNode
 	// underneath. If the function has no argument (COUNT_ROWS), it is set to
@@ -633,7 +635,7 @@ const noRenderIdx = -1
 // argRenderIdx is noRenderIdx.
 func (n *groupNode) newAggregateFuncHolder(
 	funcName string,
-	resultType types.T,
+	resultType *types.T,
 	argRenderIdx int,
 	create func(*tree.EvalContext, tree.Datums) tree.AggregateFunc,
 	arguments tree.Datums,

@@ -24,9 +24,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/stretchr/testify/require"
 )
 
 type zigzagJoinerTestCase struct {
@@ -34,21 +36,20 @@ type zigzagJoinerTestCase struct {
 	spec          distsqlpb.ZigzagJoinerSpec
 	outCols       []uint32
 	fixedValues   []sqlbase.EncDatumRow
-	expectedTypes []sqlbase.ColumnType
+	expectedTypes []types.T
 	expected      string
 }
 
-func intCols(numCols int) []sqlbase.ColumnType {
-	cols := make([]sqlbase.ColumnType, numCols)
+func intCols(numCols int) []types.T {
+	cols := make([]types.T, numCols)
 	for i := range cols {
-		cols[i] = sqlbase.IntType
+		cols[i] = *types.Int
 	}
 	return cols
 }
 
 func encInt(i int) sqlbase.EncDatum {
-	typeInt := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
-	return sqlbase.DatumToEncDatum(typeInt, tree.NewDInt(tree.DInt(i)))
+	return sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(i)))
 }
 
 func TestZigzagJoiner(t *testing.T) {
@@ -90,11 +91,15 @@ func TestZigzagJoiner(t *testing.T) {
 	}
 
 	sqlutils.CreateTableDebug(t, sqlDB, "empty",
-		"a INT, b INT, c INT, d INT, PRIMARY KEY (a,b), INDEX c (c), INDEX d (d)",
+		"a INT, b INT, x INT, c INT, d INT, PRIMARY KEY (a,b), INDEX c (c), INDEX d (d)",
 		0,
 		sqlutils.ToRowFn(aFn, bFn, cFn, dFn),
 		true, /* shouldPrint */
 	)
+
+	// Drop a column to test https://github.com/cockroachdb/cockroach/issues/37196
+	_, err := sqlDB.Exec("ALTER TABLE test.empty DROP COLUMN x")
+	require.NoError(t, err)
 
 	sqlutils.CreateTableDebug(t, sqlDB, "single",
 		"a INT, b INT, c INT, d INT, PRIMARY KEY (a,b), INDEX c (c), INDEX d (d)",
@@ -540,13 +545,12 @@ func TestZigzagJoinerDrain(t *testing.T) {
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	typeInt := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
 	v := [10]tree.Datum{}
 	for i := range v {
 		v[i] = tree.NewDInt(tree.DInt(i))
 	}
-	encThree := sqlbase.DatumToEncDatum(typeInt, v[3])
-	encSeven := sqlbase.DatumToEncDatum(typeInt, v[7])
+	encThree := sqlbase.DatumToEncDatum(types.Int, v[3])
+	encSeven := sqlbase.DatumToEncDatum(types.Int, v[7])
 
 	sqlutils.CreateTable(
 		t,
@@ -567,7 +571,7 @@ func TestZigzagJoinerDrain(t *testing.T) {
 	}
 
 	encRow := make(sqlbase.EncDatumRow, 1)
-	encRow[0] = sqlbase.DatumToEncDatum(sqlbase.IntType, tree.NewDInt(1))
+	encRow[0] = sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(1))
 
 	// ConsumerClosed verifies that when a joinReader's consumer is closed, the
 	// joinReader finishes gracefully.

@@ -18,15 +18,15 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/delegate"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
 )
 
 type planMaker interface {
@@ -42,7 +42,7 @@ type planMaker interface {
 	// This method should not be used directly; instead prefer makePlan()
 	// or prepare() below.
 	newPlan(
-		ctx context.Context, stmt tree.Statement, desiredTypes []types.T,
+		ctx context.Context, stmt tree.Statement, desiredTypes []*types.T,
 	) (planNode, error)
 
 	// makePlan prepares the query plan for a single SQL statement.  it
@@ -98,6 +98,11 @@ func (r *runParams) ExecCfg() *ExecutorConfig {
 	return r.extendedEvalCtx.ExecCfg
 }
 
+// Ann is a shortcut for the Annotations from the eval context.
+func (r *runParams) Ann() *tree.Annotations {
+	return r.extendedEvalCtx.EvalContext.Annotations
+}
+
 // planNode defines the interface for executing a query or portion of a query.
 //
 // The following methods apply to planNodes and contain special cases
@@ -111,7 +116,6 @@ func (r *runParams) ExecCfg() *ExecutorConfig {
 // - planNodeNames                 (walk.go)
 // - planMaker.optimizeFilters()   (filter_opt.go)
 // - setLimitHint()                (limit_hint.go)
-// - collectSpans()                (plan_spans.go)
 // - planOrdering()                (plan_ordering.go)
 // - planColumns()                 (plan_columns.go)
 //
@@ -166,6 +170,7 @@ type planNodeFastPath interface {
 var _ planNode = &alterIndexNode{}
 var _ planNode = &alterSequenceNode{}
 var _ planNode = &alterTableNode{}
+var _ planNode = &bufferNode{}
 var _ planNode = &cancelQueriesNode{}
 var _ planNode = &cancelSessionsNode{}
 var _ planNode = &createDatabaseNode{}
@@ -185,6 +190,7 @@ var _ planNode = &dropSequenceNode{}
 var _ planNode = &dropTableNode{}
 var _ planNode = &DropUserNode{}
 var _ planNode = &dropViewNode{}
+var _ planNode = &errorIfRowsNode{}
 var _ planNode = &explainDistSQLNode{}
 var _ planNode = &explainPlanNode{}
 var _ planNode = &filterNode{}
@@ -204,6 +210,7 @@ var _ planNode = &renameIndexNode{}
 var _ planNode = &renameTableNode{}
 var _ planNode = &renderNode{}
 var _ planNode = &rowCountNode{}
+var _ planNode = &scanBufferNode{}
 var _ planNode = &scanNode{}
 var _ planNode = &scatterNode{}
 var _ planNode = &serializeNode{}
@@ -212,6 +219,7 @@ var _ planNode = &showFingerprintsNode{}
 var _ planNode = &showTraceNode{}
 var _ planNode = &sortNode{}
 var _ planNode = &splitNode{}
+var _ planNode = &unsplitNode{}
 var _ planNode = &truncateNode{}
 var _ planNode = &unaryNode{}
 var _ planNode = &unionNode{}
@@ -306,6 +314,10 @@ type planTop struct {
 	// savedPlanForStats is conditionally populated at the end of
 	// statement execution, for registration in statement statistics.
 	savedPlanForStats *roachpb.ExplainTreePlanNode
+
+	// avoidBuffering, when set, causes the execution to avoid buffering
+	// results.
+	avoidBuffering bool
 }
 
 // makePlan implements the Planner interface. It populates the
@@ -314,8 +326,8 @@ type planTop struct {
 // The caller is responsible for populating the placeholders
 // beforehand (currently in semaCtx.Placeholders).
 //
-// After makePlan(), the caller should be careful to also call
-// p.curPlan.Close().
+// If no error is returned, the caller must call p.curPlan.Close() once the plan
+// is no longer needed.
 func (p *planner) makePlan(ctx context.Context) error {
 	// Reinitialize.
 	stmt := p.stmt
@@ -331,7 +343,7 @@ func (p *planner) makePlan(ctx context.Context) error {
 	cols := planColumns(p.curPlan.plan)
 	if stmt.ExpectedTypes != nil {
 		if !stmt.ExpectedTypes.TypesEqual(cols) {
-			return pgerror.NewError(pgerror.CodeFeatureNotSupportedError,
+			return pgerror.New(pgerror.CodeFeatureNotSupportedError,
 				"cached plan must not change result type")
 		}
 	}
@@ -431,22 +443,6 @@ func (p *planTop) columns() sqlbase.ResultColumns {
 	return planColumns(p.plan)
 }
 
-func (p *planTop) collectSpans(params runParams) (readSpans, writeSpans roachpb.Spans, err error) {
-	readSpans, writeSpans, err = collectSpans(params, p.plan)
-	if err != nil {
-		return nil, nil, err
-	}
-	for i := range params.p.curPlan.subqueryPlans {
-		reads, writes, err := collectSpans(params, params.p.curPlan.subqueryPlans[i].plan)
-		if err != nil {
-			return nil, nil, err
-		}
-		readSpans = append(readSpans, reads...)
-		writeSpans = append(writeSpans, writes...)
-	}
-	return readSpans, writeSpans, nil
-}
-
 // autoCommitNode is implemented by planNodes that might be able to commit the
 // KV txn in which they operate. Some nodes might want to do this to take
 // advantage of the 1PC optimization in case they're running as an implicit
@@ -502,9 +498,12 @@ func (p *planner) maybePlanHook(ctx context.Context, stmt tree.Statement) (planN
 	// upcoming IR work will provide unique numeric type tags, which will
 	// elegantly solve this.
 	for _, planHook := range planHooks {
-		if fn, header, subplans, err := planHook(ctx, stmt, p); err != nil {
+		if fn, header, subplans, avoidBuffering, err := planHook(ctx, stmt, p); err != nil {
 			return nil, err
 		} else if fn != nil {
+			if avoidBuffering {
+				p.curPlan.avoidBuffering = true
+			}
 			return &hookFnNode{f: fn, header: header, subplans: subplans}, nil
 		}
 	}
@@ -529,7 +528,7 @@ func (p *planner) delegateQuery(
 	name string,
 	sql string,
 	initialCheck func(ctx context.Context) error,
-	desiredTypes []types.T,
+	desiredTypes []*types.T,
 ) (planNode, error) {
 	log.VEventf(ctx, 2, "delegated query: %q", sql)
 
@@ -578,7 +577,7 @@ func (p *planner) delegateQuery(
 // newPlan constructs a planNode from a statement. This is used
 // recursively by the various node constructors.
 func (p *planner) newPlan(
-	ctx context.Context, stmt tree.Statement, desiredTypes []types.T,
+	ctx context.Context, stmt tree.Statement, desiredTypes []*types.T,
 ) (planNode, error) {
 	tracing.AnnotateTrace()
 
@@ -590,14 +589,14 @@ func (p *planner) newPlan(
 	canModifySchema := tree.CanModifySchema(stmt)
 	if canModifySchema {
 		if err := p.txn.SetSystemConfigTrigger(); err != nil {
-			return nil, errors.Wrap(err,
-				"schema change statement cannot follow a statement that has written in the same transaction")
+			return nil, pgerror.UnimplementedWithIssuef(26508,
+				"schema change statement cannot follow a statement that has written in the same transaction: %v", err)
 		}
 	}
 
 	if p.EvalContext().TxnReadOnly {
 		if canModifySchema || tree.CanWriteData(stmt) {
-			return nil, pgerror.NewErrorf(pgerror.CodeReadOnlySQLTransactionError,
+			return nil, pgerror.Newf(pgerror.CodeReadOnlySQLTransactionError,
 				"cannot execute %s in a read-only transaction", stmt.StatementTag())
 		}
 	}
@@ -700,56 +699,20 @@ func (p *planner) newPlan(
 		return p.SetSessionCharacteristics(n)
 	case *tree.ShowClusterSetting:
 		return p.ShowClusterSetting(ctx, n)
-	case *tree.ShowVar:
-		return p.ShowVar(ctx, n)
-	case *tree.ShowColumns:
-		return p.ShowColumns(ctx, n)
-	case *tree.ShowConstraints:
-		return p.ShowConstraints(ctx, n)
-	case *tree.ShowCreate:
-		return p.ShowCreate(ctx, n)
-	case *tree.ShowDatabases:
-		return p.ShowDatabases(ctx, n)
-	case *tree.ShowGrants:
-		return p.ShowGrants(ctx, n)
 	case *tree.ShowHistogram:
 		return p.ShowHistogram(ctx, n)
-	case *tree.ShowIndex:
-		return p.ShowIndex(ctx, n)
-	case *tree.ShowQueries:
-		return p.ShowQueries(ctx, n)
-	case *tree.ShowJobs:
-		return p.ShowJobs(ctx, n)
-	case *tree.ShowRoleGrants:
-		return p.ShowRoleGrants(ctx, n)
-	case *tree.ShowRoles:
-		return p.ShowRoles(ctx, n)
-	case *tree.ShowSessions:
-		return p.ShowSessions(ctx, n)
 	case *tree.ShowTableStats:
 		return p.ShowTableStats(ctx, n)
-	case *tree.ShowSyntax:
-		return p.ShowSyntax(ctx, n)
-	case *tree.ShowTables:
-		return p.ShowTables(ctx, n)
-	case *tree.ShowSchemas:
-		return p.ShowSchemas(ctx, n)
-	case *tree.ShowSequences:
-		return p.ShowSequences(ctx, n)
 	case *tree.ShowTraceForSession:
 		return p.ShowTrace(ctx, n)
-	case *tree.ShowTransactionStatus:
-		return p.ShowTransactionStatus(ctx)
-	case *tree.ShowUsers:
-		return p.ShowUsers(ctx, n)
 	case *tree.ShowZoneConfig:
 		return p.ShowZoneConfig(ctx, n)
-	case *tree.ShowRanges:
-		return p.ShowRanges(ctx, n)
 	case *tree.ShowFingerprints:
 		return p.ShowFingerprints(ctx, n)
 	case *tree.Split:
 		return p.Split(ctx, n)
+	case *tree.Unsplit:
+		return p.Unsplit(ctx, n)
 	case *tree.Truncate:
 		return p.Truncate(ctx, n)
 	case *tree.UnionClause:
@@ -760,8 +723,21 @@ func (p *planner) newPlan(
 		return p.Values(ctx, n, desiredTypes)
 	case *tree.ValuesClauseWithNames:
 		return p.Values(ctx, n, desiredTypes)
+	case tree.CCLOnlyStatement:
+		return nil, pgerror.Newf(pgerror.CodeCCLRequired,
+			"a CCL binary is required to use this statement type: %T", stmt)
 	default:
-		return nil, errors.Errorf("unknown statement type: %T", stmt)
+		var catalog optCatalog
+		catalog.init(p)
+		catalog.reset()
+		newStmt, err := delegate.TryDelegate(ctx, &catalog, p.EvalContext(), stmt)
+		if err != nil {
+			return nil, err
+		}
+		if newStmt != nil {
+			return p.newPlan(ctx, newStmt, nil /* desiredTypes */)
+		}
+		return nil, pgerror.AssertionFailedf("unknown statement type: %T", stmt)
 	}
 }
 
@@ -828,46 +804,18 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 		return p.SetZoneConfig(ctx, n)
 	case *tree.ShowClusterSetting:
 		return p.ShowClusterSetting(ctx, n)
-	case *tree.ShowVar:
-		return p.ShowVar(ctx, n)
-	case *tree.ShowCreate:
-		return p.ShowCreate(ctx, n)
-	case *tree.ShowColumns:
-		return p.ShowColumns(ctx, n)
-	case *tree.ShowDatabases:
-		return p.ShowDatabases(ctx, n)
-	case *tree.ShowGrants:
-		return p.ShowGrants(ctx, n)
-	case *tree.ShowIndex:
-		return p.ShowIndex(ctx, n)
-	case *tree.ShowConstraints:
-		return p.ShowConstraints(ctx, n)
-	case *tree.ShowQueries:
-		return p.ShowQueries(ctx, n)
-	case *tree.ShowJobs:
-		return p.ShowJobs(ctx, n)
-	case *tree.ShowRoleGrants:
-		return p.ShowRoleGrants(ctx, n)
-	case *tree.ShowRoles:
-		return p.ShowRoles(ctx, n)
-	case *tree.ShowSessions:
-		return p.ShowSessions(ctx, n)
-	case *tree.ShowTables:
-		return p.ShowTables(ctx, n)
-	case *tree.ShowSchemas:
-		return p.ShowSchemas(ctx, n)
-	case *tree.ShowSequences:
-		return p.ShowSequences(ctx, n)
+	case *tree.ShowHistogram:
+		return p.ShowHistogram(ctx, n)
+	case *tree.ShowTableStats:
+		return p.ShowTableStats(ctx, n)
 	case *tree.ShowTraceForSession:
 		return p.ShowTrace(ctx, n)
-	case *tree.ShowUsers:
-		return p.ShowUsers(ctx, n)
-	case *tree.ShowTransactionStatus:
-		return p.ShowTransactionStatus(ctx)
-	case *tree.ShowRanges:
-		return p.ShowRanges(ctx, n)
+	case *tree.ShowZoneConfig:
+		return p.ShowZoneConfig(ctx, n)
 	case *tree.Split:
 		return p.Split(ctx, n)
+	case *tree.Unsplit:
+		return p.Unsplit(ctx, n)
 	case *tree.Truncate:
 		return p.Truncate(ctx, n)
 	case *tree.Relocate:
@@ -877,6 +825,16 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 	case *tree.Update:
 		return p.Update(ctx, n, nil)
 	default:
+		var catalog optCatalog
+		catalog.init(p)
+		catalog.reset()
+		newStmt, err := delegate.TryDelegate(ctx, &catalog, p.EvalContext(), stmt)
+		if err != nil {
+			return nil, err
+		}
+		if newStmt != nil {
+			return p.newPlan(ctx, newStmt, nil /* desiredTypes */)
+		}
 		// Other statement types do not have result columns and do not
 		// support placeholders so there is no need for any special
 		// handling here.
@@ -901,6 +859,10 @@ type planFlags uint32
 const (
 	// planFlagOptUsed is set if the optimizer was used to create the plan.
 	planFlagOptUsed planFlags = (1 << iota)
+
+	// planFlagIsCorrelated is set if the plan contained a correlated subquery.
+	// This is used to enhance the error fallback and for telemetry.
+	planFlagOptIsCorrelated
 
 	// planFlagOptFallback is set if the optimizer was enabled but did not support the
 	// statement.

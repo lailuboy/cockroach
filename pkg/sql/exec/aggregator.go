@@ -15,13 +15,16 @@
 package exec
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
 	"github.com/pkg/errors"
 )
 
 // aggregateFunc is an aggregate function that performs computation on a batch
-// when Compute(batch) is called and writes the output to the ColVec passed in
+// when Compute(batch) is called and writes the output to the Vec passed in
 // in Init. The aggregateFunc performs an aggregation per group and outputs the
 // aggregation once the end of the group is reached. If the end of the group is
 // not reached before the batch is finished, the aggregateFunc will store a
@@ -33,7 +36,7 @@ type aggregateFunc interface {
 	// Init sets the groups for the aggregation and the output vector. Each index
 	// in groups corresponds to a column value in the input batch. true represents
 	// the first value of a new group.
-	Init(groups []bool, vec ColVec)
+	Init(groups []bool, vec coldata.Vec)
 
 	// Reset resets the aggregate function for another run. Primarily used for
 	// benchmarks.
@@ -54,7 +57,7 @@ type aggregateFunc interface {
 
 	// Compute computes the aggregation on the input batch. A zero-length input
 	// batch tells the aggregate function that it should flush its results.
-	Compute(batch ColBatch, inputIdxs []uint32)
+	Compute(batch coldata.Batch, inputIdxs []uint32)
 }
 
 // orderedAggregator is an aggregator that performs arbitrary aggregations on
@@ -82,19 +85,19 @@ type orderedAggregator struct {
 
 	done bool
 
-	aggCols [][]uint32
-	aggTyps [][]types.T
+	aggCols  [][]uint32
+	aggTypes [][]types.T
 
-	outputTyps []types.T
+	outputTypes []types.T
 
-	// scratch is the ColBatch to output and variables related to it. Aggregate
+	// scratch is the Batch to output and variables related to it. Aggregate
 	// function operators write directly to this output batch.
 	scratch struct {
-		ColBatch
+		coldata.Batch
 		// resumeIdx is the index at which the aggregation functions should start
 		// writing to on the next iteration of Next().
 		resumeIdx int
-		// outputSize is ColBatchSize by default.
+		// outputSize is col.BatchSize by default.
 		outputSize int
 	}
 
@@ -111,29 +114,27 @@ var _ Operator = &orderedAggregator{}
 // NewOrderedAggregator creates an ordered aggregator on the given grouping
 // columns. aggCols is a slice where each index represents a new aggregation
 // function. The slice at that index specifies the columns of the input batch
-// that the aggregate function should work on. aggTyps specifies the associated
-// types of these input columns.
-// TODO(asubiotto): Take in distsqlrun.AggregatorSpec_Func. This is currently
-// impossible due to an import cycle so we hack around it by taking in the raw
-// integer specifier.
+// that the aggregate function should work on.
 func NewOrderedAggregator(
 	input Operator,
-	groupCols []uint32,
-	groupTyps []types.T,
+	colTypes []types.T,
 	aggFns []distsqlpb.AggregatorSpec_Func,
+	groupCols []uint32,
 	aggCols [][]uint32,
-	aggTyps [][]types.T,
 ) (Operator, error) {
-	if len(aggFns) != len(aggCols) || len(aggFns) != len(aggTyps) {
+	if len(aggFns) != len(aggCols) {
 		return nil,
 			errors.Errorf(
-				"mismatched aggregation spec lengths: aggFns(%d), aggCols(%d), aggTyps(%d)",
+				"mismatched aggregation lengths: aggFns(%d), aggCols(%d)",
 				len(aggFns),
 				len(aggCols),
-				len(aggTyps),
 			)
 	}
-	op, groupCol, err := orderedDistinctColsToOperators(input, groupCols, groupTyps)
+
+	groupTypes := extractGroupTypes(groupCols, colTypes)
+	aggTypes := extractAggTypes(aggCols, colTypes)
+
+	op, groupCol, err := OrderedDistinctColsToOperators(input, groupCols, groupTypes)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +146,7 @@ func NewOrderedAggregator(
 		// oneShotOp to set the first row to distinct.
 		op = &oneShotOp{
 			input: op,
-			fn: func(batch ColBatch) {
+			fn: func(batch coldata.Batch) {
 				if batch.Length() == 0 {
 					return
 				}
@@ -159,30 +160,46 @@ func NewOrderedAggregator(
 		}
 	}
 
-	outputTyps := make([]types.T, len(aggCols))
-	aggregateFuncs := make([]aggregateFunc, len(aggCols))
 	*a = orderedAggregator{
 		input: op,
 
-		aggregateFuncs: aggregateFuncs,
-		aggCols:        aggCols,
-		aggTyps:        aggTyps,
-		outputTyps:     outputTyps,
-		groupCol:       groupCol,
+		aggCols:  aggCols,
+		aggTypes: aggTypes,
+		groupCol: groupCol,
 	}
+
+	a.aggregateFuncs, a.outputTypes, err = makeAggregateFuncs(aggTypes, aggFns)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return a, nil
+}
+
+func makeAggregateFuncs(
+	aggTyps [][]types.T, aggFns []distsqlpb.AggregatorSpec_Func,
+) ([]aggregateFunc, []types.T, error) {
+	funcs := make([]aggregateFunc, len(aggFns))
+	outTyps := make([]types.T, len(aggFns))
+
 	for i := range aggFns {
 		var err error
 		switch aggFns[i] {
 		case distsqlpb.AggregatorSpec_ANY_NOT_NULL:
-			a.aggregateFuncs[i], err = newAnyNotNullAgg(aggTyps[i][0])
+			funcs[i], err = newAnyNotNullAgg(aggTyps[i][0])
 		case distsqlpb.AggregatorSpec_AVG:
-			a.aggregateFuncs[i], err = newAvgAgg(aggTyps[i][0])
+			funcs[i], err = newAvgAgg(aggTyps[i][0])
 		case distsqlpb.AggregatorSpec_SUM, distsqlpb.AggregatorSpec_SUM_INT:
-			a.aggregateFuncs[i], err = newSumAgg(aggTyps[i][0])
+			funcs[i], err = newSumAgg(aggTyps[i][0])
 		case distsqlpb.AggregatorSpec_COUNT_ROWS:
-			a.aggregateFuncs[i] = newCountAgg()
+			funcs[i] = newCountAgg()
+		case distsqlpb.AggregatorSpec_MIN:
+			funcs[i], err = newMinAgg(aggTyps[i][0])
+		case distsqlpb.AggregatorSpec_MAX:
+			funcs[i], err = newMaxAgg(aggTyps[i][0])
 		default:
-			return nil, errors.Errorf("unsupported columnar aggregate function %d", aggFns[i])
+			return nil, nil, errors.Errorf("unsupported columnar aggregate function %d", aggFns[i])
 		}
 
 		// Set the output type of the aggregate.
@@ -190,18 +207,18 @@ func NewOrderedAggregator(
 		case distsqlpb.AggregatorSpec_COUNT_ROWS:
 			// TODO(jordan): this is a somewhat of a hack. The aggregate functions
 			// should come with their own output types, somehow.
-			a.outputTyps[i] = types.Int64
+			outTyps[i] = types.Int64
 		default:
 			// Output types are the input types for now.
-			a.outputTyps[i] = a.aggTyps[i][0]
+			outTyps[i] = aggTyps[i][0]
 		}
 
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
-	return a, nil
+	return funcs, outTyps, nil
 }
 
 func (a *orderedAggregator) initWithBatchSize(inputSize, outputSize int) {
@@ -209,8 +226,8 @@ func (a *orderedAggregator) initWithBatchSize(inputSize, outputSize int) {
 
 	// Twice the input batchSize is allocated to avoid having to check for
 	// overflow when outputting.
-	a.scratch.ColBatch = NewMemBatchWithSize(a.outputTyps, inputSize*2)
-	for i := 0; i < len(a.outputTyps); i++ {
+	a.scratch.Batch = coldata.NewMemBatchWithSize(a.outputTypes, inputSize*2)
+	for i := 0; i < len(a.outputTypes); i++ {
 		vec := a.scratch.ColVec(i)
 		a.aggregateFuncs[i].Init(a.groupCol, vec)
 	}
@@ -218,10 +235,10 @@ func (a *orderedAggregator) initWithBatchSize(inputSize, outputSize int) {
 }
 
 func (a *orderedAggregator) Init() {
-	a.initWithBatchSize(ColBatchSize, ColBatchSize)
+	a.initWithBatchSize(coldata.BatchSize, coldata.BatchSize)
 }
 
-func (a *orderedAggregator) Next() ColBatch {
+func (a *orderedAggregator) Next(ctx context.Context) coldata.Batch {
 	if a.done {
 		a.scratch.SetLength(0)
 		return a.scratch
@@ -230,11 +247,11 @@ func (a *orderedAggregator) Next() ColBatch {
 		// Copy the second part of the output batch into the first and resume from
 		// there.
 		newResumeIdx := a.scratch.resumeIdx - a.scratch.outputSize
-		for i := 0; i < len(a.outputTyps); i++ {
+		for i := 0; i < len(a.outputTypes); i++ {
 			// According to the aggregate function interface contract, the value at
 			// the current index must also be copied.
 			a.scratch.ColVec(i).Copy(a.scratch.ColVec(i), uint64(a.scratch.outputSize),
-				uint64(a.scratch.resumeIdx+1), a.outputTyps[i])
+				uint64(a.scratch.resumeIdx+1), a.outputTypes[i])
 			a.aggregateFuncs[i].SetOutputIndex(newResumeIdx)
 		}
 		a.scratch.resumeIdx = newResumeIdx
@@ -246,7 +263,7 @@ func (a *orderedAggregator) Next() ColBatch {
 	}
 
 	for a.scratch.resumeIdx < a.scratch.outputSize {
-		batch := a.input.Next()
+		batch := a.input.Next(ctx)
 		for i, fn := range a.aggregateFuncs {
 			fn.Compute(batch, a.aggCols[i])
 		}
@@ -258,7 +275,7 @@ func (a *orderedAggregator) Next() ColBatch {
 		// zero out a.groupCol. This is necessary because distinct ors the
 		// uniqueness of a value with the groupCol, allowing the operators to be
 		// linked.
-		copy(a.groupCol, zeroBoolVec)
+		copy(a.groupCol, zeroBoolColumn)
 	}
 
 	if a.scratch.resumeIdx > a.scratch.outputSize {
@@ -270,12 +287,43 @@ func (a *orderedAggregator) Next() ColBatch {
 	return a.scratch
 }
 
-// Reset resets the orderedAggregator for another run. Primarily used for
+// reset resets the orderedAggregator for another run. Primarily used for
 // benchmarks.
-func (a *orderedAggregator) Reset() {
+func (a *orderedAggregator) reset() {
+	if resetter, ok := a.input.(resetter); ok {
+		resetter.reset()
+	}
 	a.done = false
 	a.scratch.resumeIdx = 0
 	for _, fn := range a.aggregateFuncs {
 		fn.Reset()
 	}
+}
+
+// extractGroupTypes returns an array representing the type corresponding to
+// each group column. This information is extracted from the group column
+// indices and their corresponding column types.
+func extractGroupTypes(groupCols []uint32, colTypes []types.T) []types.T {
+	groupTyps := make([]types.T, len(groupCols))
+
+	for i, colIdx := range groupCols {
+		groupTyps[i] = colTypes[colIdx]
+	}
+
+	return groupTyps
+}
+
+// extractAggTypes returns a nested array representing the input types
+// corresponding to each aggregation function.
+func extractAggTypes(aggCols [][]uint32, colTypes []types.T) [][]types.T {
+	aggTyps := make([][]types.T, len(aggCols))
+
+	for aggIdx := range aggCols {
+		aggTyps[aggIdx] = make([]types.T, len(aggCols[aggIdx]))
+		for i, colIdx := range aggCols[aggIdx] {
+			aggTyps[aggIdx][i] = colTypes[colIdx]
+		}
+	}
+
+	return aggTyps
 }

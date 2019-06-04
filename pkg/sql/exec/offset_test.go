@@ -15,8 +15,10 @@
 package exec
 
 import (
+	"context"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
 )
 
@@ -66,16 +68,17 @@ func TestOffset(t *testing.T) {
 }
 
 func BenchmarkOffset(b *testing.B) {
-	batch := NewMemBatch([]types.T{types.Int64, types.Int64, types.Int64})
-	batch.SetLength(ColBatchSize)
-	source := newRepeatableBatchSource(batch)
+	ctx := context.Background()
+	batch := coldata.NewMemBatch([]types.T{types.Int64, types.Int64, types.Int64})
+	batch.SetLength(coldata.BatchSize)
+	source := NewRepeatableBatchSource(batch)
 	source.Init()
 
 	o := NewOffsetOp(source, 1)
 	// Set throughput proportional to size of the selection vector.
-	b.SetBytes(2 * ColBatchSize)
+	b.SetBytes(2 * coldata.BatchSize)
 	for i := 0; i < b.N; i++ {
 		o.(*offsetOp).Reset()
-		o.Next()
+		o.Next(ctx)
 	}
 }

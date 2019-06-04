@@ -27,9 +27,11 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/apd"
-	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/types/conv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	semtypes "github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // {{/*
@@ -38,28 +40,28 @@ import (
 var _ apd.Decimal
 
 const (
-	_SEMANTIC_TYPE = sqlbase.ColumnType_SemanticType(0)
-	_WIDTH         = int32(0)
+	_FAMILY = semtypes.Family(0)
+	_WIDTH  = int32(0)
 )
 
 type _GOTYPE interface{}
 
 func _ROWS_TO_COL_VEC(
-	rows sqlbase.EncDatumRows, vec ColVec, columnIdx int, alloc *sqlbase.DatumAlloc,
+	rows sqlbase.EncDatumRows, vec coldata.Vec, columnIdx int, alloc *sqlbase.DatumAlloc,
 ) error { // */}}
 	// {{define "rowsToColVec"}}
-	nRows := uint16(len(rows))
 	col := vec._TemplateType()
-	datumToPhysicalFn := types.GetDatumToPhysicalFn(*columnType)
-	for i := uint16(0); i < nRows; i++ {
-		if rows[i][columnIdx].Datum == nil {
-			if err := rows[i][columnIdx].EnsureDecoded(columnType, alloc); err != nil {
+	datumToPhysicalFn := conv.GetDatumToPhysicalFn(columnType)
+	for i := range rows {
+		row := rows[i]
+		if row[columnIdx].Datum == nil {
+			if err := row[columnIdx].EnsureDecoded(columnType, alloc); err != nil {
 				return err
 			}
 		}
-		datum := rows[i][columnIdx].Datum
+		datum := row[columnIdx].Datum
 		if datum == tree.DNull {
-			vec.SetNull(i)
+			vec.Nulls().SetNull(uint16(i))
 		} else {
 			v, err := datumToPhysicalFn(datum)
 			if err != nil {
@@ -79,30 +81,30 @@ func _ROWS_TO_COL_VEC(
 // vector. columnIdx is the 0-based index of the column in the EncDatumRows.
 func EncDatumRowsToColVec(
 	rows sqlbase.EncDatumRows,
-	vec ColVec,
+	vec coldata.Vec,
 	columnIdx int,
-	columnType *sqlbase.ColumnType,
+	columnType *semtypes.T,
 	alloc *sqlbase.DatumAlloc,
 ) error {
 
-	switch columnType.SemanticType {
+	switch columnType.Family() {
 	// {{range .}}
-	case _SEMANTIC_TYPE:
+	case _FAMILY:
 		// {{ if .Widths }}
-		switch columnType.Width {
+		switch columnType.Width() {
 		// {{range .Widths}}
 		case _WIDTH:
 			_ROWS_TO_COL_VEC(rows, vec, columnIdx, columnType, alloc)
 		// {{end}}
 		default:
-			panic(fmt.Sprintf("unsupported width %d for column type %s", columnType.Width, columnType.SQLString()))
+			panic(fmt.Sprintf("unsupported width %d for column type %s", columnType.Width(), columnType.String()))
 		}
 		// {{ else }}
 		_ROWS_TO_COL_VEC(rows, vec, columnIdx, columnType, alloc)
 		// {{end}}
 	// {{end}}
 	default:
-		panic(fmt.Sprintf("unsupported column type %s", columnType.SQLString()))
+		panic(fmt.Sprintf("unsupported column type %s", columnType.String()))
 	}
 	return nil
 }

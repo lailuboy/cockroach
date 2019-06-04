@@ -14,6 +14,12 @@
 
 package exec
 
+import (
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
+)
+
 // boolVecToSelOp transforms a boolean column into a selection vector by adding
 // an index to the selection for each true value in the boolean column.
 type boolVecToSelOp struct {
@@ -26,14 +32,13 @@ type boolVecToSelOp struct {
 
 var _ Operator = &boolVecToSelOp{}
 
-var zeroBoolVec = make([]bool, ColBatchSize)
-
-func (p *boolVecToSelOp) Next() ColBatch {
+func (p *boolVecToSelOp) Next(ctx context.Context) coldata.Batch {
 	// Loop until we have non-zero amount of output to return, or our input's been
 	// exhausted.
 	for {
-		batch := p.input.Next()
-		if batch.Length() == 0 {
+		batch := p.input.Next(ctx)
+		n := batch.Length()
+		if n == 0 {
 			return batch
 		}
 		outputCol := p.outputCol
@@ -43,33 +48,35 @@ func (p *boolVecToSelOp) Next() ColBatch {
 		// Note that, if the input already had a selection vector, the output
 		// selection vector will be a subset of the input selection vector.
 		idx := uint16(0)
-		n := batch.Length()
 		if sel := batch.Selection(); sel != nil {
-			for s := uint16(0); s < n; s++ {
+			sel = sel[:n]
+			for s := range sel {
 				i := sel[s]
+				var inc uint16
+				// This form is transformed into a data dependency by the compiler,
+				// avoiding an expensive conditional branch.
 				if outputCol[i] {
-					sel[idx] = i
-					idx++
+					inc = 1
 				}
+				sel[idx] = i
+				idx += inc
 			}
 		} else {
 			batch.SetSelection(true)
 			sel := batch.Selection()
-			for i := uint16(0); i < n; i++ {
+			for i := range outputCol[:n] {
+				var inc uint16
+				// Ditto above: replace a conditional with a data dependency.
 				if outputCol[i] {
-					sel[idx] = i
-					idx++
+					inc = 1
 				}
+				sel[idx] = uint16(i)
+				idx += inc
 			}
 		}
 
 		if idx == 0 {
 			continue
-		}
-
-		// Zero our output column for next time.
-		for i := range p.outputCol {
-			p.outputCol[i] = false
 		}
 
 		batch.SetLength(idx)
@@ -89,4 +96,35 @@ func boolVecToSel64(vec []bool, sel []uint64) []uint64 {
 		}
 	}
 	return sel
+}
+
+// NewBoolVecToSelOp is the operator form of boolVecToSelOp. It filters its
+// input batch by the boolean column specified by colIdx.
+//
+// For internal use cases that just need a way to create a selection vector
+// based on a boolean column that *isn't* in a batch, just create a
+// boolVecToSelOp directly with the desired boolean slice.
+func NewBoolVecToSelOp(input Operator, colIdx int) Operator {
+	d := selBoolOp{input: input, colIdx: colIdx}
+	ret := &boolVecToSelOp{input: &d}
+	d.boolVecToSelOp = ret
+	return ret
+}
+
+// selBoolOp is a small helper operator that transforms a boolVecToSelOp into
+// an operator that can see the inside of its input batch for NewBoolVecToSelOp.
+type selBoolOp struct {
+	input          Operator
+	boolVecToSelOp *boolVecToSelOp
+	colIdx         int
+}
+
+func (d selBoolOp) Init() {
+	d.input.Init()
+}
+
+func (d selBoolOp) Next(ctx context.Context) coldata.Batch {
+	batch := d.input.Next(ctx)
+	d.boolVecToSelOp.outputCol = batch.ColVec(d.colIdx).Bool()
+	return batch
 }

@@ -418,7 +418,7 @@ project
  │    ├── grouping columns: rownum:10(int!null)
  │    ├── left-join
  │    │    ├── columns: expr:3(int) true:7(bool) rownum:10(int!null)
- │    │    ├── row-number
+ │    │    ├── ordinality
  │    │    │    ├── columns: expr:3(int) rownum:10(int!null)
  │    │    │    └── project
  │    │    │         ├── columns: expr:3(int)
@@ -444,8 +444,8 @@ build
 SELECT x::VARCHAR(2) FROM b
 ----
 project
- ├── columns: x:3(string)
+ ├── columns: x:3(varchar)
  ├── scan b
  │    └── columns: b.x:1(string!null) z:2(decimal!null)
  └── projections
-      └── b.x::VARCHAR(2) [type=string]
+      └── b.x::VARCHAR(2) [type=varchar]

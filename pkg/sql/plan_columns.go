@@ -74,7 +74,7 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 	case *explainPlanNode:
 		return n.run.results.columns
 	case *windowNode:
-		return n.run.values.columns
+		return n.columns
 	case *showTraceNode:
 		return n.columns
 	case *zeroNode:
@@ -91,6 +91,8 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 		return n.resultColumns
 	case *projectSetNode:
 		return n.columns
+	case *applyJoinNode:
+		return n.columns
 	case *lookupJoinNode:
 		return n.columns
 	case *zigzagJoinNode:
@@ -105,12 +107,12 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 		return n.getColumns(mut, relocateNodeColumns)
 	case *scatterNode:
 		return n.getColumns(mut, scatterNodeColumns)
-	case *showZoneConfigNode:
-		return n.getColumns(mut, showZoneConfigNodeColumns)
 	case *showFingerprintsNode:
 		return n.getColumns(mut, showFingerprintsColumns)
 	case *splitNode:
 		return n.getColumns(mut, splitNodeColumns)
+	case *unsplitNode:
+		return n.getColumns(mut, unsplitNodeColumns)
 	case *showTraceReplicaNode:
 		return n.getColumns(mut, sqlbase.ShowReplicaTraceColumns)
 	case *sequenceSelectNode:
@@ -118,6 +120,8 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 
 	// Nodes that have the same schema as their source or their
 	// valueNode helper.
+	case *bufferNode:
+		return getPlanColumns(n.plan, mut)
 	case *distinctNode:
 		return getPlanColumns(n.plan, mut)
 	case *filterNode:
@@ -130,6 +134,10 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 		return getPlanColumns(n.source, mut)
 	case *serializeNode:
 		return getPlanColumns(n.source, mut)
+	case *saveTableNode:
+		return getPlanColumns(n.source, mut)
+	case *scanBufferNode:
+		return getPlanColumns(n.buffer, mut)
 
 	case *rowSourceToPlanNode:
 		return n.planCols

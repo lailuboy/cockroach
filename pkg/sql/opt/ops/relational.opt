@@ -171,7 +171,7 @@ define Project {
 # predicate are filtered. While expressions in the predicate can refer to
 # columns projected by either the left or right inputs, the inputs are not
 # allowed to refer to the other's projected columns.
-[Relational, Join, JoinNonApply]
+[Relational, Join, JoinNonApply, Telemetry]
 define InnerJoin {
     Left  RelExpr
     Right RelExpr
@@ -180,7 +180,7 @@ define InnerJoin {
     _ JoinPrivate
 }
 
-[Relational, Join, JoinNonApply]
+[Relational, Join, JoinNonApply, Telemetry]
 define LeftJoin {
     Left  RelExpr
     Right RelExpr
@@ -189,7 +189,7 @@ define LeftJoin {
    _ JoinPrivate
 }
 
-[Relational, Join, JoinNonApply]
+[Relational, Join, JoinNonApply, Telemetry]
 define RightJoin {
     Left  RelExpr
     Right RelExpr
@@ -198,7 +198,7 @@ define RightJoin {
     _ JoinPrivate
 }
 
-[Relational, Join, JoinNonApply]
+[Relational, Join, JoinNonApply, Telemetry]
 define FullJoin {
     Left  RelExpr
     Right RelExpr
@@ -207,7 +207,7 @@ define FullJoin {
     _ JoinPrivate
 }
 
-[Relational, Join, JoinNonApply]
+[Relational, Join, JoinNonApply, Telemetry]
 define SemiJoin {
     Left  RelExpr
     Right RelExpr
@@ -216,7 +216,7 @@ define SemiJoin {
     _ JoinPrivate
 }
 
-[Relational, Join, JoinNonApply]
+[Relational, Join, JoinNonApply, Telemetry]
 define AntiJoin {
     Left  RelExpr
     Right RelExpr
@@ -260,7 +260,7 @@ define IndexJoinPrivate {
 
 # LookupJoin represents a join between an input expression and an index. The
 # type of join is in the LookupJoinPrivate field.
-[Relational]
+[Relational, Telemetry]
 define LookupJoin {
     Input RelExpr
     On    FiltersExpr
@@ -303,13 +303,15 @@ define LookupJoinPrivate {
     # join, treating it as if it were another relational input. This makes the
     # lookup join appear more like other join operators.
     lookupProps RelProps
+
+    _ JoinPrivate
 }
 
 # MergeJoin represents a join that is executed using merge-join.
 # MergeOn is a scalar which contains the ON condition and merge-join ordering
 # information; see the MergeOn scalar operator.
 # It can be any type of join (identified in the MergeJoinPrivate field).
-[Relational]
+[Relational, Telemetry]
 define MergeJoin {
     Left  RelExpr
     Right RelExpr
@@ -341,6 +343,8 @@ define MergeJoinPrivate {
     # columns and orderings.
     LeftOrdering  OrderingChoice
     RightOrdering OrderingChoice
+
+    _ JoinPrivate
 }
 
 # ZigzagJoin represents a join that is executed using the zigzag joiner.
@@ -349,7 +353,7 @@ define MergeJoinPrivate {
 # support arbitrary inputs.
 #
 # TODO(itsbilal): Add support for representing multi-way zigzag joins.
-[Relational]
+[Relational, Telemetry]
 define ZigzagJoin {
     On   FiltersExpr
 
@@ -403,7 +407,7 @@ define ZigzagJoinPrivate {
 # InnerJoinApply has the same join semantics as InnerJoin. However, unlike
 # InnerJoin, it allows the right input to refer to columns projected by the
 # left input.
-[Relational, Join, JoinApply]
+[Relational, Join, JoinApply, Telemetry]
 define InnerJoinApply {
     Left  RelExpr
     Right RelExpr
@@ -412,7 +416,7 @@ define InnerJoinApply {
     _ JoinPrivate
 }
 
-[Relational, Join, JoinApply]
+[Relational, Join, JoinApply, Telemetry]
 define LeftJoinApply {
     Left  RelExpr
     Right RelExpr
@@ -421,7 +425,7 @@ define LeftJoinApply {
     _ JoinPrivate
 }
 
-[Relational, Join, JoinApply]
+[Relational, Join, JoinApply, Telemetry]
 define RightJoinApply {
     Left  RelExpr
     Right RelExpr
@@ -430,7 +434,7 @@ define RightJoinApply {
     _ JoinPrivate
 }
 
-[Relational, Join, JoinApply]
+[Relational, Join, JoinApply, Telemetry]
 define FullJoinApply {
     Left  RelExpr
     Right RelExpr
@@ -439,7 +443,7 @@ define FullJoinApply {
     _ JoinPrivate
 }
 
-[Relational, Join, JoinApply]
+[Relational, Join, JoinApply, Telemetry]
 define SemiJoinApply {
     Left  RelExpr
     Right RelExpr
@@ -448,7 +452,7 @@ define SemiJoinApply {
     _ JoinPrivate
 }
 
-[Relational, Join, JoinApply]
+[Relational, Join, JoinApply, Telemetry]
 define AntiJoinApply {
     Left  RelExpr
     Right RelExpr
@@ -475,7 +479,7 @@ define AntiJoinApply {
 # dependent aggregation (like ARRAY_AGG). Grouping columns are inconsequential
 # in this ordering; we currently set all grouping columns as optional in this
 # ordering (but note that this is not required by the operator).
-[Relational, Grouping]
+[Relational, Grouping, Telemetry]
 define GroupBy {
     Input        RelExpr
     Aggregations AggregationsExpr
@@ -519,7 +523,7 @@ define GroupingPrivate {
 # GroupBy and can be used in the same rules (when appropriate). In the
 # ScalarGroupBy case, the grouping column field in GroupingPrivate is always
 # empty.
-[Relational, Grouping]
+[Relational, Grouping, Telemetry]
 define ScalarGroupBy {
     Input        RelExpr
     Aggregations AggregationsExpr
@@ -561,7 +565,7 @@ define ScalarGroupBy {
 # it's polymorphic with GroupBy and can be used in the same rules (when
 # appropriate). In the DistinctOn case, the aggregations can be only FirstAgg or
 # ConstAgg.
-[Relational, Grouping]
+[Relational, Grouping, Telemetry]
 define DistinctOn {
     Input        RelExpr
     Aggregations AggregationsExpr
@@ -601,6 +605,9 @@ define Union {
 #   Left:  [2, 1]
 #   Right: [4, 3]
 #   Out:   [5, 6]  <-- synthesized output columns
+#
+# To make normalization rules and execution simpler, both inputs to the set op
+# must have matching types.
 [Private]
 define SetPrivate {
     LeftCols  ColList
@@ -787,17 +794,17 @@ define ShowTracePrivate {
     ColList ColList
 }
 
-# RowNumber adds a column to each row in its input containing a unique,
+# Ordinality adds a column to each row in its input containing a unique,
 # increasing number.
 [Relational]
-define RowNumber {
+define Ordinality {
     Input RelExpr
 
-    _ RowNumberPrivate
+    _ OrdinalityPrivate
 }
 
 [Private]
-define RowNumberPrivate {
+define OrdinalityPrivate {
     # Ordering denotes the required ordering of the input.
     Ordering OrderingChoice
 
@@ -820,8 +827,53 @@ define RowNumberPrivate {
 # of R with zip(a,b,c).
 #
 # See the Zip header for more details.
-[Relational]
+[Relational, Telemetry]
 define ProjectSet {
     Input RelExpr
     Zip   ZipExpr
+}
+
+# Window represents a window function. Window functions are operators which
+# allow computations that take into consideration other rows in the same result
+# set.
+#
+# More concretely, a window function is a relational operator that takes in a
+# result set and appends a single new column whose value depends on the other
+# rows within the result set, and that row's relative position in it.
+#
+# Depending on the exact window function being computed, the value of the new
+# column could be the position of the row in the output (`row_number`), or a
+# cumulative sum, or something else.
+[Relational]
+define Window {
+    Input    RelExpr
+
+    # Windows is the set of window functions to be computed for this operator.
+    Windows WindowsExpr
+
+    _ WindowPrivate
+}
+
+[Private]
+define WindowPrivate {
+    # Partition is the set of columns to partition on. Every set of rows
+    # sharing the values for this set of columns will be treated independently.
+    Partition ColSet
+
+    # Ordering is the ordering that the window function is computed relative to
+    # within each partition.
+    Ordering OrderingChoice
+}
+
+# FakeRel is a mock relational operator used for testing; its logical properties
+# are pre-determined and stored in the private. It can be used as the child of
+# an operator for which we are calculating properties or statistics.
+[Relational]
+define FakeRel {
+    _ FakeRelPrivate
+}
+
+[Private]
+define FakeRelPrivate {
+    Props RelPropsPtr
 }

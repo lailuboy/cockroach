@@ -21,8 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
 )
 
 // ProcessInboundStream receives rows from a DistSQL_FlowStreamServer and sends
@@ -63,7 +63,7 @@ func processInboundStreamHelper(
 
 	sendErrToConsumer := func(err error) {
 		if err != nil {
-			dst.Push(nil, &ProducerMetadata{Err: err})
+			dst.Push(nil, &distsqlpb.ProducerMetadata{Err: err})
 		}
 		dst.ProducerDone()
 	}
@@ -97,7 +97,7 @@ func processInboundStreamHelper(
 			if err != nil {
 				if err != io.EOF {
 					// Communication error.
-					err = pgerror.NewErrorf(pgerror.CodeConnectionFailureError, "communication error: %s", err)
+					err = pgerror.Newf(pgerror.CodeConnectionFailureError, "communication error: %s", err)
 					sendErrToConsumer(err)
 					errChan <- err
 					return
@@ -154,11 +154,12 @@ func processProducerMessage(
 	err := sd.AddMessage(msg)
 	if err != nil {
 		return processMessageResult{
-			err:            errors.Wrap(err, log.MakeMessage(ctx, "decoding error", nil /* args */)),
+			err: pgerror.Wrapf(err, pgerror.CodeDataExceptionError, "%s",
+				log.MakeMessage(ctx, "decoding error", nil /* args */)),
 			consumerClosed: false,
 		}
 	}
-	var types []sqlbase.ColumnType
+	var types []types.T
 	for {
 		row, meta, err := sd.GetRow(nil /* rowBuf */)
 		if err != nil {

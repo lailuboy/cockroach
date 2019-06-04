@@ -27,15 +27,16 @@ import (
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/lib/pq/oid"
 	"github.com/pkg/errors"
 )
@@ -55,7 +56,7 @@ type pgType struct {
 	size int
 }
 
-func pgTypeForParserType(t types.T) pgType {
+func pgTypeForParserType(t *types.T) pgType {
 	size := -1
 	if s, variable := tree.DatumTypeSize(t); !variable {
 		size = int(s)
@@ -66,7 +67,35 @@ func pgTypeForParserType(t types.T) pgType {
 	}
 }
 
-const secondsInDay = 24 * 60 * 60
+var resultOidMap = map[oid.Oid]oid.Oid{
+	oid.T_bit:      oid.T_varbit,
+	oid.T__bit:     oid.T__varbit,
+	oid.T_bpchar:   oid.T_text,
+	oid.T__bpchar:  oid.T__text,
+	oid.T_char:     oid.T_text,
+	oid.T__char:    oid.T__text,
+	oid.T_float4:   oid.T_float8,
+	oid.T__float4:  oid.T__float8,
+	oid.T_int2:     oid.T_int8,
+	oid.T__int2:    oid.T__int8,
+	oid.T_int4:     oid.T_int8,
+	oid.T__int4:    oid.T__int8,
+	oid.T_varchar:  oid.T_text,
+	oid.T__varchar: oid.T__text,
+}
+
+// mapResultOid maps an Oid value returned by the server to an Oid value that is
+// backwards-compatible with previous versions of CRDB. See this issue for more
+// details: https://github.com/cockroachdb/cockroach/issues/36811
+//
+// TODO(andyk): Remove this once issue #36811 is resolved.
+func mapResultOid(o oid.Oid) oid.Oid {
+	mapped := resultOidMap[o]
+	if mapped != 0 {
+		return mapped
+	}
+	return o
+}
 
 func (b *writeBuffer) writeTextDatum(
 	ctx context.Context, d tree.Datum, conv sessiondata.DataConversionConfig,
@@ -122,11 +151,9 @@ func (b *writeBuffer) writeTextDatum(
 		b.writeLengthPrefixedString(v.Contents)
 
 	case *tree.DDate:
-		t := timeutil.Unix(int64(*v)*secondsInDay, 0)
-		// Start at offset 4 because `putInt32` clobbers the first 4 bytes.
-		s := formatDate(t, nil, b.putbuf[4:4])
+		s := v.Date.String()
 		b.putInt32(int32(len(s)))
-		b.write(s)
+		b.write([]byte(s))
 
 	case *tree.DTime:
 		// Start at offset 4 because `putInt32` clobbers the first 4 bytes.
@@ -161,7 +188,8 @@ func (b *writeBuffer) writeTextDatum(
 		case oid.T_int2vector, oid.T_oidvector:
 			// vectors are serialized as a string of space-separated values.
 			sep := ""
-			// TODO(justin): add a test for nested arrays.
+			// TODO(justin): add a test for nested arrays when #32552 is
+			// addressed.
 			for _, d := range v.Array {
 				b.textFormatter.WriteString(sep)
 				b.textFormatter.FormatNode(d)
@@ -275,7 +303,7 @@ func (b *writeBuffer) writeBinaryDatum(
 				// The above encoding is not correct for Infinity, but since that encoding
 				// doesn't exist in postgres, it's unclear what to do. For now use the NaN
 				// encoding and count it to see if anyone even needs this.
-				telemetry.Count("pgwire.#32489.binary_decimal_infinity")
+				telemetry.Inc(sqltelemetry.BinaryDecimalInfinityCounter)
 			}
 
 			return
@@ -404,7 +432,7 @@ func (b *writeBuffer) writeBinaryDatum(
 
 	case *tree.DDate:
 		b.putInt32(4)
-		b.putInt32(dateToPgBinary(v))
+		b.putInt32(v.PGEpochDays())
 
 	case *tree.DTime:
 		b.putInt32(8)
@@ -429,8 +457,9 @@ func (b *writeBuffer) writeBinaryDatum(
 		b.writeLengthPrefixedBuffer(&subWriter.wrapped)
 
 	case *tree.DArray:
-		if v.ParamTyp.FamilyEqual(types.AnyArray) {
-			b.setError(errors.New("unsupported binary serialization of multidimensional arrays"))
+		if v.ParamTyp.Family() == types.ArrayFamily {
+			b.setError(pgerror.UnimplementedWithIssueDetail(32552,
+				"binenc", "unsupported binary serialization of multidimensional arrays"))
 			return
 		}
 		// TODO(andrei): We shouldn't be allocating a new buffer for every array.
@@ -461,7 +490,7 @@ func (b *writeBuffer) writeBinaryDatum(
 		b.putInt32(4)
 		b.putInt32(int32(v.DInt))
 	default:
-		b.setError(errors.Errorf("unsupported type %T", d))
+		b.setError(pgerror.AssertionFailedf("unsupported type %T", d))
 	}
 }
 
@@ -487,10 +516,6 @@ func formatTs(t time.Time, offset *time.Location, tmp []byte) (b []byte) {
 		format = pgTimeStampFormatNoOffset
 	}
 	return formatTsWithFormat(format, t, offset, tmp)
-}
-
-func formatDate(t time.Time, offset *time.Location, tmp []byte) []byte {
-	return formatTsWithFormat(pgDateFormat, t, offset, tmp)
 }
 
 // formatTsWithFormat formats t with an optional offset into a format
@@ -529,11 +554,4 @@ func timeToPgBinary(t time.Time, offset *time.Location) int64 {
 		t = t.UTC()
 	}
 	return duration.DiffMicros(t, pgwirebase.PGEpochJDate)
-}
-
-// dateToPgBinary calculates the Postgres binary format for a date. The date is
-// represented as the number of days between the given date and Jan 1, 2000
-// (dubbed the PGEpochJDate), stored within an int32.
-func dateToPgBinary(d *tree.DDate) int32 {
-	return int32(*d) - pgwirebase.PGEpochJDateFromUnix
 }

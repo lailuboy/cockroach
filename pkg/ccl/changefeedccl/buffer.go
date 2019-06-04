@@ -17,9 +17,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
@@ -36,8 +37,6 @@ type bufferEntry struct {
 
 // buffer mediates between the changed data poller and the rest of the
 // changefeed pipeline (which is backpressured all the way to the sink).
-//
-// TODO(dan): Monitor memory usage and spill to disk when necessary.
 type buffer struct {
 	entriesCh chan bufferEntry
 }
@@ -46,13 +45,12 @@ func makeBuffer() *buffer {
 	return &buffer{entriesCh: make(chan bufferEntry)}
 }
 
-// AddKV inserts a changed kv into the buffer.
-//
-// TODO(dan): AddKV currently requires that each key is added in increasing mvcc
-// timestamp order. This will have to change when we add support for RangeFeed,
-// which starts out in a catchup state without this guarantee.
-func (b *buffer) AddKV(ctx context.Context, kv roachpb.KeyValue, minTimestamp hlc.Timestamp) error {
-	return b.addEntry(ctx, bufferEntry{kv: kv, schemaTimestamp: minTimestamp})
+// AddKV inserts a changed kv into the buffer. Individual keys must be added in
+// increasing mvcc order.
+func (b *buffer) AddKV(
+	ctx context.Context, kv roachpb.KeyValue, schemaTimestamp hlc.Timestamp,
+) error {
+	return b.addEntry(ctx, bufferEntry{kv: kv, schemaTimestamp: schemaTimestamp})
 }
 
 // AddResolved inserts a resolved timestamp notification in the buffer.
@@ -61,7 +59,6 @@ func (b *buffer) AddResolved(ctx context.Context, span roachpb.Span, ts hlc.Time
 }
 
 func (b *buffer) addEntry(ctx context.Context, e bufferEntry) error {
-	// TODO(dan): Spill to a temp rocksdb if entriesCh would block.
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -82,25 +79,38 @@ func (b *buffer) Get(ctx context.Context) (bufferEntry, error) {
 	}
 }
 
-var memBufferColTypes = []sqlbase.ColumnType{
-	{SemanticType: sqlbase.ColumnType_BYTES}, // kv.Key
-	{SemanticType: sqlbase.ColumnType_BYTES}, // kv.Value
-	{SemanticType: sqlbase.ColumnType_BYTES}, // span.Key
-	{SemanticType: sqlbase.ColumnType_BYTES}, // span.EndKey
-	{SemanticType: sqlbase.ColumnType_INT},   // ts.WallTime
-	{SemanticType: sqlbase.ColumnType_INT},   // ts.Logical
-	{SemanticType: sqlbase.ColumnType_INT},   // schemaTimestamp.WallTime
-	{SemanticType: sqlbase.ColumnType_INT},   // schemaTimestamp.Logical
+// memBufferDefaultCapacity is the default capacity for a memBuffer for a single
+// changefeed.
+//
+// TODO(dan): It would be better if all changefeeds shared a single capacity
+// that was given by the operater at startup, like we do for RocksDB and SQL.
+var memBufferDefaultCapacity = envutil.EnvOrDefaultBytes(
+	"COCKROACH_CHANGEFEED_BUFFER_CAPACITY", 1<<30) // 1GB
+
+var memBufferColTypes = []types.T{
+	*types.Bytes, // kv.Key
+	*types.Bytes, // kv.Value
+	*types.Bytes, // span.Key
+	*types.Bytes, // span.EndKey
+	*types.Int,   // ts.WallTime
+	*types.Int,   // ts.Logical
+	*types.Int,   // schemaTimestamp.WallTime
+	*types.Int,   // schemaTimestamp.Logical
 }
 
 // memBuffer is an in-memory buffer for changed KV and resolved timestamp
 // events. It's size is limited only by the BoundAccount passed to the
-// constructor.
+// constructor. memBuffer is only for use with single-producer single-consumer.
 type memBuffer struct {
+	metrics *Metrics
+
 	mu struct {
 		syncutil.Mutex
 		entries rowcontainer.RowContainer
 	}
+	// signalCh can be selected on to learn when an entry is written to
+	// mu.entries.
+	signalCh chan struct{}
 
 	allocMu struct {
 		syncutil.Mutex
@@ -108,8 +118,11 @@ type memBuffer struct {
 	}
 }
 
-func makeMemBuffer(acc mon.BoundAccount) *memBuffer {
-	b := &memBuffer{}
+func makeMemBuffer(acc mon.BoundAccount, metrics *Metrics) *memBuffer {
+	b := &memBuffer{
+		metrics:  metrics,
+		signalCh: make(chan struct{}, 1),
+	}
 	b.mu.entries.Init(acc, sqlbase.ColTypeInfoFromColTypes(memBufferColTypes), 0 /* rowCapacity */)
 	return b
 }
@@ -120,7 +133,8 @@ func (b *memBuffer) Close(ctx context.Context) {
 	b.mu.Unlock()
 }
 
-// AddKV inserts a changed kv into the buffer.
+// AddKV inserts a changed kv into the buffer. Individual keys must be added in
+// increasing mvcc order.
 func (b *memBuffer) AddKV(
 	ctx context.Context, kv roachpb.KeyValue, schemaTimestamp hlc.Timestamp,
 ) error {
@@ -196,17 +210,18 @@ func (b *memBuffer) addRow(ctx context.Context, row tree.Datums) error {
 	b.mu.Lock()
 	_, err := b.mu.entries.AddRow(ctx, row)
 	b.mu.Unlock()
+	b.metrics.BufferEntriesIn.Inc(1)
+	select {
+	case b.signalCh <- struct{}{}:
+	default:
+		// Already signaled, don't need to signal again.
+	}
 	return err
 }
 
 func (b *memBuffer) getRow(ctx context.Context) (tree.Datums, error) {
-	retryOpts := retry.Options{
-		InitialBackoff: time.Millisecond,
-		MaxBackoff:     time.Second,
-	}
-
-	var row tree.Datums
-	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
+	for {
+		var row tree.Datums
 		b.mu.Lock()
 		if b.mu.entries.Len() > 0 {
 			row = b.mu.entries.At(0)
@@ -214,8 +229,14 @@ func (b *memBuffer) getRow(ctx context.Context) (tree.Datums, error) {
 		}
 		b.mu.Unlock()
 		if row != nil {
+			b.metrics.BufferEntriesOut.Inc(1)
 			return row, nil
 		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-b.signalCh:
+		}
 	}
-	return nil, ctx.Err()
 }

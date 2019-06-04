@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/opentracing/opentracing-go"
 )
@@ -38,11 +39,7 @@ var _ RowSource = &countAggregator{}
 
 const countRowsProcName = "count rows"
 
-var outputTypes = []sqlbase.ColumnType{
-	{
-		SemanticType: sqlbase.ColumnType_INT,
-	},
-}
+var outputTypes = []types.T{*types.Int}
 
 func newCountAggregator(
 	flowCtx *FlowCtx,
@@ -82,7 +79,7 @@ func (ag *countAggregator) Start(ctx context.Context) context.Context {
 	return ag.StartInternal(ctx, countRowsProcName)
 }
 
-func (ag *countAggregator) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (ag *countAggregator) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	for ag.State == StateRunning {
 		row, meta := ag.input.Next()
 		if meta != nil {
@@ -93,10 +90,12 @@ func (ag *countAggregator) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 			return nil, meta
 		}
 		if row == nil {
-			ag.MoveToDraining(nil /* err */)
 			ret := make(sqlbase.EncDatumRow, 1)
 			ret[0] = sqlbase.EncDatum{Datum: tree.NewDInt(tree.DInt(ag.count))}
-			return ag.ProcessRowHelper(ret), nil
+			rendered, _, err := ag.out.ProcessRow(ag.Ctx, ret)
+			// We're done as soon as we process our one output row.
+			ag.MoveToDraining(err)
+			return rendered, nil
 		}
 		ag.count++
 	}

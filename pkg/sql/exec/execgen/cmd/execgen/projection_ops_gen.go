@@ -26,11 +26,14 @@ package exec
 
 import (
 	"bytes"
+  "context"
 
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/types/conv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	semtypes "github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/pkg/errors"
 )
 
@@ -52,23 +55,33 @@ type {{template "opRConstName" .}} struct {
 	outputIdx int
 }
 
-func (p *{{template "opRConstName" .}}) Next() ColBatch {
-	batch := p.input.Next()
+func (p {{template "opRConstName" .}}) Next(ctx context.Context) coldata.Batch {
+	batch := p.input.Next(ctx)
+	n := batch.Length()
+	if n == 0 {
+		return batch
+	}
 	if p.outputIdx == batch.Width() {
 		batch.AppendCol(types.{{.RetTyp}})
 	}
-	projCol := batch.ColVec(p.outputIdx).{{.RetTyp}}()[:ColBatchSize]
-	col := batch.ColVec(p.colIdx).{{.LTyp}}()[:ColBatchSize]
-	n := batch.Length()
+	vec := batch.ColVec(p.colIdx)
+	col := vec.{{.LTyp}}()[:coldata.BatchSize]
+	projVec := batch.ColVec(p.outputIdx)
+	projCol := projVec.{{.RetTyp}}()[:coldata.BatchSize]
 	if sel := batch.Selection(); sel != nil {
 		for _, i := range sel {
 			{{(.Assign "projCol[i]" "col[i]" "p.constArg")}}
 		}
 	} else {
 		col = col[:n]
+		_ = projCol[len(col)-1]
 		for i := range col {
 			{{(.Assign "projCol[i]" "col[i]" "p.constArg")}}
 		}
+	}
+	if vec.Nulls().HasNulls() {
+		nulls := vec.Nulls().Copy()
+		projVec.SetNulls(&nulls)
 	}
 	return batch
 }
@@ -86,23 +99,33 @@ type {{template "opLConstName" .}} struct {
 	outputIdx int
 }
 
-func (p *{{template "opLConstName" .}}) Next() ColBatch {
-	batch := p.input.Next()
+func (p {{template "opLConstName" .}}) Next(ctx context.Context) coldata.Batch {
+	batch := p.input.Next(ctx)
+	n := batch.Length()
+	if n == 0 {
+		return batch
+	}
 	if p.outputIdx == batch.Width() {
 		batch.AppendCol(types.{{.RetTyp}})
 	}
-	projCol := batch.ColVec(p.outputIdx).{{.RetTyp}}()[:ColBatchSize]
-	col := batch.ColVec(p.colIdx).{{.RTyp}}()[:ColBatchSize]
-	n := batch.Length()
+	vec := batch.ColVec(p.colIdx)
+	col := vec.{{.RTyp}}()[:coldata.BatchSize]
+	projVec := batch.ColVec(p.outputIdx)
+	projCol := projVec.{{.RetTyp}}()[:coldata.BatchSize]
 	if sel := batch.Selection(); sel != nil {
 		for _, i := range sel {
 			{{(.Assign "projCol[i]" "p.constArg" "col[i]")}}
 		}
 	} else {
 		col = col[:n]
+		_ = projCol[len(col)-1]
 		for i := range col {
 			{{(.Assign "projCol[i]" "p.constArg" "col[i]")}}
 		}
+	}
+	if vec.Nulls().HasNulls() {
+		nulls := vec.Nulls().Copy()
+		projVec.SetNulls(&nulls)
 	}
 	return batch
 }
@@ -120,24 +143,35 @@ type {{template "opName" .}} struct {
 	outputIdx int
 }
 
-func (p *{{template "opName" .}}) Next() ColBatch {
-	batch := p.input.Next()
+func (p {{template "opName" .}}) Next(ctx context.Context) coldata.Batch {
+	batch := p.input.Next(ctx)
+	n := batch.Length()
+	if n == 0 {
+		return batch
+	}
 	if p.outputIdx == batch.Width() {
 		batch.AppendCol(types.{{.RetTyp}})
 	}
-	projCol := batch.ColVec(p.outputIdx).{{.RetTyp}}()[:ColBatchSize]
-	col1 := batch.ColVec(p.col1Idx).{{.LTyp}}()[:ColBatchSize]
-	col2 := batch.ColVec(p.col2Idx).{{.RTyp}}()[:ColBatchSize]
-	n := batch.Length()
+	projVec := batch.ColVec(p.outputIdx)
+	projCol := projVec.{{.RetTyp}}()[:coldata.BatchSize]
+	vec1 := batch.ColVec(p.col1Idx)
+	vec2 := batch.ColVec(p.col2Idx)
+	col1 := vec1.{{.LTyp}}()[:coldata.BatchSize]
+	col2 := vec2.{{.RTyp}}()[:coldata.BatchSize]
 	if sel := batch.Selection(); sel != nil {
 		for _, i := range sel {
 			{{(.Assign "projCol[i]" "col1[i]" "col2[i]")}}
 		}
 	} else {
 		col1 = col1[:n]
+		_ = projCol[len(col1)-1]
+		_ = col2[len(col1)-1]
 		for i := range col1 {
 			{{(.Assign "projCol[i]" "col1[i]" "col2[i]")}}
 		}
+	}
+	if vec1.Nulls().HasNulls() || vec2.Nulls().HasNulls() {
+		projVec.SetNulls(vec1.Nulls().Or(vec2.Nulls()))
 	}
 	return batch
 }
@@ -155,18 +189,18 @@ func (p {{template "opName" .}}) Init() {
 // GetProjectionConstOperator returns the appropriate constant projection
 // operator for the given column type and comparison.
 func GetProjection{{if $left}}L{{else}}R{{end}}ConstOperator(
-	ct sqlbase.ColumnType,
+	ct *semtypes.T,
 	op tree.Operator,
 	input Operator,
 	colIdx int,
 	constArg tree.Datum,
   outputIdx int,
 ) (Operator, error) {
-	c, err := types.GetDatumToPhysicalFn(ct)(constArg)
+	c, err := conv.GetDatumToPhysicalFn(ct)(constArg)
 	if err != nil {
 		return nil, err
 	}
-	switch t := types.FromColumnType(ct); t {
+	switch t := conv.FromColumnType(ct); t {
 	{{range $typ, $overloads := $.TypToOverloads}}
 	case types.{{$typ}}:
 		switch op.(type) {
@@ -215,14 +249,14 @@ func GetProjection{{if $left}}L{{else}}R{{end}}ConstOperator(
 // GetProjectionOperator returns the appropriate projection operator for the
 // given column type and comparison.
 func GetProjectionOperator(
-	ct sqlbase.ColumnType,
+	ct *semtypes.T,
 	op tree.Operator,
 	input Operator,
 	col1Idx int,
 	col2Idx int,
   outputIdx int,
 ) (Operator, error) {
-	switch t := types.FromColumnType(ct); t {
+	switch t := conv.FromColumnType(ct); t {
 	{{range $typ, $overloads := .TypToOverloads}}
 	case types.{{$typ}}:
 		switch op.(type) {

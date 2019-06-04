@@ -17,13 +17,17 @@ package install
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/config"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
 )
 
 type session interface {
@@ -32,39 +36,69 @@ type session interface {
 	SetStdin(r io.Reader)
 	SetStdout(w io.Writer)
 	SetStderr(w io.Writer)
+	Start(cmd string) error
 	StdinPipe() (io.WriteCloser, error)
 	StdoutPipe() (io.Reader, error)
 	StderrPipe() (io.Reader, error)
 	RequestPty() error
+	Wait() error
 	Close()
 }
 
 type remoteSession struct {
 	*exec.Cmd
-	cancel func()
+	cancel  func()
+	logfile string // captures ssh -vvv
 }
 
-func newRemoteSession(user, host string) (*remoteSession, error) {
+func newRemoteSession(user, host string, logdir string) (*remoteSession, error) {
+	logfile := filepath.Join(
+		logdir,
+		fmt.Sprintf("ssh_%s_%s", host, timeutil.Now().Format(time.RFC3339)),
+	)
 	args := []string{
 		user + "@" + host,
-		"-q",
+		"-vvv", "-E", logfile,
+		// NB: -q suppresses -E, at least on OSX. Difficult decisions will have
+		// to be made if omitting -q leads to annoyance on stdout/stderr.
+		// "-q",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "StrictHostKeyChecking=no",
+		// Send keep alives every minute to prevent connections without activity
+		// from dropping. (It is speculative that the absence of this caused
+		// problems, though there's some indication that we need them:
+		//
+		// https://github.com/cockroachdb/cockroach/issues/35337
+		"-o", "ServerAliveInterval=60",
 	}
 	args = append(args, sshAuthArgs()...)
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, "ssh", args...)
-	return &remoteSession{cmd, cancel}, nil
+	return &remoteSession{cmd, cancel, logfile}, nil
+}
+
+func (s *remoteSession) errWithDebug(err error) error {
+	if err != nil {
+		err = errors.Wrapf(err, "ssh verbose log retained in %s", s.logfile)
+		s.logfile = "" // prevent removal on close
+	}
+	return err
 }
 
 func (s *remoteSession) CombinedOutput(cmd string) ([]byte, error) {
 	s.Cmd.Args = append(s.Cmd.Args, cmd)
-	return s.Cmd.CombinedOutput()
+	b, err := s.Cmd.CombinedOutput()
+	return b, s.errWithDebug(err)
 }
 
 func (s *remoteSession) Run(cmd string) error {
 	s.Cmd.Args = append(s.Cmd.Args, cmd)
-	return s.Cmd.Run()
+	return s.errWithDebug(s.Cmd.Run())
+}
+
+func (s *remoteSession) Start(cmd string) error {
+	s.Cmd.Args = append(s.Cmd.Args, cmd)
+	return s.Cmd.Start()
 }
 
 func (s *remoteSession) SetStdin(r io.Reader) {
@@ -98,8 +132,15 @@ func (s *remoteSession) RequestPty() error {
 	return nil
 }
 
+func (s *remoteSession) Wait() error {
+	return s.Cmd.Wait()
+}
+
 func (s *remoteSession) Close() {
 	s.cancel()
+	if s.logfile != "" {
+		_ = os.Remove(s.logfile)
+	}
 }
 
 type localSession struct {
@@ -121,6 +162,11 @@ func (s *localSession) CombinedOutput(cmd string) ([]byte, error) {
 func (s *localSession) Run(cmd string) error {
 	s.Cmd.Args = append(s.Cmd.Args, cmd)
 	return s.Cmd.Run()
+}
+
+func (s *localSession) Start(cmd string) error {
+	s.Cmd.Args = append(s.Cmd.Args, cmd)
+	return s.Cmd.Start()
 }
 
 func (s *localSession) SetStdin(r io.Reader) {
@@ -151,6 +197,10 @@ func (s *localSession) StderrPipe() (io.Reader, error) {
 
 func (s *localSession) RequestPty() error {
 	return nil
+}
+
+func (s *localSession) Wait() error {
+	return s.Cmd.Wait()
 }
 
 func (s *localSession) Close() {

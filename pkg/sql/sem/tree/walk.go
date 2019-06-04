@@ -721,7 +721,7 @@ func walkReturningClause(v Visitor, clause ReturningClause) (ReturningClause, bo
 	case *ReturningNothing, *NoReturningClause:
 		return t, false
 	default:
-		panic(pgerror.NewAssertionErrorf("unexpected ReturningClause type: %T", t))
+		panic(pgerror.AssertionFailedf("unexpected ReturningClause type: %T", t))
 	}
 }
 
@@ -1386,7 +1386,7 @@ func (v *simpleVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
 	if v.err != nil {
 		return false, expr
 	}
-	v.err, recurse, newExpr = v.fn(expr)
+	recurse, newExpr, v.err = v.fn(expr)
 	if v.err != nil {
 		return false, expr
 	}
@@ -1397,7 +1397,7 @@ func (*simpleVisitor) VisitPost(expr Expr) Expr { return expr }
 
 // SimpleVisitFn is a function that is run for every node in the VisitPre stage;
 // see SimpleVisit.
-type SimpleVisitFn func(expr Expr) (err error, recurse bool, newExpr Expr)
+type SimpleVisitFn func(expr Expr) (recurse bool, newExpr Expr, err error)
 
 // SimpleVisit is a convenience wrapper for visitors that only have VisitPre
 // code and don't return any results except an error. The given function is

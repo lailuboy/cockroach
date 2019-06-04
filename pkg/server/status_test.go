@@ -18,7 +18,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/ioutil"
 	"math"
+	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -39,7 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/diagnosticspb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
-	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -155,6 +157,61 @@ func TestStatusGossipJson(t *testing.T) {
 	}
 }
 
+// TestStatusEngineStatsJson ensures that the output response for the engine
+// stats contains the required fields.
+func TestStatusEngineStatsJson(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	dir, cleanupFn := testutils.TempDir(t)
+	defer cleanupFn()
+
+	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+		StoreSpecs: []base.StoreSpec{{
+			Path: dir,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stopper().Stop(context.TODO())
+
+	var engineStats serverpb.EngineStatsResponse
+	if err := getStatusJSONProto(s, "enginestats/local", &engineStats); err != nil {
+		t.Fatal(err)
+	}
+	if len(engineStats.Stats) != 1 {
+		t.Fatal(errors.Errorf("expected one engine stats, got: %v", engineStats))
+	}
+
+	tickers := engineStats.Stats[0].TickersAndHistograms.Tickers
+	if len(tickers) == 0 {
+		t.Fatal(errors.Errorf("expected non-empty tickers list, got: %v", tickers))
+	}
+	allTickersZero := true
+	for _, ticker := range tickers {
+		if ticker != 0 {
+			allTickersZero = false
+		}
+	}
+	if allTickersZero {
+		t.Fatal(errors.Errorf("expected some tickers nonzero, got: %v", tickers))
+	}
+
+	histograms := engineStats.Stats[0].TickersAndHistograms.Histograms
+	if len(histograms) == 0 {
+		t.Fatal(errors.Errorf("expected non-empty histograms list, got: %v", histograms))
+	}
+	allHistogramsZero := true
+	for _, histogram := range histograms {
+		if histogram.Max == 0 {
+			allHistogramsZero = false
+		}
+	}
+	if allHistogramsZero {
+		t.Fatal(errors.Errorf("expected some histograms nonzero, got: %v", histograms))
+	}
+}
+
 // startServer will start a server with a short scan interval, wait for
 // the scan to complete, and return the server. The caller is
 // responsible for stopping the server.
@@ -189,50 +246,134 @@ func startServer(t *testing.T) *TestServer {
 	return ts
 }
 
-// TestStatusLocalFileRetrieval tests the files/local endpoint.
-// See debug/heap roachtest for testing heap profile file collection.
-func TestStatusLocalFileRetrieval(t *testing.T) {
+func newRPCTestContext(ts *TestServer, cfg *base.Config) *rpc.Context {
+	rpcContext := rpc.NewContext(
+		log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, cfg, ts.Clock(), ts.Stopper(),
+		&ts.ClusterSettings().Version)
+	// Ensure that the RPC client context validates the server cluster ID.
+	// This ensures that a test where the server is restarted will not let
+	// its test RPC client talk to a server started by an unrelated concurrent test.
+	rpcContext.ClusterID.Set(context.TODO(), ts.ClusterID())
+	return rpcContext
+}
+
+// TestStatusGetFiles tests the GetFiles endpoint.
+func TestStatusGetFiles(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ts := startServer(t)
+
+	tempDir, cleanupFn := testutils.TempDir(t)
+	defer cleanupFn()
+
+	storeSpec := base.StoreSpec{Path: tempDir}
+
+	tsI, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		StoreSpecs: []base.StoreSpec{
+			storeSpec,
+		},
+	})
+	ts := tsI.(*TestServer)
 	defer ts.Stopper().Stop(context.TODO())
 
 	rootConfig := testutils.NewTestBaseContext(security.RootUser)
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, rootConfig, ts.Clock(), ts.Stopper(),
-		&ts.ClusterSettings().Version)
+	rpcContext := newRPCTestContext(ts, rootConfig)
+
 	url := ts.ServingAddr()
-	conn, err := rpcContext.GRPCDial(url).Connect(context.Background())
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	client := serverpb.NewStatusClient(conn)
 
-	request := serverpb.GetFilesRequest{
-		NodeId: "local", ListOnly: true, Type: serverpb.FileType_HEAP, Patterns: []string{"*"}}
-	response, err := client.GetFiles(context.Background(), &request)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Test fetching heap files.
+	t.Run("heap", func(t *testing.T) {
+		const testFilesNo = 3
+		for i := 0; i < testFilesNo; i++ {
+			testHeapDir := filepath.Join(storeSpec.Path, "logs", base.HeapProfileDir)
+			testHeapFile := filepath.Join(testHeapDir, fmt.Sprintf("heap%d.pprof", i))
+			if err := os.MkdirAll(testHeapDir, os.ModePerm); err != nil {
+				t.Fatal(err)
+			}
+			if err := ioutil.WriteFile(testHeapFile, []byte(fmt.Sprintf("I'm heap file %d", i)), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
 
-	if a, e := len(response.Files), 0; a != e {
-		t.Errorf("expected %d files(s), found %d", e, a)
-	}
+		request := serverpb.GetFilesRequest{
+			NodeId: "local", Type: serverpb.FileType_HEAP, Patterns: []string{"*"}}
+		response, err := client.GetFiles(context.Background(), &request)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if a, e := len(response.Files), testFilesNo; a != e {
+			t.Errorf("expected %d files(s), found %d", e, a)
+		}
+
+		for i, file := range response.Files {
+			expectedFileName := fmt.Sprintf("heap%d.pprof", i)
+			if file.Name != expectedFileName {
+				t.Fatalf("expected file name %s, found %s", expectedFileName, file.Name)
+			}
+			expectedFileContents := []byte(fmt.Sprintf("I'm heap file %d", i))
+			if !bytes.Equal(file.Contents, expectedFileContents) {
+				t.Fatalf("expected file contents %s, found %s", expectedFileContents, file.Contents)
+			}
+		}
+	})
+
+	// Test fetching goroutine files.
+	t.Run("goroutines", func(t *testing.T) {
+		const testFilesNo = 3
+		for i := 0; i < testFilesNo; i++ {
+			testFile := filepath.Join(storeSpec.Path, "logs", goroutinesDir, fmt.Sprintf("goroutine_dump%d.txt.gz", i))
+			if err := ioutil.WriteFile(testFile, []byte(fmt.Sprintf("Goroutine dump %d", i)), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		request := serverpb.GetFilesRequest{
+			NodeId: "local", Type: serverpb.FileType_GOROUTINES, Patterns: []string{"*"}}
+		response, err := client.GetFiles(context.Background(), &request)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if a, e := len(response.Files), testFilesNo; a != e {
+			t.Errorf("expected %d files(s), found %d", e, a)
+		}
+
+		for i, file := range response.Files {
+			expectedFileName := fmt.Sprintf("goroutine_dump%d.txt.gz", i)
+			if file.Name != expectedFileName {
+				t.Fatalf("expected file name %s, found %s", expectedFileName, file.Name)
+			}
+			expectedFileContents := []byte(fmt.Sprintf("Goroutine dump %d", i))
+			if !bytes.Equal(file.Contents, expectedFileContents) {
+				t.Fatalf("expected file contents %s, found %s", expectedFileContents, file.Contents)
+			}
+		}
+	})
 
 	// Testing path separators in pattern.
-	request = serverpb.GetFilesRequest{NodeId: "local", ListOnly: true,
-		Type: serverpb.FileType_HEAP, Patterns: []string{"pattern/with/separators"}}
-	_, err = client.GetFiles(context.Background(), &request)
-	if err == nil {
-		t.Errorf("GetFiles: path separators allowed in pattern")
-	}
+	t.Run("path separators", func(t *testing.T) {
+		request := serverpb.GetFilesRequest{NodeId: "local", ListOnly: true,
+			Type: serverpb.FileType_HEAP, Patterns: []string{"pattern/with/separators"}}
+		_, err = client.GetFiles(context.Background(), &request)
+		if !testutils.IsError(err, "invalid pattern: cannot have path seperators") {
+			t.Errorf("GetFiles: path separators allowed in pattern")
+		}
+	})
 
 	// Testing invalid filetypes.
-	request = serverpb.GetFilesRequest{NodeId: "local", ListOnly: true,
-		Type: -1, Patterns: []string{"*"}}
-	_, err = client.GetFiles(context.Background(), &request)
-	if err == nil {
-		t.Errorf("GetFiles: invalid file type allowed")
-	}
+	t.Run("filetypes", func(t *testing.T) {
+		request := serverpb.GetFilesRequest{NodeId: "local", ListOnly: true,
+			Type: -1, Patterns: []string{"*"}}
+		_, err = client.GetFiles(context.Background(), &request)
+		if !testutils.IsError(err, "unknown file type: -1") {
+			t.Errorf("GetFiles: invalid file type allowed")
+		}
+	})
 }
 
 // TestStatusLocalLogs checks to ensure that local/logfiles,
@@ -563,8 +704,8 @@ func TestRangesResponse(t *testing.T) {
 			StoreID:   1,
 			ReplicaID: 1,
 		}
-		if len(ri.State.Desc.Replicas) != 1 || ri.State.Desc.Replicas[0] != expReplica {
-			t.Errorf("unexpected replica list %+v", ri.State.Desc.Replicas)
+		if len(ri.State.Desc.InternalReplicas) != 1 || ri.State.Desc.InternalReplicas[0] != expReplica {
+			t.Errorf("unexpected replica list %+v", ri.State.Desc.InternalReplicas)
 		}
 		if ri.State.Lease == nil || *ri.State.Lease == (roachpb.Lease{}) {
 			t.Error("expected a nontrivial Lease")
@@ -679,9 +820,7 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 
 	rpcStopper := stop.NewStopper()
 	defer rpcStopper.Stop(ctx)
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, ts.RPCContext().Config, ts.Clock(),
-		rpcStopper, &ts.ClusterSettings().Version)
+	rpcContext := newRPCTestContext(ts, ts.RPCContext().Config)
 	request := serverpb.SpanStatsRequest{
 		NodeID:   "1",
 		StartKey: []byte(roachpb.RKeyMin),
@@ -689,7 +828,8 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 	}
 
 	url := ts.ServingAddr()
-	conn, err := rpcContext.GRPCDial(url).Connect(ctx)
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID).Connect(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -714,13 +854,12 @@ func TestNodesGRPCResponse(t *testing.T) {
 	defer ts.Stopper().Stop(context.TODO())
 
 	rootConfig := testutils.NewTestBaseContext(security.RootUser)
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, rootConfig, ts.Clock(), ts.Stopper(),
-		&ts.ClusterSettings().Version)
+	rpcContext := newRPCTestContext(ts, rootConfig)
 	var request serverpb.NodesRequest
 
 	url := ts.ServingAddr()
-	conn, err := rpcContext.GRPCDial(url).Connect(context.Background())
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -844,8 +983,8 @@ func TestRangeResponse(t *testing.T) {
 	}
 
 	// Check some other values.
-	if len(info.State.Desc.Replicas) != 1 || info.State.Desc.Replicas[0] != expReplica {
-		t.Errorf("unexpected replica list %+v", info.State.Desc.Replicas)
+	if len(info.State.Desc.InternalReplicas) != 1 || info.State.Desc.InternalReplicas[0] != expReplica {
+		t.Errorf("unexpected replica list %+v", info.State.Desc.InternalReplicas)
 	}
 
 	if info.State.Lease == nil || *info.State.Lease == (roachpb.Lease{}) {
@@ -918,11 +1057,10 @@ func TestRemoteDebugModeSetting(t *testing.T) {
 	// metadata for differentiating between the two (and that we're correctly
 	// interpreting said metadata).
 	rootConfig := testutils.NewTestBaseContext(security.RootUser)
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, rootConfig, ts.Clock(), ts.Stopper(),
-		&ts.ClusterSettings().Version)
+	rpcContext := newRPCTestContext(ts, rootConfig)
 	url := ts.ServingAddr()
-	conn, err := rpcContext.GRPCDial(url).Connect(context.Background())
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1065,7 +1203,7 @@ func TestStatusAPIStatements(t *testing.T) {
 			// be automatically retried, confusing the test success check.
 			continue
 		}
-		if strings.HasPrefix(respStatement.Key.KeyData.App, sql.InternalAppNamePrefix) {
+		if strings.HasPrefix(respStatement.Key.KeyData.App, sqlbase.InternalAppNamePrefix) {
 			// We ignore internal queries, these are not relevant for the
 			// validity of this test.
 			continue
@@ -1119,11 +1257,10 @@ func TestListSessionsSecurity(t *testing.T) {
 
 	// gRPC requests behave as root and thus are always allowed.
 	rootConfig := testutils.NewTestBaseContext(security.RootUser)
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, rootConfig, ts.Clock(), ts.Stopper(),
-		&ts.ClusterSettings().Version)
+	rpcContext := newRPCTestContext(ts, rootConfig)
 	url := ts.ServingAddr()
-	conn, err := rpcContext.GRPCDial(url).Connect(context.Background())
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

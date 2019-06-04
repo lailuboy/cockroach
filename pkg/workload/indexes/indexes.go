@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 )
@@ -95,6 +96,10 @@ func (w *indexes) Hooks() workload.Hooks {
 			return nil
 		},
 		PostLoad: func(sqlDB *gosql.DB) error {
+			// Prevent the merge queue from immediately discarding our splits.
+			if err := maybeDisableMergeQueue(sqlDB); err != nil {
+				return err
+			}
 			// Split at the beginning of each index so that as long as the
 			// table has a single index, all writes will be multi-range.
 			for i := 0; i < w.idxs; i++ {
@@ -106,6 +111,17 @@ func (w *indexes) Hooks() workload.Hooks {
 			return nil
 		},
 	}
+}
+
+func maybeDisableMergeQueue(sqlDB *gosql.DB) error {
+	var ok bool
+	if err := sqlDB.QueryRow(
+		`SELECT count(*) > 0 FROM [ SHOW ALL CLUSTER SETTINGS ] AS _ (v) WHERE v = 'kv.range_merge.queue_enabled'`,
+	).Scan(&ok); err != nil || !ok {
+		return err
+	}
+	_, err := sqlDB.Exec("SET CLUSTER SETTING kv.range_merge.queue_enabled = false")
+	return err
 }
 
 // Tables implements the Generator interface.
@@ -129,13 +145,16 @@ func (w *indexes) Tables() []workload.Table {
 }
 
 // Ops implements the Opser interface.
-func (w *indexes) Ops(urls []string, reg *workload.HistogramRegistry) (workload.QueryLoad, error) {
+func (w *indexes) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, error) {
 	ctx := context.Background()
 	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
 	if err != nil {
 		return workload.QueryLoad{}, err
 	}
-	mcp, err := workload.NewMultiConnPool(w.connFlags.Concurrency+1, urls...)
+	cfg := workload.MultiConnPoolCfg{
+		MaxTotalConnections: w.connFlags.Concurrency + 1,
+	}
+	mcp, err := workload.NewMultiConnPool(cfg, urls...)
 	if err != nil {
 		return workload.QueryLoad{}, err
 	}
@@ -160,7 +179,7 @@ func (w *indexes) Ops(urls []string, reg *workload.HistogramRegistry) (workload.
 
 type indexesOp struct {
 	config *indexes
-	hists  *workload.Histograms
+	hists  *histogram.Histograms
 	rand   *rand.Rand
 	sr     workload.SQLRunner
 	stmt   workload.StmtHandle

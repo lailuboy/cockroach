@@ -31,6 +31,7 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -343,6 +344,15 @@ func (v Value) dataBytes() []byte {
 	return v.RawBytes[headerSize:]
 }
 
+func (v *Value) ensureRawBytes(size int) {
+	if cap(v.RawBytes) < size {
+		v.RawBytes = make([]byte, size)
+		return
+	}
+	v.RawBytes = v.RawBytes[:size]
+	v.setChecksum(checksumUninitialized)
+}
+
 // EqualData returns a boolean reporting whether the receiver and the parameter
 // have equivalent byte values. This check ignores the optional checksum field
 // in the Values' byte slices, returning only whether the Values have the same
@@ -357,7 +367,7 @@ func (v Value) EqualData(o Value) bool {
 
 // SetBytes sets the bytes and tag field of the receiver and clears the checksum.
 func (v *Value) SetBytes(b []byte) {
-	v.RawBytes = make([]byte, headerSize+len(b))
+	v.ensureRawBytes(headerSize + len(b))
 	copy(v.dataBytes(), b)
 	v.setTag(ValueType_BYTES)
 }
@@ -366,7 +376,7 @@ func (v *Value) SetBytes(b []byte) {
 // checksum. This is identical to SetBytes, but specialized for a string
 // argument.
 func (v *Value) SetString(s string) {
-	v.RawBytes = make([]byte, headerSize+len(s))
+	v.ensureRawBytes(headerSize + len(s))
 	copy(v.dataBytes(), s)
 	v.setTag(ValueType_BYTES)
 }
@@ -374,7 +384,7 @@ func (v *Value) SetString(s string) {
 // SetFloat encodes the specified float64 value into the bytes field of the
 // receiver, sets the tag and clears the checksum.
 func (v *Value) SetFloat(f float64) {
-	v.RawBytes = make([]byte, headerSize+8)
+	v.ensureRawBytes(headerSize + 8)
 	encoding.EncodeUint64Ascending(v.RawBytes[headerSize:headerSize], math.Float64bits(f))
 	v.setTag(ValueType_FLOAT)
 }
@@ -383,7 +393,7 @@ func (v *Value) SetFloat(f float64) {
 // receiver, sets the tag and clears the checksum.
 func (v *Value) SetBool(b bool) {
 	// 0 or 1 will always encode to a 1-byte long varint.
-	v.RawBytes = make([]byte, headerSize+1)
+	v.ensureRawBytes(headerSize + 1)
 	i := int64(0)
 	if b {
 		i = 1
@@ -395,7 +405,7 @@ func (v *Value) SetBool(b bool) {
 // SetInt encodes the specified int64 value into the bytes field of the
 // receiver, sets the tag and clears the checksum.
 func (v *Value) SetInt(i int64) {
-	v.RawBytes = make([]byte, headerSize+binary.MaxVarintLen64)
+	v.ensureRawBytes(headerSize + binary.MaxVarintLen64)
 	n := binary.PutVarint(v.RawBytes[headerSize:], i)
 	v.RawBytes = v.RawBytes[:headerSize+n]
 	v.setTag(ValueType_INT)
@@ -409,8 +419,7 @@ func (v *Value) SetProto(msg protoutil.Message) error {
 	// All of the Cockroach protos implement MarshalTo and Size. So we marshal
 	// directly into the Value.RawBytes field instead of allocating a separate
 	// []byte and copying.
-	size := msg.Size()
-	v.RawBytes = make([]byte, headerSize+size)
+	v.ensureRawBytes(headerSize + msg.Size())
 	if _, err := protoutil.MarshalToWithoutFuzzing(msg, v.RawBytes[headerSize:]); err != nil {
 		return err
 	}
@@ -427,8 +436,8 @@ func (v *Value) SetProto(msg protoutil.Message) error {
 // receiver, sets the tag and clears the checksum.
 func (v *Value) SetTime(t time.Time) {
 	const encodingSizeOverestimate = 11
-	v.RawBytes = make([]byte, headerSize, headerSize+encodingSizeOverestimate)
-	v.RawBytes = encoding.EncodeTimeAscending(v.RawBytes, t)
+	v.ensureRawBytes(headerSize + encodingSizeOverestimate)
+	v.RawBytes = encoding.EncodeTimeAscending(v.RawBytes[:headerSize], t)
 	v.setTag(ValueType_TIME)
 }
 
@@ -436,8 +445,8 @@ func (v *Value) SetTime(t time.Time) {
 // receiver, sets the tag and clears the checksum.
 func (v *Value) SetDuration(t duration.Duration) error {
 	var err error
-	v.RawBytes = make([]byte, headerSize, headerSize+encoding.EncodedDurationMaxLen)
-	v.RawBytes, err = encoding.EncodeDurationAscending(v.RawBytes, t)
+	v.ensureRawBytes(headerSize + encoding.EncodedDurationMaxLen)
+	v.RawBytes, err = encoding.EncodeDurationAscending(v.RawBytes[:headerSize], t)
 	if err != nil {
 		return err
 	}
@@ -449,8 +458,8 @@ func (v *Value) SetDuration(t duration.Duration) error {
 // receiver, sets the tag and clears the checksum.
 func (v *Value) SetBitArray(t bitarray.BitArray) {
 	words, _ := t.EncodingParts()
-	v.RawBytes = make([]byte, headerSize, headerSize+encoding.NonsortingUvarintMaxLen+8*len(words))
-	v.RawBytes = encoding.EncodeUntaggedBitArrayValue(v.RawBytes, t)
+	v.ensureRawBytes(headerSize + encoding.NonsortingUvarintMaxLen + 8*len(words))
+	v.RawBytes = encoding.EncodeUntaggedBitArrayValue(v.RawBytes[:headerSize], t)
 	v.setTag(ValueType_BITARRAY)
 }
 
@@ -458,8 +467,8 @@ func (v *Value) SetBitArray(t bitarray.BitArray) {
 // the receiver using Gob encoding, sets the tag and clears the checksum.
 func (v *Value) SetDecimal(dec *apd.Decimal) error {
 	decSize := encoding.UpperBoundNonsortingDecimalSize(dec)
-	v.RawBytes = make([]byte, headerSize, headerSize+decSize)
-	v.RawBytes = encoding.EncodeNonsortingDecimal(v.RawBytes, dec)
+	v.ensureRawBytes(headerSize + decSize)
+	v.RawBytes = encoding.EncodeNonsortingDecimal(v.RawBytes[:headerSize], dec)
 	v.setTag(ValueType_DECIMAL)
 	return nil
 }
@@ -467,9 +476,7 @@ func (v *Value) SetDecimal(dec *apd.Decimal) error {
 // SetTuple sets the tuple bytes and tag field of the receiver and clears the
 // checksum.
 func (v *Value) SetTuple(data []byte) {
-	// TODO(dan): Reuse this and stop allocating on every SetTuple call. Same for
-	// the other SetFoos.
-	v.RawBytes = make([]byte, headerSize+len(data))
+	v.ensureRawBytes(headerSize + len(data))
 	copy(v.dataBytes(), data)
 	v.setTag(ValueType_TUPLE)
 }
@@ -732,14 +739,14 @@ func (v Value) PrettyPrint() string {
 	return buf.String()
 }
 
-var _ log.SafeMessager = Transaction{}
+// IsFinalized determines whether the transaction status is in a finalized
+// state. A finalized state is terminal, meaning that once a transaction
+// enters one of these states, it will never leave it.
+func (ts TransactionStatus) IsFinalized() bool {
+	return ts == COMMITTED || ts == ABORTED
+}
 
-const (
-	// MinTxnPriority is the minimum allowed txn priority.
-	MinTxnPriority = 0
-	// MaxTxnPriority is the maximum allowed txn priority.
-	MaxTxnPriority = math.MaxInt32
-)
+var _ log.SafeMessager = Transaction{}
 
 // MakeTransaction creates a new transaction. The transaction key is
 // composed using the specified baseKey (for locality with data
@@ -789,7 +796,6 @@ func MakeTxnCoordMeta(txn Transaction) TxnCoordMeta {
 // StripRootToLeaf strips out all information that is unnecessary to communicate
 // to leaf transactions.
 func (meta *TxnCoordMeta) StripRootToLeaf() *TxnCoordMeta {
-	meta.Intents = nil
 	meta.CommandCount = 0
 	meta.RefreshReads = nil
 	meta.RefreshWrites = nil
@@ -799,7 +805,7 @@ func (meta *TxnCoordMeta) StripRootToLeaf() *TxnCoordMeta {
 // StripLeafToRoot strips out all information that is unnecessary to communicate
 // back to the root transaction.
 func (meta *TxnCoordMeta) StripLeafToRoot() *TxnCoordMeta {
-	meta.OutstandingWrites = nil
+	meta.InFlightWrites = nil
 	return meta
 }
 
@@ -813,25 +819,16 @@ func (t Transaction) LastActive() hlc.Timestamp {
 	return ts
 }
 
-// Clone creates a copy of the given transaction. The copy is "mostly" deep,
-// but does share pieces of memory with the original such as Key, ID and the
-// keys with the intent spans.
-func (t Transaction) Clone() Transaction {
-	mt := t.ObservedTimestamps
-	if mt != nil {
-		t.ObservedTimestamps = make([]ObservedTimestamp, len(mt))
-		copy(t.ObservedTimestamps, mt)
-	}
-	// Note that we're not cloning the span keys under the assumption that the
-	// keys themselves are not mutable.
-	t.Intents = append([]Span(nil), t.Intents...)
-	return t
+// Clone creates a copy of the given transaction. The copy is shallow because
+// none of the references held by a transaction allow interior mutability.
+func (t Transaction) Clone() *Transaction {
+	return &t
 }
 
 // AssertInitialized crashes if the transaction is not initialized.
 func (t *Transaction) AssertInitialized(ctx context.Context) {
 	if t.ID == (uuid.UUID{}) || t.Timestamp == (hlc.Timestamp{}) {
-		log.Fatalf(ctx, "uninitialized txn: %s", t)
+		log.Fatalf(ctx, "uninitialized txn: %s", *t)
 	}
 }
 
@@ -846,7 +843,7 @@ func (t *Transaction) AssertInitialized(ctx context.Context) {
 // If userPriority is less than or equal to MinUserPriority, returns
 // MinTxnPriority; if greater than or equal to MaxUserPriority, returns
 // MaxTxnPriority. If userPriority is 0, returns NormalUserPriority.
-func MakePriority(userPriority UserPriority) int32 {
+func MakePriority(userPriority UserPriority) enginepb.TxnPriority {
 	// A currently undocumented feature allows an explicit priority to
 	// be set by specifying priority < 1. The explicit priority is
 	// simply -userPriority in this case. This is hacky, but currently
@@ -855,13 +852,13 @@ func MakePriority(userPriority UserPriority) int32 {
 		if -userPriority > UserPriority(math.MaxInt32) {
 			panic(fmt.Sprintf("cannot set explicit priority to a value less than -%d", math.MaxInt32))
 		}
-		return int32(-userPriority)
+		return enginepb.TxnPriority(-userPriority)
 	} else if userPriority == 0 {
 		userPriority = NormalUserPriority
 	} else if userPriority >= MaxUserPriority {
-		return MaxTxnPriority
+		return enginepb.MaxTxnPriority
 	} else if userPriority <= MinUserPriority {
-		return MinTxnPriority
+		return enginepb.MinTxnPriority
 	}
 
 	// We generate random values which are biased according to priorities. If v1 is a value
@@ -912,12 +909,12 @@ func MakePriority(userPriority UserPriority) int32 {
 	// For userPriority=MaxUserPriority, the probability of overflow is 0.7%.
 	// For userPriority=(MaxUserPriority/2), the probability of overflow is 0.005%.
 	val = (val / (5 * float64(MaxUserPriority))) * math.MaxInt32
-	if val < MinTxnPriority+1 {
-		return MinTxnPriority + 1
-	} else if val > MaxTxnPriority-1 {
-		return MaxTxnPriority - 1
+	if val < float64(enginepb.MinTxnPriority+1) {
+		return enginepb.MinTxnPriority + 1
+	} else if val > float64(enginepb.MaxTxnPriority-1) {
+		return enginepb.MaxTxnPriority - 1
 	}
-	return int32(val)
+	return enginepb.TxnPriority(val)
 }
 
 // Restart reconfigures a transaction for restart. The epoch is
@@ -925,7 +922,7 @@ func MakePriority(userPriority UserPriority) int32 {
 // transaction on restart is set to the maximum of the transaction's
 // timestamp and the specified timestamp.
 func (t *Transaction) Restart(
-	userPriority UserPriority, upgradePriority int32, timestamp hlc.Timestamp,
+	userPriority UserPriority, upgradePriority enginepb.TxnPriority, timestamp hlc.Timestamp,
 ) {
 	t.BumpEpoch()
 	if t.Timestamp.Less(timestamp) {
@@ -979,14 +976,16 @@ func (t *Transaction) Update(o *Transaction) {
 	}
 	o.AssertInitialized(context.TODO())
 	if t.ID == (uuid.UUID{}) {
-		*t = o.Clone()
+		*t = *o
 		return
 	}
 	if len(t.Key) == 0 {
 		t.Key = o.Key
 	}
-	if o.Status != PENDING {
-		t.Status = o.Status
+	if !t.Status.IsFinalized() {
+		if (t.Epoch < o.Epoch) || (t.Epoch == o.Epoch && o.Status != PENDING) {
+			t.Status = o.Status
+		}
 	}
 
 	// If the epoch or refreshed timestamp move forward, overwrite
@@ -1022,8 +1021,11 @@ func (t *Transaction) Update(o *Transaction) {
 	if t.Sequence < o.Sequence {
 		t.Sequence = o.Sequence
 	}
-	if len(o.Intents) > 0 {
-		t.Intents = o.Intents
+	if len(o.IntentSpans) > 0 {
+		t.IntentSpans = o.IntentSpans
+	}
+	if len(o.InFlightWrites) > 0 {
+		t.InFlightWrites = o.InFlightWrites
 	}
 	// On update, set epoch zero timestamp to the minimum seen by either txn.
 	if o.EpochZeroTimestamp != (hlc.Timestamp{}) {
@@ -1037,8 +1039,8 @@ func (t *Transaction) Update(o *Transaction) {
 // priority and the specified minPriority. The exception is if the
 // current priority is set to the minimum, in which case the minimum
 // is preserved.
-func (t *Transaction) UpgradePriority(minPriority int32) {
-	if minPriority > t.Priority && t.Priority != MinTxnPriority {
+func (t *Transaction) UpgradePriority(minPriority enginepb.TxnPriority) {
+	if minPriority > t.Priority && t.Priority != enginepb.MinTxnPriority {
 		t.Priority = minPriority
 	}
 }
@@ -1063,8 +1065,11 @@ func (t Transaction) String() string {
 		"ts=%s orig=%s max=%s wto=%t seq=%d",
 		t.Short(), Key(t.Key), t.IsWriting(), floatPri, t.Status, t.Epoch, t.Timestamp,
 		t.OrigTimestamp, t.MaxTimestamp, t.WriteTooOld, t.Sequence)
-	if ni := len(t.Intents); t.Status != PENDING && ni > 0 {
+	if ni := len(t.IntentSpans); t.Status != PENDING && ni > 0 {
 		fmt.Fprintf(&buf, " int=%d", ni)
+	}
+	if nw := len(t.InFlightWrites); t.Status != PENDING && nw > 0 {
+		fmt.Fprintf(&buf, " ifw=%d", nw)
 	}
 	return buf.String()
 }
@@ -1084,8 +1089,11 @@ func (t Transaction) SafeMessage() string {
 		"ts=%s orig=%s max=%s wto=%t seq=%d",
 		t.Short(), t.IsWriting(), floatPri, t.Status, t.Epoch, t.Timestamp,
 		t.OrigTimestamp, t.MaxTimestamp, t.WriteTooOld, t.Sequence)
-	if ni := len(t.Intents); t.Status != PENDING && ni > 0 {
+	if ni := len(t.IntentSpans); t.Status != PENDING && ni > 0 {
 		fmt.Fprintf(&buf, " int=%d", ni)
+	}
+	if nw := len(t.InFlightWrites); t.Status != PENDING && nw > 0 {
+		fmt.Fprintf(&buf, " ifw=%d", nw)
 	}
 	return buf.String()
 }
@@ -1132,7 +1140,8 @@ func (t *Transaction) AsRecord() TransactionRecord {
 	tr.Status = t.Status
 	tr.LastHeartbeat = t.LastHeartbeat
 	tr.OrigTimestamp = t.OrigTimestamp
-	tr.Intents = t.Intents
+	tr.IntentSpans = t.IntentSpans
+	tr.InFlightWrites = t.InFlightWrites
 	return tr
 }
 
@@ -1145,7 +1154,8 @@ func (tr *TransactionRecord) AsTransaction() Transaction {
 	t.Status = tr.Status
 	t.LastHeartbeat = tr.LastHeartbeat
 	t.OrigTimestamp = tr.OrigTimestamp
-	t.Intents = tr.Intents
+	t.IntentSpans = tr.IntentSpans
+	t.InFlightWrites = tr.InFlightWrites
 	return t
 }
 
@@ -1174,7 +1184,7 @@ func PrepareTransactionForRetry(
 		log.Fatalf(ctx, "missing txn for retryable error: %s", pErr)
 	}
 
-	txn := pErr.GetTxn().Clone()
+	txn := *pErr.GetTxn()
 	aborted := false
 	switch tErr := pErr.GetDetail().(type) {
 	case *TransactionAbortedError:
@@ -1259,7 +1269,7 @@ func CanTransactionRetryAtRefreshedTimestamp(
 	newTxn.RefreshedTimestamp.Forward(newTxn.Timestamp)
 	newTxn.WriteTooOld = false
 
-	return true, &newTxn
+	return true, newTxn
 }
 
 func readWithinUncertaintyIntervalRetryTimestamp(
@@ -1731,7 +1741,8 @@ func (kv KeyValueByKey) Swap(i, j int) {
 
 var _ sort.Interface = KeyValueByKey{}
 
-// observedTimestampSlice maintains a sorted list of observed timestamps.
+// observedTimestampSlice maintains an immutable sorted list of observed
+// timestamps.
 type observedTimestampSlice []ObservedTimestamp
 
 func (s observedTimestampSlice) index(nodeID NodeID) int {
@@ -1753,19 +1764,61 @@ func (s observedTimestampSlice) get(nodeID NodeID) (hlc.Timestamp, bool) {
 }
 
 // update the timestamp for the specified node, or add a new entry in the
-// correct (sorted) location.
+// correct (sorted) location. The receiver is not mutated.
 func (s observedTimestampSlice) update(
 	nodeID NodeID, timestamp hlc.Timestamp,
 ) observedTimestampSlice {
 	i := s.index(nodeID)
 	if i < len(s) && s[i].NodeID == nodeID {
 		if timestamp.Less(s[i].Timestamp) {
-			s[i].Timestamp = timestamp
+			// The input slice is immutable, so copy and update.
+			cpy := make(observedTimestampSlice, len(s))
+			copy(cpy, s)
+			cpy[i].Timestamp = timestamp
+			return cpy
 		}
 		return s
 	}
-	s = append(s, ObservedTimestamp{})
-	copy(s[i+1:], s[i:])
-	s[i] = ObservedTimestamp{NodeID: nodeID, Timestamp: timestamp}
-	return s
+	// The input slice is immutable, so copy and update. Don't append to
+	// avoid an allocation. Doing so could invalidate a previous update
+	// to this receiver.
+	cpy := make(observedTimestampSlice, len(s)+1)
+	copy(cpy[:i], s[:i])
+	cpy[i] = ObservedTimestamp{NodeID: nodeID, Timestamp: timestamp}
+	copy(cpy[i+1:], s[i:])
+	return cpy
 }
+
+// SequencedWriteBySeq implements sorting of a slice of SequencedWrites
+// by sequence number.
+type SequencedWriteBySeq []SequencedWrite
+
+// Len implements sort.Interface.
+func (s SequencedWriteBySeq) Len() int { return len(s) }
+
+// Less implements sort.Interface.
+func (s SequencedWriteBySeq) Less(i, j int) bool { return s[i].Sequence < s[j].Sequence }
+
+// Swap implements sort.Interface.
+func (s SequencedWriteBySeq) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+var _ sort.Interface = SequencedWriteBySeq{}
+
+// Find searches for the index of the SequencedWrite with the provided
+// sequence number. Returns -1 if no corresponding write is found.
+func (s SequencedWriteBySeq) Find(seq enginepb.TxnSeq) int {
+	if util.RaceEnabled {
+		if !sort.IsSorted(s) {
+			panic("SequencedWriteBySeq must be sorted")
+		}
+	}
+	if i := sort.Search(len(s), func(i int) bool {
+		return s[i].Sequence >= seq
+	}); i < len(s) && s[i].Sequence == seq {
+		return i
+	}
+	return -1
+}
+
+// Silence unused warning.
+var _ = (SequencedWriteBySeq{}).Find

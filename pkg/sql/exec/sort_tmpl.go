@@ -25,10 +25,12 @@ package exec
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/pkg/errors"
@@ -86,20 +88,21 @@ func newSingleSorter(t types.T, dir distsqlpb.Ordering_Column_Direction) (colSor
 // {{range .Overloads}} {{/* for each direction */}}
 
 type sort_TYPE_DIROp struct {
-	sortCol      []_GOTYPE
-	order        []uint64
-	workingSpace []uint64
+	sortCol       []_GOTYPE
+	order         []uint64
+	workingSpace  []uint64
+	cancelChecker CancelChecker
 }
 
-func (s *sort_TYPE_DIROp) init(col ColVec, order []uint64, workingSpace []uint64) {
+func (s *sort_TYPE_DIROp) init(col coldata.Vec, order []uint64, workingSpace []uint64) {
 	s.sortCol = col._TemplateType()
 	s.order = order
 	s.workingSpace = workingSpace
 }
 
-func (s *sort_TYPE_DIROp) sort() {
+func (s *sort_TYPE_DIROp) sort(ctx context.Context) {
 	n := len(s.sortCol)
-	s.quickSort(0, n, maxDepth(n))
+	s.quickSort(ctx, 0, n, maxDepth(n))
 }
 
 func (s *sort_TYPE_DIROp) reorder() {
@@ -125,7 +128,7 @@ func (s *sort_TYPE_DIROp) reorder() {
 	}
 }
 
-func (s *sort_TYPE_DIROp) sortPartitions(partitions []uint64) {
+func (s *sort_TYPE_DIROp) sortPartitions(ctx context.Context, partitions []uint64) {
 	if len(partitions) < 1 {
 		panic(fmt.Sprintf("invalid partitions list %v", partitions))
 	}
@@ -141,7 +144,7 @@ func (s *sort_TYPE_DIROp) sortPartitions(partitions []uint64) {
 		s.order = order[partitionStart:partitionEnd]
 		s.sortCol = sortCol[partitionStart:partitionEnd]
 		n := int(partitionEnd - partitionStart)
-		s.quickSort(0, n, maxDepth(n))
+		s.quickSort(ctx, 0, n, maxDepth(n))
 	}
 }
 

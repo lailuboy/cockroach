@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
 )
@@ -48,7 +49,7 @@ func (p *planner) DropTable(ctx context.Context, n *tree.DropTable) (planNode, e
 	td := make([]toDelete, 0, len(n.Names))
 	for i := range n.Names {
 		tn := &n.Names[i]
-		droppedDesc, err := p.prepareDrop(ctx, tn, !n.IfExists, requireTableDesc)
+		droppedDesc, err := p.prepareDrop(ctx, tn, !n.IfExists, ResolveRequireTableDesc)
 		if err != nil {
 			return nil, err
 		}
@@ -110,7 +111,7 @@ func (n *dropTableNode) startExec(params runParams) error {
 			ctx,
 			[]*sqlbase.MutableTableDescriptor{droppedDesc},
 			[]jobspb.DroppedTableDetails{droppedDetails},
-			tree.AsStringWithFlags(n.n, tree.FmtAlwaysQualifyTableNames),
+			tree.AsStringWithFQNames(n.n, params.Ann()),
 			true, /* drainNames */
 			sqlbase.InvalidID /* droppedDatabaseID */); err != nil {
 			return err
@@ -160,7 +161,7 @@ func (*dropTableNode) Close(context.Context)        {}
 // new leases for it and existing leases are released).
 // If the table does not exist, this function returns a nil descriptor.
 func (p *planner) prepareDrop(
-	ctx context.Context, name *tree.TableName, required bool, requiredType requiredType,
+	ctx context.Context, name *tree.TableName, required bool, requiredType ResolveRequiredType,
 ) (*sqlbase.MutableTableDescriptor, error) {
 	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, name, required, requiredType)
 	if err != nil {
@@ -206,7 +207,7 @@ func (p *planner) canRemoveInterleave(
 	// non-public state for referential integrity of the `InterleaveDescriptor`
 	// pointers.
 	if behavior != tree.DropCascade {
-		return pgerror.UnimplementedWithIssueErrorf(
+		return pgerror.UnimplementedWithIssuef(
 			8036, "%q is interleaved by table %q", from, table.Name)
 	}
 	return p.CheckPrivilege(ctx, table, privilege.CREATE)
@@ -287,8 +288,8 @@ func (p *planner) dropTableImpl(
 	}
 
 	// Remove sequence dependencies.
-	for _, columnDesc := range tableDesc.Columns {
-		if err := removeSequenceDependencies(tableDesc, &columnDesc, params); err != nil {
+	for i := range tableDesc.Columns {
+		if err := removeSequenceDependencies(tableDesc, &tableDesc.Columns[i], params); err != nil {
 			return droppedViews, err
 		}
 	}
@@ -389,7 +390,8 @@ func (p *planner) initiateDropTable(
 		}
 
 		if err := job.WithTxn(p.txn).Succeeded(ctx, jobs.NoopFn); err != nil {
-			return errors.Wrapf(err, "failed to mark job %d as as successful", jobID)
+			return pgerror.NewAssertionErrorWithWrappedErrf(err,
+				"failed to mark job %d as as successful", log.Safe(jobID))
 		}
 	}
 
@@ -420,16 +422,28 @@ func (p *planner) removeFKBackReference(
 		// The referenced table is being dropped. No need to modify it further.
 		return nil
 	}
-	targetIdx, err := t.FindIndexByID(idx.ForeignKey.Index)
+	if err := removeFKBackReferenceFromTable(t, idx.ForeignKey.Index, tableDesc.ID, idx.ID); err != nil {
+		return err
+	}
+	return p.writeSchemaChange(ctx, t, sqlbase.InvalidMutationID)
+}
+
+func removeFKBackReferenceFromTable(
+	targetDesc *sqlbase.MutableTableDescriptor,
+	referencedIdx sqlbase.IndexID,
+	source sqlbase.ID,
+	sourceIdx sqlbase.IndexID,
+) error {
+	targetIdx, err := targetDesc.FindIndexByID(referencedIdx)
 	if err != nil {
 		return err
 	}
 	for k, ref := range targetIdx.ReferencedBy {
-		if ref.Table == tableDesc.ID && ref.Index == idx.ID {
+		if ref.Table == source && ref.Index == sourceIdx {
 			targetIdx.ReferencedBy = append(targetIdx.ReferencedBy[:k], targetIdx.ReferencedBy[k+1:]...)
 		}
 	}
-	return p.writeSchemaChange(ctx, t, sqlbase.InvalidMutationID)
+	return nil
 }
 
 func (p *planner) removeInterleaveBackReference(

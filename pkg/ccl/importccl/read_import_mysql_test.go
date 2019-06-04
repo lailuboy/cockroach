@@ -21,12 +21,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -89,7 +90,7 @@ func TestMysqldumpDataReader(t *testing.T) {
 	table := descForTable(t, `CREATE TABLE simple (i INT PRIMARY KEY, s text, b bytea)`, 10, 20, NoFKs)
 	tables := map[string]*sqlbase.TableDescriptor{"simple": table}
 
-	converter, err := newMysqldumpReader(make(chan kvBatch, 10), tables, testEvalCtx)
+	converter, err := newMysqldumpReader(make(chan []roachpb.KeyValue, 10), tables, testEvalCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +291,7 @@ func TestMysqlValueToDatum(t *testing.T) {
 	}
 	tests := []struct {
 		raw  mysql.Expr
-		typ  types.T
+		typ  *types.T
 		want tree.Datum
 	}{
 		{raw: mysql.NewStrVal([]byte("0000-00-00")), typ: types.Date, want: tree.DNull},

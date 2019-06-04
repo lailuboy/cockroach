@@ -16,14 +16,17 @@ package sql
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	sqlstats "github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
@@ -40,20 +43,34 @@ type requestedStat struct {
 const histogramSamples = 10000
 const histogramBuckets = 200
 
+// maxTimestampAge is the maximum allowed age of a scan timestamp during table
+// stats collection, used when creating statistics AS OF SYSTEM TIME. The
+// timestamp is advanced during long operations as needed. See TableReaderSpec.
+//
+// The lowest TTL we recommend is 10 minutes. This value must be be lower than
+// that.
+var maxTimestampAge = settings.RegisterDurationSetting(
+	"sql.stats.max_timestamp_age",
+	"maximum age of timestamp during table statistics collection",
+	5*time.Minute,
+)
+
 func (dsp *DistSQLPlanner) createStatsPlan(
 	planCtx *PlanningCtx,
 	desc *sqlbase.ImmutableTableDescriptor,
-	stats []requestedStat,
+	reqStats []requestedStat,
 	job *jobs.Job,
 ) (PhysicalPlan, error) {
-	if len(stats) == 0 {
+	if len(reqStats) == 0 {
 		return PhysicalPlan{}, errors.New("no stats requested")
 	}
+
+	details := job.Details().(jobspb.CreateStatsDetails)
 
 	// Calculate the set of columns we need to scan.
 	var colCfg scanColumnsConfig
 	var tableColSet util.FastIntSet
-	for _, s := range stats {
+	for _, s := range reqStats {
 		for _, c := range s.columns {
 			if !tableColSet.Contains(int(c)) {
 				tableColSet.Add(int(c))
@@ -78,9 +95,18 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 		return PhysicalPlan{}, err
 	}
 
-	sketchSpecs := make([]distsqlpb.SketchSpec, len(stats))
+	if details.AsOf != nil {
+		// If the read is historical, set the max timestamp age.
+		val := maxTimestampAge.Get(&dsp.st.SV)
+		for i := range p.Processors {
+			spec := p.Processors[i].Spec.Core.TableReader
+			spec.MaxTimestampAgeNanos = uint64(val)
+		}
+	}
+
+	sketchSpecs := make([]distsqlpb.SketchSpec, len(reqStats))
 	sampledColumnIDs := make([]sqlbase.ColumnID, scan.valNeededForCol.Len())
-	for i, s := range stats {
+	for i, s := range reqStats {
 		spec := distsqlpb.SketchSpec{
 			SketchType:          distsqlpb.SketchType_HLL_PLUS_PLUS_V1,
 			GenerateHistogram:   s.histogram,
@@ -103,29 +129,27 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 
 	// Set up the samplers.
 	sampler := &distsqlpb.SamplerSpec{Sketches: sketchSpecs}
-	for _, s := range stats {
-		if s.name == sqlstats.AutoStatsName {
-			sampler.FractionIdle = sqlstats.AutomaticStatisticsIdleTime.Get(&dsp.st.SV)
-		}
+	for _, s := range reqStats {
+		sampler.MaxFractionIdle = details.MaxFractionIdle
 		if s.histogram {
 			sampler.SampleSize = histogramSamples
 		}
 	}
 
 	// The sampler outputs the original columns plus a rank column and four sketch columns.
-	outTypes := make([]sqlbase.ColumnType, 0, len(p.ResultTypes)+5)
+	outTypes := make([]types.T, 0, len(p.ResultTypes)+5)
 	outTypes = append(outTypes, p.ResultTypes...)
 	// An INT column for the rank of each row.
-	outTypes = append(outTypes, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT})
+	outTypes = append(outTypes, *types.Int)
 	// An INT column indicating the sketch index.
-	outTypes = append(outTypes, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT})
+	outTypes = append(outTypes, *types.Int)
 	// An INT column indicating the number of rows processed.
-	outTypes = append(outTypes, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT})
+	outTypes = append(outTypes, *types.Int)
 	// An INT column indicating the number of rows that have a NULL in any sketch
 	// column.
-	outTypes = append(outTypes, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT})
+	outTypes = append(outTypes, *types.Int)
 	// A BYTES column with the sketch data.
-	outTypes = append(outTypes, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BYTES})
+	outTypes = append(outTypes, *types.Bytes)
 
 	p.AddNoGroupingStage(
 		distsqlpb.ProcessorCoreUnion{Sampler: sampler},
@@ -134,14 +158,36 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 		distsqlpb.Ordering{},
 	)
 
+	// Estimate the expected number of rows based on existing stats in the cache.
+	tableStats, err := planCtx.planner.execCfg.TableStatsCache.GetTableStats(planCtx.ctx, desc.ID)
+	if err != nil {
+		return PhysicalPlan{}, err
+	}
+
+	var rowsExpected uint64
+	if len(tableStats) > 0 {
+		overhead := stats.AutomaticStatisticsFractionStaleRows.Get(&dsp.st.SV)
+		// Convert to a signed integer first to make the linter happy.
+		rowsExpected = uint64(int64(
+			// The total expected number of rows is the same number that was measured
+			// most recently, plus some overhead for possible insertions.
+			float64(tableStats[0].RowCount) * (1 + overhead),
+		))
+	}
+
+	var jobID int64
+	if job.ID() != nil {
+		jobID = *job.ID()
+	}
+
 	// Set up the final SampleAggregator stage.
 	agg := &distsqlpb.SampleAggregatorSpec{
 		Sketches:         sketchSpecs,
 		SampleSize:       sampler.SampleSize,
 		SampledColumnIDs: sampledColumnIDs,
 		TableID:          desc.ID,
-		InputProcCnt:     uint32(len(p.ResultRouters)),
-		JobID:            *job.ID(),
+		JobID:            jobID,
+		RowsExpected:     rowsExpected,
 	}
 	// Plan the SampleAggregator on the gateway, unless we have a single Sampler.
 	node := dsp.nodeDesc.NodeID
@@ -152,7 +198,7 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 		node,
 		distsqlpb.ProcessorCoreUnion{SampleAggregator: agg},
 		distsqlpb.PostProcessSpec{},
-		[]sqlbase.ColumnType{},
+		[]types.T{},
 	)
 
 	return p, nil
@@ -162,32 +208,32 @@ func (dsp *DistSQLPlanner) createPlanForCreateStats(
 	planCtx *PlanningCtx, job *jobs.Job,
 ) (PhysicalPlan, error) {
 	details := job.Details().(jobspb.CreateStatsDetails)
-	stats := make([]requestedStat, len(details.ColumnLists))
-	for i := 0; i < len(stats); i++ {
-		// Currently we do not use histograms, so don't bother creating one for
-		// automatic stats.
-		histogram := len(details.ColumnLists[i].IDs) == 1 && details.Name != sqlstats.AutoStatsName
-		stats[i] = requestedStat{
+	reqStats := make([]requestedStat, len(details.ColumnLists))
+	for i := 0; i < len(reqStats); i++ {
+		// Currently we do not use histograms, so don't bother creating one.
+		// When this changes, we can only use it for single-column stats.
+		histogram := false
+		reqStats[i] = requestedStat{
 			columns:             details.ColumnLists[i].IDs,
 			histogram:           histogram,
 			histogramMaxBuckets: histogramBuckets,
-			name:                string(details.Name),
+			name:                details.Name,
 		}
 	}
 
 	tableDesc := sqlbase.NewImmutableTableDescriptor(details.Table)
-	return dsp.createStatsPlan(planCtx, tableDesc, stats, job)
+	return dsp.createStatsPlan(planCtx, tableDesc, reqStats, job)
 }
 
 func (dsp *DistSQLPlanner) planAndRunCreateStats(
 	ctx context.Context,
 	evalCtx *extendedEvalContext,
+	planCtx *PlanningCtx,
 	txn *client.Txn,
 	job *jobs.Job,
 	resultRows *RowResultWriter,
 ) error {
 	ctx = logtags.AddTag(ctx, "create-stats-distsql", nil)
-	planCtx := dsp.NewPlanningCtx(ctx, evalCtx, txn)
 
 	physPlan, err := dsp.createPlanForCreateStats(planCtx, job)
 	if err != nil {

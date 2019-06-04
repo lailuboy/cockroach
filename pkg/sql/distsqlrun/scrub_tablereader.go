@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
@@ -38,10 +39,10 @@ import (
 // TODO(joey): If we want a way find the key for the error, we will need
 // additional data such as the key bytes and the table descriptor ID.
 // Repair won't be possible without this.
-var ScrubTypes = []sqlbase.ColumnType{
-	{SemanticType: sqlbase.ColumnType_STRING},
-	{SemanticType: sqlbase.ColumnType_STRING},
-	{SemanticType: sqlbase.ColumnType_JSONB},
+var ScrubTypes = []types.T{
+	*types.String,
+	*types.String,
+	*types.Jsonb,
 }
 
 type scrubTableReader struct {
@@ -172,15 +173,15 @@ func (tr *scrubTableReader) generateScrubErrorRow(
 	primaryKeyValues := tr.prettyPrimaryKeyValues(row, &tr.tableDesc)
 	return sqlbase.EncDatumRow{
 		sqlbase.DatumToEncDatum(
-			ScrubTypes[0],
+			&ScrubTypes[0],
 			tree.NewDString(scrubErr.Code),
 		),
 		sqlbase.DatumToEncDatum(
-			ScrubTypes[1],
+			&ScrubTypes[1],
 			tree.NewDString(primaryKeyValues),
 		),
 		sqlbase.DatumToEncDatum(
-			ScrubTypes[2],
+			&ScrubTypes[2],
 			detailsJSON,
 		),
 	}, nil
@@ -190,8 +191,9 @@ func (tr *scrubTableReader) prettyPrimaryKeyValues(
 	row sqlbase.EncDatumRow, table *sqlbase.TableDescriptor,
 ) string {
 	colIdxMap := make(map[sqlbase.ColumnID]int, len(table.Columns))
-	for i, c := range table.Columns {
-		colIdxMap[c.ID] = i
+	for i := range table.Columns {
+		id := table.Columns[i].ID
+		colIdxMap[id] = i
 	}
 	colIDToRowIdxMap := make(map[sqlbase.ColumnID]int, len(table.Columns))
 	for rowIdx, colIdx := range tr.fetcherResultToColIdx {
@@ -227,7 +229,7 @@ func (tr *scrubTableReader) Start(ctx context.Context) context.Context {
 }
 
 // Next is part of the RowSource interface.
-func (tr *scrubTableReader) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (tr *scrubTableReader) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	for tr.State == StateRunning {
 		var row sqlbase.EncDatumRow
 		var err error
@@ -249,6 +251,7 @@ func (tr *scrubTableReader) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 		//
 		// NB: Cases 3 and 4 are handled further below, in the standard
 		// table scanning code path.
+		err = errors.Cause(err)
 		if v, ok := err.(*scrub.Error); ok {
 			row, err = tr.generateScrubErrorRow(row, v)
 		} else if err == nil && row != nil {

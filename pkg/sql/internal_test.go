@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -153,7 +154,7 @@ func TestInternalExecAppNameInitialization(t *testing.T) {
 	// sem will be fired every time pg_sleep(1337666) is called.
 	sem := make(chan struct{})
 	params.Knobs.SQLExecutor = &sql.ExecutorTestingKnobs{
-		BeforeExecute: func(ctx context.Context, stmt string, _ /* isParallel*/ bool) {
+		BeforeExecute: func(ctx context.Context, stmt string) {
 			if strings.Contains(stmt, "(1.337666") {
 				sem <- struct{}{}
 			}
@@ -165,8 +166,8 @@ func TestInternalExecAppNameInitialization(t *testing.T) {
 		defer s.Stopper().Stop(context.TODO())
 
 		testInternalExecutorAppNameInitialization(t, sem,
-			sql.InternalAppNamePrefix+"internal-test-query", // app name in SHOW
-			sql.InternalAppNamePrefix+"internal-test-query", // app name in stats
+			sqlbase.InternalAppNamePrefix+"-test-query", // app name in SHOW
+			sqlbase.InternalAppNamePrefix+"-test-query", // app name in stats
 			s.InternalExecutor().(*sql.InternalExecutor))
 	})
 
@@ -191,7 +192,7 @@ func TestInternalExecAppNameInitialization(t *testing.T) {
 		testInternalExecutorAppNameInitialization(
 			t, sem,
 			"appname_findme", // app name in SHOW
-			sql.DelegatedAppNamePrefix+"appname_findme", // app name in stats
+			sqlbase.DelegatedAppNamePrefix+"appname_findme", // app name in stats
 			ie,
 		)
 	})
@@ -247,7 +248,7 @@ func testInternalExecutorAppNameInitialization(
 			nil, /* txn */
 			// We need to assemble the magic string so that this SELECT
 			// does not find itself.
-			"SELECT query_id, application_name FROM [SHOW QUERIES] WHERE query LIKE '%337' || '666%'")
+			"SELECT query_id, application_name FROM [SHOW ALL QUERIES] WHERE query LIKE '%337' || '666%'")
 		if err != nil {
 			return err
 		}

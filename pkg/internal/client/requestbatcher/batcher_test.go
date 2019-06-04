@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,6 +38,7 @@ type batchResp struct {
 }
 
 type batchSend struct {
+	ctx      context.Context
 	ba       roachpb.BatchRequest
 	respChan chan<- batchResp
 }
@@ -48,7 +50,7 @@ func (c chanSender) Send(
 ) (*roachpb.BatchResponse, *roachpb.Error) {
 	respChan := make(chan batchResp)
 	select {
-	case c <- batchSend{ba: ba, respChan: respChan}:
+	case c <- batchSend{ctx: ctx, ba: ba, respChan: respChan}:
 	case <-ctx.Done():
 		return nil, roachpb.NewError(ctx.Err())
 	}
@@ -294,7 +296,91 @@ func TestPanicWithNilStopper(t *testing.T) {
 	New(Config{Sender: make(chanSender)})
 }
 
-func TestTimeoutDisabled(t *testing.T) {
+// TestBatchTimeout verfies the the RequestBatcher uses the context with the
+// deadline from the latest call to send.
+func TestBatchTimeout(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const timeout = 5 * time.Millisecond
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.Background())
+	sc := make(chanSender)
+	t.Run("WithTimeout", func(t *testing.T) {
+		b := New(Config{
+			// MaxMsgsPerBatch of 1 is chosen so that the first call to Send will
+			// immediately lead to a batch being sent.
+			MaxMsgsPerBatch: 1,
+			Sender:          sc,
+			Stopper:         stopper,
+		})
+		// This test attempts to verify that a batch with a request with a timeout
+		// will be sent with that timeout. The test faces challenges of timing.
+		// There are several different phases at which the timeout may fire;
+		// the request may time out before it has been sent to the batcher, it
+		// may timeout while it is being sent or it may not time out until after
+		// it has been sent. Each of these cases are handled and verified to ensure
+		// that the request was indeed sent with a timeout.
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		respChan := make(chan Response, 1)
+		if err := b.SendWithChan(ctx, respChan, 1, &roachpb.GetRequest{}); err != nil {
+			testutils.IsError(err, context.DeadlineExceeded.Error())
+			return
+		}
+		select {
+		case s := <-sc:
+			deadline, hasDeadline := s.ctx.Deadline()
+			assert.True(t, hasDeadline)
+			assert.True(t, timeutil.Until(deadline) < timeout)
+			s.respChan <- batchResp{}
+		case resp := <-respChan:
+			assert.Nil(t, resp.Resp)
+			testutils.IsError(resp.Err, context.DeadlineExceeded.Error())
+		}
+	})
+	t.Run("NoTimeout", func(t *testing.T) {
+		b := New(Config{
+			// MaxMsgsPerBatch of 2 is chosen so that the second call to Send will
+			// immediately lead to a batch being sent.
+			MaxMsgsPerBatch: 2,
+			Sender:          sc,
+			Stopper:         stopper,
+		})
+		// This test attempts to verify that a batch with two requests where one
+		// carries a timeout leads to the batch being sent without a timeout.
+		// There is a hazard that the goroutine which is being canceled is not
+		// able to send its request to the batcher before its deadline expires
+		// in which case the batch is never sent due to size constraints.
+		// The test will pass in this scenario with after logging and cleaning up.
+		ctx1, cancel1 := context.WithTimeout(context.Background(), timeout)
+		defer cancel1()
+		ctx2, cancel2 := context.WithCancel(context.Background())
+		defer cancel2()
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var err1, err2 error
+		go func() { _, err1 = b.Send(ctx1, 1, &roachpb.GetRequest{}); wg.Done() }()
+		go func() { _, err2 = b.Send(ctx2, 1, &roachpb.GetRequest{}); wg.Done() }()
+		select {
+		case s := <-sc:
+			assert.Len(t, s.ba.Requests, 2)
+			s.respChan <- batchResp{}
+		case <-ctx1.Done():
+			// This case implies that the test did not exercise what was intended
+			// but that's okay, clean up the other request and return.
+			t.Logf("canceled goroutine failed to send within %v, passing", timeout)
+			cancel2()
+			wg.Wait()
+			return
+		}
+		wg.Wait()
+		testutils.IsError(err1, context.DeadlineExceeded.Error())
+		assert.Nil(t, err2)
+	})
+}
+
+// TestIdleAndMaxTimeoutDisabled exercises the RequestBatcher when it is
+// configured to send only based on batch size policies.
+func TestIdleAndMaxTimeoutDisabled(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())

@@ -109,7 +109,7 @@ func CanWriteData(stmt Statement) bool {
 	case *CopyFrom, *Import, *Restore:
 		return true
 	// CockroachDB extensions.
-	case *Split, *Relocate, *Scatter:
+	case *Split, *Unsplit, *Relocate, *Scatter:
 		return true
 	}
 	return false
@@ -143,16 +143,6 @@ type HiddenFromShowQueries interface {
 	hiddenFromShowQueries()
 }
 
-// IndependentFromParallelizedPriors is a pseudo-interface to be implemented
-// by statements which do not force parallel statement execution synchronization
-// when they run.
-// NB: Only statements that don't send any requests using the current
-// transaction can implement this. Otherwise, the statement will fail if any of
-// the parallel statements has encoutered a KV error (which toasts the txn).
-type IndependentFromParallelizedPriors interface {
-	independentFromParallelizedPriors()
-}
-
 // ObserverStatement is a marker interface for statements which are allowed to
 // run regardless of the current transaction state: statements other than
 // rollback are generally rejected if the session is in a failed transaction
@@ -167,6 +157,21 @@ type IndependentFromParallelizedPriors interface {
 type ObserverStatement interface {
 	observerStatement()
 }
+
+// CCLOnlyStatement is a marker interface for statements that require
+// a CCL binary for successful planning or execution.
+// It is used to enhance error messages when attempting to use these
+// statements in non-CCL binaries.
+type CCLOnlyStatement interface {
+	cclOnlyStatement()
+}
+
+var _ CCLOnlyStatement = &Backup{}
+var _ CCLOnlyStatement = &Restore{}
+var _ CCLOnlyStatement = &CreateRole{}
+var _ CCLOnlyStatement = &DropRole{}
+var _ CCLOnlyStatement = &GrantRole{}
+var _ CCLOnlyStatement = &RevokeRole{}
 
 // StatementType implements the Statement interface.
 func (*AlterIndex) StatementType() StatementType { return DDL }
@@ -204,6 +209,8 @@ func (*Backup) StatementType() StatementType { return Rows }
 // StatementTag returns a short string identifying the type of statement.
 func (*Backup) StatementTag() string { return "BACKUP" }
 
+func (*Backup) cclOnlyStatement() {}
+
 func (*Backup) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
@@ -220,23 +227,17 @@ func (n *ControlJobs) StatementTag() string {
 	return fmt.Sprintf("%s JOBS", JobCommandToStatement[n.Command])
 }
 
-func (*ControlJobs) independentFromParallelizedPriors() {}
-
 // StatementType implements the Statement interface.
 func (*CancelQueries) StatementType() StatementType { return RowsAffected }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*CancelQueries) StatementTag() string { return "CANCEL QUERIES" }
 
-func (*CancelQueries) independentFromParallelizedPriors() {}
-
 // StatementType implements the Statement interface.
 func (*CancelSessions) StatementType() StatementType { return RowsAffected }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*CancelSessions) StatementTag() string { return "CANCEL SESSIONS" }
-
-func (*CancelSessions) independentFromParallelizedPriors() {}
 
 // StatementType implements the Statement interface.
 func (*CannedOptPlan) StatementType() StatementType { return Rows }
@@ -330,6 +331,8 @@ func (*CreateRole) StatementType() StatementType { return RowsAffected }
 // StatementTag returns a short string identifying the type of statement.
 func (*CreateRole) StatementTag() string { return "CREATE ROLE" }
 
+func (*CreateRole) cclOnlyStatement() {}
+
 func (*CreateRole) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
@@ -416,13 +419,13 @@ func (*DropRole) StatementType() StatementType { return RowsAffected }
 // StatementTag returns a short string identifying the type of statement.
 func (*DropRole) StatementTag() string { return "DROP ROLE" }
 
+func (*DropRole) cclOnlyStatement() {}
+
 // StatementType implements the Statement interface.
 func (*Execute) StatementType() StatementType { return Unknown }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*Execute) StatementTag() string { return "EXECUTE" }
-
-func (*Execute) independentFromParallelizedPriors() {}
 
 // StatementType implements the Statement interface.
 func (*Explain) StatementType() StatementType { return Rows }
@@ -447,6 +450,8 @@ func (*GrantRole) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*GrantRole) StatementTag() string { return "GRANT" }
+
+func (*GrantRole) cclOnlyStatement() {}
 
 // StatementType implements the Statement interface.
 func (n *Insert) StatementType() StatementType { return n.Returning.statementType() }
@@ -526,6 +531,8 @@ func (*Restore) StatementType() StatementType { return Rows }
 // StatementTag returns a short string identifying the type of statement.
 func (*Restore) StatementTag() string { return "RESTORE" }
 
+func (*Restore) cclOnlyStatement() {}
+
 func (*Restore) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
@@ -539,6 +546,8 @@ func (*RevokeRole) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*RevokeRole) StatementTag() string { return "REVOKE" }
+
+func (*RevokeRole) cclOnlyStatement() {}
 
 // StatementType implements the Statement interface.
 func (*RollbackToSavepoint) StatementType() StatementType { return Ack }
@@ -627,15 +636,17 @@ func (*ShowVar) StatementType() StatementType { return Rows }
 // StatementTag returns a short string identifying the type of statement.
 func (*ShowVar) StatementTag() string { return "SHOW" }
 
-func (*ShowVar) independentFromParallelizedPriors() {}
-
 // StatementType implements the Statement interface.
 func (*ShowClusterSetting) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*ShowClusterSetting) StatementTag() string { return "SHOW" }
 
-func (*ShowClusterSetting) independentFromParallelizedPriors() {}
+// StatementType implements the Statement interface.
+func (*ShowAllClusterSettings) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowAllClusterSettings) StatementTag() string { return "SHOW" }
 
 // StatementType implements the Statement interface.
 func (*ShowColumns) StatementType() StatementType { return Rows }
@@ -674,10 +685,16 @@ func (*ShowGrants) StatementType() StatementType { return Rows }
 func (*ShowGrants) StatementTag() string { return "SHOW GRANTS" }
 
 // StatementType implements the Statement interface.
-func (*ShowIndex) StatementType() StatementType { return Rows }
+func (*ShowDatabaseIndexes) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*ShowIndex) StatementTag() string { return "SHOW INDEX" }
+func (*ShowDatabaseIndexes) StatementTag() string { return "SHOW INDEXES FROM DATABASE" }
+
+// StatementType implements the Statement interface.
+func (*ShowIndexes) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowIndexes) StatementTag() string { return "SHOW INDEXES FROM TABLE" }
 
 // StatementType implements the Statement interface.
 func (*ShowQueries) StatementType() StatementType { return Rows }
@@ -685,15 +702,11 @@ func (*ShowQueries) StatementType() StatementType { return Rows }
 // StatementTag returns a short string identifying the type of statement.
 func (*ShowQueries) StatementTag() string { return "SHOW QUERIES" }
 
-func (*ShowQueries) independentFromParallelizedPriors() {}
-
 // StatementType implements the Statement interface.
 func (*ShowJobs) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*ShowJobs) StatementTag() string { return "SHOW JOBS" }
-
-func (*ShowJobs) independentFromParallelizedPriors() {}
 
 // StatementType implements the Statement interface.
 func (*ShowRoleGrants) StatementType() StatementType { return Rows }
@@ -706,8 +719,6 @@ func (*ShowSessions) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*ShowSessions) StatementTag() string { return "SHOW SESSIONS" }
-
-func (*ShowSessions) independentFromParallelizedPriors() {}
 
 // StatementType implements the Statement interface.
 func (*ShowTableStats) StatementType() StatementType { return Rows }
@@ -727,8 +738,7 @@ func (*ShowSyntax) StatementType() StatementType { return Rows }
 // StatementTag returns a short string identifying the type of statement.
 func (*ShowSyntax) StatementTag() string { return "SHOW SYNTAX" }
 
-func (*ShowSyntax) observerStatement()                 {}
-func (*ShowSyntax) independentFromParallelizedPriors() {}
+func (*ShowSyntax) observerStatement() {}
 
 // StatementType implements the Statement interface.
 func (*ShowTransactionStatus) StatementType() StatementType { return Rows }
@@ -736,8 +746,7 @@ func (*ShowTransactionStatus) StatementType() StatementType { return Rows }
 // StatementTag returns a short string identifying the type of statement.
 func (*ShowTransactionStatus) StatementTag() string { return "SHOW TRANSACTION STATUS" }
 
-func (*ShowTransactionStatus) observerStatement()                 {}
-func (*ShowTransactionStatus) independentFromParallelizedPriors() {}
+func (*ShowTransactionStatus) observerStatement() {}
 
 // StatementType implements the Statement interface.
 func (*ShowUsers) StatementType() StatementType { return Rows }
@@ -798,6 +807,12 @@ func (*Split) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*Split) StatementTag() string { return "SPLIT" }
+
+// StatementType implements the Statement interface.
+func (*Unsplit) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*Unsplit) StatementTag() string { return "UNSPLIT" }
 
 // StatementType implements the Statement interface.
 func (*Truncate) StatementType() StatementType { return Ack }
@@ -901,13 +916,15 @@ func (n *SetTracing) String() string                { return AsString(n) }
 func (n *SetVar) String() string                    { return AsString(n) }
 func (n *ShowBackup) String() string                { return AsString(n) }
 func (n *ShowClusterSetting) String() string        { return AsString(n) }
+func (n *ShowAllClusterSettings) String() string    { return AsString(n) }
 func (n *ShowColumns) String() string               { return AsString(n) }
 func (n *ShowConstraints) String() string           { return AsString(n) }
 func (n *ShowCreate) String() string                { return AsString(n) }
 func (n *ShowDatabases) String() string             { return AsString(n) }
+func (n *ShowDatabaseIndexes) String() string       { return AsString(n) }
 func (n *ShowGrants) String() string                { return AsString(n) }
 func (n *ShowHistogram) String() string             { return AsString(n) }
-func (n *ShowIndex) String() string                 { return AsString(n) }
+func (n *ShowIndexes) String() string               { return AsString(n) }
 func (n *ShowJobs) String() string                  { return AsString(n) }
 func (n *ShowQueries) String() string               { return AsString(n) }
 func (n *ShowRanges) String() string                { return AsString(n) }
@@ -926,6 +943,7 @@ func (n *ShowVar) String() string                   { return AsString(n) }
 func (n *ShowZoneConfig) String() string            { return AsString(n) }
 func (n *ShowFingerprints) String() string          { return AsString(n) }
 func (n *Split) String() string                     { return AsString(n) }
+func (n *Unsplit) String() string                   { return AsString(n) }
 func (n *Truncate) String() string                  { return AsString(n) }
 func (n *UnionClause) String() string               { return AsString(n) }
 func (n *Update) String() string                    { return AsString(n) }

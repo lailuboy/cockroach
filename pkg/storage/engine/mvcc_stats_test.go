@@ -584,11 +584,13 @@ func TestMVCCStatsDelDelCommitMovesTimestamp(t *testing.T) {
 		aggMS := *aggMS
 		engine := engine.NewBatch()
 		defer engine.Close()
-		txn := txn.Clone()
 
-		txn.Status = roachpb.COMMITTED
-		txn.Timestamp.Forward(ts3)
-		if err := MVCCResolveWriteIntent(ctx, engine, &aggMS, roachpb.Intent{Span: roachpb.Span{Key: key}, Status: txn.Status, Txn: txn.TxnMeta}); err != nil {
+		txnCommit := txn.Clone()
+		txnCommit.Status = roachpb.COMMITTED
+		txnCommit.Timestamp.Forward(ts3)
+		if err := MVCCResolveWriteIntent(ctx, engine, &aggMS, roachpb.Intent{
+			Span: roachpb.Span{Key: key}, Status: txnCommit.Status, Txn: txnCommit.TxnMeta,
+		}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -612,12 +614,11 @@ func TestMVCCStatsDelDelCommitMovesTimestamp(t *testing.T) {
 		engine := engine.NewBatch()
 		defer engine.Close()
 
-		txn := txn.Clone()
-
-		txn.Status = roachpb.ABORTED
-		txn.Timestamp.Forward(ts3)
+		txnAbort := txn.Clone()
+		txnAbort.Status = roachpb.ABORTED
+		txnAbort.Timestamp.Forward(ts3)
 		if err := MVCCResolveWriteIntent(ctx, engine, &aggMS, roachpb.Intent{
-			Span: roachpb.Span{Key: key}, Status: txn.Status, Txn: txn.TxnMeta,
+			Span: roachpb.Span{Key: key}, Status: txnAbort.Status, Txn: txnAbort.TxnMeta,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -739,11 +740,11 @@ func TestMVCCStatsPutDelPutMovesTimestamp(t *testing.T) {
 		aggMS := *aggMS
 		engine := engine.NewBatch()
 		defer engine.Close()
-		txn := txn.Clone()
 
-		txn.Status = roachpb.ABORTED // doesn't change m2ValSize, fortunately
+		txnAbort := txn.Clone()
+		txnAbort.Status = roachpb.ABORTED // doesn't change m2ValSize, fortunately
 		if err := MVCCResolveWriteIntent(ctx, engine, &aggMS, roachpb.Intent{
-			Span: roachpb.Span{Key: key}, Status: txn.Status, Txn: txn.TxnMeta,
+			Span: roachpb.Span{Key: key}, Status: txnAbort.Status, Txn: txnAbort.TxnMeta,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -1050,72 +1051,6 @@ func TestMVCCStatsPutWaitDeleteGC(t *testing.T) {
 	}
 
 	assertEq(t, engine, "after GC", aggMS, &expMS)
-}
-
-// TestMVCCStatsDocumentNegativeWrites documents that things go wrong when you
-// write at a negative timestamp. We shouldn't do that in practice and perhaps
-// we should have it error outright.
-//
-// See https://github.com/cockroachdb/cockroach/issues/21112.
-func TestMVCCStatsDocumentNegativeWrites(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	engine := createTestEngine()
-	defer engine.Close()
-
-	ctx := context.Background()
-	aggMS := &enginepb.MVCCStats{}
-
-	assertEq(t, engine, "initially", aggMS, &enginepb.MVCCStats{})
-
-	key := roachpb.Key("a")
-
-	// Do something funky: write a key at a negative WallTime. This must never
-	// happen in practice but it did in `TestMVCCStatsRandomized` (no more).
-	tsNegative := hlc.Timestamp{WallTime: -1}
-
-	// Put a deletion tombstone. We just need something at a negative timestamp
-	// that generates GCByteAge and this is the simplest we can do.
-	if err := MVCCDelete(ctx, engine, aggMS, key, tsNegative, nil); err != nil {
-		t.Fatal(err)
-	}
-
-	mKeySize := int64(mvccKey(key).EncodedSize()) // 2
-	vKeySize := mvccVersionTimestampSize          // 12
-
-	expMS := enginepb.MVCCStats{
-		LastUpdateNanos: 0,
-		KeyBytes:        mKeySize + vKeySize, // 14
-		KeyCount:        1,
-		ValCount:        1,
-	}
-	assertEq(t, engine, "after deletion", aggMS, &expMS)
-
-	// Do it again at higher timestamp to expose that we've corrupted things.
-	ts1 := hlc.Timestamp{WallTime: 1E9}
-	if err := MVCCDelete(ctx, engine, aggMS, key, ts1, nil); err != nil {
-		t.Fatal(err)
-	}
-
-	expMS = enginepb.MVCCStats{
-		LastUpdateNanos: 1E9,
-		KeyBytes:        mKeySize + 2*vKeySize, // 2 + 24 = 26
-		KeyCount:        1,
-		ValCount:        2,
-		// vKeySize is what you'd kinda expect. Really you would hope to also
-		// see the transition through zero as adding to the factor (picking up a
-		// 2x), but this isn't true (we compute the number of steps via
-		// now/1E9-ts/1E9, which doesn't handle this case). What we get is even
-		// more surprising though, and if you dig into it, you'll see that the
-		// negative-timestamp value has become the first value (i.e. it has
-		// inverted with the one written at ts1). We're screwed.
-		GCBytesAge: vKeySize + mKeySize, // 14
-	}
-	// Make the test pass with what comes out of recomputing from the engine:
-	// The value at -1 is now the first value, so it picks up one second GCBytesAge
-	// but gets to claim mKeySize as part of itself (which it wouldn't if it were
-	// in its proper place).
-	aggMS.GCBytesAge += mKeySize
-	assertEq(t, engine, "after second deletion", aggMS, &expMS)
 }
 
 // TestMVCCStatsSysTxnPutPut prevents regression of a bug that, when rewriting an intent

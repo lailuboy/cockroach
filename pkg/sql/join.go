@@ -20,8 +20,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
@@ -151,7 +151,7 @@ func (p *planner) makeJoin(
 				// ambiguity later.
 				continue
 			}
-			return planDataSource{}, pgerror.NewErrorf(
+			return planDataSource{}, pgerror.Newf(
 				pgerror.CodeDuplicateAliasError,
 				"source name %q specified more than once (missing AS clause)",
 				t,

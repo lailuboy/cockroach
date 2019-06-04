@@ -17,7 +17,6 @@ package server
 import (
 	"context"
 	"fmt"
-	"math"
 	"net"
 	"sort"
 	"time"
@@ -36,9 +35,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/closedts/container"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/growstack"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -174,79 +173,44 @@ func allocateNodeID(ctx context.Context, db *client.DB) (roachpb.NodeID, error) 
 }
 
 // allocateStoreIDs increments the store id generator key for the
-// specified node to allocate "inc" new, unique store ids. The
+// specified node to allocate count new, unique store ids. The
 // first ID in a contiguous range is returned on success.
 func allocateStoreIDs(
-	ctx context.Context, nodeID roachpb.NodeID, inc int64, db *client.DB,
+	ctx context.Context, nodeID roachpb.NodeID, count int64, db *client.DB,
 ) (roachpb.StoreID, error) {
-	val, err := client.IncrementValRetryable(ctx, db, keys.StoreIDGenerator, inc)
+	val, err := client.IncrementValRetryable(ctx, db, keys.StoreIDGenerator, count)
 	if err != nil {
-		return 0, errors.Wrapf(err, "unable to allocate %d store IDs for node %d", inc, nodeID)
+		return 0, errors.Wrapf(err, "unable to allocate %d store IDs for node %d", count, nodeID)
 	}
-	return roachpb.StoreID(val - inc + 1), nil
+	return roachpb.StoreID(val - count + 1), nil
 }
 
 // GetBootstrapSchema returns the schema which will be used to bootstrap a new
 // server.
-func GetBootstrapSchema() sqlbase.MetadataSchema {
-	return sqlbase.MakeMetadataSchema()
+func GetBootstrapSchema(
+	defaultZoneConfig *config.ZoneConfig, defaultSystemZoneConfig *config.ZoneConfig,
+) sqlbase.MetadataSchema {
+	return sqlbase.MakeMetadataSchema(defaultZoneConfig, defaultSystemZoneConfig)
 }
 
-// bootstrapCluster bootstraps multiple stores using the provided engines.
+// bootstrapCluster initializes the passed-in engines for a new cluster.
 // Returns the cluster ID.
 //
-// Ranges for various static split points are created (i.e. various system
-// ranges and system tables). Note however that many of these ranges cannot be
-// accessed by KV in regular means until the node liveness is written, since
-// epoch-based leases cannot be granted until then.
+// The first engine will contain ranges for various static split points (i.e.
+// various system ranges and system tables). Note however that many of these
+// ranges cannot be accessed by KV in regular means until the node liveness is
+// written, since epoch-based leases cannot be granted until then. All other
+// engines are initialized with their StoreIdent.
 func bootstrapCluster(
 	ctx context.Context,
-	cfg storage.StoreConfig,
 	engines []engine.Engine,
 	bootstrapVersion cluster.ClusterVersion,
-	txnMetrics kv.TxnMetrics,
+	defaultZoneConfig *config.ZoneConfig,
+	defaultSystemZoneConfig *config.ZoneConfig,
 ) (uuid.UUID, error) {
 	clusterID := uuid.MakeV4()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-
-	// Make sure that the store config has a valid clock and that it doesn't
-	// try to use gossip, since that can introduce race conditions.
-	if cfg.Clock == nil {
-		cfg.Clock = hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	}
-	cfg.Gossip = nil
-	cfg.TestingKnobs = storage.StoreTestingKnobs{}
-	cfg.ScanInterval = 10 * time.Minute
-	cfg.HistogramWindowInterval = time.Duration(math.MaxInt64)
-	tr := cfg.Settings.Tracer
-	defer tr.Close()
-	cfg.AmbientCtx.Tracer = tr
-	// Create a KV DB with a sender that routes all requests to the first range
-	// and first local store.
-	stores := storage.NewStores(cfg.AmbientCtx, cfg.Clock, cfg.Settings.Version.MinSupportedVersion, cfg.Settings.Version.ServerVersion)
-	localSender := client.Wrap(stores, func(ba roachpb.BatchRequest) roachpb.BatchRequest {
-		ba.RangeID = 1
-		ba.Replica.StoreID = 1
-		return ba
-	})
-	tcsFactory := kv.NewTxnCoordSenderFactory(
-		kv.TxnCoordSenderFactoryConfig{
-			AmbientCtx: cfg.AmbientCtx,
-			Settings:   cfg.Settings,
-			Clock:      cfg.Clock,
-			Stopper:    stopper,
-			Metrics:    txnMetrics,
-		},
-		localSender,
-	)
-
-	cfg.DB = client.NewDB(cfg.AmbientCtx, tcsFactory, cfg.Clock)
-	cfg.Transport = storage.NewDummyRaftTransport(cfg.Settings)
-	cfg.ClosedTimestamp = container.NoopContainer()
-	if err := cfg.Settings.InitializeVersion(bootstrapVersion); err != nil {
-		return uuid.UUID{}, errors.Wrap(err, "while initializing cluster version")
-	}
+	// TODO(andrei): It'd be cool if this method wouldn't do anything to engines
+	// other than the first one, and let regular node startup code deal with them.
 	for i, eng := range engines {
 		sIdent := roachpb.StoreIdent{
 			ClusterID: clusterID,
@@ -254,36 +218,31 @@ func bootstrapCluster(
 			StoreID:   roachpb.StoreID(i + 1),
 		}
 
-		// The bootstrapping store will not connect to other nodes so its
-		// StoreConfig doesn't really matter.
-		s := storage.NewStore(cfg, eng, &roachpb.NodeDescriptor{NodeID: FirstNodeID})
-
-		// Bootstrap store to persist the store ident and cluster version.
-		if err := storage.Bootstrap(ctx, eng, sIdent, bootstrapVersion); err != nil {
+		// Initialize the engine backing the store with the store ident and cluster
+		// version.
+		if err := storage.InitEngine(ctx, eng, sIdent, bootstrapVersion); err != nil {
 			return uuid.UUID{}, err
 		}
+
 		// Create first range, writing directly to engine. Note this does
 		// not create the range, just its data. Only do this if this is the
 		// first store.
 		if i == 0 {
-			schema := GetBootstrapSchema()
+			schema := GetBootstrapSchema(defaultZoneConfig, defaultSystemZoneConfig)
 			initialValues, tableSplits := schema.GetInitialValues()
 			splits := append(config.StaticSplits(), tableSplits...)
 			sort.Slice(splits, func(i, j int) bool {
 				return splits[i].Less(splits[j])
 			})
 
-			if err := s.WriteInitialData(
-				ctx, initialValues, bootstrapVersion.Version, len(engines), splits,
+			if err := storage.WriteInitialClusterData(
+				ctx, eng, initialValues,
+				bootstrapVersion.Version, len(engines), splits,
+				hlc.UnixNano(),
 			); err != nil {
 				return uuid.UUID{}, err
 			}
 		}
-		if err := s.Start(ctx, stopper); err != nil {
-			return uuid.UUID{}, err
-		}
-
-		stores.AddStore(s)
 	}
 	return clusterID, nil
 }
@@ -342,14 +301,18 @@ func (n *Node) AnnotateCtxWithSpan(
 	return n.storeCfg.AmbientCtx.AnnotateCtxWithSpan(ctx, opName)
 }
 
-func (n *Node) bootstrap(
-	ctx context.Context, engines []engine.Engine, bootstrapVersion cluster.ClusterVersion,
+func (n *Node) bootstrapCluster(
+	ctx context.Context,
+	engines []engine.Engine,
+	bootstrapVersion cluster.ClusterVersion,
+	defaultZoneConfig *config.ZoneConfig,
+	defaultSystemZoneConfig *config.ZoneConfig,
 ) error {
 	if n.initialBoot || n.clusterID.Get() != uuid.Nil {
 		return fmt.Errorf("cluster has already been initialized with ID %s", n.clusterID.Get())
 	}
 	n.initialBoot = true
-	clusterID, err := bootstrapCluster(ctx, n.storeCfg, engines, bootstrapVersion, n.txnMetrics)
+	clusterID, err := bootstrapCluster(ctx, engines, bootstrapVersion, defaultZoneConfig, defaultSystemZoneConfig)
 	if err != nil {
 		return err
 	}
@@ -374,7 +337,7 @@ func (n *Node) onClusterVersionChange(cv cluster.ClusterVersion) {
 func (n *Node) start(
 	ctx context.Context,
 	addr net.Addr,
-	bootstrappedEngines, emptyEngines []engine.Engine,
+	initializedEngines, emptyEngines []engine.Engine,
 	attrs roachpb.Attributes,
 	locality roachpb.Locality,
 	cv cluster.ClusterVersion,
@@ -389,8 +352,8 @@ func (n *Node) start(
 	// stores, the NodeID is persisted in each of them. If not, then we'll need to
 	// use the KV store to get a NodeID assigned.
 	var nodeID roachpb.NodeID
-	if len(bootstrappedEngines) > 0 {
-		firstIdent, err := storage.ReadStoreIdent(ctx, bootstrappedEngines[0])
+	if len(initializedEngines) > 0 {
+		firstIdent, err := storage.ReadStoreIdent(ctx, initializedEngines[0])
 		if err != nil {
 			return err
 		}
@@ -413,6 +376,9 @@ func (n *Node) start(
 		span.Finish()
 		nodeID = newID
 	}
+
+	// Inform the RPC context of the node ID.
+	n.storeCfg.RPCContext.NodeID.Set(ctx, nodeID)
 
 	n.startedAt = n.storeCfg.Clock.Now().WallTime
 	n.Descriptor = roachpb.NodeDescriptor{
@@ -441,13 +407,9 @@ func (n *Node) start(
 	// Start the closed timestamp subsystem.
 	n.storeCfg.ClosedTimestamp.Start(n.Descriptor.NodeID)
 
-	// Initialize the stores we're going to start.
-	stores, err := n.initStores(ctx, bootstrappedEngines, n.stopper)
-	if err != nil {
-		return err
-	}
-
-	for _, s := range stores {
+	// Create stores from the engines that were already bootstrapped.
+	for _, e := range initializedEngines {
+		s := storage.NewStore(ctx, n.storeCfg, e, &n.Descriptor)
 		if err := s.Start(ctx, n.stopper); err != nil {
 			return errors.Errorf("failed to start store: %s", err)
 		}
@@ -467,7 +429,7 @@ func (n *Node) start(
 	if err := n.validateStores(ctx); err != nil {
 		return err
 	}
-	log.Event(ctx, "validated stores")
+	log.VEventf(ctx, 2, "validated stores")
 
 	// Compute the time this node was last up; this is done by reading the
 	// "last up time" from every store and choosing the most recent timestamp.
@@ -500,7 +462,7 @@ func (n *Node) start(
 		return err
 	}
 
-	if len(bootstrappedEngines) != 0 {
+	if len(initializedEngines) != 0 {
 		// Connect gossip before starting bootstrap. This will be necessary
 		// to bootstrap new stores. We do it before initializing the NodeID
 		// as well (if needed) to avoid awkward error messages until Gossip
@@ -537,7 +499,7 @@ func (n *Node) start(
 	// bumped immediately, which would be possible if gossip got started earlier).
 	n.startGossip(ctx, n.stopper)
 
-	allEngines := append([]engine.Engine(nil), bootstrappedEngines...)
+	allEngines := append([]engine.Engine(nil), initializedEngines...)
 	allEngines = append(allEngines, emptyEngines...)
 	log.Infof(ctx, "%s: started with %v engine(s) and attributes %v", n, allEngines, attrs.Attrs)
 	return nil
@@ -570,25 +532,6 @@ func (n *Node) SetHLCUpperBound(ctx context.Context, hlcUpperBound int64) error 
 	return n.stores.VisitStores(func(s *storage.Store) error {
 		return s.WriteHLCUpperBound(ctx, hlcUpperBound)
 	})
-}
-
-// initStores initializes the Stores map from ID to Store. Stores are
-// added to the local sender if already bootstrapped. A bootstrapped
-// Store has a valid ident with cluster, node and Store IDs set. If
-// the Store doesn't yet have a valid ident, it's added to the
-// bootstraps list for initialization once the cluster and node IDs
-// have been determined.
-func (n *Node) initStores(
-	ctx context.Context, engines []engine.Engine, stopper *stop.Stopper,
-) ([]*storage.Store, error) {
-	var stores []*storage.Store
-	for _, e := range engines {
-		s := storage.NewStore(n.storeCfg, e, &n.Descriptor)
-		log.Eventf(ctx, "created store for engine: %s", e)
-
-		stores = append(stores, s)
-	}
-	return stores, nil
 }
 
 func (n *Node) addStore(store *storage.Store) {
@@ -645,7 +588,7 @@ func (n *Node) bootstrapStores(
 	{
 		// Bootstrap all waiting stores by allocating a new store id for
 		// each and invoking storage.Bootstrap() to persist it and the cluster
-		// version.
+		// version and to create stores.
 		inc := int64(len(emptyEngines))
 		firstID, err := allocateStoreIDs(ctx, n.Descriptor.NodeID, inc, n.storeCfg.DB)
 		if err != nil {
@@ -657,28 +600,23 @@ func (n *Node) bootstrapStores(
 			StoreID:   firstID,
 		}
 		for _, eng := range emptyEngines {
-			if err := storage.Bootstrap(ctx, eng, sIdent, cv); err != nil {
+			if err := storage.InitEngine(ctx, eng, sIdent, cv); err != nil {
 				return err
 			}
-			sIdent.StoreID++
-		}
-	}
 
-	// Start the newly bootstrapped stores.
-	bootstraps, err := n.initStores(ctx, emptyEngines, n.stopper)
-	if err != nil {
-		return err
-	}
-	for _, s := range bootstraps {
-		if err := s.Start(ctx, stopper); err != nil {
-			return err
-		}
-		n.addStore(s)
-		log.Infof(ctx, "bootstrapped store %s", s)
-		// Done regularly in Node.startGossip, but this cuts down the time
-		// until this store is used for range allocations.
-		if err := s.GossipStore(ctx, false /* useCached */); err != nil {
-			log.Warningf(ctx, "error doing initial gossiping: %s", err)
+			s := storage.NewStore(ctx, n.storeCfg, eng, &n.Descriptor)
+			if err := s.Start(ctx, stopper); err != nil {
+				return err
+			}
+			n.addStore(s)
+			log.Infof(ctx, "bootstrapped store %s", s)
+			// Done regularly in Node.startGossip, but this cuts down the time
+			// until this store is used for range allocations.
+			if err := s.GossipStore(ctx, false /* useCached */); err != nil {
+				log.Warningf(ctx, "error doing initial gossiping: %s", err)
+			}
+
+			sIdent.StoreID++
 		}
 	}
 
@@ -832,12 +770,12 @@ func (n *Node) startGraphiteStatsExporter(st *cluster.Settings) {
 func (n *Node) startWriteNodeStatus(frequency time.Duration) {
 	ctx := logtags.AddTag(n.AnnotateCtx(context.Background()), "summaries", nil)
 	// Immediately record summaries once on server startup.
+	if err := n.writeNodeStatus(ctx, 0 /* alertTTL */); err != nil {
+		log.Warningf(ctx, "error recording initial status summaries: %s", err)
+	}
 	n.stopper.RunWorker(ctx, func(ctx context.Context) {
 		// Write a status summary immediately; this helps the UI remain
 		// responsive when new nodes are added.
-		if err := n.writeNodeStatus(ctx, 0 /* alertTTL */); err != nil {
-			log.Warningf(ctx, "error recording initial status summaries: %s", err)
-		}
 		ticker := time.NewTicker(frequency)
 		defer ticker.Stop()
 		for {
@@ -999,7 +937,7 @@ func (n *Node) batchInternal(
 func (n *Node) Batch(
 	ctx context.Context, args *roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, error) {
-	growStack()
+	growstack.Grow()
 
 	// NB: Node.Batch is called directly for "local" calls. We don't want to
 	// carry the associated log tags forward as doing so makes adding additional
@@ -1086,6 +1024,8 @@ func (n *Node) setupSpanForIncomingRPC(
 func (n *Node) RangeFeed(
 	args *roachpb.RangeFeedRequest, stream roachpb.Internal_RangeFeedServer,
 ) error {
+	growstack.Grow()
+
 	pErr := n.stores.RangeFeed(args, stream)
 	if pErr != nil {
 		var event roachpb.RangeFeedEvent
@@ -1095,24 +1035,4 @@ func (n *Node) RangeFeed(
 		return stream.Send(&event)
 	}
 	return nil
-}
-
-var growStackGlobal = false
-
-//go:noinline
-func growStack() {
-	// Goroutine stacks currently start at 2 KB in size. The code paths through
-	// the storage package often need a stack that is 32 KB in size. The stack
-	// growth is mildly expensive making it useful to trick the runtime into
-	// growing the stack early. Since goroutine stacks grow in multiples of 2 and
-	// start at 2 KB in size, by placing a 16 KB object on the stack early in the
-	// lifetime of a goroutine we force the runtime to use a 32 KB stack for the
-	// goroutine.
-	var buf [16 << 10] /* 16 KB */ byte
-	if growStackGlobal {
-		// Make sure the compiler doesn't optimize away buf.
-		for i := range buf {
-			buf[i] = byte(i)
-		}
-	}
 }

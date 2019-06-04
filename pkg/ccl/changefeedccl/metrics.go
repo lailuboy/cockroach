@@ -10,7 +10,6 @@ package changefeedccl
 
 import (
 	"context"
-	"math"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -95,10 +94,22 @@ var (
 		Measurement: "Flushes",
 		Unit:        metric.Unit_COUNT,
 	}
-	metaChangefeedSinkErrorRetries = metric.Metadata{
-		Name:        "changefeed.sink_error_retries",
-		Help:        "Total retryable errors encountered while emitting to sinks",
+	metaChangefeedErrorRetries = metric.Metadata{
+		Name:        "changefeed.error_retries",
+		Help:        "Total retryable errors encountered by all changefeeds",
 		Measurement: "Errors",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaChangefeedBufferEntriesIn = metric.Metadata{
+		Name:        "changefeed.buffer_entries.in",
+		Help:        "Total entries entering the buffer between raft and changefeed sinks",
+		Measurement: "Entries",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaChangefeedBufferEntriesOut = metric.Metadata{
+		Name:        "changefeed.buffer_entries.out",
+		Help:        "Total entries leaving the buffer between raft and changefeed sinks",
+		Measurement: "Entries",
 		Unit:        metric.Unit_COUNT,
 	}
 
@@ -137,15 +148,13 @@ var (
 	// any changefeed ahead of its gc ttl threshold, but keeping that correct in
 	// the face of changing zone configs is much harder, so this will have to do
 	// for now.
-	metaChangefeedMinHighWater = metric.Metadata{
-		Name:        "changefeed.min_high_water",
-		Help:        "Latest high_water timestamp of most behind feed",
+	metaChangefeedMaxBehindNanos = metric.Metadata{
+		Name:        "changefeed.max_behind_nanos",
+		Help:        "Largest commit-to-emit duration of any running feed",
 		Measurement: "Nanoseconds",
-		Unit:        metric.Unit_TIMESTAMP_NS,
+		Unit:        metric.Unit_NANOSECONDS,
 	}
 )
-
-const noMinHighWaterSentinel = int64(math.MaxInt64)
 
 const pollRequestNanosHistMaxLatency = time.Hour
 
@@ -154,7 +163,9 @@ type Metrics struct {
 	EmittedMessages  *metric.Counter
 	EmittedBytes     *metric.Counter
 	Flushes          *metric.Counter
-	SinkErrorRetries *metric.Counter
+	ErrorRetries     *metric.Counter
+	BufferEntriesIn  *metric.Counter
+	BufferEntriesOut *metric.Counter
 
 	PollRequestNanosHist *metric.Histogram
 	ProcessingNanos      *metric.Counter
@@ -167,7 +178,7 @@ type Metrics struct {
 		id       int
 		resolved map[int]hlc.Timestamp
 	}
-	MinHighWater *metric.Gauge
+	MaxBehindNanos *metric.Gauge
 }
 
 // MetricStruct implements the metric.Struct interface.
@@ -179,7 +190,9 @@ func MakeMetrics(histogramWindow time.Duration) metric.Struct {
 		EmittedMessages:  metric.NewCounter(metaChangefeedEmittedMessages),
 		EmittedBytes:     metric.NewCounter(metaChangefeedEmittedBytes),
 		Flushes:          metric.NewCounter(metaChangefeedFlushes),
-		SinkErrorRetries: metric.NewCounter(metaChangefeedSinkErrorRetries),
+		ErrorRetries:     metric.NewCounter(metaChangefeedErrorRetries),
+		BufferEntriesIn:  metric.NewCounter(metaChangefeedBufferEntriesIn),
+		BufferEntriesOut: metric.NewCounter(metaChangefeedBufferEntriesOut),
 
 		// Metrics for changefeed performance debugging: - PollRequestNanos and
 		// PollRequestNanosHist, things are first
@@ -203,16 +216,18 @@ func MakeMetrics(histogramWindow time.Duration) metric.Struct {
 		FlushNanos:         metric.NewCounter(metaChangefeedFlushNanos),
 	}
 	m.mu.resolved = make(map[int]hlc.Timestamp)
-	m.MinHighWater = metric.NewFunctionalGauge(metaChangefeedMinHighWater, func() int64 {
-		minHighWater := noMinHighWaterSentinel
+
+	m.MaxBehindNanos = metric.NewFunctionalGauge(metaChangefeedMaxBehindNanos, func() int64 {
+		now := timeutil.Now()
+		var maxBehind time.Duration
 		m.mu.Lock()
 		for _, resolved := range m.mu.resolved {
-			if minHighWater == noMinHighWaterSentinel || resolved.WallTime < minHighWater {
-				minHighWater = resolved.WallTime
+			if behind := now.Sub(resolved.GoTime()); behind > maxBehind {
+				maxBehind = behind
 			}
 		}
 		m.mu.Unlock()
-		return minHighWater
+		return maxBehind.Nanoseconds()
 	})
 	return m
 }

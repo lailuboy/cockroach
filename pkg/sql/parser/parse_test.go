@@ -256,10 +256,10 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE IF NOT EXISTS a AS SELECT * FROM b UNION SELECT * FROM c`},
 		{`CREATE TABLE a AS SELECT * FROM b UNION VALUES ('one', 1) ORDER BY c LIMIT 5`},
 		{`CREATE TABLE IF NOT EXISTS a AS SELECT * FROM b UNION VALUES ('one', 1) ORDER BY c LIMIT 5`},
-		{`CREATE TABLE a (b STRING COLLATE "DE")`},
-		{`CREATE TABLE a (b STRING(3) COLLATE "DE")`},
-		{`CREATE TABLE a (b STRING[] COLLATE "DE")`},
-		{`CREATE TABLE a (b STRING(3)[] COLLATE "DE")`},
+		{`CREATE TABLE a (b STRING COLLATE de)`},
+		{`CREATE TABLE a (b STRING(3) COLLATE de)`},
+		{`CREATE TABLE a (b STRING[] COLLATE de)`},
+		{`CREATE TABLE a (b STRING(3)[] COLLATE de)`},
 
 		{`CREATE VIEW a AS SELECT * FROM b`},
 		{`EXPLAIN CREATE VIEW a AS SELECT * FROM b`},
@@ -294,6 +294,10 @@ func TestParse(t *testing.T) {
 		{`EXPLAIN CREATE STATISTICS a ON col1 FROM t`},
 		{`CREATE STATISTICS a ON col1, col2 FROM t`},
 		{`CREATE STATISTICS a ON col1 FROM d.t`},
+		{`CREATE STATISTICS a ON col1 FROM t`},
+		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.9`},
+		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '2016-01-01'`},
+		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.1 AS OF SYSTEM TIME '2016-01-01'`},
 
 		{`DELETE FROM a`},
 		{`EXPLAIN DELETE FROM a`},
@@ -383,7 +387,7 @@ func TestParse(t *testing.T) {
 
 		{`SHOW CLUSTER SETTING a`},
 		{`EXPLAIN SHOW CLUSTER SETTING a`},
-		{`SHOW CLUSTER SETTING "all"`},
+		{`SHOW ALL CLUSTER SETTINGS`},
 
 		{`SHOW DATABASES`},
 		{`EXPLAIN SHOW DATABASES`},
@@ -406,6 +410,7 @@ func TestParse(t *testing.T) {
 		{`SHOW INDEXES FROM a`},
 		{`EXPLAIN SHOW INDEXES FROM a`},
 		{`SHOW INDEXES FROM a.b.c`},
+		{`SHOW INDEXES FROM DATABASE a`},
 		{`SHOW CONSTRAINTS FROM a`},
 		{`SHOW CONSTRAINTS FROM a.b.c`},
 		{`EXPLAIN SHOW CONSTRAINTS FROM a.b.c`},
@@ -417,14 +422,24 @@ func TestParse(t *testing.T) {
 		{`EXPLAIN SHOW USERS`},
 		{`SHOW JOBS`},
 		{`EXPLAIN SHOW JOBS`},
+		{`SHOW AUTOMATIC JOBS`},
+		{`EXPLAIN SHOW AUTOMATIC JOBS`},
 		{`SHOW CLUSTER QUERIES`},
 		{`EXPLAIN SHOW CLUSTER QUERIES`},
+		{`SHOW ALL CLUSTER QUERIES`},
+		{`EXPLAIN SHOW ALL CLUSTER QUERIES`},
 		{`SHOW LOCAL QUERIES`},
 		{`EXPLAIN SHOW LOCAL QUERIES`},
+		{`SHOW ALL LOCAL QUERIES`},
+		{`EXPLAIN SHOW ALL LOCAL QUERIES`},
 		{`SHOW CLUSTER SESSIONS`},
 		{`EXPLAIN SHOW CLUSTER SESSIONS`},
+		{`SHOW ALL CLUSTER SESSIONS`},
+		{`EXPLAIN SHOW ALL CLUSTER SESSIONS`},
 		{`SHOW LOCAL SESSIONS`},
 		{`EXPLAIN SHOW LOCAL SESSIONS`},
+		{`SHOW ALL LOCAL SESSIONS`},
+		{`EXPLAIN SHOW ALL LOCAL SESSIONS`},
 		{`SHOW TRACE FOR SESSION`},
 		{`EXPLAIN SHOW TRACE FOR SESSION`},
 		{`SHOW KV TRACE FOR SESSION`},
@@ -623,7 +638,7 @@ func TestParse(t *testing.T) {
 		{`SELECT ((() AS a)).*`},
 		{`SELECT (TABLE a)`},
 		{`SELECT 0x1`},
-		{`SELECT 'Deutsch' COLLATE "DE"`},
+		{`SELECT 'Deutsch' COLLATE de`},
 		{`SELECT a @> b`},
 		{`SELECT a <@ b`},
 		{`SELECT a ? b`},
@@ -660,8 +675,9 @@ func TestParse(t *testing.T) {
 		{`SELECT 'a' FROM t@primary`},
 		{`SELECT 'a' FROM t@like`},
 		{`SELECT 'a' FROM t@{NO_INDEX_JOIN}`},
+		{`SELECT 'a' FROM t@{IGNORE_FOREIGN_KEYS}`},
 		{`SELECT 'a' FROM t@{FORCE_INDEX=idx,ASC}`},
-		{`SELECT 'a' FROM t@{FORCE_INDEX=idx,DESC}`},
+		{`SELECT 'a' FROM t@{FORCE_INDEX=idx,DESC,IGNORE_FOREIGN_KEYS}`},
 		{`SELECT * FROM t AS "of" AS OF SYSTEM TIME '2016-01-01'`},
 
 		{`SELECT BOOL 'foo', 'foo'::BOOL`},
@@ -681,10 +697,9 @@ func TestParse(t *testing.T) {
 		{`SELECT TIMESTAMP 'foo', 'foo'::TIMESTAMP`},
 		{`SELECT TIMESTAMPTZ 'foo', 'foo'::TIMESTAMPTZ`},
 		{`SELECT JSONB 'foo', 'foo'::JSONB`},
-		{`SELECT SERIAL8 'foo', 'foo'::SERIAL8`},
 
 		{`SELECT 'foo'::DECIMAL(1)`},
-		{`SELECT 'foo'::DECIMAL(1,2)`},
+		{`SELECT 'foo'::DECIMAL(2,1)`},
 		{`SELECT 'foo'::BIT(3)`},
 		{`SELECT 'foo'::VARBIT(3)`},
 		{`SELECT 'foo'::CHAR(3)`},
@@ -739,6 +754,8 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM (SELECT 1 FROM t) WITH ORDINALITY AS bar`},
 		{`SELECT a FROM ROWS FROM (a(x), b(y), c(z))`},
 		{`SELECT a FROM t1, t2`},
+		{`SELECT a FROM t1, LATERAL (SELECT * FROM t2 WHERE a = b)`},
+		{`SELECT a FROM t1, LATERAL ROWS FROM (generate_series(1, t1.x))`},
 		{`SELECT a FROM t AS t1`},
 		{`SELECT a FROM t AS t1 (c1)`},
 		{`SELECT a FROM t AS t1 (c1, c2, c3, c4)`},
@@ -930,6 +947,7 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t1 INNER JOIN t2 ON a = b`},
 		{`SELECT a FROM t1 INNER HASH JOIN t2 ON a = b`},
 		{`SELECT a FROM t1 CROSS JOIN t2`},
+		{`SELECT a FROM t1 CROSS LOOKUP JOIN t2`},
 		{`SELECT a FROM t1 NATURAL JOIN t2`},
 		{`SELECT a FROM t1 NATURAL INNER MERGE JOIN t2`},
 		{`SELECT a FROM t1 INNER JOIN t2 USING (a)`},
@@ -1026,18 +1044,21 @@ func TestParse(t *testing.T) {
 		{`ALTER DATABASE a RENAME TO b`},
 		{`EXPLAIN ALTER DATABASE a RENAME TO b`},
 
-		{`ALTER TABLE a RENAME TO b`},
-		{`EXPLAIN ALTER TABLE a RENAME TO b`},
-		{`ALTER TABLE IF EXISTS a RENAME TO b`},
-
 		{`ALTER INDEX b RENAME TO b`},
 		{`EXPLAIN ALTER INDEX b RENAME TO b`},
 		{`ALTER INDEX a@b RENAME TO b`},
 		{`ALTER INDEX a@primary RENAME TO like`},
 		{`ALTER INDEX IF EXISTS a@b RENAME TO b`},
 		{`ALTER INDEX IF EXISTS a@primary RENAME TO like`},
+
+		{`ALTER TABLE a RENAME TO b`},
+		{`EXPLAIN ALTER TABLE a RENAME TO b`},
+		{`ALTER TABLE IF EXISTS a RENAME TO b`},
 		{`ALTER TABLE a RENAME COLUMN c1 TO c2`},
 		{`ALTER TABLE IF EXISTS a RENAME COLUMN c1 TO c2`},
+		{`ALTER TABLE a RENAME CONSTRAINT c1 TO c2`},
+		{`ALTER TABLE IF EXISTS a RENAME CONSTRAINT c1 TO c2`},
+		{`ALTER TABLE a RENAME CONSTRAINT c TO d, RENAME COLUMN e TO f`},
 
 		{`ALTER TABLE a ADD COLUMN b INT8, ADD CONSTRAINT a_idx UNIQUE (a)`},
 		{`EXPLAIN ALTER TABLE a ADD COLUMN b INT8`},
@@ -1091,6 +1112,17 @@ func TestParse(t *testing.T) {
 		{`ALTER INDEX "primary" SPLIT AT VALUES (2)`},
 		{`ALTER INDEX public.public."primary" SPLIT AT VALUES (2)`},
 
+		{`ALTER TABLE a UNSPLIT AT VALUES (1)`},
+		{`EXPLAIN ALTER TABLE a UNSPLIT AT VALUES (1)`},
+		{`ALTER TABLE a UNSPLIT AT SELECT * FROM t`},
+		{`ALTER TABLE d.a UNSPLIT AT VALUES ('b', 2)`},
+		{`ALTER INDEX a@i UNSPLIT AT VALUES (1)`},
+		{`ALTER INDEX d.a@i UNSPLIT AT VALUES (2)`},
+		{`ALTER INDEX i UNSPLIT AT VALUES (1)`},
+		{`ALTER INDEX d.i UNSPLIT AT VALUES (2)`},
+		{`ALTER INDEX "primary" UNSPLIT AT VALUES (2)`},
+		{`ALTER INDEX public.public."primary" UNSPLIT AT VALUES (2)`},
+
 		{`ALTER TABLE a EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 1)`},
 		{`EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE TABLE b`},
 		{`ALTER TABLE a EXPERIMENTAL_RELOCATE SELECT * FROM t`},
@@ -1128,6 +1160,9 @@ func TestParse(t *testing.T) {
 		{`EXPLAIN ALTER INDEX i CONFIGURE ZONE = 'foo'`},
 		{`ALTER INDEX db.t@i CONFIGURE ZONE = 'foo'`},
 		{`ALTER INDEX t@i CONFIGURE ZONE = 'foo'`},
+
+		{`ALTER PARTITION p OF INDEX db.t@idx CONFIGURE ZONE = 'foo'`},
+		{`EXPLAIN ALTER PARTITION p OF INDEX db.t@idx CONFIGURE ZONE = 'foo'`},
 
 		{`ALTER TABLE t CONFIGURE ZONE = b'foo'`},
 		{`ALTER TABLE t CONFIGURE ZONE = a || b`},
@@ -1243,6 +1278,7 @@ func TestParse(t *testing.T) {
 		{`IMPORT TABLE foo (id INT8 PRIMARY KEY, email STRING, age INT8) CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
 		{`IMPORT TABLE foo (id INT8, email STRING, age INT8) CSV DATA ('path/to/some/file', $1) WITH comma = ',', "nullif" = 'n/a', temp = $2`},
 		{`IMPORT TABLE foo FROM PGDUMPCREATE 'nodelocal:///foo/bar' WITH temp = 'path/to/temp'`},
+		{`IMPORT INTO foo(id, email) CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
 
 		{`IMPORT PGDUMP 'nodelocal:///foo/bar' WITH temp = 'path/to/temp'`},
 		{`EXPLAIN IMPORT PGDUMP 'nodelocal:///foo/bar' WITH temp = 'path/to/temp'`},
@@ -1335,11 +1371,15 @@ func TestParse2(t *testing.T) {
 		{`CREATE TABLE a (b BIT VARYING(2), c BIT(1))`,
 			`CREATE TABLE a (b VARBIT(2), c BIT)`},
 
+		{`CREATE STATISTICS a ON col1 FROM t AS OF SYSTEM TIME '2016-01-01'`,
+			`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '2016-01-01'`},
+
 		{`SELECT TIMESTAMP WITHOUT TIME ZONE 'foo'`, `SELECT TIMESTAMP 'foo'`},
 		{`SELECT CAST('foo' AS TIMESTAMP WITHOUT TIME ZONE)`, `SELECT CAST('foo' AS TIMESTAMP)`},
 		{`SELECT CAST(1 AS "timestamp")`, `SELECT CAST(1 AS TIMESTAMP)`},
 		{`SELECT CAST(1 AS _int8)`, `SELECT CAST(1 AS INT8[])`},
 		{`SELECT CAST(1 AS "_int8")`, `SELECT CAST(1 AS INT8[])`},
+		{`SELECT SERIAL8 'foo', 'foo'::SERIAL8`, `SELECT INT8 'foo', 'foo'::INT8`},
 
 		{`SELECT 'a' FROM t@{FORCE_INDEX=bar}`, `SELECT 'a' FROM t@bar`},
 		{`SELECT 'a' FROM t@{ASC,FORCE_INDEX=idx}`, `SELECT 'a' FROM t@{FORCE_INDEX=idx,ASC}`},
@@ -1609,6 +1649,8 @@ func TestParse2(t *testing.T) {
 			`SELECT a FROM ROWS FROM (generate_series(1, 32)) AS s (x)`},
 		{`SELECT a FROM generate_series(1, 32) WITH ORDINALITY AS s (x)`,
 			`SELECT a FROM ROWS FROM (generate_series(1, 32)) WITH ORDINALITY AS s (x)`},
+		{`SELECT a FROM LATERAL generate_series(1, 32)`,
+			`SELECT a FROM LATERAL ROWS FROM (generate_series(1, 32))`},
 
 		// Tuples
 		{`SELECT 1 IN (b)`, `SELECT 1 IN (b,)`},
@@ -1632,7 +1674,14 @@ func TestParse2(t *testing.T) {
 		{`SHOW SESSION database`, `SHOW database`},
 		{`SHOW SESSION TIME ZONE`, `SHOW timezone`},
 		{`SHOW SESSION TIMEZONE`, `SHOW timezone`},
+
 		{`SHOW ALL ZONE CONFIGURATIONS`, `SHOW ZONE CONFIGURATIONS`},
+
+		{`SHOW ZONE CONFIGURATION FOR TABLE t PARTITION foo`,
+			`SHOW ZONE CONFIGURATION FOR PARTITION foo OF TABLE t`},
+		{`SHOW ZONE CONFIGURATION FOR INDEX t@idx PARTITION foo`,
+			`SHOW ZONE CONFIGURATION FOR PARTITION foo OF INDEX t@idx`},
+
 		{`BEGIN`,
 			`BEGIN TRANSACTION`},
 		{`START TRANSACTION`,
@@ -1685,10 +1734,12 @@ func TestParse2(t *testing.T) {
 		{`CREATE CHANGEFEED FOR TABLE foo INTO sink`,
 			`CREATE CHANGEFEED FOR TABLE foo INTO 'sink'`},
 
-		{`SHOW ALL CLUSTER SETTINGS`, `SHOW CLUSTER SETTING "all"`},
+		{`SHOW CLUSTER SETTING ALL`, `SHOW ALL CLUSTER SETTINGS`},
 
 		{`SHOW SESSIONS`, `SHOW CLUSTER SESSIONS`},
+		{`SHOW ALL SESSIONS`, `SHOW ALL CLUSTER SESSIONS`},
 		{`SHOW QUERIES`, `SHOW CLUSTER QUERIES`},
+		{`SHOW ALL QUERIES`, `SHOW ALL CLUSTER QUERIES`},
 
 		{`USE foo`, `SET database = foo`},
 
@@ -1719,6 +1770,9 @@ func TestParse2(t *testing.T) {
 			`DROP USER IF EXISTS 'foo', 'bar'`},
 		{`ALTER USER foo WITH PASSWORD bar`,
 			`ALTER USER 'foo' WITH PASSWORD 'bar'`},
+
+		{`ALTER TABLE a RENAME b TO c`,
+			`ALTER TABLE a RENAME COLUMN b TO c`},
 
 		// Identifier handling for zone configs.
 
@@ -2085,19 +2139,19 @@ SELECT2 1
 SELECT 1 FROM (t)
                 ^
 HINT: try \h <SOURCE>`},
-		{`SET TIME ZONE INTERVAL 'foobar'`, `could not parse "foobar" as type interval: interval: missing unit at position 0: "foobar" at or near "EOF"
+		{`SET TIME ZONE INTERVAL 'foobar'`, `syntax error: could not parse "foobar" as type interval: interval: missing unit at position 0: "foobar" at or near "EOF"
 SET TIME ZONE INTERVAL 'foobar'
                                ^
 `},
-		{`SELECT INTERVAL 'foo'`, `could not parse "foo" as type interval: interval: missing unit at position 0: "foo" at or near "EOF"
+		{`SELECT INTERVAL 'foo'`, `syntax error: could not parse "foo" as type interval: interval: missing unit at position 0: "foo" at or near "EOF"
 SELECT INTERVAL 'foo'
                      ^
 `},
-		{`SELECT 1 /* hello`, `unterminated comment
+		{`SELECT 1 /* hello`, `lexical error: unterminated comment
 SELECT 1 /* hello
          ^
 `},
-		{`SELECT '1`, `unterminated string
+		{`SELECT '1`, `lexical error: unterminated string
 SELECT '1
        ^
 HINT: try \h SELECT`},
@@ -2116,14 +2170,14 @@ CREATE TABLE test (
 HINT: try \h CREATE TABLE`},
 		{`CREATE TABLE test (
   foo BIT(0)
-)`, `length for type bit must be at least 1 at or near ")"
+)`, `syntax error: length for type bit must be at least 1 at or near ")"
 CREATE TABLE test (
   foo BIT(0)
            ^
 `},
 		{`CREATE TABLE test (
   foo INT8 DEFAULT 1 DEFAULT 2
-)`, `multiple default values specified for column "foo" at or near ")"
+)`, `syntax error: multiple default values specified for column "foo" at or near ")"
 CREATE TABLE test (
   foo INT8 DEFAULT 1 DEFAULT 2
 )
@@ -2131,7 +2185,7 @@ CREATE TABLE test (
 `},
 		{`CREATE TABLE test (
   foo INT8 REFERENCES t1 REFERENCES t2
-)`, `multiple foreign key constraints specified for column "foo" at or near ")"
+)`, `syntax error: multiple foreign key constraints specified for column "foo" at or near ")"
 CREATE TABLE test (
   foo INT8 REFERENCES t1 REFERENCES t2
 )
@@ -2139,7 +2193,7 @@ CREATE TABLE test (
 `},
 		{`CREATE TABLE test (
   foo INT8 FAMILY a FAMILY b
-)`, `multiple column families specified for column "foo" at or near ")"
+)`, `syntax error: multiple column families specified for column "foo" at or near ")"
 CREATE TABLE test (
   foo INT8 FAMILY a FAMILY b
 )
@@ -2151,7 +2205,7 @@ SELECT family FROM test
 HINT: try \h SELECT`},
 		{`CREATE TABLE test (
   foo INT8 NOT NULL NULL
-)`, `conflicting NULL/NOT NULL declarations for column "foo" at or near ")"
+)`, `syntax error: conflicting NULL/NOT NULL declarations for column "foo" at or near ")"
 CREATE TABLE test (
   foo INT8 NOT NULL NULL
 )
@@ -2159,7 +2213,7 @@ CREATE TABLE test (
 `},
 		{`CREATE TABLE test (
   foo INT8 NULL NOT NULL
-)`, `conflicting NULL/NOT NULL declarations for column "foo" at or near ")"
+)`, `syntax error: conflicting NULL/NOT NULL declarations for column "foo" at or near ")"
 CREATE TABLE test (
   foo INT8 NULL NOT NULL
 )
@@ -2197,32 +2251,32 @@ SELECT FROM t
 HINT: try \h SELECT`},
 
 		{"SELECT 1e-\n-1",
-			`invalid floating point literal
+			`lexical error: invalid floating point literal
 SELECT 1e-
        ^
 HINT: try \h SELECT`},
 		{"SELECT foo''",
-			`type does not exist at or near ""
+			`syntax error: type does not exist at or near ""
 SELECT foo''
           ^
 `},
 		{
 			`SELECT 0x FROM t`,
-			`invalid hexadecimal numeric literal
+			`lexical error: invalid hexadecimal numeric literal
 SELECT 0x FROM t
        ^
 HINT: try \h SELECT`,
 		},
 		{
 			`SELECT x'fail' FROM t`,
-			`invalid hexadecimal bytes literal
+			`lexical error: invalid hexadecimal bytes literal
 SELECT x'fail' FROM t
        ^
 HINT: try \h SELECT`,
 		},
 		{
 			`SELECT x'AAB' FROM t`,
-			`invalid hexadecimal bytes literal
+			`lexical error: invalid hexadecimal bytes literal
 SELECT x'AAB' FROM t
        ^
 HINT: try \h SELECT`,
@@ -2250,35 +2304,42 @@ HINT: try \h <SOURCE>`,
 		},
 		{
 			`SELECT a FROM foo@{FORCE_INDEX=bar,FORCE_INDEX=baz}`,
-			`FORCE_INDEX specified multiple times at or near "baz"
+			`syntax error: FORCE_INDEX specified multiple times at or near "baz"
 SELECT a FROM foo@{FORCE_INDEX=bar,FORCE_INDEX=baz}
                                                ^
 `,
 		},
 		{
 			`SELECT a FROM foo@{FORCE_INDEX=bar,NO_INDEX_JOIN}`,
-			`FORCE_INDEX cannot be specified in conjunction with NO_INDEX_JOIN at or near "}"
+			`syntax error: FORCE_INDEX cannot be specified in conjunction with NO_INDEX_JOIN at or near "}"
 SELECT a FROM foo@{FORCE_INDEX=bar,NO_INDEX_JOIN}
                                                 ^
 `,
 		},
 		{
 			`SELECT a FROM foo@{NO_INDEX_JOIN,NO_INDEX_JOIN}`,
-			`NO_INDEX_JOIN specified multiple times at or near "no_index_join"
+			`syntax error: NO_INDEX_JOIN specified multiple times at or near "no_index_join"
 SELECT a FROM foo@{NO_INDEX_JOIN,NO_INDEX_JOIN}
                                  ^
 `,
 		},
 		{
+			`SELECT a FROM foo@{IGNORE_FOREIGN_KEYS,IGNORE_FOREIGN_KEYS}`,
+			`syntax error: IGNORE_FOREIGN_KEYS specified multiple times at or near "ignore_foreign_keys"
+SELECT a FROM foo@{IGNORE_FOREIGN_KEYS,IGNORE_FOREIGN_KEYS}
+                                       ^
+`,
+		},
+		{
 			`SELECT a FROM foo@{ASC}`,
-			`ASC/DESC must be specified in conjunction with an index at or near "}"
+			`syntax error: ASC/DESC must be specified in conjunction with an index at or near "}"
 SELECT a FROM foo@{ASC}
                       ^
 `,
 		},
 		{
 			`SELECT a FROM foo@{DESC}`,
-			`ASC/DESC must be specified in conjunction with an index at or near "}"
+			`syntax error: ASC/DESC must be specified in conjunction with an index at or near "}"
 SELECT a FROM foo@{DESC}
                        ^
 `,
@@ -2299,14 +2360,14 @@ HINT: try \h ALTER TABLE`,
 		},
 		{
 			`SELECT CAST(1.2+2.3 AS notatype)`,
-			`type does not exist at or near "notatype"
+			`syntax error: type does not exist at or near "notatype"
 SELECT CAST(1.2+2.3 AS notatype)
                        ^
 `,
 		},
 		{
 			`SELECT ANNOTATE_TYPE(1.2+2.3, notatype)`,
-			`type does not exist at or near "notatype"
+			`syntax error: type does not exist at or near "notatype"
 SELECT ANNOTATE_TYPE(1.2+2.3, notatype)
                               ^
 `,
@@ -2369,14 +2430,14 @@ SELECT EXISTS(SELECT 1)[1]
 		},
 		{
 			`SELECT 1 + ANY ARRAY[1, 2, 3]`,
-			`+ ANY <array> is invalid because "+" is not a boolean operator at or near "EOF"
+			`syntax error: + ANY <array> is invalid because "+" is not a boolean operator at or near "EOF"
 SELECT 1 + ANY ARRAY[1, 2, 3]
                              ^
 `,
 		},
 		{
 			`SELECT 'f'::"blah"`,
-			`type does not exist at or near "blah"
+			`syntax error: type does not exist at or near "blah"
 SELECT 'f'::"blah"
             ^
 `,
@@ -2413,63 +2474,63 @@ HINT: try \h RESTORE`,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS UNBOUNDED FOLLOWING) FROM t`,
-			`frame start cannot be UNBOUNDED FOLLOWING at or near "following"
+			`syntax error: frame start cannot be UNBOUNDED FOLLOWING at or near "following"
 SELECT avg(1) OVER (ROWS UNBOUNDED FOLLOWING) FROM t
                                    ^
 `,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS 1 FOLLOWING) FROM t`,
-			`frame starting from following row cannot end with current row at or near "following"
+			`syntax error: frame starting from following row cannot end with current row at or near "following"
 SELECT avg(1) OVER (ROWS 1 FOLLOWING) FROM t
                            ^
 `,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING) FROM t`,
-			`frame start cannot be UNBOUNDED FOLLOWING at or near "following"
+			`syntax error: frame start cannot be UNBOUNDED FOLLOWING at or near "following"
 SELECT avg(1) OVER (ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING) FROM t
                                                                    ^
 `,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED PRECEDING) FROM t`,
-			`frame end cannot be UNBOUNDED PRECEDING at or near "preceding"
+			`syntax error: frame end cannot be UNBOUNDED PRECEDING at or near "preceding"
 SELECT avg(1) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED PRECEDING) FROM t
                                                                    ^
 `,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t`,
-			`frame starting from current row cannot have preceding rows at or near "preceding"
+			`syntax error: frame starting from current row cannot have preceding rows at or near "preceding"
 SELECT avg(1) OVER (ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t
                                                    ^
 `,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM t`,
-			`frame starting from following row cannot have preceding rows at or near "preceding"
+			`syntax error: frame starting from following row cannot have preceding rows at or near "preceding"
 SELECT avg(1) OVER (ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM t
                                                    ^
 `,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM t`,
-			`frame starting from following row cannot have preceding rows at or near "row"
+			`syntax error: frame starting from following row cannot have preceding rows at or near "row"
 SELECT avg(1) OVER (ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM t
                                                          ^
 `,
 		},
 		{
 			`CREATE TABLE foo(a CHAR(0))`,
-			`length for type CHAR must be at least 1 at or near ")"
+			`syntax error: length for type CHAR must be at least 1 at or near ")"
 CREATE TABLE foo(a CHAR(0))
                          ^
 `,
 		},
 		{
 			`e'\xad'::string`,
-			`invalid UTF-8 byte sequence
+			`lexical error: invalid UTF-8 byte sequence
 e'\xad'::string
 ^
 `,
@@ -2483,7 +2544,7 @@ HINT: try \h EXPLAIN`,
 		},
 		{
 			`SELECT $0`,
-			`placeholder index must be between 1 and 65536
+			`lexical error: placeholder index must be between 1 and 65536
 SELECT $0
        ^
 HINT: try \h SELECT`,
@@ -2497,10 +2558,32 @@ HINT: try \h SELECT`,
 		},
 		{
 			`SELECT $123456789`,
-			`placeholder index must be between 1 and 65536
+			`lexical error: placeholder index must be between 1 and 65536
 SELECT $123456789
        ^
 HINT: try \h SELECT`,
+		},
+
+		{
+			`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 2.0`,
+			`syntax error: THROTTLING fraction must be between 0 and 1 at or near "2.0"
+CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 2.0
+                                                           ^
+`,
+		},
+		{
+			`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.1 THROTTLING 0.5`,
+			`syntax error: THROTTLING specified multiple times at or near "0.5"
+CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.1 THROTTLING 0.5
+                                                                          ^
+`,
+		},
+		{
+			`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '-1s' THROTTLING 0.1 AS OF SYSTEM TIME '-2s'`,
+			`syntax error: AS OF specified multiple times at or near "EOF"
+CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '-1s' THROTTLING 0.1 AS OF SYSTEM TIME '-2s'
+                                                                                                              ^
+`,
 		},
 	}
 	for _, d := range testData {
@@ -2747,7 +2830,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 	}{
 		{`ALTER TABLE a ALTER CONSTRAINT foo`, 31632, `alter constraint`},
 		{`ALTER TABLE a ALTER b SET NOT NULL`, 28751, ``},
-		{`ALTER TABLE a RENAME CONSTRAINT b TO c`, 32555, ``},
 
 		{`CREATE AGGREGATE a`, 0, `create aggregate`},
 		{`CREATE CAST a`, 0, `create cast`},
@@ -2804,6 +2886,10 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE TEMP VIEW a AS SELECT b`, 5807, ``},
 		{`CREATE TEMP SEQUENCE a`, 5807, ``},
 
+		{`CREATE TABLE a(x INT[][])`, 32552, ``},
+		{`CREATE TABLE a(x INT[1][2])`, 32552, ``},
+		{`CREATE TABLE a(x INT ARRAY[1][2])`, 32552, ``},
+
 		{`CREATE TABLE a(LIKE b)`, 30840, ``},
 
 		{`CREATE TABLE a(b INT8) WITH OIDS`, 0, `create table with oids`},
@@ -2849,8 +2935,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`INSERT INTO foo(a, a.b) VALUES (1,2)`, 27792, ``},
 		{`INSERT INTO foo VALUES (1,2) ON CONFLICT ON CONSTRAINT a DO NOTHING`, 28161, ``},
 
-		{`SELECT * FROM ab, LATERAL (SELECT * FROM kv)`, 24560, `select`},
-		{`SELECT * FROM ab, LATERAL foo(a)`, 24560, `srf`},
 		{`SELECT max(a ORDER BY b) FROM ab`, 23620, ``},
 
 		{`SELECT * FROM a FOR UPDATE`, 6583, ``},
@@ -2930,23 +3014,23 @@ func TestUnimplementedSyntax(t *testing.T) {
 				t.Errorf("%s: unknown err type: %T", d.sql, err)
 				return
 			}
-			if !strings.HasPrefix(pgerr.Message, "unimplemented") {
+			if !strings.HasPrefix(pgerr.Message, "syntax error: unimplemented") {
 				t.Errorf("%s: expected unimplemented at start of message, got %q", d.sql, pgerr.Message)
 			}
-			if pgerr.InternalCommand == "" {
+			if pgerr.TelemetryKey == "" {
 				t.Errorf("%s: expected internal command set", d.sql)
 			} else {
-				if !strings.HasPrefix(pgerr.InternalCommand, "syntax.") {
-					t.Errorf("%s: expected 'syntax.' at start of internal command, got %q", d.sql, pgerr.InternalCommand)
+				if !strings.HasPrefix(pgerr.TelemetryKey, "syntax.") {
+					t.Errorf("%s: expected 'syntax.' at start of internal command, got %q", d.sql, pgerr.TelemetryKey)
 				}
-				if !strings.Contains(pgerr.InternalCommand, d.expected) {
-					t.Errorf("%s: expected %q in internal command, got %q", d.sql, d.expected, pgerr.InternalCommand)
+				if !strings.Contains(pgerr.TelemetryKey, d.expected) {
+					t.Errorf("%s: expected %q in internal command, got %q", d.sql, d.expected, pgerr.TelemetryKey)
 				}
 			}
 			if d.issue != 0 {
 				exp := fmt.Sprintf("syntax.#%d", d.issue)
-				if !strings.HasPrefix(pgerr.InternalCommand, exp) {
-					t.Errorf("%s: expected %q at start of internal command, got %q", d.sql, exp, pgerr.InternalCommand)
+				if !strings.HasPrefix(pgerr.TelemetryKey, exp) {
+					t.Errorf("%s: expected %q at start of internal command, got %q", d.sql, exp, pgerr.TelemetryKey)
 				}
 				exp2 := fmt.Sprintf("issues/%d", d.issue)
 				if !strings.HasSuffix(pgerr.Hint, exp2) {

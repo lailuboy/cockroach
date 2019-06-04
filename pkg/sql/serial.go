@@ -18,10 +18,12 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
@@ -48,8 +50,7 @@ var virtualSequenceOpts = tree.SequenceOptions{
 func (p *planner) processSerialInColumnDef(
 	ctx context.Context, d *tree.ColumnTableDef, tableName *ObjectName,
 ) (*tree.ColumnTableDef, *DatabaseDescriptor, *ObjectName, tree.SequenceOptions, error) {
-	t, ok := d.Type.(*coltypes.TSerial)
-	if !ok {
+	if !d.IsSerial {
 		// Column is not SERIAL: nothing to do.
 		return d, nil, nil, nil, nil
 	}
@@ -76,12 +77,21 @@ func (p *planner) processSerialInColumnDef(
 		// TODO(bob): Follow up with https://github.com/cockroachdb/cockroach/issues/32534
 		// when the default is inverted to determine if we should also
 		// switch this behavior around.
-		newSpec.Type = coltypes.Int8
+		newSpec.Type = types.Int
 
 	case sessiondata.SerialUsesSQLSequences:
-		// With real sequences we can use exactly the requested type.
-		newSpec.Type = t.TInt
+		// With real sequences we can use the requested type as-is.
+
+	default:
+		return nil, nil, nil, nil,
+			pgerror.AssertionFailedf("unknown serial normalization mode: %s", serialNormalizationMode)
 	}
+
+	// Clear the IsSerial bit now that it's been remapped.
+	newSpec.IsSerial = false
+
+	telemetry.Inc(sqltelemetry.SerialColumnNormalizationCounter(
+		d.Type.Name(), serialNormalizationMode.String()))
 
 	if serialNormalizationMode == sessiondata.SerialUsesRowID {
 		// We're not constructing a sequence for this SERIAL column.
@@ -113,7 +123,7 @@ func (p *planner) processSerialInColumnDef(
 		if i > 0 {
 			seqName.TableName = tree.Name(fmt.Sprintf("%s%d", nameBase, i))
 		}
-		res, err := p.ResolveUncachedTableDescriptor(ctx, seqName, false /*required*/, anyDescType)
+		res, err := p.ResolveUncachedTableDescriptor(ctx, seqName, false /*required*/, ResolveAnyDescType)
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
@@ -150,7 +160,7 @@ func (p *planner) processSerialInColumnDef(
 func SimplifySerialInColumnDefWithRowID(
 	ctx context.Context, d *tree.ColumnTableDef, tableName *ObjectName,
 ) error {
-	if _, ok := d.Type.(*coltypes.TSerial); !ok {
+	if !d.IsSerial {
 		// Column is not SERIAL: nothing to do.
 		return nil
 	}
@@ -165,8 +175,11 @@ func SimplifySerialInColumnDefWithRowID(
 
 	// We're not constructing a sequence for this SERIAL column.
 	// Use the "old school" CockroachDB default.
-	d.Type = coltypes.Int8
+	d.Type = types.Int
 	d.DefaultExpr.Expr = uniqueRowIDExpr
+
+	// Clear the IsSerial bit now that it's been remapped.
+	d.IsSerial = false
 
 	return nil
 }
@@ -175,7 +188,7 @@ func assertValidSerialColumnDef(d *tree.ColumnTableDef, tableName *ObjectName) e
 	if d.HasDefaultExpr() {
 		// SERIAL implies a new default expression, we can't have one to
 		// start with. This is the error produced by pg in such case.
-		return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+		return pgerror.Newf(pgerror.CodeSyntaxError,
 			"multiple default values specified for column %q of table %q",
 			tree.ErrString(&d.Name), tree.ErrString(tableName))
 	}
@@ -183,14 +196,14 @@ func assertValidSerialColumnDef(d *tree.ColumnTableDef, tableName *ObjectName) e
 	if d.Nullable.Nullability == tree.Null {
 		// SERIAL implies a non-NULL column, we can't accept a nullability
 		// spec. This is the error produced by pg in such case.
-		return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+		return pgerror.Newf(pgerror.CodeSyntaxError,
 			"conflicting NULL/NOT NULL declarations for column %q of table %q",
 			tree.ErrString(&d.Name), tree.ErrString(tableName))
 	}
 
 	if d.Computed.Expr != nil {
 		// SERIAL cannot be a computed column.
-		return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+		return pgerror.Newf(pgerror.CodeSyntaxError,
 			"SERIAL column %q of table %q cannot be computed",
 			tree.ErrString(&d.Name), tree.ErrString(tableName))
 	}

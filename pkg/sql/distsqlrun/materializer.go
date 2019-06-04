@@ -19,11 +19,14 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
+	"github.com/lib/pq/oid"
 )
 
 // materializer converts an exec.Operator input into a RowSource.
@@ -46,8 +49,8 @@ type materializer struct {
 	// curIdx represents the current index into the column batch: the next row the
 	// materializer will emit.
 	curIdx uint16
-	// batch is the current ColBatch the materializer is processing.
-	batch exec.ColBatch
+	// batch is the current Batch the materializer is processing.
+	batch coldata.Batch
 
 	// row is the memory used for the output row.
 	row sqlbase.EncDatumRow
@@ -57,69 +60,68 @@ func newMaterializer(
 	flowCtx *FlowCtx,
 	processorID int32,
 	input exec.Operator,
-	types []sqlbase.ColumnType,
+	typs []types.T,
 	outputToInputColIdx []int,
 	post *distsqlpb.PostProcessSpec,
 	output RowReceiver,
+	metadataSourcesQueue []distsqlpb.MetadataSource,
+	outputStatsToTrace func(),
 ) (*materializer, error) {
 	m := &materializer{
 		input:               input,
 		outputToInputColIdx: outputToInputColIdx,
 		row:                 make(sqlbase.EncDatumRow, len(outputToInputColIdx)),
 	}
-	for i := 0; i < len(m.row); i++ {
-		ct := types[i]
-		switch ct.SemanticType {
-		case sqlbase.ColumnType_BOOL:
-			m.row[i] = sqlbase.EncDatum{Datum: tree.DBoolTrue}
-		case sqlbase.ColumnType_INT:
-			m.row[i] = sqlbase.EncDatum{Datum: tree.NewDInt(0)}
-		case sqlbase.ColumnType_FLOAT:
-			m.row[i] = sqlbase.EncDatum{Datum: tree.NewDFloat(0)}
-		case sqlbase.ColumnType_DECIMAL:
-			m.row[i] = sqlbase.EncDatum{Datum: &tree.DDecimal{Decimal: apd.Decimal{}}}
-		case sqlbase.ColumnType_DATE:
-			m.row[i] = sqlbase.EncDatum{Datum: tree.NewDDate(0)}
-		case sqlbase.ColumnType_STRING:
-			m.row[i] = sqlbase.EncDatum{Datum: tree.NewDString("")}
-		case sqlbase.ColumnType_BYTES:
-			m.row[i] = sqlbase.EncDatum{Datum: tree.NewDBytes("")}
-		case sqlbase.ColumnType_NAME:
-			m.row[i] = sqlbase.EncDatum{Datum: tree.NewDName("")}
-		case sqlbase.ColumnType_OID:
-			m.row[i] = sqlbase.EncDatum{Datum: tree.NewDOid(0)}
-		default:
-			panic(fmt.Sprintf("Unsupported column type %s", ct.SQLString()))
-		}
-	}
+
 	if err := m.ProcessorBase.Init(
 		m,
 		post,
-		types,
+		typs,
 		flowCtx,
 		processorID,
 		output,
-		nil,
-		ProcStateOpts{},
+		nil, /* memMonitor */
+		ProcStateOpts{
+			TrailingMetaCallback: func(ctx context.Context) []distsqlpb.ProducerMetadata {
+				var trailingMeta []distsqlpb.ProducerMetadata
+				for _, src := range metadataSourcesQueue {
+					trailingMeta = append(trailingMeta, src.DrainMeta(ctx)...)
+				}
+				return trailingMeta
+			},
+		},
 	); err != nil {
 		return nil, err
 	}
+	m.finishTrace = outputStatsToTrace
 	return m, nil
 }
 
 func (m *materializer) Start(ctx context.Context) context.Context {
 	m.input.Init()
+	m.Ctx = ctx
 	return ctx
 }
 
-func (m *materializer) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+// nextBatch saves the next batch from input in m.batch. For internal use only.
+// The purpose of having this function is to not create an anonymous function
+// on every call to Next().
+func (m *materializer) nextBatch() {
+	m.batch = m.input.Next(m.Ctx)
+}
+
+func (m *materializer) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	for m.State == StateRunning {
 		if m.batch == nil || m.curIdx >= m.batch.Length() {
 			// Get a fresh batch.
-			m.batch = m.input.Next()
+			if err := exec.CatchVectorizedRuntimeError(m.nextBatch); err != nil {
+				m.MoveToDraining(err)
+				return nil, m.DrainHelper()
+			}
+
 			if m.batch.Length() == 0 {
 				m.MoveToDraining(nil /* err */)
-				return nil, nil
+				return nil, m.DrainHelper()
 			}
 			m.curIdx = 0
 		}
@@ -131,24 +133,24 @@ func (m *materializer) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 		}
 		m.curIdx++
 
-		types := m.OutputTypes()
+		typs := m.OutputTypes()
 		for outIdx, cIdx := range m.outputToInputColIdx {
 			col := m.batch.ColVec(cIdx)
-			if col.NullAt(rowIdx) {
+			if col.Nulls().NullAt(rowIdx) {
 				m.row[outIdx].Datum = tree.DNull
 				continue
 			}
 
-			ct := types[outIdx]
-			switch ct.SemanticType {
-			case sqlbase.ColumnType_BOOL:
+			ct := typs[outIdx]
+			switch ct.Family() {
+			case types.BoolFamily:
 				if col.Bool()[rowIdx] {
 					m.row[outIdx].Datum = tree.DBoolTrue
 				} else {
 					m.row[outIdx].Datum = tree.DBoolFalse
 				}
-			case sqlbase.ColumnType_INT:
-				switch ct.Width {
+			case types.IntFamily:
+				switch ct.Width() {
 				case 8:
 					m.row[outIdx].Datum = m.da.NewDInt(tree.DInt(col.Int8()[rowIdx]))
 				case 16:
@@ -158,29 +160,30 @@ func (m *materializer) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 				default:
 					m.row[outIdx].Datum = m.da.NewDInt(tree.DInt(col.Int64()[rowIdx]))
 				}
-			case sqlbase.ColumnType_FLOAT:
+			case types.FloatFamily:
 				m.row[outIdx].Datum = m.da.NewDFloat(tree.DFloat(col.Float64()[rowIdx]))
-			case sqlbase.ColumnType_DECIMAL:
+			case types.DecimalFamily:
 				m.row[outIdx].Datum = m.da.NewDDecimal(tree.DDecimal{Decimal: col.Decimal()[rowIdx]})
-			case sqlbase.ColumnType_DATE:
-				m.row[outIdx].Datum = tree.NewDDate(tree.DDate(col.Int64()[rowIdx]))
-			case sqlbase.ColumnType_STRING:
+			case types.DateFamily:
+				m.row[outIdx].Datum = tree.NewDDate(pgdate.MakeCompatibleDateFromDisk(col.Int64()[rowIdx]))
+			case types.StringFamily:
 				b := col.Bytes()[rowIdx]
-				m.row[outIdx].Datum = m.da.NewDString(tree.DString(*(*string)(unsafe.Pointer(&b))))
-			case sqlbase.ColumnType_BYTES:
+				if ct.Oid() == oid.T_name {
+					m.row[outIdx].Datum = m.da.NewDString(tree.DString(*(*string)(unsafe.Pointer(&b))))
+				} else {
+					m.row[outIdx].Datum = m.da.NewDName(tree.DString(*(*string)(unsafe.Pointer(&b))))
+				}
+			case types.BytesFamily:
 				m.row[outIdx].Datum = m.da.NewDBytes(tree.DBytes(col.Bytes()[rowIdx]))
-			case sqlbase.ColumnType_NAME:
-				b := col.Bytes()[rowIdx]
-				m.row[outIdx].Datum = m.da.NewDName(tree.DString(*(*string)(unsafe.Pointer(&b))))
-			case sqlbase.ColumnType_OID:
+			case types.OidFamily:
 				m.row[outIdx].Datum = m.da.NewDOid(tree.MakeDOid(tree.DInt(col.Int64()[rowIdx])))
 			default:
-				panic(fmt.Sprintf("Unsupported column type %s", ct.SQLString()))
+				panic(fmt.Sprintf("Unsupported column type %s", ct.String()))
 			}
 		}
 		return m.ProcessRowHelper(m.row), nil
 	}
-	return nil, nil
+	return nil, m.DrainHelper()
 }
 
 func (m *materializer) ConsumerClosed() {

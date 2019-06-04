@@ -30,7 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datadriven"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
@@ -49,7 +49,7 @@ import (
 //    Builds a memo structure from a SQL scalar expression and outputs a
 //    representation of the "expression view" of the memo structure.
 //
-//    The supported args (in addition to the ones supported by OptTester:
+//    The supported args (in addition to the ones supported by OptTester):
 //
 //      - vars=(type1,type2,...)
 //
@@ -62,7 +62,7 @@ func TestBuilder(t *testing.T) {
 		catalog := testcat.New()
 
 		datadriven.RunTest(t, path, func(d *datadriven.TestData) string {
-			var varTypes []types.T
+			var varTypes []*types.T
 			var iVarHelper tree.IndexedVarHelper
 			var err error
 
@@ -75,26 +75,26 @@ func TestBuilder(t *testing.T) {
 				memo.ExprFmtHideCost |
 				memo.ExprFmtHideQualifications
 
-			for _, arg := range d.CmdArgs {
-				key, vals := arg.Key, arg.Vals
-				switch key {
-				case "vars":
-					varTypes, err = exprgen.ParseTypes(vals)
-					if err != nil {
-						d.Fatalf(t, "%v", err)
-					}
-
-					iVarHelper = tree.MakeTypesOnlyIndexedVarHelper(varTypes)
-
-				default:
-					if err := tester.Flags.Set(arg); err != nil {
-						d.Fatalf(t, "%s", err)
-					}
-				}
-			}
-
 			switch d.Cmd {
 			case "build-scalar":
+				for _, arg := range d.CmdArgs {
+					key, vals := arg.Key, arg.Vals
+					switch key {
+					case "vars":
+						varTypes, err = exprgen.ParseTypes(vals)
+						if err != nil {
+							d.Fatalf(t, "%v", err)
+						}
+
+						iVarHelper = tree.MakeTypesOnlyIndexedVarHelper(varTypes)
+
+					default:
+						if err := tester.Flags.Set(arg); err != nil {
+							d.Fatalf(t, "%s", err)
+						}
+					}
+				}
+
 				typedExpr, err := testutils.ParseScalarExpr(d.Input, iVarHelper.Container())
 				if err != nil {
 					d.Fatalf(t, "%v", err)

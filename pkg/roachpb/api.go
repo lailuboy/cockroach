@@ -16,7 +16,6 @@ package roachpb
 
 import (
 	"fmt"
-	"strconv"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -53,21 +52,6 @@ const (
 	MaxUserPriority UserPriority = 1000
 )
 
-// A RangeID is a unique ID associated to a Raft consensus group.
-type RangeID int64
-
-// String implements the fmt.Stringer interface.
-func (r RangeID) String() string {
-	return strconv.FormatInt(int64(r), 10)
-}
-
-// RangeIDSlice implements sort.Interface.
-type RangeIDSlice []RangeID
-
-func (r RangeIDSlice) Len() int           { return len(r) }
-func (r RangeIDSlice) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
-func (r RangeIDSlice) Less(i, j int) bool { return r[i] < r[j] }
-
 // RequiresReadLease returns whether the ReadConsistencyType requires
 // that a read-only request be performed on an active valid leaseholder.
 func (rc ReadConsistencyType) RequiresReadLease() bool {
@@ -103,24 +87,23 @@ func (rc ReadConsistencyType) SupportsBatch(ba BatchRequest) error {
 }
 
 const (
-	isAdmin        = 1 << iota // admin cmds don't go through raft, but run on lease holder
-	isRead                     // read-only cmds don't go through raft, but may run on lease holder
-	isWrite                    // write cmds go through raft and must be proposed on lease holder
-	isTxn                      // txn commands may be part of a transaction
-	isTxnWrite                 // txn write cmds start heartbeat and are marked for intent resolution
-	isRange                    // range commands may span multiple keys
-	isReverse                  // reverse commands traverse ranges in descending direction
-	isAlone                    // requests which must be alone in a batch
-	isPrefix                   // requests which should be grouped with the next request in a batch
-	isUnsplittable             // range command that must not be split during sending
-	// Requests for acquiring a lease skip the (proposal-time) check that the
-	// proposing replica has a valid lease.
-	skipLeaseCheck
-	consultsTSCache       // mutating commands which write data at a timestamp
-	updatesReadTSCache    // commands which update the read timestamp cache
-	updatesWriteTSCache   // commands which update the write timestamp cache
-	updatesTSCacheOnError // commands which make read data available on errors
-	needsRefresh          // commands which require refreshes to avoid serializable retries
+	isAdmin             = 1 << iota // admin cmds don't go through raft, but run on lease holder
+	isRead                          // read-only cmds don't go through raft, but may run on lease holder
+	isWrite                         // write cmds go through raft and must be proposed on lease holder
+	isTxn                           // txn commands may be part of a transaction
+	isTxnWrite                      // txn write cmds start heartbeat and are marked for intent resolution
+	isRange                         // range commands may span multiple keys
+	isReverse                       // reverse commands traverse ranges in descending direction
+	isAlone                         // requests which must be alone in a batch
+	isPrefix                        // requests which should be grouped with the next request in a batch
+	isUnsplittable                  // range command that must not be split during sending
+	skipLeaseCheck                  // commands which skip the check that the evaluting replica has a valid lease
+	consultsTSCache                 // mutating commands which write data at a timestamp
+	updatesReadTSCache              // commands which update the read timestamp cache
+	updatesWriteTSCache             // commands which update the write timestamp cache
+	updatesTSCacheOnErr             // commands which make read data available on errors
+	needsRefresh                    // commands which require refreshes to avoid serializable retries
+	canBackpressure                 // commands which deserve backpressure when a Range grows too large
 )
 
 // IsReadOnly returns true iff the request is read-only.
@@ -173,13 +156,19 @@ func UpdatesWriteTimestampCache(args Request) bool {
 // update the timestamp cache even on error, as in some cases the data
 // which was read is returned (e.g. ConditionalPut ConditionFailedError).
 func UpdatesTimestampCacheOnError(args Request) bool {
-	return (args.flags() & updatesTSCacheOnError) != 0
+	return (args.flags() & updatesTSCacheOnErr) != 0
 }
 
 // NeedsRefresh returns whether the command must be refreshed in
 // order to avoid client-side retries on serializable transactions.
 func NeedsRefresh(args Request) bool {
 	return (args.flags() & needsRefresh) != 0
+}
+
+// CanBackpressure returns whether the command can be backpressured
+// when waiting for a Range to split after it has grown too large.
+func CanBackpressure(args Request) bool {
+	return (args.flags() & canBackpressure) != 0
 }
 
 // Request is an interface for RPC requests.
@@ -311,6 +300,7 @@ var _ combinable = &ResolveIntentRangeResponse{}
 func (cc *CheckConsistencyResponse) combine(c combinable) error {
 	if cc != nil {
 		otherCC := c.(*CheckConsistencyResponse)
+		cc.Result = append(cc.Result, otherCC.Result...)
 		if err := cc.ResponseHeader.combine(otherCC.Header()); err != nil {
 			return err
 		}
@@ -383,10 +373,12 @@ func (h *BatchResponse_Header) combine(o BatchResponse_Header) error {
 		)
 	}
 	h.Timestamp.Forward(o.Timestamp)
-	if h.Txn == nil {
-		h.Txn = o.Txn
-	} else {
-		h.Txn.Update(o.Txn)
+	if txn := o.Txn; txn != nil {
+		if h.Txn == nil {
+			h.Txn = txn.Clone()
+		} else {
+			h.Txn.Update(txn)
+		}
 	}
 	h.Now.Forward(o.Now)
 	h.CollectedSpans = append(h.CollectedSpans, o.CollectedSpans...)
@@ -501,6 +493,9 @@ func (*EndTransactionRequest) Method() Method { return EndTransaction }
 func (*AdminSplitRequest) Method() Method { return AdminSplit }
 
 // Method implements the Request interface.
+func (*AdminUnsplitRequest) Method() Method { return AdminUnsplit }
+
+// Method implements the Request interface.
 func (*AdminMergeRequest) Method() Method { return AdminMerge }
 
 // Method implements the Request interface.
@@ -520,6 +515,9 @@ func (*GCRequest) Method() Method { return GC }
 
 // Method implements the Request interface.
 func (*PushTxnRequest) Method() Method { return PushTxn }
+
+// Method implements the Request interface.
+func (*RecoverTxnRequest) Method() Method { return RecoverTxn }
 
 // Method implements the Request interface.
 func (*QueryTxnRequest) Method() Method { return QueryTxn }
@@ -666,6 +664,12 @@ func (asr *AdminSplitRequest) ShallowCopy() Request {
 }
 
 // ShallowCopy implements the Request interface.
+func (aur *AdminUnsplitRequest) ShallowCopy() Request {
+	shallowCopy := *aur
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
 func (amr *AdminMergeRequest) ShallowCopy() Request {
 	shallowCopy := *amr
 	return &shallowCopy
@@ -704,6 +708,12 @@ func (gcr *GCRequest) ShallowCopy() Request {
 // ShallowCopy implements the Request interface.
 func (ptr *PushTxnRequest) ShallowCopy() Request {
 	shallowCopy := *ptr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
+func (rtr *RecoverTxnRequest) ShallowCopy() Request {
+	shallowCopy := *rtr
 	return &shallowCopy
 }
 
@@ -952,7 +962,9 @@ func NewReverseScan(key, endKey Key) Request {
 }
 
 func (*GetRequest) flags() int { return isRead | isTxn | updatesReadTSCache | needsRefresh }
-func (*PutRequest) flags() int { return isWrite | isTxn | isTxnWrite | consultsTSCache }
+func (*PutRequest) flags() int {
+	return isWrite | isTxn | isTxnWrite | consultsTSCache | canBackpressure
+}
 
 // ConditionalPut effectively reads and may not write, so must update
 // the timestamp cache. Note that on ConditionFailedErrors
@@ -961,7 +973,7 @@ func (*PutRequest) flags() int { return isWrite | isTxn | isTxnWrite | consultsT
 // errors, they return an error immediately instead of continuing a
 // serializable transaction to be retried at end transaction.
 func (*ConditionalPutRequest) flags() int {
-	return isRead | isWrite | isTxn | isTxnWrite | updatesReadTSCache | updatesTSCacheOnError | consultsTSCache
+	return isRead | isWrite | isTxn | isTxnWrite | consultsTSCache | updatesReadTSCache | updatesTSCacheOnErr | canBackpressure
 }
 
 // InitPut, like ConditionalPut, effectively reads and may not write.
@@ -971,7 +983,7 @@ func (*ConditionalPutRequest) flags() int {
 // immediately instead of continuing a serializable transaction to be
 // retried at end transaction.
 func (*InitPutRequest) flags() int {
-	return isRead | isWrite | isTxn | isTxnWrite | updatesReadTSCache | updatesTSCacheOnError | consultsTSCache
+	return isRead | isWrite | isTxn | isTxnWrite | consultsTSCache | updatesReadTSCache | updatesTSCacheOnErr | canBackpressure
 }
 
 // Increment reads the existing value, but always leaves an intent so
@@ -980,10 +992,12 @@ func (*InitPutRequest) flags() int {
 // error immediately instead of continuing a serializable transaction
 // to be retried at end transaction.
 func (*IncrementRequest) flags() int {
-	return isRead | isWrite | isTxn | isTxnWrite | consultsTSCache
+	return isRead | isWrite | isTxn | isTxnWrite | consultsTSCache | canBackpressure
 }
 
-func (*DeleteRequest) flags() int { return isWrite | isTxn | isTxnWrite | consultsTSCache }
+func (*DeleteRequest) flags() int {
+	return isWrite | isTxn | isTxnWrite | consultsTSCache | canBackpressure
+}
 func (drr *DeleteRangeRequest) flags() int {
 	// DeleteRangeRequest has different properties if the "inline" flag is set.
 	// This flag indicates that the request is deleting inline MVCC values,
@@ -1006,7 +1020,7 @@ func (drr *DeleteRangeRequest) flags() int {
 	// intents or tombstones for keys which don't yet exist. By updating
 	// the write timestamp cache, it forces subsequent writes to get a
 	// write-too-old error and avoids the phantom delete anomaly.
-	return isWrite | isTxn | isTxnWrite | isRange | updatesWriteTSCache | needsRefresh | consultsTSCache
+	return isWrite | isTxn | isTxnWrite | isRange | consultsTSCache | updatesWriteTSCache | needsRefresh | canBackpressure
 }
 
 // Note that ClearRange commands cannot be part of a transaction as
@@ -1023,6 +1037,7 @@ func (*BeginTransactionRequest) flags() int { return isWrite | isTxn }
 // have Txn.WriteTooOld=true and must retry on EndTransaction.
 func (*EndTransactionRequest) flags() int      { return isWrite | isTxn | isAlone | updatesWriteTSCache }
 func (*AdminSplitRequest) flags() int          { return isAdmin | isAlone }
+func (*AdminUnsplitRequest) flags() int        { return isAdmin | isAlone }
 func (*AdminMergeRequest) flags() int          { return isAdmin | isAlone }
 func (*AdminTransferLeaseRequest) flags() int  { return isAdmin | isAlone }
 func (*AdminChangeReplicasRequest) flags() int { return isAdmin | isAlone }
@@ -1035,16 +1050,19 @@ func (*GCRequest) flags() int                  { return isWrite | isRange }
 func (*PushTxnRequest) flags() int {
 	return isWrite | isAlone | updatesReadTSCache | updatesWriteTSCache
 }
-func (*QueryTxnRequest) flags() int { return isRead | isAlone }
+func (*RecoverTxnRequest) flags() int { return isWrite | isAlone | updatesWriteTSCache }
+func (*QueryTxnRequest) flags() int   { return isRead | isAlone }
 
 // QueryIntent only updates the read timestamp cache when attempting
 // to prevent an intent that is found missing from ever being written
 // in the future. See QueryIntentRequest_PREVENT.
-func (*QueryIntentRequest) flags() int        { return isRead | isPrefix | updatesReadTSCache }
+func (*QueryIntentRequest) flags() int {
+	return isRead | isPrefix | updatesReadTSCache | updatesTSCacheOnErr
+}
 func (*ResolveIntentRequest) flags() int      { return isWrite }
 func (*ResolveIntentRangeRequest) flags() int { return isWrite | isRange }
 func (*TruncateLogRequest) flags() int        { return isWrite }
-func (*MergeRequest) flags() int              { return isWrite }
+func (*MergeRequest) flags() int              { return isWrite | canBackpressure }
 func (*RequestLeaseRequest) flags() int       { return isWrite | isAlone | skipLeaseCheck }
 
 // LeaseInfoRequest is usually executed in an INCONSISTENT batch, which has the
@@ -1071,8 +1089,10 @@ func (*CheckConsistencyRequest) flags() int { return isAdmin | isRange }
 func (*WriteBatchRequest) flags() int       { return isWrite | isRange }
 func (*ExportRequest) flags() int           { return isRead | isRange | updatesReadTSCache }
 func (*ImportRequest) flags() int           { return isAdmin | isAlone }
-func (*AdminScatterRequest) flags() int     { return isAdmin | isAlone | isRange }
-func (*AddSSTableRequest) flags() int       { return isWrite | isAlone | isRange | isUnsplittable }
+func (*AdminScatterRequest) flags() int     { return isAdmin | isRange | isAlone }
+func (*AddSSTableRequest) flags() int {
+	return isWrite | isRange | isAlone | isUnsplittable | canBackpressure
+}
 
 // RefreshRequest and RefreshRangeRequest both determine which timestamp cache
 // they update based on their Write parameter.
@@ -1091,6 +1111,13 @@ func (r *RefreshRangeRequest) flags() int {
 
 func (*SubsumeRequest) flags() int    { return isRead | isAlone | updatesReadTSCache }
 func (*RangeStatsRequest) flags() int { return isRead }
+
+// IsParallelCommit returns whether the EndTransaction request is attempting to
+// perform a parallel commit. See txn_interceptor_committer.go for a discussion
+// about parallel commits.
+func (etr *EndTransactionRequest) IsParallelCommit() bool {
+	return etr.Commit && len(etr.InFlightWrites) > 0
+}
 
 // Keys returns credentials in an aws.Config.
 func (b *ExportStorage_S3) Keys() *aws.Config {

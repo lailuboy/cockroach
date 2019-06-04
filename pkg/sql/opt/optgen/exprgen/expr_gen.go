@@ -29,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // Build generates an expression from an optgen string (the kind of expression
@@ -184,7 +184,7 @@ func (eg *exprGen) eval(expr lang.Expr) interface{} {
 		return string(*expr)
 
 	default:
-		panic(errorf("unsupported expression %s", expr.Op()))
+		panic(errorf("unsupported expression %s: %v", expr.Op(), expr))
 	}
 }
 
@@ -269,9 +269,15 @@ func (eg *exprGen) castToDesiredType(arg interface{}, desiredType reflect.Type) 
 		}
 	}
 
+	if i, ok := arg.(*tree.DInt); ok {
+		if desiredType == reflect.TypeOf(memo.ScanLimit(0)) {
+			return memo.MakeScanLimit(int64(*i), false)
+		}
+	}
+
 	if str, ok := arg.(string); ok {
 		// String to type.
-		if desiredType == reflect.TypeOf((*types.T)(nil)).Elem() {
+		if desiredType == reflect.TypeOf((*types.T)(nil)) {
 			typ, err := ParseType(str)
 			if err != nil {
 				panic(exprGenErr{err})
@@ -297,6 +303,11 @@ func (eg *exprGen) castToDesiredType(arg interface{}, desiredType reflect.Type) 
 		// String to ColSet.
 		if desiredType == reflect.TypeOf(opt.ColSet{}) {
 			return eg.ColSet(str)
+		}
+
+		// String to ExplainOptions.
+		if desiredType == reflect.TypeOf(tree.ExplainOptions{}) {
+			return eg.ExplainOptions(str)
 		}
 	}
 	return nil

@@ -25,13 +25,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/lib/pq/oid"
@@ -174,14 +174,10 @@ func TestEncodings(t *testing.T) {
 						}
 						// Text decoding returns a string for some kinds of arrays. If that's the
 						// case, manually do the conversion to array.
-						if darr, isdarr := tc.Datum.(*tree.DArray); isdarr && d.ResolvedType() == types.String {
+						darr, isdarr := tc.Datum.(*tree.DArray)
+						if isdarr && d.ResolvedType().Family() == types.StringFamily {
 							t.Log("convert string to array")
-							var typ coltypes.T
-							typ, err = coltypes.DatumTypeToColumnType(darr.ParamTyp)
-							if err != nil {
-								t.Fatal(err)
-							}
-							d, err = tree.ParseDArrayFromString(&evalCtx, string(value), typ)
+							d, err = tree.ParseDArrayFromString(&evalCtx, string(value), darr.ParamTyp)
 							if err != nil {
 								t.Fatal(err)
 							}
@@ -192,6 +188,45 @@ func TestEncodings(t *testing.T) {
 					})
 				}
 			})
+		})
+	}
+}
+
+// TestExoticNumericEncodings goes through specific, legal pgwire encodings
+// that Postgres itself would usually choose to not produce, which therefore
+// would not be covered by TestEncodings. Of course, being valid encodings
+// they'd still be accepted and correctly parsed by Postgres.
+func TestExoticNumericEncodings(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		Value    *apd.Decimal
+		Encoding []byte
+	}{
+		{apd.New(0, 0), []byte{0, 0, 0, 0, 0, 0, 0, 0}},
+		{apd.New(0, 0), []byte{0, 1, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{apd.New(10000, 0), []byte{0, 2, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0}},
+		{apd.New(10001, 0), []byte{0, 2, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1}},
+		{apd.New(1000000, 0), []byte{0, 2, 0, 1, 0, 0, 0, 0, 0, 100, 0, 0}},
+		{apd.New(1000001, 0), []byte{0, 2, 0, 1, 0, 0, 0, 0, 0, 100, 0, 1}},
+		{apd.New(100000000, 0), []byte{0, 1, 0, 2, 0, 0, 0, 0, 0, 1}},
+		{apd.New(100000000, 0), []byte{0, 2, 0, 2, 0, 0, 0, 0, 0, 1, 0, 0}},
+		{apd.New(100000000, 0), []byte{0, 3, 0, 2, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0}},
+		{apd.New(100000001, 0), []byte{0, 3, 0, 2, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1}},
+	}
+
+	evalCtx := tree.MakeTestingEvalContext(nil)
+	for i, c := range testCases {
+		t.Run(fmt.Sprintf("%d_%s", i, c.Value), func(t *testing.T) {
+			d, err := pgwirebase.DecodeOidDatum(nil, oid.T_numeric, pgwirebase.FormatBinary, c.Encoding)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			expected := &tree.DDecimal{Decimal: *c.Value}
+			if d.Compare(&evalCtx, expected) != 0 {
+				t.Fatalf("%v != %v", d, expected)
+			}
 		})
 	}
 }
@@ -235,7 +270,7 @@ func TestEncodingErrorCounts(t *testing.T) {
 	buf := newWriteBuffer(metric.NewCounter(metric.Metadata{}))
 	d, _ := tree.ParseDDecimal("Inf")
 	buf.writeBinaryDatum(context.Background(), d, nil, d.ResolvedType().Oid())
-	if count := telemetry.GetFeatureCounts()["pgwire.#32489.binary_decimal_infinity"]; count != 1 {
+	if count := telemetry.GetRawFeatureCounts()["pgwire.#32489.binary_decimal_infinity"]; count != 1 {
 		t.Fatalf("expected 1 encoding error, got %d", count)
 	}
 }

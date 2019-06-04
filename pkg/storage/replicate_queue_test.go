@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -50,12 +51,6 @@ func TestReplicateQueueRebalance(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				ScanMinIdleTime: time.Millisecond,
 				ScanMaxIdleTime: time.Millisecond,
-				Knobs: base.TestingKnobs{
-					Store: &storage.StoreTestingKnobs{
-						// Prevent the merge queue from immediately discarding our splits.
-						DisableMergeQueue: true,
-					},
-				},
 			},
 		},
 	)
@@ -90,7 +85,7 @@ func TestReplicateQueueRebalance(t *testing.T) {
 		return counts
 	}
 
-	initialRanges, err := server.ExpectedInitialRangeCount(tc.Servers[0].DB())
+	initialRanges, err := server.ExpectedInitialRangeCount(tc.Servers[0].DB(), config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,8 +127,8 @@ func TestReplicateQueueUpReplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(desc.Replicas) != 1 {
-		t.Fatalf("replica count, want 1, current %d", len(desc.Replicas))
+	if len(desc.InternalReplicas) != 1 {
+		t.Fatalf("replica count, want 1, current %d", len(desc.InternalReplicas))
 	}
 
 	tc.AddServer(t, base.TestServerArgs{})
@@ -170,8 +165,8 @@ func TestReplicateQueueUpReplicate(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(desc.Replicas) != replicaCount {
-			return errors.Errorf("replica count, want %d, current %d", replicaCount, len(desc.Replicas))
+		if len(desc.InternalReplicas) != replicaCount {
+			return errors.Errorf("replica count, want %d, current %d", replicaCount, len(desc.InternalReplicas))
 		}
 		return nil
 	})
@@ -198,12 +193,6 @@ func TestReplicateQueueDownReplicate(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				ScanMinIdleTime: 10 * time.Millisecond,
 				ScanMaxIdleTime: 10 * time.Millisecond,
-				Knobs: base.TestingKnobs{
-					Store: &storage.StoreTestingKnobs{
-						// Prevent the merge queue from immediately discarding our splits.
-						DisableMergeQueue: true,
-					},
-				},
 			},
 		},
 	)
@@ -255,8 +244,8 @@ func TestReplicateQueueDownReplicate(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(desc.Replicas) != replicaCount {
-			return errors.Errorf("replica count, want %d, current %d", replicaCount, len(desc.Replicas))
+		if len(desc.InternalReplicas) != replicaCount {
+			return errors.Errorf("replica count, want %d, current %d", replicaCount, len(desc.InternalReplicas))
 		}
 		return nil
 	})

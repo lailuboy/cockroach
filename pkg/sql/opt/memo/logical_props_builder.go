@@ -15,15 +15,16 @@
 package memo
 
 import (
-	"fmt"
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 var fdAnnID = opt.NewTableAnnID()
@@ -587,8 +588,10 @@ func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relation
 	setPrivate := setNode.Private().(*SetPrivate)
 	if len(setPrivate.OutCols) != len(setPrivate.LeftCols) ||
 		len(setPrivate.OutCols) != len(setPrivate.RightCols) {
-		panic(fmt.Errorf("lists in SetPrivate are not all the same length. new:%d, left:%d, right:%d",
-			len(setPrivate.OutCols), len(setPrivate.LeftCols), len(setPrivate.RightCols)))
+		panic(pgerror.AssertionFailedf(
+			"lists in SetPrivate are not all the same length. new:%d, left:%d, right:%d",
+			log.Safe(len(setPrivate.OutCols)), log.Safe(len(setPrivate.LeftCols)), log.Safe(len(setPrivate.RightCols)),
+		))
 	}
 
 	// Output Columns
@@ -697,7 +700,9 @@ func (b *logicalPropsBuilder) buildExplainProps(explain *ExplainExpr, rel *props
 
 	// Statistics
 	// ----------
-	// Zero value for Stats is ok for Explain.
+	if !b.disableStats {
+		b.sb.buildExplain(rel)
+	}
 }
 
 func (b *logicalPropsBuilder) buildShowTraceForSessionProps(
@@ -729,7 +734,10 @@ func (b *logicalPropsBuilder) buildShowTraceForSessionProps(
 
 	// Statistics
 	// ----------
-	// Zero value for Stats is ok for ShowTrace.
+	if !b.disableStats {
+		b.sb.buildShowTrace(rel)
+	}
+
 }
 
 func (b *logicalPropsBuilder) buildLimitProps(limit *LimitExpr, rel *props.Relational) {
@@ -873,23 +881,23 @@ func (b *logicalPropsBuilder) buildMax1RowProps(max1Row *Max1RowExpr, rel *props
 	}
 }
 
-func (b *logicalPropsBuilder) buildRowNumberProps(rowNum *RowNumberExpr, rel *props.Relational) {
-	BuildSharedProps(b.mem, rowNum, &rel.Shared)
+func (b *logicalPropsBuilder) buildOrdinalityProps(ord *OrdinalityExpr, rel *props.Relational) {
+	BuildSharedProps(b.mem, ord, &rel.Shared)
 
-	inputProps := rowNum.Input.Relational()
+	inputProps := ord.Input.Relational()
 
 	// Output Columns
 	// --------------
 	// An extra output column is added to those projected by input operator.
 	rel.OutputCols = inputProps.OutputCols.Copy()
-	rel.OutputCols.Add(int(rowNum.ColID))
+	rel.OutputCols.Add(int(ord.ColID))
 
 	// Not Null Columns
 	// ----------------
 	// The new output column is not null, and other columns inherit not null
 	// property from input.
 	rel.NotNullCols = inputProps.NotNullCols.Copy()
-	rel.NotNullCols.Add(int(rowNum.ColID))
+	rel.NotNullCols.Add(int(ord.ColID))
 
 	// Outer Columns
 	// -------------
@@ -904,7 +912,7 @@ func (b *logicalPropsBuilder) buildRowNumberProps(rowNum *RowNumberExpr, rel *pr
 		// Any existing keys are still keys.
 		rel.FuncDeps.AddStrictKey(key, rel.OutputCols)
 	}
-	rel.FuncDeps.AddStrictKey(util.MakeFastIntSet(int(rowNum.ColID)), rel.OutputCols)
+	rel.FuncDeps.AddStrictKey(util.MakeFastIntSet(int(ord.ColID)), rel.OutputCols)
 
 	// Cardinality
 	// -----------
@@ -914,7 +922,55 @@ func (b *logicalPropsBuilder) buildRowNumberProps(rowNum *RowNumberExpr, rel *pr
 	// Statistics
 	// ----------
 	if !b.disableStats {
-		b.sb.buildRowNumber(rowNum, rel)
+		b.sb.buildOrdinality(ord, rel)
+	}
+}
+
+func (b *logicalPropsBuilder) buildWindowProps(window *WindowExpr, rel *props.Relational) {
+	BuildSharedProps(b.mem, window, &rel.Shared)
+
+	inputProps := window.Input.Relational()
+
+	// Output Columns
+	// --------------
+	// Output columns are all the passthrough columns with the addition of the
+	// window function column.
+	rel.OutputCols = inputProps.OutputCols.Copy()
+	for _, w := range window.Windows {
+		rel.OutputCols.Add(int(w.Col))
+	}
+
+	// Not Null Columns
+	// ----------------
+	// Inherit not null columns from input.
+	// TODO(justin): in many cases the added column may not be nullable.
+	rel.NotNullCols = inputProps.NotNullCols.Intersection(rel.OutputCols)
+
+	// Outer Columns
+	// -------------
+	// Outer columns were derived by BuildSharedProps; remove any that are bound
+	// by input columns.
+	rel.OuterCols.DifferenceWith(inputProps.OutputCols)
+
+	// Functional Dependencies
+	// -----------------------
+	// Functional dependencies are the same as the input.
+	// TODO(justin): in many cases there are more FDs to be derived, some
+	// examples include:
+	// * row_number+the partition is a key.
+	// * rank is determined by the partition and the value being ordered by.
+	// * aggregations/first_value/last_value are determined by the partition.
+	rel.FuncDeps.CopyFrom(&inputProps.FuncDeps)
+
+	// Cardinality
+	// -----------
+	// Window functions never change the cardinality of their input.
+	rel.Cardinality = inputProps.Cardinality
+
+	// Statistics
+	// ----------
+	if !b.disableStats {
+		b.sb.buildWindow(window, rel)
 	}
 }
 
@@ -1072,9 +1128,13 @@ func (b *logicalPropsBuilder) buildFiltersItemProps(item *FiltersItem, scalar *p
 	// Constraints
 	// -----------
 	cb := constraintsBuilder{md: b.mem.Metadata(), evalCtx: b.evalCtx}
-	scalar.Constraints, scalar.TightConstraints = cb.buildConstraints(item.Condition)
-	if scalar.Constraints.IsUnconstrained() {
+	// TODO(rytaft): Using local variables here to avoid a data race. It would be
+	// better to avoid lazy building of props altogether.
+	constraints, tightConstraints := cb.buildConstraints(item.Condition)
+	if constraints.IsUnconstrained() {
 		scalar.Constraints, scalar.TightConstraints = nil, false
+	} else {
+		scalar.Constraints, scalar.TightConstraints = constraints, tightConstraints
 	}
 
 	// Functional Dependencies
@@ -1112,6 +1172,11 @@ func (b *logicalPropsBuilder) buildAggregationsItemProps(
 	BuildSharedProps(b.mem, item.Agg, &scalar.Shared)
 }
 
+func (b *logicalPropsBuilder) buildWindowsItemProps(item *WindowsItem, scalar *props.Scalar) {
+	item.Typ = item.Function.DataType()
+	BuildSharedProps(b.mem, item.Function, &scalar.Shared)
+}
+
 func (b *logicalPropsBuilder) buildZipItemProps(item *ZipItem, scalar *props.Scalar) {
 	item.Typ = item.Func.DataType()
 	BuildSharedProps(b.mem, item.Func, &scalar.Shared)
@@ -1137,6 +1202,9 @@ func BuildSharedProps(mem *Memo, e opt.Expr, shared *props.Shared) {
 	case *SubqueryExpr, *ExistsExpr, *AnyExpr, *ArrayFlattenExpr:
 		shared.HasSubquery = true
 		shared.HasCorrelatedSubquery = !e.Child(0).(RelExpr).Relational().OuterCols.Empty()
+		if t.Op() == opt.AnyOp && !shared.HasCorrelatedSubquery {
+			shared.HasCorrelatedSubquery = hasOuterCols(mem, e.Child(1))
+		}
 
 	case *FunctionExpr:
 		if t.Properties.Impure {
@@ -1186,6 +1254,27 @@ func BuildSharedProps(mem *Memo, e opt.Expr, shared *props.Shared) {
 			BuildSharedProps(mem, e.Child(i), shared)
 		}
 	}
+}
+
+// hasOuterCols returns true if the given expression has outer columns (i.e.
+// columns that are referenced by the expression but not bound by it).
+func hasOuterCols(mem *Memo, e opt.Expr) bool {
+	switch t := e.(type) {
+	case *VariableExpr:
+		return true
+	case RelExpr:
+		return !t.Relational().OuterCols.Empty()
+	case ScalarPropsExpr:
+		return !t.ScalarProps(mem).Shared.OuterCols.Empty()
+	}
+
+	for i, n := 0, e.ChildCount(); i < n; i++ {
+		if hasOuterCols(mem, e.Child(i)) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // makeTableFuncDep returns the set of functional dependencies derived from the
@@ -1683,4 +1772,8 @@ func (h *joinPropsHelper) cardinality() props.Cardinality {
 	default:
 		return innerJoinCard
 	}
+}
+
+func (b *logicalPropsBuilder) buildFakeRelProps(fake *FakeRelExpr, rel *props.Relational) {
+	*rel = *fake.Props
 }

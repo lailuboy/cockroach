@@ -20,13 +20,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -44,14 +43,16 @@ import (
 type mysqldumpReader struct {
 	evalCtx  *tree.EvalContext
 	tables   map[string]*rowConverter
-	kvCh     chan kvBatch
+	kvCh     chan []roachpb.KeyValue
 	debugRow func(tree.Datums)
 }
 
 var _ inputConverter = &mysqldumpReader{}
 
 func newMysqldumpReader(
-	kvCh chan kvBatch, tables map[string]*sqlbase.TableDescriptor, evalCtx *tree.EvalContext,
+	kvCh chan []roachpb.KeyValue,
+	tables map[string]*sqlbase.TableDescriptor,
+	evalCtx *tree.EvalContext,
 ) (*mysqldumpReader, error) {
 	res := &mysqldumpReader{evalCtx: evalCtx, kvCh: kvCh}
 
@@ -174,7 +175,7 @@ const (
 // wrapper types are: StrVal, IntVal, FloatVal, HexNum, HexVal, ValArg, BitVal
 // as well as NullVal.
 func mysqlValueToDatum(
-	raw mysql.Expr, desired types.T, evalContext *tree.EvalContext,
+	raw mysql.Expr, desired *types.T, evalContext *tree.EvalContext,
 ) (tree.Datum, error) {
 	switch v := raw.(type) {
 	case mysql.BoolVal:
@@ -189,12 +190,12 @@ func mysqlValueToDatum(
 			// https://github.com/cockroachdb/cockroach/issues/29298
 
 			if strings.HasPrefix(s, zeroYear) {
-				switch desired {
-				case types.TimestampTZ, types.Timestamp:
+				switch desired.Family() {
+				case types.TimestampTZFamily, types.TimestampFamily:
 					if s == zeroTime {
 						return tree.DNull, nil
 					}
-				case types.Date:
+				case types.DateFamily:
 					if s == zeroDate {
 						return tree.DNull, nil
 					}
@@ -546,70 +547,70 @@ func mysqlColToCockroach(
 	switch typ := col.SQLType(); typ {
 
 	case mysqltypes.Char:
-		def.Type = strOpt(coltypes.Char, length)
+		def.Type = types.MakeChar(int32(length))
 	case mysqltypes.VarChar:
-		def.Type = strOpt(coltypes.VarChar, length)
+		def.Type = types.MakeVarChar(int32(length))
 	case mysqltypes.Text:
-		def.Type = strOpt(coltypes.String, length)
+		def.Type = types.MakeString(int32(length))
 
 	case mysqltypes.Blob:
-		def.Type = coltypes.Bytes
+		def.Type = types.Bytes
 	case mysqltypes.VarBinary:
-		def.Type = coltypes.Bytes
+		def.Type = types.Bytes
 	case mysqltypes.Binary:
-		def.Type = coltypes.Bytes
+		def.Type = types.Bytes
 
 	case mysqltypes.Int8:
-		def.Type = coltypes.Int2
+		def.Type = types.Int2
 	case mysqltypes.Uint8:
-		def.Type = coltypes.Int2
+		def.Type = types.Int2
 	case mysqltypes.Int16:
-		def.Type = coltypes.Int2
+		def.Type = types.Int2
 	case mysqltypes.Uint16:
-		def.Type = coltypes.Int4
+		def.Type = types.Int4
 	case mysqltypes.Int24:
-		def.Type = coltypes.Int4
+		def.Type = types.Int4
 	case mysqltypes.Uint24:
-		def.Type = coltypes.Int4
+		def.Type = types.Int4
 	case mysqltypes.Int32:
-		def.Type = coltypes.Int4
+		def.Type = types.Int4
 	case mysqltypes.Uint32:
-		def.Type = coltypes.Int8
+		def.Type = types.Int
 	case mysqltypes.Int64:
-		def.Type = coltypes.Int8
+		def.Type = types.Int
 	case mysqltypes.Uint64:
-		def.Type = coltypes.Int8
+		def.Type = types.Int
 
 	case mysqltypes.Float32:
-		def.Type = coltypes.Float4
+		def.Type = types.Float4
 	case mysqltypes.Float64:
-		def.Type = coltypes.Float8
+		def.Type = types.Float
 
 	case mysqltypes.Decimal:
-		def.Type = decOpt(coltypes.Decimal, length, scale)
+		def.Type = types.MakeDecimal(int32(length), int32(scale))
 
 	case mysqltypes.Date:
-		def.Type = coltypes.Date
+		def.Type = types.Date
 		if col.Default != nil && bytes.Equal(col.Default.Val, []byte(zeroDate)) {
 			col.Default = nil
 		}
 	case mysqltypes.Time:
-		def.Type = coltypes.Time
+		def.Type = types.Time
 	case mysqltypes.Timestamp:
-		def.Type = coltypes.TimestampWithTZ
+		def.Type = types.TimestampTZ
 		if col.Default != nil && bytes.Equal(col.Default.Val, []byte(zeroTime)) {
 			col.Default = nil
 		}
 	case mysqltypes.Datetime:
-		def.Type = coltypes.TimestampWithTZ
+		def.Type = types.TimestampTZ
 		if col.Default != nil && bytes.Equal(col.Default.Val, []byte(zeroTime)) {
 			col.Default = nil
 		}
 	case mysqltypes.Year:
-		def.Type = coltypes.Int2
+		def.Type = types.Int2
 
 	case mysqltypes.Enum:
-		def.Type = coltypes.String
+		def.Type = types.String
 
 		expr, err := parser.ParseExpr(fmt.Sprintf("%s in (%s)", name, strings.Join(col.EnumValues, ",")))
 		if err != nil {
@@ -621,21 +622,21 @@ func mysqlColToCockroach(
 		}
 
 	case mysqltypes.TypeJSON:
-		def.Type = coltypes.JSON
+		def.Type = types.Jsonb
 
 	case mysqltypes.Set:
-		return nil, pgerror.UnimplementedWithIssueHintError(32560,
+		return nil, pgerror.UnimplementedWithIssueHint(32560,
 			"cannot import SET columns at this time",
 			"try converting the column to a 64-bit integer before import")
 	case mysqltypes.Geometry:
-		return nil, pgerror.UnimplementedWithIssueErrorf(32559,
+		return nil, pgerror.UnimplementedWithIssuef(32559,
 			"cannot import GEOMETRY columns at this time")
 	case mysqltypes.Bit:
-		return nil, pgerror.UnimplementedWithIssueHintError(32561,
+		return nil, pgerror.UnimplementedWithIssueHint(32561,
 			"cannot improt BIT columns at this time",
 			"try converting the column to a 64-bit integer before import")
 	default:
-		return nil, pgerror.Unimplemented(fmt.Sprintf("import.mysqlcoltype.%s", typ), "unsupported mysql type %q", col.Type)
+		return nil, pgerror.Unimplementedf(fmt.Sprintf("import.mysqlcoltype.%s", typ), "unsupported mysql type %q", col.Type)
 	}
 
 	if col.NotNull {
@@ -651,31 +652,10 @@ func mysqlColToCockroach(
 		} else {
 			expr, err := parser.ParseExpr(exprString)
 			if err != nil {
-				return nil, pgerror.Unimplemented("import.mysql.default", "unsupported default expression %q for column %q: %v", exprString, name, err)
+				return nil, pgerror.Unimplementedf("import.mysql.default", "unsupported default expression %q for column %q: %v", exprString, name, err)
 			}
 			def.DefaultExpr.Expr = expr
 		}
 	}
 	return def, nil
-}
-
-// strOpt configures a string column type with the passed length if non-zero.
-func strOpt(in *coltypes.TString, i int) coltypes.T {
-	if i == 0 {
-		return in
-	}
-	res := *in
-	res.N = uint(i)
-	return &res
-}
-
-// strOpt configures a decimal column type with passed options if non-zero.
-func decOpt(in *coltypes.TDecimal, prec, scale int) coltypes.T {
-	if prec == 0 && scale == 0 {
-		return in
-	}
-	res := *in
-	res.Prec = prec
-	res.Scale = scale
-	return &res
 }

@@ -18,8 +18,10 @@ import (
 	"context"
 	"sort"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // IndexedRows are rows with the corresponding indices.
@@ -39,8 +41,7 @@ type IndexedRow interface {
 type WindowFrameRun struct {
 	// constant for all calls to WindowFunc.Add
 	Rows             IndexedRows
-	ArgIdxStart      int          // the index which arguments to the window function begin
-	ArgCount         int          // the number of window function arguments
+	ArgsIdxs         []uint32     // indices of the arguments to the window function
 	Frame            *WindowFrame // If non-nil, Frame represents the frame specification of this window. If nil, default frame is used.
 	StartBoundOffset Datum
 	EndBoundOffset   Datum
@@ -68,7 +69,7 @@ type WindowFrameRangeOps struct{}
 // LookupImpl looks up implementation of Plus and Minus binary operators for
 // provided left and right types and returns them along with a boolean which
 // indicates whether lookup is successful.
-func (o WindowFrameRangeOps) LookupImpl(left, right types.T) (*BinOp, *BinOp, bool) {
+func (o WindowFrameRangeOps) LookupImpl(left, right *types.T) (*BinOp, *BinOp, bool) {
 	plusOverloads, minusOverloads := BinOps[Plus], BinOps[Minus]
 	plusOp, found := plusOverloads.lookupImpl(left, right)
 	if !found {
@@ -187,7 +188,9 @@ func (wfr *WindowFrameRun) FrameStartIdx(ctx context.Context, evalCtx *EvalConte
 				return valueAt.Compare(evalCtx, value) >= 0
 			}), wfr.err
 		default:
-			panic("unexpected WindowFrameBoundType in RANGE mode")
+			return 0, pgerror.AssertionFailedf(
+				"unexpected WindowFrameBoundType in RANGE mode: %d",
+				log.Safe(wfr.Frame.Bounds.StartBound.BoundType))
 		}
 	case ROWS:
 		switch wfr.Frame.Bounds.StartBound.BoundType {
@@ -210,7 +213,9 @@ func (wfr *WindowFrameRun) FrameStartIdx(ctx context.Context, evalCtx *EvalConte
 			}
 			return idx, nil
 		default:
-			panic("unexpected WindowFrameBoundType in ROWS mode")
+			return 0, pgerror.AssertionFailedf(
+				"unexpected WindowFrameBoundType in ROWS mode: %d",
+				log.Safe(wfr.Frame.Bounds.StartBound.BoundType))
 		}
 	case GROUPS:
 		switch wfr.Frame.Bounds.StartBound.BoundType {
@@ -237,10 +242,12 @@ func (wfr *WindowFrameRun) FrameStartIdx(ctx context.Context, evalCtx *EvalConte
 			}
 			return wfr.PeerHelper.GetFirstPeerIdx(peerGroupNum), nil
 		default:
-			panic("unexpected WindowFrameBoundType in GROUPS mode")
+			return 0, pgerror.AssertionFailedf(
+				"unexpected WindowFrameBoundType in GROUPS mode: %d",
+				log.Safe(wfr.Frame.Bounds.StartBound.BoundType))
 		}
 	default:
-		panic("unexpected WindowFrameMode")
+		return 0, pgerror.AssertionFailedf("unexpected WindowFrameMode: %d", wfr.Frame.Mode)
 	}
 }
 
@@ -343,7 +350,9 @@ func (wfr *WindowFrameRun) FrameEndIdx(ctx context.Context, evalCtx *EvalContext
 		case UnboundedFollowing:
 			return wfr.unboundedFollowing(), nil
 		default:
-			panic("unexpected WindowFrameBoundType in RANGE mode")
+			return 0, pgerror.AssertionFailedf(
+				"unexpected WindowFrameBoundType in RANGE mode: %d",
+				log.Safe(wfr.Frame.Bounds.EndBound.BoundType))
 		}
 	case ROWS:
 		if wfr.Frame.Bounds.EndBound == nil {
@@ -370,7 +379,9 @@ func (wfr *WindowFrameRun) FrameEndIdx(ctx context.Context, evalCtx *EvalContext
 		case UnboundedFollowing:
 			return wfr.unboundedFollowing(), nil
 		default:
-			panic("unexpected WindowFrameBoundType in ROWS mode")
+			return 0, pgerror.AssertionFailedf(
+				"unexpected WindowFrameBoundType in ROWS mode: %d",
+				log.Safe(wfr.Frame.Bounds.EndBound.BoundType))
 		}
 	case GROUPS:
 		if wfr.Frame.Bounds.EndBound == nil {
@@ -402,10 +413,13 @@ func (wfr *WindowFrameRun) FrameEndIdx(ctx context.Context, evalCtx *EvalContext
 		case UnboundedFollowing:
 			return wfr.unboundedFollowing(), nil
 		default:
-			panic("unexpected WindowFrameBoundType in GROUPS mode")
+			return 0, pgerror.AssertionFailedf(
+				"unexpected WindowFrameBoundType in GROUPS mode: %d",
+				log.Safe(wfr.Frame.Bounds.EndBound.BoundType))
 		}
 	default:
-		panic("unexpected WindowFrameMode")
+		return 0, pgerror.AssertionFailedf(
+			"unexpected WindowFrameMode: %d", log.Safe(wfr.Frame.Mode))
 	}
 }
 
@@ -463,11 +477,7 @@ func (wfr *WindowFrameRun) Args(ctx context.Context) (Datums, error) {
 
 // ArgsWithRowOffset returns the argument set at the given offset in the window frame.
 func (wfr *WindowFrameRun) ArgsWithRowOffset(ctx context.Context, offset int) (Datums, error) {
-	row, err := wfr.Rows.GetRow(ctx, wfr.RowIdx+offset)
-	if err != nil {
-		return nil, err
-	}
-	return row.GetDatums(wfr.ArgIdxStart, wfr.ArgIdxStart+wfr.ArgCount)
+	return wfr.ArgsByRowIdx(ctx, wfr.RowIdx+offset)
 }
 
 // ArgsByRowIdx returns the argument set of the row at idx.
@@ -476,7 +486,14 @@ func (wfr *WindowFrameRun) ArgsByRowIdx(ctx context.Context, idx int) (Datums, e
 	if err != nil {
 		return nil, err
 	}
-	return row.GetDatums(wfr.ArgIdxStart, wfr.ArgIdxStart+wfr.ArgCount)
+	datums := make(Datums, len(wfr.ArgsIdxs))
+	for i, argIdx := range wfr.ArgsIdxs {
+		datums[i], err = row.GetDatum(int(argIdx))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return datums, nil
 }
 
 // valueAt returns the first argument of the window function at the row idx.

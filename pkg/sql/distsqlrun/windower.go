@@ -25,8 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -39,23 +39,19 @@ import (
 // GetWindowFunctionInfo returns windowFunc constructor and the return type
 // when given fn is applied to given inputTypes.
 func GetWindowFunctionInfo(
-	fn distsqlpb.WindowerSpec_Func, inputTypes ...sqlbase.ColumnType,
-) (
-	windowConstructor func(*tree.EvalContext) tree.WindowFunc,
-	returnType sqlbase.ColumnType,
-	err error,
-) {
+	fn distsqlpb.WindowerSpec_Func, inputTypes ...types.T,
+) (windowConstructor func(*tree.EvalContext) tree.WindowFunc, returnType *types.T, err error) {
 	if fn.AggregateFunc != nil && *fn.AggregateFunc == distsqlpb.AggregatorSpec_ANY_NOT_NULL {
 		// The ANY_NOT_NULL builtin does not have a fixed return type;
 		// handle it separately.
 		if len(inputTypes) != 1 {
-			return nil, sqlbase.ColumnType{}, errors.Errorf("any_not_null aggregate needs 1 input")
+			return nil, nil, errors.Errorf("any_not_null aggregate needs 1 input")
 		}
-		return builtins.NewAggregateWindowFunc(builtins.NewAnyNotNullAggregate), inputTypes[0], nil
+		return builtins.NewAggregateWindowFunc(builtins.NewAnyNotNullAggregate), &inputTypes[0], nil
 	}
-	datumTypes := make([]types.T, len(inputTypes))
+	datumTypes := make([]*types.T, len(inputTypes))
 	for i := range inputTypes {
-		datumTypes[i] = inputTypes[i].ToDatumType()
+		datumTypes[i] = &inputTypes[i]
 	}
 
 	var funcStr string
@@ -64,18 +60,18 @@ func GetWindowFunctionInfo(
 	} else if fn.WindowFunc != nil {
 		funcStr = fn.WindowFunc.String()
 	} else {
-		return nil, sqlbase.ColumnType{}, errors.Errorf(
+		return nil, nil, errors.Errorf(
 			"function is neither an aggregate nor a window function",
 		)
 	}
 	props, builtins := builtins.GetBuiltinProperties(strings.ToLower(funcStr))
 	for _, b := range builtins {
-		types := b.Types.Types()
-		if len(types) != len(inputTypes) {
+		typs := b.Types.Types()
+		if len(typs) != len(inputTypes) {
 			continue
 		}
 		match := true
-		for i, t := range types {
+		for i, t := range typs {
 			if !datumTypes[i].Equivalent(t) {
 				if props.NullableArgs && datumTypes[i].IsAmbiguous() {
 					continue
@@ -89,15 +85,10 @@ func GetWindowFunctionInfo(
 			constructAgg := func(evalCtx *tree.EvalContext) tree.WindowFunc {
 				return b.WindowFunc(datumTypes, evalCtx)
 			}
-
-			colTyp, err := sqlbase.DatumTypeToColumnType(b.FixedReturnType())
-			if err != nil {
-				return nil, sqlbase.ColumnType{}, err
-			}
-			return constructAgg, colTyp, nil
+			return constructAgg, b.FixedReturnType(), nil
 		}
 	}
-	return nil, sqlbase.ColumnType{}, errors.Errorf(
+	return nil, nil, errors.Errorf(
 		"no builtin aggregate/window function for %s on %v", funcStr, inputTypes,
 	)
 }
@@ -116,10 +107,9 @@ const (
 )
 
 // windower is the processor that performs computation of window functions
-// that have the same PARTITION BY clause. It puts the output of a window
-// function windowFn at windowFn.argIdxStart and "consumes" columns
-// windowFn.argIdxStart : windowFn.argIdxStart+windowFn.argCount,
-// so it can both add (when argCount = 0) and remove (when argCount > 1) columns.
+// that have the same PARTITION BY clause. It passes through all of its input
+// columns and puts the output of a window function windowFn at
+// windowFn.outputColIdx.
 type windower struct {
 	ProcessorBase
 
@@ -129,10 +119,11 @@ type windower struct {
 	runningState windowerState
 	input        RowSource
 	inputDone    bool
-	inputTypes   []sqlbase.ColumnType
-	outputTypes  []sqlbase.ColumnType
+	inputTypes   []types.T
+	outputTypes  []types.T
 	datumAlloc   sqlbase.DatumAlloc
 	acc          mon.BoundAccount
+	diskMonitor  *mon.BytesMonitor
 
 	scratch       []byte
 	cancelChecker *sqlbase.CancelChecker
@@ -173,6 +164,7 @@ func newWindower(
 	ctx := evalCtx.Ctx()
 	memMonitor := NewMonitor(ctx, evalCtx.Mon, "windower-mem")
 	w.acc = memMonitor.MakeBoundAccount()
+	w.diskMonitor = NewMonitor(ctx, flowCtx.diskMonitor, "windower-disk")
 	if sp := opentracing.SpanFromContext(ctx); sp != nil && tracing.IsRecording(sp) {
 		w.input = NewInputStatCollector(w.input)
 		w.finishTrace = w.outputStatsToTrace
@@ -184,7 +176,7 @@ func newWindower(
 		nil, /* memRowContainer */
 		evalCtx,
 		memMonitor,
-		flowCtx.diskMonitor,
+		w.diskMonitor,
 		flowCtx.TempStorage,
 	)
 	w.allRowsPartitioned = &allRowsPartitioned
@@ -197,44 +189,35 @@ func newWindower(
 	); err != nil {
 		return nil, err
 	}
+
 	w.windowFns = make([]*windowFunc, 0, len(windowFns))
-	w.outputTypes = make([]sqlbase.ColumnType, 0, len(w.inputTypes))
-
-	// inputColIdx is the index of the column that should be processed next.
-	inputColIdx := 0
+	// windower passes through all of its input columns and appends an output
+	// column for each of window functions it is computing.
+	w.outputTypes = make([]types.T, len(w.inputTypes)+len(windowFns))
+	copy(w.outputTypes, w.inputTypes)
 	for _, windowFn := range windowFns {
-		// All window functions are sorted by their argIdxStart,
-		// so we simply "copy" all columns up to windowFn.argIdxStart
-		// (all window functions in samePartitionFuncs after windowFn
-		// have their arguments in later columns).
-		w.outputTypes = append(w.outputTypes, w.inputTypes[inputColIdx:int(windowFn.ArgIdxStart)]...)
-
 		// Check for out of bounds arguments has been done during planning step.
-		argTypes := w.inputTypes[windowFn.ArgIdxStart : windowFn.ArgIdxStart+windowFn.ArgCount]
+		argTypes := make([]types.T, len(windowFn.ArgsIdxs))
+		for i, argIdx := range windowFn.ArgsIdxs {
+			argTypes[i] = w.inputTypes[argIdx]
+		}
 		windowConstructor, outputType, err := GetWindowFunctionInfo(windowFn.Func, argTypes...)
 		if err != nil {
 			return nil, err
 		}
-		// Windower processor consumes all arguments of windowFn
-		// and puts the result of computation of this window function
-		// at windowFn.argIdxStart.
-		w.outputTypes = append(w.outputTypes, outputType)
-		inputColIdx = int(windowFn.ArgIdxStart + windowFn.ArgCount)
+		w.outputTypes[windowFn.OutputColIdx] = *outputType
 
 		wf := &windowFunc{
 			create:       windowConstructor,
 			ordering:     windowFn.Ordering,
-			argIdxStart:  int(windowFn.ArgIdxStart),
-			argCount:     int(windowFn.ArgCount),
+			argsIdxs:     windowFn.ArgsIdxs,
 			frame:        windowFn.Frame,
 			filterColIdx: int(windowFn.FilterColIdx),
+			outputColIdx: int(windowFn.OutputColIdx),
 		}
 
 		w.windowFns = append(w.windowFns, wf)
 	}
-	// We will simply copy all columns that come after arguments
-	// to all window function.
-	w.outputTypes = append(w.outputTypes, w.inputTypes[inputColIdx:]...)
 	w.outputRow = make(sqlbase.EncDatumRow, len(w.outputTypes))
 
 	if err := w.InitWithEvalCtx(
@@ -247,7 +230,7 @@ func newWindower(
 		output,
 		memMonitor,
 		ProcStateOpts{InputsToDrain: []RowSource{w.input},
-			TrailingMetaCallback: func(context.Context) []ProducerMetadata {
+			TrailingMetaCallback: func(context.Context) []distsqlpb.ProducerMetadata {
 				w.close()
 				return nil
 			}},
@@ -268,10 +251,10 @@ func (w *windower) Start(ctx context.Context) context.Context {
 }
 
 // Next is part of the RowSource interface.
-func (w *windower) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (w *windower) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	for w.State == StateRunning {
 		var row sqlbase.EncDatumRow
-		var meta *ProducerMetadata
+		var meta *distsqlpb.ProducerMetadata
 		switch w.runningState {
 		case windowerAccumulating:
 			w.runningState, row, meta = w.accumulateRows()
@@ -306,13 +289,18 @@ func (w *windower) close() {
 		}
 		w.acc.Close(w.Ctx)
 		w.MemMonitor.Stop(w.Ctx)
+		w.diskMonitor.Stop(w.Ctx)
 	}
 }
 
 // accumulateRows continually reads rows from the input and accumulates them
 // in allRowsPartitioned. If it encounters metadata, the metadata is returned
 // immediately. Subsequent calls of this function will resume row accumulation.
-func (w *windower) accumulateRows() (windowerState, sqlbase.EncDatumRow, *ProducerMetadata) {
+func (w *windower) accumulateRows() (
+	windowerState,
+	sqlbase.EncDatumRow,
+	*distsqlpb.ProducerMetadata,
+) {
 	for {
 		row, meta := w.input.Next()
 		if meta != nil {
@@ -350,7 +338,7 @@ func (w *windower) accumulateRows() (windowerState, sqlbase.EncDatumRow, *Produc
 //
 // emitRow() might move to stateDraining. It might also not return a row if the
 // ProcOutputHelper filtered the current row out.
-func (w *windower) emitRow() (windowerState, sqlbase.EncDatumRow, *ProducerMetadata) {
+func (w *windower) emitRow() (windowerState, sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	if w.inputDone {
 		for !w.populated {
 			if err := w.cancelChecker.Check(); err != nil {
@@ -481,8 +469,7 @@ func (w *windower) processPartition(
 		windowFn := w.windowFns[windowFnIdx]
 
 		frameRun := &tree.WindowFrameRun{
-			ArgCount:     windowFn.argCount,
-			ArgIdxStart:  windowFn.argIdxStart,
+			ArgsIdxs:     windowFn.argsIdxs,
 			FilterColIdx: windowFn.filterColIdx,
 		}
 
@@ -495,18 +482,21 @@ func (w *windower) processPartition(
 				case distsqlpb.WindowerSpec_Frame_ROWS:
 					frameRun.StartBoundOffset = tree.NewDInt(tree.DInt(int(startBound.IntOffset)))
 				case distsqlpb.WindowerSpec_Frame_RANGE:
-					datum, rem, err := sqlbase.DecodeTableValue(&w.datumAlloc, startBound.OffsetType.Type.ToDatumType(), startBound.TypedOffset)
+					datum, rem, err := sqlbase.DecodeTableValue(&w.datumAlloc, &startBound.OffsetType.Type, startBound.TypedOffset)
 					if err != nil {
-						return errors.Wrapf(err, "error decoding %d bytes", len(startBound.TypedOffset))
+						return pgerror.NewAssertionErrorWithWrappedErrf(err,
+							"error decoding %d bytes", log.Safe(len(startBound.TypedOffset)))
 					}
 					if len(rem) != 0 {
-						return errors.Errorf("%d trailing bytes in encoded value", len(rem))
+						return pgerror.AssertionFailedf(
+							"%d trailing bytes in encoded value", log.Safe(len(rem)))
 					}
 					frameRun.StartBoundOffset = datum
 				case distsqlpb.WindowerSpec_Frame_GROUPS:
 					frameRun.StartBoundOffset = tree.NewDInt(tree.DInt(int(startBound.IntOffset)))
 				default:
-					panic("unexpected WindowFrameMode")
+					return pgerror.AssertionFailedf(
+						"unexpected WindowFrameMode: %d", log.Safe(windowFn.frame.Mode))
 				}
 			}
 			if endBound != nil {
@@ -516,18 +506,21 @@ func (w *windower) processPartition(
 					case distsqlpb.WindowerSpec_Frame_ROWS:
 						frameRun.EndBoundOffset = tree.NewDInt(tree.DInt(int(endBound.IntOffset)))
 					case distsqlpb.WindowerSpec_Frame_RANGE:
-						datum, rem, err := sqlbase.DecodeTableValue(&w.datumAlloc, endBound.OffsetType.Type.ToDatumType(), endBound.TypedOffset)
+						datum, rem, err := sqlbase.DecodeTableValue(&w.datumAlloc, &endBound.OffsetType.Type, endBound.TypedOffset)
 						if err != nil {
-							return errors.Wrapf(err, "error decoding %d bytes", len(endBound.TypedOffset))
+							return pgerror.NewAssertionErrorWithWrappedErrf(err,
+								"error decoding %d bytes", log.Safe(len(endBound.TypedOffset)))
 						}
 						if len(rem) != 0 {
-							return errors.Errorf("%d trailing bytes in encoded value", len(rem))
+							return pgerror.AssertionFailedf(
+								"%d trailing bytes in encoded value", log.Safe(len(rem)))
 						}
 						frameRun.EndBoundOffset = datum
 					case distsqlpb.WindowerSpec_Frame_GROUPS:
 						frameRun.EndBoundOffset = tree.NewDInt(tree.DInt(int(endBound.IntOffset)))
 					default:
-						panic("unexpected WindowFrameMode")
+						return pgerror.AssertionFailedf("unexpected WindowFrameMode: %d",
+							log.Safe(windowFn.frame.Mode))
 					}
 				}
 			}
@@ -538,7 +531,7 @@ func (w *windower) processPartition(
 				// as zeroth "entry" which its proto equivalent doesn't have.
 				frameRun.OrdDirection = encoding.Direction(ordCol.Direction + 1)
 
-				colTyp := w.inputTypes[ordCol.ColIdx].ToDatumType()
+				colTyp := &w.inputTypes[ordCol.ColIdx]
 				// Type of offset depends on the ordering column's type.
 				offsetTyp := colTyp
 				if types.IsDateTimeType(colTyp) {
@@ -547,7 +540,8 @@ func (w *windower) processPartition(
 				}
 				plusOp, minusOp, found := tree.WindowFrameRangeOps{}.LookupImpl(colTyp, offsetTyp)
 				if !found {
-					return pgerror.NewErrorf(pgerror.CodeWindowingError, "given logical offset cannot be combined with ordering column")
+					return pgerror.Newf(pgerror.CodeWindowingError,
+						"given logical offset cannot be combined with ordering column")
 				}
 				frameRun.PlusOp, frameRun.MinusOp = plusOp, minusOp
 			}
@@ -660,8 +654,8 @@ func (w *windower) computeWindowFunctions(ctx context.Context, evalCtx *tree.Eva
 		w.evalCtx,
 		w.flowCtx.TempStorage,
 		w.MemMonitor,
-		w.flowCtx.diskMonitor,
-		0,
+		w.diskMonitor,
+		0, /* rowCapacity */
 	)
 	i, err := w.allRowsPartitioned.NewAllRowsIterator(ctx)
 	if err != nil {
@@ -691,7 +685,8 @@ func (w *windower) computeWindowFunctions(ctx context.Context, evalCtx *tree.Eva
 			w.scratch = w.scratch[:0]
 			for _, col := range w.partitionBy {
 				if int(col) >= len(row) {
-					panic(fmt.Sprintf("hash column %d, row with only %d columns", col, len(row)))
+					return pgerror.AssertionFailedf(
+						"hash column %d, row with only %d columns", log.Safe(col), log.Safe(len(row)))
 				}
 				var err error
 				w.scratch, err = row[int(col)].Encode(&w.inputTypes[int(col)], &w.datumAlloc, preferredEncoding, w.scratch)
@@ -729,19 +724,16 @@ func (w *windower) computeWindowFunctions(ctx context.Context, evalCtx *tree.Eva
 	return w.processPartition(ctx, evalCtx, w.partition, len(w.partitionSizes))
 }
 
-// populateNextOutputRow combines results of computing window functions with
-// non-argument columns of the input row to produce an output row.
-// The output of windowFn is put in column windowFn.argIdxStart of w.outputRow.
-// All columns that were arguments to window functions are omitted, and columns
-// that were not such are passed through.
+// populateNextOutputRow populates next output row to be returned. All input
+// columns are passed through, and the results of window functions'
+// computations are put in the desired columns (i.e. in outputColIdx of each
+// window function).
 func (w *windower) populateNextOutputRow() (bool, error) {
 	if w.partitionIdx < len(w.partitionSizes) {
 		if w.allRowsIterator == nil {
 			w.allRowsIterator = w.allRowsPartitioned.NewUnmarkedIterator(w.Ctx)
 			w.allRowsIterator.Rewind()
 		}
-		// We reuse the same EncDatumRow since caller of Next() should've copied it.
-		w.outputRow = w.outputRow[:0]
 		// rowIdx is the index of the next row to be emitted from the
 		// partitionIdx'th partition.
 		rowIdx := w.rowsInBucketEmitted
@@ -755,19 +747,12 @@ func (w *windower) populateNextOutputRow() (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		inputColIdx := 0
+		copy(w.outputRow, inputRow[:len(w.inputTypes)])
 		for windowFnIdx, windowFn := range w.windowFns {
-			// We simply pass through columns in [inputColIdx, windowFn.argIdxStart).
-			w.outputRow = append(w.outputRow, inputRow[inputColIdx:windowFn.argIdxStart]...)
 			windowFnRes := w.windowValues[w.partitionIdx][windowFnIdx][rowIdx]
-			encWindowFnRes := sqlbase.DatumToEncDatum(w.outputTypes[len(w.outputRow)], windowFnRes)
-			w.outputRow = append(w.outputRow, encWindowFnRes)
-			// We skip all columns that were arguments to windowFn.
-			inputColIdx = windowFn.argIdxStart + windowFn.argCount
+			encWindowFnRes := sqlbase.DatumToEncDatum(&w.outputTypes[windowFn.outputColIdx], windowFnRes)
+			w.outputRow[windowFn.outputColIdx] = encWindowFnRes
 		}
-		// We simply pass through all columns after all arguments to window
-		// functions.
-		w.outputRow = append(w.outputRow, inputRow[inputColIdx:]...)
 		w.rowsInBucketEmitted++
 		if w.rowsInBucketEmitted == w.partitionSizes[w.partitionIdx] {
 			// We have emitted all rows from the current bucket, so we advance the
@@ -784,10 +769,10 @@ func (w *windower) populateNextOutputRow() (bool, error) {
 type windowFunc struct {
 	create       func(*tree.EvalContext) tree.WindowFunc
 	ordering     distsqlpb.Ordering
-	argIdxStart  int
-	argCount     int
+	argsIdxs     []uint32
 	frame        *distsqlpb.WindowerSpec_Frame
 	filterColIdx int
+	outputColIdx int
 }
 
 type partitionPeerGrouper struct {
@@ -870,6 +855,7 @@ const windowerTagPrefix = "windower."
 func (ws *WindowerStats) Stats() map[string]string {
 	inputStatsMap := ws.InputStats.Stats(windowerTagPrefix)
 	inputStatsMap[windowerTagPrefix+maxMemoryTagSuffix] = humanizeutil.IBytes(ws.MaxAllocatedMem)
+	inputStatsMap[windowerTagPrefix+maxDiskTagSuffix] = humanizeutil.IBytes(ws.MaxAllocatedDisk)
 	return inputStatsMap
 }
 
@@ -878,6 +864,7 @@ func (ws *WindowerStats) StatsForQueryPlan() []string {
 	return append(
 		ws.InputStats.StatsForQueryPlan("" /* prefix */),
 		fmt.Sprintf("%s: %s", maxMemoryQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedMem)),
+		fmt.Sprintf("%s: %s", maxDiskQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedDisk)),
 	)
 }
 func (w *windower) outputStatsToTrace() {
@@ -889,8 +876,9 @@ func (w *windower) outputStatsToTrace() {
 		tracing.SetSpanStats(
 			sp,
 			&WindowerStats{
-				InputStats:      is,
-				MaxAllocatedMem: w.MemMonitor.MaximumBytes(),
+				InputStats:       is,
+				MaxAllocatedMem:  w.MemMonitor.MaximumBytes(),
+				MaxAllocatedDisk: w.diskMonitor.MaximumBytes(),
 			},
 		)
 	}

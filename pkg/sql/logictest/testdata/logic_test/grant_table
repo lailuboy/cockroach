@@ -57,6 +57,7 @@ test           crdb_internal       node_runtime_info                  public   S
 test           crdb_internal       node_sessions                      public   SELECT
 test           crdb_internal       node_statement_statistics          public   SELECT
 test           crdb_internal       partitions                         public   SELECT
+test           crdb_internal       predefined_comments                public   SELECT
 test           crdb_internal       ranges                             public   SELECT
 test           crdb_internal       ranges_no_leases                   public   SELECT
 test           crdb_internal       schema_changes                     public   SELECT
@@ -144,7 +145,7 @@ test           public              NULL        root     ALL
 statement ok
 SET DATABASE = ''
 
-query TTTTT colnames
+query TTTTT colnames,rowsort
 SELECT * FROM [SHOW GRANTS]
  WHERE schema_name NOT IN ('crdb_internal', 'pg_catalog', 'information_schema')
 ----
@@ -701,7 +702,7 @@ SET DATABASE = ""
 statement error pq: syntax error at or near "@"
 GRANT ALL ON a.t@xyz TO readwrite
 
-statement error pq: "\*" does not match any valid database or schema
+statement error no database specified
 GRANT ALL ON * TO readwrite
 
 statement error pgcode 42P01 relation "a.tt" does not exist

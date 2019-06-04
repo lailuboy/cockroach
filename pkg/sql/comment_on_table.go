@@ -24,7 +24,7 @@ import (
 
 type commentOnTableNode struct {
 	n         *tree.CommentOnTable
-	tableDesc *MutableTableDescriptor
+	tableDesc *ImmutableTableDescriptor
 }
 
 // CommentOnTable add comment on a table.
@@ -32,7 +32,7 @@ type commentOnTableNode struct {
 //   notes: postgres requires CREATE on the table.
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) CommentOnTable(ctx context.Context, n *tree.CommentOnTable) (planNode, error) {
-	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, &n.Table, true, requireTableDesc)
+	tableDesc, err := p.ResolveUncachedTableDescriptorEx(ctx, n.Table, true, ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -82,10 +82,11 @@ func (n *commentOnTableNode) startExec(params runParams) error {
 			User      string
 			Comment   *string
 		}{
-			n.n.Table.FQString(),
+			params.p.ResolvedName(n.n.Table).FQString(),
 			n.n.String(),
 			params.SessionData().User,
-			n.n.Comment},
+			n.n.Comment,
+		},
 	)
 }
 

@@ -24,6 +24,7 @@ import "roachpb/metadata.proto";
 import "server/diagnosticspb/diagnostics.proto";
 import "server/status/statuspb/status.proto";
 import "storage/engine/enginepb/mvcc.proto";
+import "storage/engine/enginepb/rocksdb.proto";
 import "storage/storagepb/lease_status.proto";
 import "storage/storagepb/state.proto";
 import "util/log/log.proto";
@@ -149,6 +150,7 @@ message RangeProblems {
   bool leader_not_lease_holder = 2;
   bool no_raft_leader = 3;
   bool underreplicated = 4;
+  bool overreplicated = 8;
   bool no_lease = 5;
 
   // Quiescent ranges do not tick by definition, but we track this in
@@ -219,6 +221,25 @@ message GossipRequest {
   // node_id is a string so that "local" can be used to specify that no
   // forwarding is necessary.
   string node_id = 1;
+}
+
+message EngineStatsInfo {
+  int32 store_id = 1 [
+    (gogoproto.customname) = "StoreID",
+    (gogoproto.casttype) =
+        "github.com/cockroachdb/cockroach/pkg/roachpb.StoreID"
+  ];
+  cockroach.storage.engine.enginepb.TickersAndHistograms tickers_and_histograms = 2;
+}
+
+message EngineStatsRequest {
+  // node_id is a string so that "local" can be used to specify that no
+  // forwarding is necessary.
+  string node_id = 1;
+}
+
+message EngineStatsResponse {
+  repeated EngineStatsInfo stats = 1 [ (gogoproto.nullable) = false ];
 }
 
 message TraceEvent {
@@ -308,7 +329,10 @@ message StacksRequest {
 // TODO(ridwanmsharif): Add support for log files. They're currently served
 // by an endpoint that parses the log messages, which is not what the 
 // debug zip client wants.
-enum FileType { HEAP = 0; }
+enum FileType {
+  HEAP = 0;
+  GOROUTINES = 1;
+}
 
 message File {
   string name = 1;
@@ -562,6 +586,11 @@ message ProblemRangesResponse {
       (gogoproto.casttype) =
           "github.com/cockroachdb/cockroach/pkg/roachpb.RangeID"
     ];
+    repeated int64 overreplicated_range_ids = 9 [
+      (gogoproto.customname) = "OverreplicatedRangeIDs",
+      (gogoproto.casttype) =
+          "github.com/cockroachdb/cockroach/pkg/roachpb.RangeID"
+    ];
     repeated int64 quiescent_equals_ticking_range_ids = 7 [
       (gogoproto.customname) = "QuiescentEqualsTickingRangeIDs",
       (gogoproto.casttype) =
@@ -712,6 +741,9 @@ message StatementsResponse {
   repeated CollectedStatementStatistics statements = 1 [(gogoproto.nullable) = false];
   // Timestamp of the last stats reset.
   google.protobuf.Timestamp last_reset = 3 [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
+  // If set and non-empty, indicates the prefix to application_name
+  // used for statements/queries issued internally by CockroachDB.
+  string internal_app_name_prefix = 4;
 }
 
 service Status {
@@ -749,6 +781,11 @@ service Status {
   rpc Gossip(GossipRequest) returns (gossip.InfoStatus) {
     option (google.api.http) = {
       get : "/_status/gossip/{node_id}"
+    };
+  }
+  rpc EngineStats(EngineStatsRequest) returns (EngineStatsResponse) {
+    option (google.api.http) = {
+      get : "/_status/enginestats/{node_id}"
     };
   }
   rpc Allocator(AllocatorRequest) returns (AllocatorResponse) {

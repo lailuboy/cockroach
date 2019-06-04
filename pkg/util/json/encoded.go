@@ -118,7 +118,7 @@ func jsonTypeFromRootBuffer(v []byte) ([]byte, Type, error) {
 			return v[containerHeaderLen+jEntryLen:], StringJSONType, nil
 		}
 	}
-	return nil, 0, pgerror.NewErrorf(pgerror.CodeInternalError, "unknown type %d", typeTag)
+	return nil, 0, pgerror.AssertionFailedf("unknown json type %d", typeTag)
 }
 
 func newEncoded(e jEntry, v []byte) (JSON, error) {
@@ -159,7 +159,8 @@ func newEncoded(e jEntry, v []byte) (JSON, error) {
 
 func getUint32At(v []byte, idx int) (uint32, error) {
 	if idx+4 > len(v) {
-		return 0, pgerror.NewError(pgerror.CodeInternalError, "insufficient bytes to decode uint32 int value")
+		return 0, pgerror.AssertionFailedf(
+			"insufficient bytes to decode uint32 int value: %+v", v)
 	}
 
 	return uint32(v[idx])<<24 |
@@ -505,7 +506,7 @@ func (j *jsonEncoded) shallowDecode() (JSON, error) {
 		}
 		return result, nil
 	default:
-		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unknown type %v", j.typ)
+		return nil, pgerror.AssertionFailedf("unknown json type: %v", j.typ)
 	}
 }
 
@@ -715,6 +716,18 @@ func (j *jsonEncoded) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 		return nil, err
 	}
 	return decoded.encodeInvertedIndexKeys(b)
+}
+
+// numInvertedIndexEntries implements the JSON interface.
+func (j *jsonEncoded) numInvertedIndexEntries() (int, error) {
+	if j.isScalar() || j.containerLen == 0 {
+		return 1, nil
+	}
+	decoded, err := j.decode()
+	if err != nil {
+		return 0, err
+	}
+	return decoded.numInvertedIndexEntries()
 }
 
 func (j *jsonEncoded) allPaths() ([]JSON, error) {

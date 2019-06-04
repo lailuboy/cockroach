@@ -95,6 +95,12 @@ func abortIntentOp(txnID uuid.UUID) enginepb.MVCCLogicalOp {
 	})
 }
 
+func abortTxnOp(txnID uuid.UUID) enginepb.MVCCLogicalOp {
+	return makeLogicalOp(&enginepb.MVCCAbortTxnOp{
+		TxnID: txnID,
+	})
+}
+
 func makeRangeFeedEvent(val interface{}) *roachpb.RangeFeedEvent {
 	var event roachpb.RangeFeedEvent
 	event.MustSetValue(val)
@@ -174,13 +180,14 @@ func TestProcessorBasic(t *testing.T) {
 	// Add a registration.
 	r1Stream := newTestStream()
 	r1ErrC := make(chan *roachpb.Error, 1)
-	p.Register(
+	r1OK := p.Register(
 		roachpb.RSpan{Key: roachpb.RKey("a"), EndKey: roachpb.RKey("m")},
 		hlc.Timestamp{WallTime: 1},
 		nil, /* catchUpIter */
 		r1Stream,
 		r1ErrC,
 	)
+	require.True(t, r1OK)
 	p.syncEventAndRegistrations()
 	require.Equal(t, 1, p.Len())
 	require.Equal(t,
@@ -288,13 +295,14 @@ func TestProcessorBasic(t *testing.T) {
 	// Add another registration.
 	r2Stream := newTestStream()
 	r2ErrC := make(chan *roachpb.Error, 1)
-	p.Register(
+	r2OK := p.Register(
 		roachpb.RSpan{Key: roachpb.RKey("c"), EndKey: roachpb.RKey("z")},
 		hlc.Timestamp{WallTime: 1},
 		nil, /* catchUpIter */
 		r2Stream,
 		r2ErrC,
 	)
+	require.True(t, r2OK)
 	p.syncEventAndRegistrations()
 	require.Equal(t, 2, p.Len())
 	require.Equal(t,
@@ -353,6 +361,18 @@ func TestProcessorBasic(t *testing.T) {
 	pErr := roachpb.NewErrorf("stop err")
 	p.StopWithErr(pErr)
 	require.NotNil(t, <-r2ErrC)
+
+	// Adding another registration should fail.
+	r3Stream := newTestStream()
+	r3ErrC := make(chan *roachpb.Error, 1)
+	r3OK := p.Register(
+		roachpb.RSpan{Key: roachpb.RKey("c"), EndKey: roachpb.RKey("z")},
+		hlc.Timestamp{WallTime: 1},
+		nil, /* catchUpIter */
+		r3Stream,
+		r3ErrC,
+	)
+	require.False(t, r3OK)
 }
 
 func TestNilProcessor(t *testing.T) {
@@ -658,6 +678,7 @@ func TestProcessorTxnPushAttempt(t *testing.T) {
 	// Add a few intents and move the closed timestamp forward.
 	p.ConsumeLogicalOps(
 		writeIntentOpWithKey(txn1Meta.ID, txn1Meta.Key, txn1Meta.Timestamp),
+		writeIntentOpWithKey(txn2Meta.ID, txn2Meta.Key, txn2Meta.Timestamp),
 		writeIntentOpWithKey(txn2Meta.ID, txn2Meta.Key, txn2Meta.Timestamp),
 		writeIntentOpWithKey(txn3Meta.ID, txn3Meta.Key, txn3Meta.Timestamp),
 	)

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/pkg/errors"
 )
@@ -72,18 +73,18 @@ func (ba *BatchRequest) SetActiveTimestamp(nowFn func() hlc.Timestamp) error {
 // UpdateTxn updates the batch transaction from the supplied one in
 // a copy-on-write fashion, i.e. without mutating an existing
 // Transaction struct.
-func (ba *BatchRequest) UpdateTxn(otherTxn *Transaction) {
-	if otherTxn == nil {
+func (ba *BatchRequest) UpdateTxn(o *Transaction) {
+	if o == nil {
 		return
 	}
-	otherTxn.AssertInitialized(context.TODO())
+	o.AssertInitialized(context.TODO())
 	if ba.Txn == nil {
-		ba.Txn = otherTxn
+		ba.Txn = o
 		return
 	}
 	clonedTxn := ba.Txn.Clone()
-	clonedTxn.Update(otherTxn)
-	ba.Txn = &clonedTxn
+	clonedTxn.Update(o)
+	ba.Txn = clonedTxn
 }
 
 // IsLeaseRequest returns whether the batch consists of a single RequestLease
@@ -117,7 +118,6 @@ func (ba *BatchRequest) IsReadOnly() bool {
 // leaseholders of the ranges it addresses.
 func (ba *BatchRequest) RequiresLeaseHolder() bool {
 	return !ba.IsReadOnly() || ba.Header.ReadConsistency.RequiresReadLease()
-
 }
 
 // IsReverse returns true iff the BatchRequest contains a reverse request.
@@ -125,10 +125,16 @@ func (ba *BatchRequest) IsReverse() bool {
 	return ba.hasFlag(isReverse)
 }
 
-// IsPossibleTransaction returns true iff the BatchRequest contains
-// requests that can be part of a transaction.
-func (ba *BatchRequest) IsPossibleTransaction() bool {
+// IsTransactional returns true iff the BatchRequest contains requests that can
+// be part of a transaction.
+func (ba *BatchRequest) IsTransactional() bool {
 	return ba.hasFlag(isTxn)
+}
+
+// IsAllTransactional returns true iff the BatchRequest contains only requests
+// that can be part of a transaction.
+func (ba *BatchRequest) IsAllTransactional() bool {
+	return ba.hasFlagForAll(isTxn)
 }
 
 // IsTransactionWrite returns true iff the BatchRequest contains a txn write.
@@ -212,6 +218,16 @@ func (ba *BatchRequest) IsSingleComputeChecksumRequest() bool {
 	return false
 }
 
+// IsSingleAddSSTableRequest returns true iff the batch contains a single
+// request, and that request is an AddSSTableRequest.
+func (ba *BatchRequest) IsSingleAddSSTableRequest() bool {
+	if ba.IsSingleRequest() {
+		_, ok := ba.Requests[0].GetInner().(*AddSSTableRequest)
+		return ok
+	}
+	return false
+}
+
 // IsCompleteTransaction determines whether a batch contains every write in a
 // transactions.
 func (ba *BatchRequest) IsCompleteTransaction() bool {
@@ -242,7 +258,7 @@ func (ba *BatchRequest) IsCompleteTransaction() bool {
 	// Check whether any sequence numbers were skipped between 1 and the
 	// EndTransaction's sequence number. A Batch is only a complete transaction
 	// if it contains every write that the transaction performed.
-	nextSeq := int32(1)
+	nextSeq := enginepb.TxnSeq(1)
 	for _, args := range ba.Requests {
 		req := args.GetInner()
 		seq := req.Header().Sequence
@@ -278,6 +294,20 @@ func (ba *BatchRequest) hasFlag(flag int) bool {
 		}
 	}
 	return false
+}
+
+// hasFlagForAll returns true iff all of the requests within the batch contains
+// the specified flag.
+func (ba *BatchRequest) hasFlagForAll(flag int) bool {
+	if len(ba.Requests) == 0 {
+		return false
+	}
+	for _, union := range ba.Requests {
+		if (union.GetInner().flags() & flag) == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // GetArg returns a request of the given type if one is contained in the
@@ -334,7 +364,7 @@ func (ba *BatchRequest) IntentSpanIterate(br *BatchResponse, fn func(Span)) {
 		if br != nil {
 			resp = br.Responses[i].GetInner()
 		}
-		if span, ok := actualSpan(req, resp); ok {
+		if span, ok := ActualSpan(req, resp); ok {
 			fn(span)
 		}
 	}
@@ -362,7 +392,7 @@ func (ba *BatchRequest) RefreshSpanIterate(br *BatchResponse, fn func(Span, bool
 		if br != nil {
 			resp = br.Responses[i].GetInner()
 		}
-		if span, ok := actualSpan(req, resp); ok {
+		if span, ok := ActualSpan(req, resp); ok {
 			if !fn(span, UpdatesWriteTimestampCache(req)) {
 				return false
 			}
@@ -371,10 +401,10 @@ func (ba *BatchRequest) RefreshSpanIterate(br *BatchResponse, fn func(Span, bool
 	return true
 }
 
-// actualSpan returns the actual request span which was operated on,
+// ActualSpan returns the actual request span which was operated on,
 // according to the existence of a resume span in the response. If
 // nothing was operated on, returns false.
-func actualSpan(req Request, resp Response) (Span, bool) {
+func ActualSpan(req Request, resp Response) (Span, bool) {
 	h := req.Header()
 	if resp != nil {
 		resumeSpan := resp.Header().ResumeSpan
@@ -424,7 +454,6 @@ func (br *BatchResponse) Combine(otherBatch *BatchResponse, positions []int) err
 			return errors.Errorf("can not combine %T and %T", valLeft, valRight)
 		}
 	}
-	br.Txn.Update(otherBatch.Txn)
 	return nil
 }
 

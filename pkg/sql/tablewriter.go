@@ -71,9 +71,6 @@ type tableWriter interface {
 	// will modify.
 	tableDesc() *sqlbase.ImmutableTableDescriptor
 
-	// fkSpanCollector returns the FkSpanCollector for the tableWriter.
-	fkSpanCollector() row.FkSpanCollector
-
 	// close frees all resources held by the tableWriter.
 	close(context.Context)
 
@@ -87,7 +84,10 @@ type tableWriter interface {
 
 type autoCommitOpt int
 
-const autoCommitEnabled autoCommitOpt = 1
+const (
+	autoCommitDisabled autoCommitOpt = 0
+	autoCommitEnabled  autoCommitOpt = 1
+)
 
 // extendedTableWriter is a temporary interface introduced
 // until all the tableWriters implement it. When that is achieved, it will be merged into

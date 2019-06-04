@@ -49,7 +49,9 @@ CREATE TABLE mutation (
     m INT PRIMARY KEY,
     n INT,
     "o:write-only" INT DEFAULT(10),
-    "p:write-only" INT AS (o + n) STORED
+    "p:write-only" INT AS (o + n) STORED,
+    "q:delete-only" INT AS (m * p) STORED,
+    CHECK (m > 0)
 )
 ----
 TABLE mutation
@@ -57,8 +59,10 @@ TABLE mutation
  ├── n int
  ├── o int (mutation)
  ├── p int (mutation)
- └── INDEX primary
-      └── m int not null
+ ├── q int (mutation)
+ ├── INDEX primary
+ │    └── m int not null
+ └── CHECK (m > 0)
 
 exec-ddl
 CREATE TABLE checks (
@@ -78,6 +82,24 @@ TABLE checks
  │    └── a int not null
  ├── CHECK (checks.b < d)
  └── CHECK (a > 0)
+
+exec-ddl
+CREATE TABLE decimals (
+    a DECIMAL(10,0) PRIMARY KEY CHECK (round(a) = a),
+    b DECIMAL(5,1)[] CHECK (b[0] > 1),
+    c DECIMAL(10,1) DEFAULT (1.23),
+    d DECIMAL(10,1) AS (a+c) STORED
+)
+----
+TABLE decimals
+ ├── a decimal not null
+ ├── b decimal[]
+ ├── c decimal
+ ├── d decimal
+ ├── INDEX primary
+ │    └── a decimal not null
+ ├── CHECK (round(a) = a)
+ └── CHECK (b[0] > 1)
 
 # ------------------------------------------------------------------------------
 # Basic tests.
@@ -425,7 +447,7 @@ select
 build
 UPDATE unknown SET x=1
 ----
-error: no data source matches prefix: "unknown"
+error (42P01): no data source matches prefix: "unknown"
 
 # Unknown target column.
 build
@@ -437,13 +459,13 @@ error (42703): column "f" does not exist
 build
 UPDATE xyz SET x=1, y=1, z=1
 ----
-error (42804): value type int doesn't match type STRING of column "x"
+error (42804): value type int doesn't match type string of column "x"
 
 # Try to use non-returning UPDATE as expression.
 build
 SELECT * FROM [UPDATE abcde SET a=1]
 ----
-error (0A000): statement source "UPDATE abcde SET a = 1" does not return any columns
+error (42703): statement source "UPDATE abcde SET a = 1" does not return any columns
 
 # Non-referenced CTE with mutation.
 build
@@ -461,7 +483,7 @@ error (42P01): no data source matches prefix: abcde
 build
 UPDATE abcde SET b=1 ORDER BY c
 ----
-error: UPDATE statement requires LIMIT when ORDER BY is used
+error (42601): UPDATE statement requires LIMIT when ORDER BY is used
 
 # ------------------------------------------------------------------------------
 # Test RETURNING.
@@ -619,13 +641,13 @@ project
 build
 UPDATE abcde SET b=1 RETURNING sum(a)
 ----
-error: sum(): aggregate functions are not allowed in RETURNING
+error (42803): sum(): aggregate functions are not allowed in RETURNING
 
 # Try to use SRF in RETURNING clause.
 build
 UPDATE abcde SET c=1 RETURNING generate_series(1, 10)
 ----
-error: generate_series(): generator functions are not allowed in RETURNING
+error (0A000): generate_series(): generator functions are not allowed in RETURNING
 
 # ------------------------------------------------------------------------------
 # Test DEFAULT values.
@@ -816,12 +838,12 @@ update abcde
 build
 UPDATE abcde SET (a, b)=(1, 2, 3)
 ----
-error: number of columns (2) does not match number of values (3)
+error (42601): number of columns (2) does not match number of values (3)
 
 build
 UPDATE abcde SET (a, b, a)=(1, 2, 3)
 ----
-error: multiple assignments to the same column "a"
+error (42601): multiple assignments to the same column "a"
 
 build
 UPDATE abcde SET (a, unk)=(1, 2)
@@ -1122,25 +1144,25 @@ project
 build
 UPDATE abcde SET (a, b)=(SELECT y, y+1 AS y1, y+2 AS y2 FROM xyz)
 ----
-error: number of columns (2) does not match number of values (3)
+error (42601): number of columns (2) does not match number of values (3)
 
 # Too few values.
 build
 UPDATE abcde SET (a, b, c)=(SELECT y, y+1 AS y1 FROM xyz)
 ----
-error: number of columns (3) does not match number of values (2)
+error (42601): number of columns (3) does not match number of values (2)
 
 # Try to update same column.
 build
 UPDATE abcde SET (a, b)=(1, 2), (c, b)=(SELECT y, y+1 AS y1 FROM xyz)
 ----
-error: multiple assignments to the same column "b"
+error (42601): multiple assignments to the same column "b"
 
 # Target type does not match subquery result.
 build
 UPDATE xyz SET (x, y)=(SELECT a, b FROM abcde WHERE a>0)
 ----
-error (42804): value type int doesn't match type STRING of column "x"
+error (42804): value type int doesn't match type string of column "x"
 
 # ------------------------------------------------------------------------------
 # Test CTEs.
@@ -1222,22 +1244,29 @@ UPDATE mutation SET m=1
 ----
 update mutation
  ├── columns: <none>
- ├── fetch columns: m:5(int) n:6(int) o:7(int) p:8(int)
+ ├── fetch columns: m:6(int) n:7(int) o:8(int) p:9(int) q:10(int)
  ├── update-mapping:
- │    ├──  column9:9 => m:1
- │    └──  column10:10 => p:4
+ │    ├──  column11:11 => m:1
+ │    └──  column12:12 => p:4
+ ├── check columns: check1:13(bool)
  └── project
-      ├── columns: column10:10(int) m:5(int!null) n:6(int) o:7(int) p:8(int) column9:9(int!null)
+      ├── columns: check1:13(bool) m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int) column11:11(int!null) column12:12(int)
       ├── project
-      │    ├── columns: column9:9(int!null) m:5(int!null) n:6(int) o:7(int) p:8(int)
-      │    ├── scan mutation
-      │    │    └── columns: m:5(int!null) n:6(int) o:7(int) p:8(int)
+      │    ├── columns: column12:12(int) m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int) column11:11(int!null)
+      │    ├── project
+      │    │    ├── columns: column11:11(int!null) m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int)
+      │    │    ├── scan mutation
+      │    │    │    └── columns: m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int)
+      │    │    └── projections
+      │    │         └── const: 1 [type=int]
       │    └── projections
-      │         └── const: 1 [type=int]
+      │         └── plus [type=int]
+      │              ├── variable: o [type=int]
+      │              └── variable: n [type=int]
       └── projections
-           └── plus [type=int]
-                ├── variable: o [type=int]
-                └── variable: n [type=int]
+           └── gt [type=bool]
+                ├── variable: column11 [type=int]
+                └── const: 0 [type=int]
 
 # Test update that requires computed mutation column to be recalculated.
 build
@@ -1245,24 +1274,31 @@ UPDATE mutation SET m=1, n=2
 ----
 update mutation
  ├── columns: <none>
- ├── fetch columns: m:5(int) n:6(int) o:7(int) p:8(int)
+ ├── fetch columns: m:6(int) n:7(int) o:8(int) p:9(int) q:10(int)
  ├── update-mapping:
- │    ├──  column9:9 => m:1
- │    ├──  column10:10 => n:2
- │    └──  column11:11 => p:4
+ │    ├──  column11:11 => m:1
+ │    ├──  column12:12 => n:2
+ │    └──  column13:13 => p:4
+ ├── check columns: check1:14(bool)
  └── project
-      ├── columns: column11:11(int) m:5(int!null) n:6(int) o:7(int) p:8(int) column9:9(int!null) column10:10(int!null)
+      ├── columns: check1:14(bool) m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int) column11:11(int!null) column12:12(int!null) column13:13(int)
       ├── project
-      │    ├── columns: column9:9(int!null) column10:10(int!null) m:5(int!null) n:6(int) o:7(int) p:8(int)
-      │    ├── scan mutation
-      │    │    └── columns: m:5(int!null) n:6(int) o:7(int) p:8(int)
+      │    ├── columns: column13:13(int) m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int) column11:11(int!null) column12:12(int!null)
+      │    ├── project
+      │    │    ├── columns: column11:11(int!null) column12:12(int!null) m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int)
+      │    │    ├── scan mutation
+      │    │    │    └── columns: m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int)
+      │    │    └── projections
+      │    │         ├── const: 1 [type=int]
+      │    │         └── const: 2 [type=int]
       │    └── projections
-      │         ├── const: 1 [type=int]
-      │         └── const: 2 [type=int]
+      │         └── plus [type=int]
+      │              ├── variable: o [type=int]
+      │              └── variable: column12 [type=int]
       └── projections
-           └── plus [type=int]
-                ├── variable: o [type=int]
-                └── variable: column10 [type=int]
+           └── gt [type=bool]
+                ├── variable: column11 [type=int]
+                └── const: 0 [type=int]
 
 # Ensure that ORDER BY wildcard does not select mutation columns.
 build
@@ -1270,29 +1306,36 @@ UPDATE mutation SET m=1 ORDER BY mutation.* LIMIT 10
 ----
 update mutation
  ├── columns: <none>
- ├── fetch columns: m:5(int) n:6(int) o:7(int) p:8(int)
+ ├── fetch columns: m:6(int) n:7(int) o:8(int) p:9(int) q:10(int)
  ├── update-mapping:
- │    ├──  column9:9 => m:1
- │    └──  column10:10 => p:4
+ │    ├──  column11:11 => m:1
+ │    └──  column12:12 => p:4
+ ├── check columns: check1:13(bool)
  └── project
-      ├── columns: column10:10(int) m:5(int!null) n:6(int) o:7(int) p:8(int) column9:9(int!null)
+      ├── columns: check1:13(bool) m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int) column11:11(int!null) column12:12(int)
       ├── project
-      │    ├── columns: column9:9(int!null) m:5(int!null) n:6(int) o:7(int) p:8(int)
-      │    ├── limit
-      │    │    ├── columns: m:5(int!null) n:6(int) o:7(int) p:8(int)
-      │    │    ├── internal-ordering: +5,+6
-      │    │    ├── sort
-      │    │    │    ├── columns: m:5(int!null) n:6(int) o:7(int) p:8(int)
-      │    │    │    ├── ordering: +5,+6
-      │    │    │    └── scan mutation
-      │    │    │         └── columns: m:5(int!null) n:6(int) o:7(int) p:8(int)
-      │    │    └── const: 10 [type=int]
+      │    ├── columns: column12:12(int) m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int) column11:11(int!null)
+      │    ├── project
+      │    │    ├── columns: column11:11(int!null) m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int)
+      │    │    ├── limit
+      │    │    │    ├── columns: m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int)
+      │    │    │    ├── internal-ordering: +6,+7
+      │    │    │    ├── sort
+      │    │    │    │    ├── columns: m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int)
+      │    │    │    │    ├── ordering: +6,+7
+      │    │    │    │    └── scan mutation
+      │    │    │    │         └── columns: m:6(int!null) n:7(int) o:8(int) p:9(int) q:10(int)
+      │    │    │    └── const: 10 [type=int]
+      │    │    └── projections
+      │    │         └── const: 1 [type=int]
       │    └── projections
-      │         └── const: 1 [type=int]
+      │         └── plus [type=int]
+      │              ├── variable: o [type=int]
+      │              └── variable: n [type=int]
       └── projections
-           └── plus [type=int]
-                ├── variable: o [type=int]
-                └── variable: n [type=int]
+           └── gt [type=bool]
+                ├── variable: column11 [type=int]
+                └── const: 0 [type=int]
 
 # Use column "o" from higher scope that is shadowed by mutation column "o".
 build
@@ -1308,22 +1351,29 @@ project
            └── exists [type=bool]
                 └── update mutation
                      ├── columns: mutation.m:7(int!null) mutation.n:8(int)
-                     ├── fetch columns: mutation.m:11(int) mutation.n:12(int) mutation.o:13(int) p:14(int)
+                     ├── fetch columns: mutation.m:12(int) mutation.n:13(int) mutation.o:14(int) p:15(int) q:16(int)
                      ├── update-mapping:
-                     │    ├──  o:15 => mutation.m:7
-                     │    └──  column16:16 => p:10
+                     │    ├──  o:17 => mutation.m:7
+                     │    └──  column18:18 => p:10
+                     ├── check columns: check1:19(bool)
                      └── project
-                          ├── columns: column16:16(int) mutation.m:11(int!null) mutation.n:12(int) mutation.o:13(int) p:14(int) o:15(int)
+                          ├── columns: check1:19(bool) mutation.m:12(int!null) mutation.n:13(int) mutation.o:14(int) p:15(int) q:16(int) o:17(int) column18:18(int)
                           ├── project
-                          │    ├── columns: o:15(int) mutation.m:11(int!null) mutation.n:12(int) mutation.o:13(int) p:14(int)
-                          │    ├── scan mutation
-                          │    │    └── columns: mutation.m:11(int!null) mutation.n:12(int) mutation.o:13(int) p:14(int)
+                          │    ├── columns: column18:18(int) mutation.m:12(int!null) mutation.n:13(int) mutation.o:14(int) p:15(int) q:16(int) o:17(int)
+                          │    ├── project
+                          │    │    ├── columns: o:17(int) mutation.m:12(int!null) mutation.n:13(int) mutation.o:14(int) p:15(int) q:16(int)
+                          │    │    ├── scan mutation
+                          │    │    │    └── columns: mutation.m:12(int!null) mutation.n:13(int) mutation.o:14(int) p:15(int) q:16(int)
+                          │    │    └── projections
+                          │    │         └── variable: mno.o [type=int]
                           │    └── projections
-                          │         └── variable: mno.o [type=int]
+                          │         └── plus [type=int]
+                          │              ├── variable: mutation.o [type=int]
+                          │              └── variable: mutation.n [type=int]
                           └── projections
-                               └── plus [type=int]
-                                    ├── variable: mutation.o [type=int]
-                                    └── variable: mutation.n [type=int]
+                               └── gt [type=bool]
+                                    ├── variable: o [type=int]
+                                    └── const: 0 [type=int]
 
 # Try to return a mutation column.
 build
@@ -1506,3 +1556,49 @@ update checks
            └── gt [type=bool]
                 ├── variable: abcde.a [type=int]
                 └── const: 0 [type=int]
+
+# ------------------------------------------------------------------------------
+# Test decimal column truncation.
+# ------------------------------------------------------------------------------
+
+opt
+UPDATE decimals SET a=1.1, b=ARRAY[0.95, NULL, 15]
+----
+update decimals
+ ├── columns: <none>
+ ├── fetch columns: decimals.a:5(decimal) decimals.b:6(decimal[]) c:7(decimal) decimals.d:8(decimal)
+ ├── update-mapping:
+ │    ├──  a:11 => decimals.a:1
+ │    ├──  b:12 => decimals.b:2
+ │    └──  d:15 => decimals.d:4
+ ├── check columns: check1:16(bool) check2:17(bool)
+ └── project
+      ├── columns: check1:16(bool) check2:17(bool) d:15(decimal) decimals.a:5(decimal!null) decimals.b:6(decimal[]) c:7(decimal) decimals.d:8(decimal) a:11(decimal) b:12(decimal[])
+      ├── project
+      │    ├── columns: a:11(decimal) b:12(decimal[]) decimals.a:5(decimal!null) decimals.b:6(decimal[]) c:7(decimal) decimals.d:8(decimal)
+      │    ├── scan decimals
+      │    │    └── columns: decimals.a:5(decimal!null) decimals.b:6(decimal[]) c:7(decimal) decimals.d:8(decimal)
+      │    └── projections
+      │         ├── function: crdb_internal.round_decimal_values [type=decimal]
+      │         │    ├── const: 1.1 [type=decimal]
+      │         │    └── const: 0 [type=int]
+      │         └── function: crdb_internal.round_decimal_values [type=decimal[]]
+      │              ├── const: ARRAY[0.95,NULL,15] [type=decimal[]]
+      │              └── const: 1 [type=int]
+      └── projections
+           ├── eq [type=bool]
+           │    ├── variable: a [type=decimal]
+           │    └── function: round [type=decimal]
+           │         └── variable: a [type=decimal]
+           ├── gt [type=bool]
+           │    ├── indirection [type=decimal]
+           │    │    ├── variable: b [type=decimal[]]
+           │    │    └── const: 0 [type=int]
+           │    └── const: 1 [type=decimal]
+           └── function: crdb_internal.round_decimal_values [type=decimal]
+                ├── function: crdb_internal.round_decimal_values [type=decimal]
+                │    ├── plus [type=decimal]
+                │    │    ├── variable: a [type=decimal]
+                │    │    └── variable: c [type=decimal]
+                │    └── const: 1 [type=int]
+                └── const: 1 [type=int]

@@ -145,6 +145,11 @@ func TestTxnCoordSenderKeyRanges(t *testing.T) {
 	defer s.Stop()
 
 	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+	// Disable txn pipelining so that all write spans are immediately
+	// added to the transaction's write footprint.
+	if err := txn.DisablePipelining(); err != nil {
+		t.Fatal(err)
+	}
 	tc := txn.Sender().(*TxnCoordSender)
 
 	for _, rng := range ranges {
@@ -159,15 +164,12 @@ func TestTxnCoordSenderKeyRanges(t *testing.T) {
 		}
 	}
 
-	// Verify that the transaction metadata contains only two entries
-	// in its intents slice. "a" and range "aa"-"c".
-	meta, err := tc.GetMeta(ctx, client.AnyTxnStatus)
-	if err != nil {
-		t.Fatal(err)
-	}
-	intents, _ := roachpb.MergeSpans(meta.Intents)
-	if len(intents) != 2 {
-		t.Errorf("expected 2 entries in keys range group; got %v", intents)
+	// Verify that the transaction coordinator is only tracking two intent
+	// spans. "a" and range "aa"-"c".
+	tc.interceptorAlloc.txnPipeliner.footprint.mergeAndSort()
+	intentSpans := tc.interceptorAlloc.txnPipeliner.footprint.asSlice()
+	if len(intentSpans) != 2 {
+		t.Errorf("expected 2 entries in keys range group; got %v", intentSpans)
 	}
 }
 
@@ -202,7 +204,7 @@ func TestTxnCoordSenderCondenseIntentSpans(t *testing.T) {
 		{span: g, expIntents: []roachpb.Span{cToEClosed, a, b, fTof0, g}, expIntentsSize: 9},
 		{span: g0Tog1, expIntents: []roachpb.Span{fTog1Closed, cToEClosed, aToBClosed}, expIntentsSize: 9},
 		// Add a key in the middle of a span, which will get merged on commit.
-		{span: c, expIntents: []roachpb.Span{cToEClosed, aToBClosed, fTog1Closed}, expIntentsSize: 9},
+		{span: c, expIntents: []roachpb.Span{aToBClosed, cToEClosed, fTog1Closed}, expIntentsSize: 9},
 	}
 	splits := []roachpb.Span{
 		{Key: roachpb.Key("a"), EndKey: roachpb.Key("c")},
@@ -212,31 +214,36 @@ func TestTxnCoordSenderCondenseIntentSpans(t *testing.T) {
 	descs := []roachpb.RangeDescriptor{testMetaRangeDescriptor}
 	for i, s := range splits {
 		descs = append(descs, roachpb.RangeDescriptor{
-			RangeID:  roachpb.RangeID(2 + i),
-			StartKey: roachpb.RKey(s.Key),
-			EndKey:   roachpb.RKey(s.EndKey),
-			Replicas: []roachpb.ReplicaDescriptor{{NodeID: 1, StoreID: 1}},
+			RangeID:          roachpb.RangeID(2 + i),
+			StartKey:         roachpb.RKey(s.Key),
+			EndKey:           roachpb.RKey(s.EndKey),
+			InternalReplicas: []roachpb.ReplicaDescriptor{{NodeID: 1, StoreID: 1}},
 		})
 	}
 	descDB := mockRangeDescriptorDBForDescs(descs...)
 	s := createTestDB(t)
 	st := s.Store.ClusterSettings()
-	maxTxnIntentsBytes.Override(&st.SV, 10) /* 10 bytes and it will condense */
+	trackedWritesMaxSize.Override(&st.SV, 10) /* 10 bytes and it will condense */
 	defer s.Stop()
 
-	// Check end transaction intents, which should exclude the intent at
-	// key "c" as it's merged with the cToEClosed span.
-	expIntents := []roachpb.Span{fTog1Closed, cToEClosed, a, b}
+	// Check end transaction intents, which should be condensed and split
+	// at range boundaries.
+	expIntents := []roachpb.Span{aToBClosed, cToEClosed, fTog1Closed}
 	var sendFn simpleSendFn = func(
 		_ context.Context, _ SendOptions, _ ReplicaSlice, args roachpb.BatchRequest,
 	) (*roachpb.BatchResponse, error) {
-		if req, ok := args.GetArg(roachpb.EndTransaction); ok {
-			if a, e := req.(*roachpb.EndTransactionRequest).IntentSpans, expIntents; !reflect.DeepEqual(a, e) {
-				t.Errorf("expected end transaction to have intents %+v; got %+v", e, a)
-			}
-		}
 		resp := args.CreateReply()
 		resp.Txn = args.Txn
+		if req, ok := args.GetArg(roachpb.EndTransaction); ok {
+			if !req.(*roachpb.EndTransactionRequest).Commit {
+				t.Errorf("expected commit to be true")
+			}
+			et := req.(*roachpb.EndTransactionRequest)
+			if a, e := et.IntentSpans, expIntents; !reflect.DeepEqual(a, e) {
+				t.Errorf("expected end transaction to have intents %+v; got %+v", e, a)
+			}
+			resp.Txn.Status = roachpb.COMMITTED
+		}
 		return resp, nil
 	}
 	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
@@ -244,6 +251,7 @@ func TestTxnCoordSenderCondenseIntentSpans(t *testing.T) {
 		DistSenderConfig{
 			AmbientCtx: ambient,
 			Clock:      s.Clock,
+			RPCContext: s.Cfg.RPCContext,
 			TestingKnobs: ClientTestingKnobs{
 				TransportFactory: adaptSimpleTransport(sendFn),
 			},
@@ -264,6 +272,11 @@ func TestTxnCoordSenderCondenseIntentSpans(t *testing.T) {
 	ctx := context.Background()
 
 	txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+	// Disable txn pipelining so that all write spans are immediately
+	// added to the transaction's write footprint.
+	if err := txn.DisablePipelining(); err != nil {
+		t.Fatal(err)
+	}
 	for i, tc := range testCases {
 		if tc.span.EndKey != nil {
 			if err := txn.DelRange(ctx, tc.span.Key, tc.span.EndKey); err != nil {
@@ -274,17 +287,21 @@ func TestTxnCoordSenderCondenseIntentSpans(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		meta := txn.GetTxnCoordMeta(ctx)
-		if a, e := meta.Intents, tc.expIntents; !reflect.DeepEqual(a, e) {
+		tcs := txn.Sender().(*TxnCoordSender)
+		intents := tcs.interceptorAlloc.txnPipeliner.footprint.asSlice()
+		if a, e := intents, tc.expIntents; !reflect.DeepEqual(a, e) {
 			t.Errorf("%d: expected keys %+v; got %+v", i, e, a)
 		}
 		intentsSize := int64(0)
-		for _, i := range meta.Intents {
+		for _, i := range intents {
 			intentsSize += int64(len(i.Key) + len(i.EndKey))
 		}
 		if a, e := intentsSize, tc.expIntentsSize; a != e {
 			t.Errorf("%d: keys size expected %d; got %d", i, e, a)
 		}
+	}
+	if err := txn.Commit(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -302,7 +319,7 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 	keyA := roachpb.Key("a")
 	keyC := roachpb.Key("c")
 	splitKey := roachpb.Key("b")
-	if err := s.DB.AdminSplit(ctx, splitKey /* spanKey */, splitKey /* splitKey */); err != nil {
+	if err := s.DB.AdminSplit(ctx, splitKey /* spanKey */, splitKey /* splitKey */, true /* manual */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -404,6 +421,7 @@ func getTxn(ctx context.Context, txn *client.Txn) (*roachpb.Transaction, *roachp
 	}
 
 	ba := roachpb.BatchRequest{}
+	ba.Timestamp = txnMeta.Timestamp
 	ba.Add(qt)
 
 	db := txn.DB()
@@ -455,7 +473,7 @@ func TestTxnCoordSenderEndTxn(t *testing.T) {
 		}
 		// Conflicting transaction that pushes the above transaction.
 		conflictTxn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
-		conflictTxn.InternalSetPriority(roachpb.MaxTxnPriority)
+		conflictTxn.InternalSetPriority(enginepb.MaxTxnPriority)
 		if _, pErr := conflictTxn.Get(ctx, key); pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -505,16 +523,13 @@ func TestTxnCoordSenderEndTxn(t *testing.T) {
 
 			case 1:
 				// Past deadline.
-				if err := roachpb.CheckTxnDeadlineExceededErr(err); err != nil {
-					t.Fatal(err)
-				}
-
+				fallthrough
 			case 2:
 				// Equal deadline.
-				if err != nil {
-					t.Fatal(err)
+				assertTransactionRetryError(t, err)
+				if !testutils.IsError(err, "RETRY_COMMIT_DEADLINE_EXCEEDED") {
+					t.Fatalf("expected deadline exceeded, got: %s", err)
 				}
-
 			case 3:
 				// Future deadline.
 				if err != nil {
@@ -550,11 +565,8 @@ func TestTxnCoordSenderAddIntentOnError(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	meta, err := tc.GetMeta(ctx, client.AnyTxnStatus)
-	if err != nil {
-		t.Fatal(err)
-	}
-	intentSpans, _ := roachpb.MergeSpans(meta.Intents)
+	tc.interceptorAlloc.txnPipeliner.footprint.mergeAndSort()
+	intentSpans := tc.interceptorAlloc.txnPipeliner.footprint.asSlice()
 	expSpans := []roachpb.Span{{Key: key, EndKey: []byte("")}}
 	equal := !reflect.DeepEqual(intentSpans, expSpans)
 	if err := txn.Rollback(ctx); err != nil {
@@ -685,8 +697,8 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 		// The test's name.
 		name             string
 		pErrGen          func(txn *roachpb.Transaction) *roachpb.Error
-		expEpoch         uint32
-		expPri           int32
+		expEpoch         enginepb.TxnEpoch
+		expPri           enginepb.TxnPriority
 		expTS, expOrigTS hlc.Timestamp
 		// Is set, we're expecting that the Transaction proto is re-initialized (as
 		// opposed to just having the epoch incremented).
@@ -743,7 +755,7 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 			pErrGen: func(txn *roachpb.Transaction) *roachpb.Error {
 				return roachpb.NewErrorWithTxn(&roachpb.TransactionPushError{
 					PusheeTxn: roachpb.Transaction{
-						TxnMeta: enginepb.TxnMeta{Timestamp: plus10, Priority: int32(10)},
+						TxnMeta: enginepb.TxnMeta{Timestamp: plus10, Priority: 10},
 					},
 				}, txn)
 			},
@@ -910,15 +922,15 @@ func TestTxnCoordSenderNoDuplicateIntents(t *testing.T) {
 
 	var senderFn client.SenderFunc = func(_ context.Context, ba roachpb.BatchRequest) (
 		*roachpb.BatchResponse, *roachpb.Error) {
+		br := ba.CreateReply()
+		br.Txn = ba.Txn.Clone()
 		if rArgs, ok := ba.GetArg(roachpb.EndTransaction); ok {
 			et := rArgs.(*roachpb.EndTransactionRequest)
 			if !reflect.DeepEqual(et.IntentSpans, expectedIntents) {
 				t.Errorf("Invalid intents: %+v; expected %+v", et.IntentSpans, expectedIntents)
 			}
+			br.Txn.Status = roachpb.COMMITTED
 		}
-		br := ba.CreateReply()
-		txnClone := ba.Txn.Clone()
-		br.Txn = &txnClone
 		return br, nil
 	}
 	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
@@ -1264,8 +1276,7 @@ func TestAbortTransactionOnCommitErrors(t *testing.T) {
 				_ context.Context, ba roachpb.BatchRequest,
 			) (*roachpb.BatchResponse, *roachpb.Error) {
 				br := ba.CreateReply()
-				txn := ba.Txn.Clone()
-				br.Txn = &txn
+				br.Txn = ba.Txn.Clone()
 
 				if _, hasPut := ba.GetArg(roachpb.Put); hasPut {
 					if _, ok := ba.Requests[0].GetInner().(*roachpb.PutRequest); !ok {
@@ -1274,8 +1285,6 @@ func TestAbortTransactionOnCommitErrors(t *testing.T) {
 					union := &br.Responses[0] // avoid operating on copy
 					union.MustSetInner(&roachpb.PutResponse{})
 					if ba.Txn != nil && br.Txn == nil {
-						txnClone := ba.Txn.Clone()
-						br.Txn = &txnClone
 						br.Txn.Status = roachpb.PENDING
 					}
 				} else if et, hasET := ba.GetArg(roachpb.EndTransaction); hasET {
@@ -1356,8 +1365,7 @@ func (s *mockSender) Send(
 	}
 	// If none of the matchers triggered, just create an empty reply.
 	br := ba.CreateReply()
-	txn := ba.Txn.Clone()
-	br.Txn = &txn
+	br.Txn = ba.Txn.Clone()
 	return br, nil
 }
 
@@ -1476,8 +1484,7 @@ func TestOnePCErrorTracking(t *testing.T) {
 		resp := ba.CreateReply()
 		// Set the response's txn to the Aborted status (as the server would). This
 		// will make the TxnCoordSender stop the heartbeat loop.
-		txnCopy := ba.Txn.Clone()
-		resp.Txn = &txnCopy
+		resp.Txn = ba.Txn.Clone()
 		resp.Txn.Status = roachpb.ABORTED
 		return resp, nil
 	})
@@ -1508,60 +1515,6 @@ func TestOnePCErrorTracking(t *testing.T) {
 		}
 		return nil
 	})
-}
-
-// Test that the TxnCoordSender accumulates intents even if it hasn't seen a
-// BeginTransaction. It didn't use to.
-// The TxnCoordSender can send (and get a response for) a write before it sees a
-// BeginTransaction because of racing requests going through the client.Txn. One
-// of them will get a BeginTransaction, but others might overtake it and get to
-// the TxnCoordSender first.
-func TestIntentTrackingBeforeBeginTransaction(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
-	sender := &mockSender{}
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-	factory := NewTxnCoordSenderFactory(
-		TxnCoordSenderFactoryConfig{
-			AmbientCtx: ambient,
-			Clock:      clock,
-			Stopper:    stopper,
-		},
-		sender,
-	)
-	key := roachpb.Key("a")
-	txn := roachpb.MakeTransaction(
-		"test txn",
-		key,
-		roachpb.UserPriority(0),
-		clock.Now(),
-		clock.MaxOffset().Nanoseconds(),
-	)
-	meta := roachpb.MakeTxnCoordMeta(txn)
-	tcs := factory.TransactionalSender(client.RootTxn, meta)
-	txnHeader := roachpb.Header{
-		Txn: &txn,
-	}
-	if _, pErr := client.SendWrappedWith(
-		ctx, tcs, txnHeader, &roachpb.PutRequest{
-			RequestHeader: roachpb.RequestHeader{
-				Key: key,
-			},
-		},
-	); pErr != nil {
-		t.Fatal(pErr)
-	}
-
-	meta, err := tcs.GetMeta(ctx, client.AnyTxnStatus)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if numSpans := len(meta.Intents); numSpans != 1 {
-		t.Fatalf("expected 1 intent span, got: %d", numSpans)
-	}
 }
 
 // TestCommitReadOnlyTransaction verifies that a read-only does not send an
@@ -1630,14 +1583,20 @@ func TestCommitMutatingTransaction(t *testing.T) {
 
 	var calls []roachpb.Method
 	sender.match(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		br := ba.CreateReply()
+		br.Txn = ba.Txn.Clone()
+
 		calls = append(calls, ba.Methods()...)
 		if !bytes.Equal(ba.Txn.Key, roachpb.Key("a")) {
 			t.Errorf("expected transaction key to be \"a\"; got %s", ba.Txn.Key)
 		}
-		if et, ok := ba.GetArg(roachpb.EndTransaction); ok && !et.(*roachpb.EndTransactionRequest).Commit {
-			t.Errorf("expected commit to be true")
+		if et, ok := ba.GetArg(roachpb.EndTransaction); ok {
+			if !et.(*roachpb.EndTransactionRequest).Commit {
+				t.Errorf("expected commit to be true")
+			}
+			br.Txn.Status = roachpb.COMMITTED
 		}
-		return nil, nil
+		return br, nil
 	})
 
 	factory := NewTxnCoordSenderFactory(
@@ -1720,14 +1679,20 @@ func TestTxnInsertBeginTransaction(t *testing.T) {
 
 	var calls []roachpb.Method
 	sender.match(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		br := ba.CreateReply()
+		br.Txn = ba.Txn.Clone()
+
 		calls = append(calls, ba.Methods()...)
 		if bt, ok := ba.GetArg(roachpb.BeginTransaction); ok && !bt.Header().Key.Equal(roachpb.Key("a")) {
 			t.Errorf("expected begin transaction key to be \"a\"; got %s", bt.Header().Key)
 		}
-		if et, ok := ba.GetArg(roachpb.EndTransaction); ok && !et.(*roachpb.EndTransactionRequest).Commit {
-			t.Errorf("expected commit to be true")
+		if et, ok := ba.GetArg(roachpb.EndTransaction); ok {
+			if !et.(*roachpb.EndTransactionRequest).Commit {
+				t.Errorf("expected commit to be true")
+			}
+			br.Txn.Status = roachpb.COMMITTED
 		}
-		return nil, nil
+		return br, nil
 	})
 
 	v := cluster.VersionByKey(cluster.Version2_1)
@@ -1874,11 +1839,19 @@ func TestEndWriteRestartReadOnlyTransaction(t *testing.T) {
 
 	var calls []roachpb.Method
 	sender.match(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		br := ba.CreateReply()
+		br.Txn = ba.Txn.Clone()
+
 		calls = append(calls, ba.Methods()...)
 		if _, ok := ba.GetArg(roachpb.Put); ok {
-			return nil, roachpb.NewErrorWithTxn(roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE), ba.Txn)
+			return nil, roachpb.NewErrorWithTxn(
+				roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE, "test err"),
+				ba.Txn)
 		}
-		return nil, nil
+		if _, ok := ba.GetArg(roachpb.EndTransaction); ok {
+			br.Txn.Status = roachpb.COMMITTED
+		}
+		return br, nil
 	})
 
 	factory := NewTxnCoordSenderFactory(
@@ -1935,12 +1908,13 @@ func TestTransactionKeyNotChangedInRestart(t *testing.T) {
 	keys := []string{"first", "second"}
 	attempt := 0
 	sender.match(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		br := ba.CreateReply()
+		br.Txn = ba.Txn.Clone()
+
 		// Ignore the final EndTxnRequest.
 		if _, ok := ba.GetArg(roachpb.EndTransaction); ok {
-			br := ba.CreateReply()
-			txn := ba.Txn.Clone()
-			br.Txn = &txn
-			return nil, nil
+			br.Txn.Status = roachpb.COMMITTED
+			return br, nil
 		}
 
 		// Both attempts should have a PutRequest.
@@ -1955,9 +1929,11 @@ func TestTransactionKeyNotChangedInRestart(t *testing.T) {
 		}
 
 		if attempt == 0 {
-			return nil, roachpb.NewErrorWithTxn(roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE), ba.Txn)
+			return nil, roachpb.NewErrorWithTxn(
+				roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE, "test err"),
+				ba.Txn)
 		}
-		return nil, nil
+		return br, nil
 	})
 	factory := NewTxnCoordSenderFactory(
 		TxnCoordSenderFactoryConfig{
@@ -1994,7 +1970,7 @@ func TestSequenceNumbers(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	var expSequence int32
+	var expSequence enginepb.TxnSeq
 	sender.match(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		for _, ru := range ba.Requests {
 			args := ru.GetInner()
@@ -2054,7 +2030,13 @@ func TestConcurrentTxnRequests(t *testing.T) {
 			callCounts[m]++
 		}
 		callCountsMu.Unlock()
-		return nil, nil
+
+		br := ba.CreateReply()
+		br.Txn = ba.Txn.Clone()
+		if _, ok := ba.GetArg(roachpb.EndTransaction); ok {
+			br.Txn.Status = roachpb.COMMITTED
+		}
+		return br, nil
 	})
 	factory := NewTxnCoordSenderFactory(
 		TxnCoordSenderFactoryConfig{
@@ -2133,9 +2115,8 @@ func TestTxnRequestTxnTimestamp(t *testing.T) {
 				curReq, req.expRequestTS, ba.Txn.Timestamp)
 		}
 
-		txnClone := ba.Txn.Clone()
 		br := ba.CreateReply()
-		br.Txn = &txnClone
+		br.Txn = ba.Txn.Clone()
 		br.Txn.Timestamp.Forward(requests[curReq].responseTS)
 		return br, nil
 	})
@@ -2170,9 +2151,8 @@ func TestReadOnlyTxnObeysDeadline(t *testing.T) {
 	sender.match(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		if _, ok := ba.GetArg(roachpb.Get); ok {
 			manual.Increment(100)
-			txnClone := ba.Txn.Clone()
 			br := ba.CreateReply()
-			br.Txn = &txnClone
+			br.Txn = ba.Txn.Clone()
 			br.Txn.Timestamp.Forward(clock.Now())
 			return br, nil
 		}
@@ -2199,9 +2179,10 @@ func TestReadOnlyTxnObeysDeadline(t *testing.T) {
 		if _, err := txn.Get(ctx, "k"); err != nil {
 			t.Fatal(err)
 		}
-		if err := txn.Commit(ctx); !testutils.IsError(
-			err, "deadline exceeded before transaction finalization") {
-			t.Fatal(err)
+		err := txn.Commit(ctx)
+		assertTransactionRetryError(t, err)
+		if !testutils.IsError(err, "RETRY_COMMIT_DEADLINE_EXCEEDED") {
+			t.Fatalf("expected deadline exceeded, got: %s", err)
 		}
 	})
 
@@ -2211,9 +2192,10 @@ func TestReadOnlyTxnObeysDeadline(t *testing.T) {
 		txn.UpdateDeadlineMaybe(ctx, clock.Now())
 		b := txn.NewBatch()
 		b.Get("k")
-		if err := txn.CommitInBatch(ctx, b); !testutils.IsError(
-			err, "deadline exceeded before transaction finalization") {
-			t.Fatal(err)
+		err := txn.CommitInBatch(ctx, b)
+		assertTransactionRetryError(t, err)
+		if !testutils.IsError(err, "RETRY_COMMIT_DEADLINE_EXCEEDED") {
+			t.Fatalf("expected deadline exceeded, got: %s", err)
 		}
 	})
 }
@@ -2235,6 +2217,10 @@ func TestTxnCoordSenderPipelining(t *testing.T) {
 		ctx context.Context, ba roachpb.BatchRequest,
 	) (*roachpb.BatchResponse, *roachpb.Error) {
 		calls = append(calls, ba.Methods()...)
+		if et, ok := ba.GetArg(roachpb.EndTransaction); ok {
+			// Ensure that no transactions enter a STAGING state.
+			et.(*roachpb.EndTransactionRequest).InFlightWrites = nil
+		}
 		return distSender.Send(ctx, ba)
 	}
 
@@ -2307,8 +2293,10 @@ func TestAnchorKey(t *testing.T) {
 			t.Fatalf("expected anchor %q, got %q", key2, ba.Txn.Key)
 		}
 		br := ba.CreateReply()
-		txn := ba.Txn.Clone()
-		br.Txn = &txn
+		br.Txn = ba.Txn.Clone()
+		if _, ok := ba.GetArg(roachpb.EndTransaction); ok {
+			br.Txn.Status = roachpb.COMMITTED
+		}
 		return br, nil
 	}
 
@@ -2350,8 +2338,8 @@ func TestLeafTxnClientRejectError(t *testing.T) {
 				txn := ba.Txn.Clone()
 				txn.Status = roachpb.ABORTED
 				return roachpb.NewErrorWithTxn(
-					roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_UNKNOWN),
-					&txn)
+					roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_UNKNOWN), txn,
+				)
 			}
 			return nil
 		},
@@ -2379,5 +2367,25 @@ func TestLeafTxnClientRejectError(t *testing.T) {
 	_, err := leafTxn.Get(ctx, roachpb.Key("a"))
 	if _, ok := err.(*roachpb.UnhandledRetryableError); !ok {
 		t.Fatalf("expected UnhandledRetryableError(TransactionAbortedError), got: (%T) %v", err, err)
+	}
+}
+
+// Check that ingesting an Aborted txn record is a no-op. The TxnCoordSender is
+// supposed to reject such updates because they risk putting it into an
+// inconsistent state. See comments in TxnCoordSender.AugmentMeta().
+func TestAugmentTxnCoordMetaAbortedTxn(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := createTestDBWithContextAndKnobs(t, client.DefaultDBContext(), nil /* knobs */)
+	defer s.Stop()
+	ctx := context.Background()
+
+	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+	txnProto := txn.Serialize()
+	txnProto.Status = roachpb.ABORTED
+	txn.AugmentTxnCoordMeta(ctx, roachpb.TxnCoordMeta{Txn: *txnProto})
+	// Check that the transaction was not updated.
+	txnProto = txn.Serialize()
+	if txnProto.Status != roachpb.PENDING {
+		t.Fatalf("expected PENDING txn, got: %s", txnProto.Status)
 	}
 }

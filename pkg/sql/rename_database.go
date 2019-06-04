@@ -40,7 +40,7 @@ func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (p
 	}
 
 	if string(n.Name) == p.SessionData().Database && p.SessionData().SafeUpdates {
-		return nil, pgerror.NewDangerousStatementErrorf("RENAME DATABASE on current database")
+		return nil, pgerror.DangerousStatementf("RENAME DATABASE on current database")
 	}
 
 	if err := p.RequireSuperUser(ctx, "ALTER DATABASE ... RENAME"); err != nil {
@@ -90,7 +90,7 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 	}
 	lookupFlags.required = false
 	for i := range tbNames {
-		objDesc, _, err := phyAccessor.GetObjectDesc(ctx, p.txn, &tbNames[i],
+		objDesc, err := phyAccessor.GetObjectDesc(ctx, p.txn, &tbNames[i],
 			ObjectLookupFlags{CommonLookupFlags: lookupFlags})
 		if err != nil {
 			return err

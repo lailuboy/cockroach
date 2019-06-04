@@ -24,8 +24,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/pkg/errors"
 )
@@ -185,7 +185,7 @@ func (n *scanNode) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, e
 	panic("scanNode can't be run in local mode")
 }
 
-func (n *scanNode) IndexedVarResolvedType(idx int) types.T {
+func (n *scanNode) IndexedVarResolvedType(idx int) *types.T {
 	return n.resultColumns[idx].Typ
 }
 
@@ -351,7 +351,8 @@ func (n *scanNode) initCols() error {
 	}
 
 	if n.colCfg.addUnwantedAsHidden {
-		for _, c := range n.desc.Columns {
+		for i := range n.desc.Columns {
+			c := &n.desc.Columns[i]
 			found := false
 			for _, wc := range n.colCfg.wantedColumns {
 				if sqlbase.ColumnID(wc) == c.ID {
@@ -360,7 +361,7 @@ func (n *scanNode) initCols() error {
 				}
 			}
 			if !found {
-				col := c
+				col := *c
 				col.Hidden = true
 				n.cols = append(n.cols, col)
 			}

@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -93,7 +94,11 @@ func GetObjectNames(
 // resolution, if successful. It is not modified in case of error or
 // if no object is found.
 func ResolveExistingObject(
-	ctx context.Context, sc SchemaResolver, tn *ObjectName, required bool, requiredType requiredType,
+	ctx context.Context,
+	sc SchemaResolver,
+	tn *ObjectName,
+	required bool,
+	requiredType ResolveRequiredType,
 ) (res *ImmutableTableDescriptor, err error) {
 	desc, err := resolveExistingObjectImpl(ctx, sc, tn, required, false /* requiredMutable */, requiredType)
 	if err != nil || desc == nil {
@@ -110,7 +115,11 @@ func ResolveExistingObject(
 // resolution, if successful. It is not modified in case of error or
 // if no object is found.
 func ResolveMutableExistingObject(
-	ctx context.Context, sc SchemaResolver, tn *ObjectName, required bool, requiredType requiredType,
+	ctx context.Context,
+	sc SchemaResolver,
+	tn *ObjectName,
+	required bool,
+	requiredType ResolveRequiredType,
 ) (res *MutableTableDescriptor, err error) {
 	desc, err := resolveExistingObjectImpl(ctx, sc, tn, required, true /* requiredMutable */, requiredType)
 	if err != nil || desc == nil {
@@ -125,7 +134,7 @@ func resolveExistingObjectImpl(
 	tn *ObjectName,
 	required bool,
 	requiredMutable bool,
-	requiredType requiredType,
+	requiredType ResolveRequiredType,
 ) (res tree.NameResolutionResult, err error) {
 	found, descI, err := tn.ResolveExisting(ctx, sc, requiredMutable, sc.CurrentDatabase(), sc.CurrentSearchPath())
 	if err != nil {
@@ -141,13 +150,13 @@ func resolveExistingObjectImpl(
 
 	goodType := true
 	switch requiredType {
-	case requireTableDesc:
+	case ResolveRequireTableDesc:
 		goodType = obj.TableDesc().IsTable()
-	case requireViewDesc:
+	case ResolveRequireViewDesc:
 		goodType = obj.TableDesc().IsView()
-	case requireTableOrViewDesc:
+	case ResolveRequireTableOrViewDesc:
 		goodType = obj.TableDesc().IsTable() || obj.TableDesc().IsView()
-	case requireSequenceDesc:
+	case ResolveRequireSequenceDesc:
 		goodType = obj.TableDesc().IsSequence()
 	}
 	if !goodType {
@@ -186,13 +195,13 @@ type resolveFlags struct {
 }
 
 func (p *planner) ResolveMutableTableDescriptor(
-	ctx context.Context, tn *ObjectName, required bool, requiredType requiredType,
+	ctx context.Context, tn *ObjectName, required bool, requiredType ResolveRequiredType,
 ) (table *MutableTableDescriptor, err error) {
 	return ResolveMutableExistingObject(ctx, p, tn, required, requiredType)
 }
 
 func (p *planner) ResolveUncachedTableDescriptor(
-	ctx context.Context, tn *ObjectName, required bool, requiredType requiredType,
+	ctx context.Context, tn *ObjectName, required bool, requiredType ResolveRequiredType,
 ) (table *ImmutableTableDescriptor, err error) {
 	p.runWithOptions(resolveFlags{skipCache: true}, func() {
 		table, err = ResolveExistingObject(ctx, p, tn, required, requiredType)
@@ -214,12 +223,15 @@ func ResolveTargetObject(
 		return nil, err
 	}
 	if !found {
-		return nil, pgerror.NewErrorf(pgerror.CodeInvalidSchemaNameError,
+		if !tn.ExplicitSchema && !tn.ExplicitCatalog {
+			return nil, pgerror.New(pgerror.CodeInvalidNameError, "no database specified")
+		}
+		return nil, pgerror.Newf(pgerror.CodeInvalidSchemaNameError,
 			"cannot create %q because the target database or schema does not exist",
 			tree.ErrString(tn)).SetHintf("verify that the current database and search_path are valid and/or the target database exists")
 	}
 	if tn.Schema() != tree.PublicSchema {
-		return nil, pgerror.NewErrorf(pgerror.CodeInvalidNameError,
+		return nil, pgerror.Newf(pgerror.CodeInvalidNameError,
 			"schema cannot be modified: %q", tree.ErrString(&tn.TableNamePrefix))
 	}
 	return descI.(*DatabaseDescriptor), nil
@@ -234,23 +246,24 @@ func (p *planner) ResolveUncachedDatabase(
 	return res, err
 }
 
-// requiredType can be passed to the ResolveExistingObject function to
+// ResolveRequiredType can be passed to the ResolveExistingObject function to
 // require the returned descriptor to be of a specific type.
-type requiredType int
+type ResolveRequiredType int
 
+// ResolveRequiredType options have descriptive names.
 const (
-	anyDescType requiredType = iota
-	requireTableDesc
-	requireViewDesc
-	requireTableOrViewDesc
-	requireSequenceDesc
+	ResolveAnyDescType ResolveRequiredType = iota
+	ResolveRequireTableDesc
+	ResolveRequireViewDesc
+	ResolveRequireTableOrViewDesc
+	ResolveRequireSequenceDesc
 )
 
 var requiredTypeNames = [...]string{
-	requireTableDesc:       "table",
-	requireViewDesc:        "view",
-	requireTableOrViewDesc: "table or view",
-	requireSequenceDesc:    "sequence",
+	ResolveRequireTableDesc:       "table",
+	ResolveRequireViewDesc:        "view",
+	ResolveRequireTableOrViewDesc: "table or view",
+	ResolveRequireSequenceDesc:    "sequence",
 }
 
 // LookupSchema implements the tree.TableNameTargetResolver interface.
@@ -271,7 +284,7 @@ func (p *planner) LookupObject(
 ) (found bool, objMeta tree.NameResolutionResult, err error) {
 	sc := p.LogicalSchemaAccessor()
 	p.tableName = tree.MakeTableNameWithSchema(tree.Name(dbName), tree.Name(scName), tree.Name(tbName))
-	objDesc, _, err := sc.GetObjectDesc(ctx, p.txn, &p.tableName, p.ObjectLookupFlags(false /*required*/, requireMutable))
+	objDesc, err := sc.GetObjectDesc(ctx, p.txn, &p.tableName, p.ObjectLookupFlags(false /*required*/, requireMutable))
 	return objDesc != nil, objDesc, err
 }
 
@@ -320,12 +333,12 @@ func getDescriptorsFromTargetList(
 		if err != nil {
 			return nil, err
 		}
-		tableNames, err := expandTableGlob(ctx, p.txn, p, tableGlob)
+		tableNames, err := expandTableGlob(ctx, p, tableGlob)
 		if err != nil {
 			return nil, err
 		}
 		for i := range tableNames {
-			descriptor, err := ResolveMutableExistingObject(ctx, p, &tableNames[i], true, anyDescType)
+			descriptor, err := ResolveMutableExistingObject(ctx, p, &tableNames[i], true, ResolveAnyDescType)
 			if err != nil {
 				return nil, err
 			}
@@ -383,7 +396,7 @@ func findTableContainingIndex(
 	result = nil
 	for i := range tns {
 		tn := &tns[i]
-		tableDesc, err := ResolveMutableExistingObject(ctx, sc, tn, true, anyDescType)
+		tableDesc, err := ResolveMutableExistingObject(ctx, sc, tn, true, ResolveAnyDescType)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -397,7 +410,7 @@ func findTableContainingIndex(
 			continue
 		}
 		if result != nil {
-			return nil, nil, pgerror.NewErrorf(pgerror.CodeAmbiguousParameterError,
+			return nil, nil, pgerror.Newf(pgerror.CodeAmbiguousParameterError,
 				"index name %q is ambiguous (found in %s and %s)",
 				idxName, tn.String(), result.String())
 		}
@@ -405,7 +418,7 @@ func findTableContainingIndex(
 		desc = tableDesc
 	}
 	if result == nil && lookupFlags.required {
-		return nil, nil, pgerror.NewErrorf(pgerror.CodeUndefinedObjectError,
+		return nil, nil, pgerror.Newf(pgerror.CodeUndefinedObjectError,
 			"index %q does not exist", idxName)
 	}
 	return result, desc, nil
@@ -440,7 +453,7 @@ func expandIndexName(
 	tn = &index.Table
 	if tn.Table() != "" {
 		// The index and its table prefix must exist already. Resolve the table.
-		desc, err = ResolveMutableExistingObject(ctx, sc, tn, requireTable, requireTableDesc)
+		desc, err = ResolveMutableExistingObject(ctx, sc, tn, requireTable, ResolveRequireTableDesc)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -458,7 +471,7 @@ func expandIndexName(
 	}
 	if !found {
 		if requireTable {
-			return nil, nil, pgerror.NewErrorf(pgerror.CodeUndefinedObjectError,
+			return nil, nil, pgerror.Newf(pgerror.CodeUndefinedObjectError,
 				"schema or database was not found while searching index: %q",
 				tree.ErrString(&index.Index)).SetHintf(
 				"check the current database and search_path are valid")
@@ -481,77 +494,40 @@ func expandIndexName(
 	return tn, desc, nil
 }
 
-// getTableAndIndex returns the table and index descriptors for a table
-// (primary index) or table-with-index. Only one of table and tableWithIndex can
-// be set.  This is useful for statements that have both table and index
-// variants (like `ALTER TABLE/INDEX ... SPLIT AT ...`).
+// getTableAndIndex returns the table and index descriptors for a
+// TableIndexName.
+//
 // It can return indexes that are being rolled out.
 func (p *planner) getTableAndIndex(
-	ctx context.Context,
-	table *tree.TableName,
-	tableWithIndex *tree.TableIndexName,
-	privilege privilege.Kind,
+	ctx context.Context, tableWithIndex *tree.TableIndexName, privilege privilege.Kind,
 ) (*MutableTableDescriptor, *sqlbase.IndexDescriptor, error) {
-	var tableDesc *MutableTableDescriptor
-	var err error
-	if tableWithIndex == nil {
-		// Variant: ALTER TABLE
-		tableDesc, err = p.ResolveMutableTableDescriptor(
-			ctx, table, true /*required*/, requireTableDesc,
-		)
-	} else {
-		// Variant: ALTER INDEX
-		_, tableDesc, err = expandMutableIndexName(ctx, p, tableWithIndex, true /* requireTable */)
-	}
+	var catalog optCatalog
+	catalog.init(p)
+	catalog.reset()
+
+	idx, err := cat.ResolveTableIndex(
+		ctx, &catalog, cat.Flags{AvoidDescriptorCaches: true}, tableWithIndex,
+	)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	if err := p.CheckPrivilege(ctx, tableDesc, privilege); err != nil {
+	if err := catalog.CheckPrivilege(ctx, idx.Table(), privilege); err != nil {
 		return nil, nil, err
 	}
-
-	// Determine which index to use.
-	var index *sqlbase.IndexDescriptor
-	if tableWithIndex == nil {
-		index = &tableDesc.PrimaryIndex
-	} else {
-		idx, dropped, err := tableDesc.FindIndexByName(string(tableWithIndex.Index))
-		if err != nil {
-			return nil, nil, err
-		}
-		if dropped {
-			return nil, nil, fmt.Errorf("index %q being dropped", tableWithIndex.Index)
-		}
-		index = idx
-	}
-	return tableDesc, index, nil
+	optIdx := idx.(*optIndex)
+	return sqlbase.NewMutableExistingTableDescriptor(optIdx.tab.desc.TableDescriptor), optIdx.desc, nil
 }
 
 // expandTableGlob expands pattern into a list of tables represented
 // as a tree.TableNames.
 func expandTableGlob(
-	ctx context.Context, txn *client.Txn, sc SchemaResolver, pattern tree.TablePattern,
+	ctx context.Context, p *planner, pattern tree.TablePattern,
 ) (tree.TableNames, error) {
-	if t, ok := pattern.(*tree.TableName); ok {
-		_, err := ResolveExistingObject(ctx, sc, t, true /*required*/, anyDescType)
-		if err != nil {
-			return nil, err
-		}
-		return tree.TableNames{*t}, nil
-	}
+	var catalog optCatalog
+	catalog.init(p)
+	catalog.reset()
 
-	glob := pattern.(*tree.AllTablesSelector)
-	found, descI, err := glob.TableNamePrefix.Resolve(
-		ctx, sc, sc.CurrentDatabase(), sc.CurrentSearchPath())
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, sqlbase.NewInvalidWildcardError(tree.ErrString(glob))
-	}
-
-	return GetObjectNames(ctx, txn, sc, descI.(*DatabaseDescriptor), glob.Schema(), glob.ExplicitSchema)
+	return cat.ExpandDataSourceGlob(ctx, &catalog, cat.Flags{}, pattern)
 }
 
 // fkSelfResolver is a SchemaResolver that inserts itself between a
@@ -663,4 +639,57 @@ func (l *internalLookupCtx) getParentName(table *TableDescriptor) string {
 		parentName = fmt.Sprintf("[%d]", table.GetParentID())
 	}
 	return parentName
+}
+
+// The versions below are part of the work for #34240.
+// TODO(radu): clean these up when everything is switched over.
+
+// See ResolveMutableTableDescriptor.
+func (p *planner) ResolveMutableTableDescriptorEx(
+	ctx context.Context,
+	name *tree.UnresolvedObjectName,
+	required bool,
+	requiredType ResolveRequiredType,
+) (*MutableTableDescriptor, error) {
+	tn := name.ToTableName()
+	table, err := ResolveMutableExistingObject(ctx, p, &tn, required, requiredType)
+	if err != nil {
+		return nil, err
+	}
+	name.SetAnnotation(&p.semaCtx.Annotations, &tn)
+	return table, nil
+}
+
+// See ResolveUncachedTableDescriptor.
+func (p *planner) ResolveUncachedTableDescriptorEx(
+	ctx context.Context,
+	name *tree.UnresolvedObjectName,
+	required bool,
+	requiredType ResolveRequiredType,
+) (table *ImmutableTableDescriptor, err error) {
+	p.runWithOptions(resolveFlags{skipCache: true}, func() {
+		table, err = p.ResolveExistingObjectEx(ctx, name, required, requiredType)
+	})
+	return table, err
+}
+
+// See ResolveExistingObject.
+func (p *planner) ResolveExistingObjectEx(
+	ctx context.Context,
+	name *tree.UnresolvedObjectName,
+	required bool,
+	requiredType ResolveRequiredType,
+) (res *ImmutableTableDescriptor, err error) {
+	tn := name.ToTableName()
+	desc, err := resolveExistingObjectImpl(ctx, p, &tn, required, false /* requiredMutable */, requiredType)
+	if err != nil || desc == nil {
+		return nil, err
+	}
+	name.SetAnnotation(&p.semaCtx.Annotations, &tn)
+	return desc.(*ImmutableTableDescriptor), nil
+}
+
+// ResolvedName is a convenience wrapper for UnresolvedObjectName.Resolved.
+func (p *planner) ResolvedName(u *tree.UnresolvedObjectName) *tree.TableName {
+	return u.Resolved(&p.semaCtx.Annotations)
 }

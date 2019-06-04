@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -27,10 +28,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
 )
 
@@ -93,8 +96,8 @@ type tableInfo struct {
 
 	// -- Fields updated during a scan --
 
-	keyValTypes []sqlbase.ColumnType
-	extraTypes  []sqlbase.ColumnType
+	keyValTypes []types.T
+	extraTypes  []types.T
 	keyVals     []sqlbase.EncDatum
 	extraVals   []sqlbase.EncDatum
 	row         sqlbase.EncDatumRow
@@ -197,7 +200,7 @@ type Fetcher struct {
 	// requests. This has some cost, so it's only enabled by DistSQL when this
 	// info is actually useful for correcting the plan (e.g. not for the PK-side
 	// of an index-join).
-	// If set, GetRangeInfo() can be used to retrieve the accumulated info.
+	// If set, GetRangesInfo() can be used to retrieve the accumulated info.
 	returnRangeInfo bool
 
 	// traceKV indicates whether or not session tracing is enabled. It is set
@@ -250,7 +253,7 @@ func (rf *Fetcher) Init(
 	tables ...FetcherTableArgs,
 ) error {
 	if len(tables) == 0 {
-		panic("no tables to fetch from")
+		return pgerror.AssertionFailedf("no tables to fetch from")
 	}
 
 	rf.reverse = reverse
@@ -356,7 +359,7 @@ func (rf *Fetcher) Init(
 			} else {
 				table.indexColIdx[i] = -1
 				if table.neededCols.Contains(int(id)) {
-					panic(fmt.Sprintf("needed column %d not in colIdxMap", id))
+					return pgerror.AssertionFailedf("needed column %d not in colIdxMap", id)
 				}
 			}
 		}
@@ -445,30 +448,111 @@ func (rf *Fetcher) StartScan(
 	traceKV bool,
 ) error {
 	if len(spans) == 0 {
-		panic("no spans")
+		return pgerror.AssertionFailedf("no spans")
 	}
 
 	rf.traceKV = traceKV
-
-	// If we have a limit hint, we limit the first batch size. Subsequent
-	// batches get larger to avoid making things too slow (e.g. in case we have
-	// a very restrictive filter and actually have to retrieve a lot of rows).
-	firstBatchLimit := limitHint
-	if firstBatchLimit != 0 {
-		// The limitHint is a row limit, but each row could be made up
-		// of more than one key. We take the maximum possible keys
-		// per row out of all the table rows we could potentially
-		// scan over.
-		firstBatchLimit = limitHint * int64(rf.maxKeysPerRow)
-		// We need an extra key to make sure we form the last row.
-		firstBatchLimit++
-	}
-
-	f, err := makeKVBatchFetcher(txn, spans, rf.reverse, limitBatches, firstBatchLimit, rf.returnRangeInfo)
+	f, err := makeKVBatchFetcher(
+		txn, spans, rf.reverse, limitBatches, rf.firstBatchLimit(limitHint), rf.returnRangeInfo,
+	)
 	if err != nil {
 		return err
 	}
 	return rf.StartScanFrom(ctx, &f)
+}
+
+// StartInconsistentScan initializes and starts an inconsistent scan, where each
+// KV batch can be read at a different historical timestamp.
+//
+// The scan uses the initial timestamp, until it becomes older than
+// maxTimestampAge; at this time the timestamp is bumped by the amount of time
+// that has passed. See the documentation for TableReaderSpec for more
+// details.
+//
+// Can be used multiple times.
+func (rf *Fetcher) StartInconsistentScan(
+	ctx context.Context,
+	db *client.DB,
+	initialTimestamp hlc.Timestamp,
+	maxTimestampAge time.Duration,
+	spans roachpb.Spans,
+	limitBatches bool,
+	limitHint int64,
+	traceKV bool,
+) error {
+	if len(spans) == 0 {
+		return pgerror.AssertionFailedf("no spans")
+	}
+
+	txnTimestamp := initialTimestamp
+	txnStartTime := timeutil.Now()
+	if txnStartTime.Sub(txnTimestamp.GoTime()) >= maxTimestampAge {
+		return errors.Errorf(
+			"AS OF SYSTEM TIME: cannot specify timestamp older than %s for this operation",
+			maxTimestampAge,
+		)
+	}
+	txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+	txn.SetFixedTimestamp(ctx, txnTimestamp)
+	if log.V(1) {
+		log.Infof(ctx, "starting inconsistent scan at timestamp %v", txnTimestamp)
+	}
+
+	sendFn := func(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, error) {
+		if now := timeutil.Now(); now.Sub(txnTimestamp.GoTime()) >= maxTimestampAge {
+			// Time to bump the transaction. First commit the old one (should be a no-op).
+			if err := txn.Commit(ctx); err != nil {
+				return nil, err
+			}
+			// Advance the timestamp by the time that passed.
+			txnTimestamp = txnTimestamp.Add(now.Sub(txnStartTime).Nanoseconds(), 0 /* logical */)
+			txnStartTime = now
+			txn = client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+			txn.SetFixedTimestamp(ctx, txnTimestamp)
+
+			if log.V(1) {
+				log.Infof(ctx, "bumped inconsistent scan timestamp to %v", txnTimestamp)
+			}
+		}
+
+		res, err := txn.Send(ctx, ba)
+		if err != nil {
+			return nil, err.GoError()
+		}
+		return res, nil
+	}
+
+	// TODO(radu): we should commit the last txn. Right now the commit is a no-op
+	// on read transactions, but perhaps one day it will release some resources.
+
+	rf.traceKV = traceKV
+	f, err := makeKVBatchFetcherWithSendFunc(
+		sendFunc(sendFn),
+		spans,
+		rf.reverse,
+		limitBatches,
+		rf.firstBatchLimit(limitHint),
+		rf.returnRangeInfo,
+	)
+	if err != nil {
+		return err
+	}
+	return rf.StartScanFrom(ctx, &f)
+}
+
+func (rf *Fetcher) firstBatchLimit(limitHint int64) int64 {
+	if limitHint == 0 {
+		return 0
+	}
+	// If we have a limit hint, we limit the first batch size. Subsequent
+	// batches get larger to avoid making things too slow (e.g. in case we have
+	// a very restrictive filter and actually have to retrieve a lot of rows).
+	// The limitHint is a row limit, but each row could be made up of more than
+	// one key. We take the maximum possible keys per row out of all the table
+	// rows we could potentially scan over.
+	//
+	// We add an extra key to make sure we form the last row.
+	return limitHint*int64(rf.maxKeysPerRow) + 1
 }
 
 // StartScanFrom initializes and starts a scan from the given kvBatchFetcher. Can be
@@ -500,9 +584,38 @@ func (rf *Fetcher) NextKey(ctx context.Context) (rowDone bool, err error) {
 			return true, nil
 		}
 
+		// unchangedPrefix will be set to true if we can skip decoding the index key
+		// completely, because the last key we saw has identical prefix to the
+		// current key.
+		unchangedPrefix := rf.indexKey != nil && bytes.HasPrefix(rf.kv.Key, rf.indexKey)
+		if unchangedPrefix {
+			keySuffix := rf.kv.Key[len(rf.indexKey):]
+			if _, foundSentinel := encoding.DecodeIfInterleavedSentinel(keySuffix); foundSentinel {
+				// We found an interleaved sentinel, which means that the key we just
+				// found belongs to a different interleave. That means we have to go
+				// through with index key decoding.
+				unchangedPrefix = false
+			} else {
+				rf.keyRemainingBytes = keySuffix
+			}
+		}
 		// See Init() for a detailed description of when we can get away with not
 		// reading the index key.
-		if rf.mustDecodeIndexKey || rf.traceKV {
+		if unchangedPrefix {
+			// Skip decoding!
+			// We must set the rowReadyTable to the currentTable like ReadIndexKey
+			// would do. This will happen when we see 2 rows in a row with the same
+			// prefix. If the previous prefix was from a different table, then we must
+			// update the ready table to the current table, updating the fetcher state
+			// machine to recognize that the next row that it outputs will be from
+			// rf.currentTable, which will be set to the table of the key that was
+			// last sent to ReadIndexKey.
+			//
+			// TODO(jordan): this is a major (but correct) mess. The fetcher is past
+			// due for a refactor, now that it's (more) clear what the state machine
+			// it's trying to model is.
+			rf.rowReadyTable = rf.currentTable
+		} else if rf.mustDecodeIndexKey || rf.traceKV {
 			rf.keyRemainingBytes, ok, err = rf.ReadIndexKey(rf.kv.Key)
 			if err != nil {
 				return false, err
@@ -543,7 +656,7 @@ func (rf *Fetcher) NextKey(ctx context.Context) (rowDone bool, err error) {
 		case rf.currentTable.isSecondaryIndex:
 			// Secondary indexes have only one key per row.
 			rowDone = true
-		case !bytes.HasPrefix(rf.kv.Key, rf.indexKey):
+		case !unchangedPrefix:
 			// If the prefix of the key has changed, current key is from a different
 			// row than the previous one.
 			rowDone = true
@@ -566,13 +679,15 @@ func (rf *Fetcher) NextKey(ctx context.Context) (rowDone bool, err error) {
 	}
 }
 
-func (rf *Fetcher) prettyEncDatums(types []sqlbase.ColumnType, vals []sqlbase.EncDatum) string {
-	var buf bytes.Buffer
+func (rf *Fetcher) prettyEncDatums(types []types.T, vals []sqlbase.EncDatum) string {
+	var buf strings.Builder
 	for i, v := range vals {
 		if err := v.EnsureDecoded(&types[i], rf.alloc); err != nil {
-			fmt.Fprintf(&buf, "error decoding: %v", err)
+			buf.WriteString("error decoding: ")
+			buf.WriteString(err.Error())
 		}
-		fmt.Fprintf(&buf, "/%v", v.Datum)
+		buf.WriteByte('/')
+		buf.WriteString(v.Datum.String())
 	}
 	return buf.String()
 }
@@ -839,7 +954,7 @@ func (rf *Fetcher) processValueSingle(
 			if len(kv.Value.RawBytes) == 0 {
 				return prettyKey, "", nil
 			}
-			typ := table.cols[idx].Type
+			typ := &table.cols[idx].Type
 			// TODO(arjun): The value is a directly marshaled single value, so we
 			// unmarshal it eagerly here. This can potentially be optimized out,
 			// although that would require changing UnmarshalColumnValue to operate
@@ -1105,18 +1220,20 @@ func (rf *Fetcher) NextRowWithErrors(ctx context.Context) (sqlbase.EncDatumRow, 
 func (rf *Fetcher) checkPrimaryIndexDatumEncodings(ctx context.Context) error {
 	table := rf.rowReadyTable
 	scratch := make([]byte, 1024)
-	colIDToColumn := make(map[sqlbase.ColumnID]sqlbase.ColumnDescriptor)
-	for _, col := range table.desc.Columns {
+	colIDToColumn := make(map[sqlbase.ColumnID]*sqlbase.ColumnDescriptor)
+	for i := range table.desc.Columns {
+		col := &table.desc.Columns[i]
 		colIDToColumn[col.ID] = col
 	}
 
 	rh := rowHelper{TableDesc: table.desc, Indexes: table.desc.Indexes}
 
-	for _, family := range table.desc.Families {
+	for i := range table.desc.Families {
 		var lastColID sqlbase.ColumnID
-		familySortedColumnIDs, ok := rh.sortedColumnFamily(family.ID)
+		familyID := table.desc.Families[i].ID
+		familySortedColumnIDs, ok := rh.sortedColumnFamily(familyID)
 		if !ok {
-			panic("invalid family sorted column id map")
+			return pgerror.AssertionFailedf("invalid family sorted column id map for family %d", familyID)
 		}
 
 		for _, colID := range familySortedColumnIDs {
@@ -1126,25 +1243,27 @@ func (rf *Fetcher) checkPrimaryIndexDatumEncodings(ctx context.Context) error {
 				continue
 			}
 
-			if skip, err := rh.skipColumnInPK(colID, family.ID, rowVal.Datum); err != nil {
-				log.Errorf(ctx, "unexpected error: %s", err)
-				continue
+			if skip, err := rh.skipColumnInPK(colID, familyID, rowVal.Datum); err != nil {
+				return pgerror.NewAssertionErrorWithWrappedErrf(err, "unable to determine skip")
 			} else if skip {
 				continue
 			}
 
 			col := colIDToColumn[colID]
+			if col == nil {
+				return pgerror.AssertionFailedf("column mapping not found for column %d", colID)
+			}
 
 			if lastColID > col.ID {
-				panic(fmt.Errorf("cannot write column id %d after %d", col.ID, lastColID))
+				return pgerror.AssertionFailedf("cannot write column id %d after %d", col.ID, lastColID)
 			}
 			colIDDiff := col.ID - lastColID
 			lastColID = col.ID
 
 			if result, err := sqlbase.EncodeTableValue([]byte(nil), colIDDiff, rowVal.Datum,
 				scratch); err != nil {
-				log.Errorf(ctx, "Could not re-encode column %s, value was %#v. Got error %s",
-					col.Name, rowVal.Datum, err)
+				return pgerror.NewAssertionErrorWithWrappedErrf(err, "could not re-encode column %s, value was %#v",
+					col.Name, rowVal.Datum)
 			} else if !rowVal.BytesEqual(result) {
 				return scrub.WrapError(scrub.IndexValueDecodingError, errors.Errorf(
 					"value failed to round-trip encode. Column=%s colIDDiff=%d Key=%s expected %#v, got: %#v",
@@ -1250,7 +1369,7 @@ func (rf *Fetcher) finalizeRow() error {
 						indexColValues = append(indexColValues, "?")
 					}
 				}
-				err := pgerror.NewAssertionErrorf(
+				err := pgerror.AssertionFailedf(
 					"Non-nullable column \"%s:%s\" with no value! Index scanned was %q with the index key columns (%s) and the values (%s)",
 					table.desc.Name, table.cols[i].Name, table.index.Name,
 					strings.Join(table.index.ColumnNames, ","), strings.Join(indexColValues, ","))
@@ -1294,10 +1413,20 @@ func (rf *Fetcher) PartialKey(nCols int) (roachpb.Key, error) {
 	return rf.kv.Key[:n+rf.currentTable.knownPrefixLength], nil
 }
 
-// GetRangeInfo returns information about the ranges where the rows came from.
+// GetRangesInfo returns information about the ranges where the rows came from.
 // The RangeInfo's are deduped and not ordered.
-func (rf *Fetcher) GetRangeInfo() []roachpb.RangeInfo {
-	return rf.kvFetcher.getRangesInfo()
+func (rf *Fetcher) GetRangesInfo() []roachpb.RangeInfo {
+	f := rf.kvFetcher.kvBatchFetcher
+	if f == nil {
+		// Not yet initialized.
+		return nil
+	}
+	return f.getRangesInfo()
+}
+
+// GetBytesRead returns total number of bytes read by the underlying kvFetcher.
+func (rf *Fetcher) GetBytesRead() int64 {
+	return rf.kvFetcher.bytesRead
 }
 
 // Only unique secondary indexes have extra columns to decode (namely the

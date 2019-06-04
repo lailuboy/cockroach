@@ -34,7 +34,7 @@ func init() {
 }
 
 func declareKeysPushTransaction(
-	_ roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+	_ *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
 	pr := req.(*roachpb.PushTxnRequest)
 	spans.Add(spanset.SpanReadWrite, roachpb.Span{Key: keys.TransactionKey(pr.PusheeTxn.Key, pr.PusheeTxn.ID)})
@@ -89,6 +89,11 @@ func declareKeysPushTransaction(
 //
 // Push cannot proceed: a TransactionPushError is returned.
 //
+// Push can proceed but txn record staging: if the transaction record
+// is STAGING then it can't be changed by a pusher without going through
+// the transaction recovery process. An IndeterminateCommitError is returned
+// to kick off recovery.
+//
 // Push can proceed: the pushee's transaction record is modified and
 // rewritten, based on the value of args.PushType. If args.PushType
 // is PUSH_ABORT, txn.Status is set to ABORTED. If args.PushType is
@@ -110,18 +115,26 @@ func PushTxn(
 	if h.Txn != nil {
 		return result.Result{}, ErrTransactionUnsupported
 	}
-	if args.Now == (hlc.Timestamp{}) {
-		return result.Result{}, errors.Errorf("the field Now must be provided")
+	if h.Timestamp.Less(args.PushTo) {
+		// Verify that the PushTxn's timestamp is not less than the timestamp that
+		// the request intends to push the transaction to. Transactions should not
+		// be pushed into the future or their effect may not be fully reflected in
+		// a future leaseholder's timestamp cache. This is analogous to how reads
+		// should not be performed at a timestamp in the future.
+		return result.Result{}, errors.Errorf("request timestamp %s less than PushTo timestamp %s", h.Timestamp, args.PushTo)
 	}
-
+	if h.Timestamp.Less(args.PusheeTxn.Timestamp) {
+		// This condition must hold for the timestamp cache access/update to be safe.
+		return result.Result{}, errors.Errorf("request timestamp %s less than pushee txn timestamp %s", h.Timestamp, args.PusheeTxn.Timestamp)
+	}
 	if !bytes.Equal(args.Key, args.PusheeTxn.Key) {
-		return result.Result{}, errors.Errorf("request key %s should match pushee's txn key %s", args.Key, args.PusheeTxn.Key)
+		return result.Result{}, errors.Errorf("request key %s should match pushee txn key %s", args.Key, args.PusheeTxn.Key)
 	}
 	key := keys.TransactionKey(args.PusheeTxn.Key, args.PusheeTxn.ID)
 
 	// Fetch existing transaction; if missing, we're allowed to abort.
-	existTxn := &roachpb.Transaction{}
-	ok, err := engine.MVCCGetProto(ctx, batch, key, hlc.Timestamp{}, existTxn, engine.MVCCGetOptions{})
+	var existTxn roachpb.Transaction
+	ok, err := engine.MVCCGetProto(ctx, batch, key, hlc.Timestamp{}, &existTxn, engine.MVCCGetOptions{})
 	if err != nil {
 		return result.Result{}, err
 	} else if !ok {
@@ -167,7 +180,7 @@ func PushTxn(
 		}
 	} else {
 		// Start with the persisted transaction record.
-		reply.PusheeTxn = existTxn.Clone()
+		reply.PusheeTxn = existTxn
 
 		// Forward the last heartbeat time of the transaction record by
 		// the timestamp of the intent. This is another indication of
@@ -176,14 +189,14 @@ func PushTxn(
 	}
 
 	// If already committed or aborted, return success.
-	if reply.PusheeTxn.Status != roachpb.PENDING {
+	if reply.PusheeTxn.Status.IsFinalized() {
 		// Trivial noop.
 		return result.Result{}, nil
 	}
 
 	// If we're trying to move the timestamp forward, and it's already
 	// far enough forward, return success.
-	if args.PushType == roachpb.PUSH_TIMESTAMP && args.PushTo.Less(reply.PusheeTxn.Timestamp) {
+	if args.PushType == roachpb.PUSH_TIMESTAMP && !reply.PusheeTxn.Timestamp.Less(args.PushTo) {
 		// Trivial noop.
 		return result.Result{}, nil
 	}
@@ -195,17 +208,18 @@ func PushTxn(
 	}
 	reply.PusheeTxn.UpgradePriority(args.PusheeTxn.Priority)
 
+	pushType := args.PushType
 	var pusherWins bool
 	var reason string
 
 	switch {
-	case txnwait.IsExpired(args.Now, &reply.PusheeTxn):
+	case txnwait.IsExpired(h.Timestamp, &reply.PusheeTxn):
 		reason = "pushee is expired"
 		// When cleaning up, actually clean up (as opposed to simply pushing
 		// the garbage in the path of future writers).
-		args.PushType = roachpb.PUSH_ABORT
+		pushType = roachpb.PUSH_ABORT
 		pusherWins = true
-	case args.PushType == roachpb.PUSH_TOUCH:
+	case pushType == roachpb.PUSH_TOUCH:
 		// If just attempting to cleanup old or already-committed txns,
 		// pusher always fails.
 		pusherWins = false
@@ -223,8 +237,20 @@ func PushTxn(
 			s = "failed to push"
 		}
 		log.Infof(ctx, "%s "+s+" (push type=%s) %s: %s (pushee last active: %s)",
-			args.PusherTxn.Short(), args.PushType, args.PusheeTxn.Short(),
+			args.PusherTxn.Short(), pushType, args.PusheeTxn.Short(),
 			reason, reply.PusheeTxn.LastActive())
+	}
+
+	// If the pushed transaction is in the staging state, we can't change its
+	// record without first going through the transaction recovery process and
+	// attempting to finalize it.
+	recoverOnFailedPush := cArgs.EvalCtx.EvalKnobs().RecoverIndeterminateCommitsOnFailedPushes
+	if reply.PusheeTxn.Status == roachpb.STAGING && (pusherWins || recoverOnFailedPush) {
+		err := roachpb.NewIndeterminateCommitError(reply.PusheeTxn)
+		if log.V(1) {
+			log.Infof(ctx, "%v", err)
+		}
+		return result.Result{}, err
 	}
 
 	if !pusherWins {
@@ -239,22 +265,24 @@ func PushTxn(
 	reply.PusheeTxn.UpgradePriority(args.PusherTxn.Priority - 1)
 
 	// Determine what to do with the pushee, based on the push type.
-	switch args.PushType {
+	switch pushType {
 	case roachpb.PUSH_ABORT:
 		// If aborting the transaction, set the new status.
 		reply.PusheeTxn.Status = roachpb.ABORTED
-		// Forward the timestamp to accommodate AbortSpan GC. See method
-		// comment for details.
-		reply.PusheeTxn.Timestamp.Forward(reply.PusheeTxn.LastActive())
+		// If the transaction record was already present, forward the timestamp
+		// to accommodate AbortSpan GC. See method comment for details.
+		if ok {
+			reply.PusheeTxn.Timestamp.Forward(reply.PusheeTxn.LastActive())
+		}
 	case roachpb.PUSH_TIMESTAMP:
 		// Otherwise, update timestamp to be one greater than the request's
 		// timestamp. This new timestamp will be use to update the read
 		// timestamp cache. If the transaction record was not already present
 		// then we rely on the read timestamp cache to prevent the record from
 		// ever being written with a timestamp beneath this timestamp.
-		reply.PusheeTxn.Timestamp = args.PushTo.Next()
+		reply.PusheeTxn.Timestamp.Forward(args.PushTo)
 	default:
-		return result.Result{}, errors.Errorf("unexpected push type: %v", args.PushType)
+		return result.Result{}, errors.Errorf("unexpected push type: %v", pushType)
 	}
 
 	// If the transaction record was already present, persist the updates to it.

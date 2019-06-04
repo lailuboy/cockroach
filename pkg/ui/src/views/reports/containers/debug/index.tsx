@@ -221,6 +221,7 @@ export default function Debug() {
         <DebugTableRow title="Profiling UI/pprof">
           <DebugTableLink name="Heap" url="/debug/pprof/ui/heap/" />
           <DebugTableLink name="Profile" url="/debug/pprof/ui/profile/?seconds=5" />
+          <DebugTableLink name="Profile (w/ Labels)" url="/debug/pprof/ui/profile/?seconds=5&amp;labels=true" />
           <DebugTableLink name="Block" url="/debug/pprof/ui/block/" />
           <DebugTableLink name="Mutex" url="/debug/pprof/ui/mutex/" />
           <DebugTableLink name="Thread Create" url="/debug/pprof/ui/threadcreate/" />
@@ -302,6 +303,11 @@ export default function Debug() {
             name="Stacks"
             url="/_status/stacks/local"
             note="/_status/stacks/[node_id]"
+          />
+          <DebugTableLink
+            name="Engine Stats"
+            url="/_status/enginestats/local"
+            note="/_status/enginestats/[node_id]"
           />
           <DebugTableLink
             name="Certificates"

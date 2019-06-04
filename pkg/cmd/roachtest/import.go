@@ -21,11 +21,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
-)
-
-const (
-	gcsTestBucket = `cockroach-tmp`
 )
 
 func registerImportTPCC(r *registry) {
@@ -47,10 +44,35 @@ func registerImportTPCC(r *registry) {
 			defer dul.Done()
 			defer hc.Done()
 			cmd := fmt.Sprintf(
-				`./workload fixtures make tpcc --warehouses=%d --csv-server='http://localhost:8081' `+
-					`--gcs-bucket-override=%s --gcs-prefix-override=%s`,
-				warehouses, gcsTestBucket, c.name)
+				`./workload fixtures import tpcc --warehouses=%d --csv-server='http://localhost:8081'`,
+				warehouses)
 			c.Run(ctx, c.Node(1), cmd)
+			return nil
+		})
+		m.Wait()
+	}
+
+	runImportDirectIngestion := func(ctx context.Context, t *test, c *cluster, warehouses int) {
+		c.Put(ctx, cockroach, "./cockroach")
+		c.Start(ctx, t)
+
+		t.Status("importing")
+		m := newMonitor(ctx, c)
+		dul := NewDiskUsageLogger(c)
+		m.Go(dul.Runner)
+		hc := NewHealthChecker(c, c.All())
+		m.Go(hc.Runner)
+
+		m.Go(func(ctx context.Context) error {
+			defer dul.Done()
+			defer hc.Done()
+			cmd := fmt.Sprintf(
+				`./cockroach workload fixtures import tpcc --warehouses=%d --experimental-direct-ingestion`+
+					` --checks=false`,
+				warehouses)
+			importStart := timeutil.Now()
+			c.Run(ctx, c.Node(1), cmd)
+			t.l.Printf("IMPORT finished in %s\n", timeutil.Since(importStart))
 			return nil
 		})
 		m.Wait()
@@ -67,6 +89,26 @@ func registerImportTPCC(r *registry) {
 			},
 		})
 	}
+	const geoWarehouses = 4000
+	const geoZones = "europe-west2-b,europe-west4-b,asia-northeast1-b,us-west1-b"
+	r.Add(testSpec{
+		Name:    fmt.Sprintf("import/tpcc/warehouses=%d/geo", geoWarehouses),
+		Cluster: makeClusterSpec(8, cpu(16), geo(), zones(geoZones)),
+		Timeout: 5 * time.Hour,
+		Run: func(ctx context.Context, t *test, c *cluster) {
+			runImportTPCC(ctx, t, c, geoWarehouses)
+		},
+	})
+	r.Add(testSpec{
+		Name:       `import/experimental-direct-ingestion`,
+		Skip:       `bricks cluster`,
+		MinVersion: `v19.1.0`,
+		Cluster:    makeClusterSpec(3, cpu(16)),
+		Timeout:    2 * time.Hour,
+		Run: func(ctx context.Context, t *test, c *cluster) {
+			runImportDirectIngestion(ctx, t, c, warehouses)
+		},
+	})
 }
 
 func registerImportTPCH(r *registry) {

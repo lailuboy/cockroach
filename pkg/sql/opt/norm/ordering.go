@@ -16,6 +16,7 @@ package norm
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 )
 
@@ -58,25 +59,65 @@ func (c *CustomFuncs) SimplifyGroupingOrdering(
 	return &copy
 }
 
-// CanSimplifyRowNumberOrdering returns true if the ordering required by the
-// RowNumber operator can be made less restrictive, so that the input operator
+// CanSimplifyOrdinalityOrdering returns true if the ordering required by the
+// Ordinality operator can be made less restrictive, so that the input operator
 // has more ordering choices.
-func (c *CustomFuncs) CanSimplifyRowNumberOrdering(
-	in memo.RelExpr, private *memo.RowNumberPrivate,
+func (c *CustomFuncs) CanSimplifyOrdinalityOrdering(
+	in memo.RelExpr, private *memo.OrdinalityPrivate,
 ) bool {
 	return c.canSimplifyOrdering(in, private.Ordering)
 }
 
-// SimplifyRowNumberOrdering makes the ordering required by the RowNumber
+// SimplifyOrdinalityOrdering makes the ordering required by the Ordinality
 // operator less restrictive by removing optional columns, adding equivalent
 // columns, and removing redundant columns.
-func (c *CustomFuncs) SimplifyRowNumberOrdering(
-	in memo.RelExpr, private *memo.RowNumberPrivate,
-) *memo.RowNumberPrivate {
-	// Copy RowNumberPrivate to stack and replace Ordering field.
+func (c *CustomFuncs) SimplifyOrdinalityOrdering(
+	in memo.RelExpr, private *memo.OrdinalityPrivate,
+) *memo.OrdinalityPrivate {
+	// Copy OrdinalityPrivate to stack and replace Ordering field.
 	copy := *private
 	copy.Ordering = c.simplifyOrdering(in, private.Ordering)
 	return &copy
+}
+
+// withinPartitionFuncDeps returns the functional dependencies that apply
+// within any given partition in a window function's input. These are stronger
+// than the input's FDs since within any partition the partition columns are
+// held constant.
+func (c *CustomFuncs) withinPartitionFuncDeps(
+	in memo.RelExpr, private *memo.WindowPrivate,
+) *props.FuncDepSet {
+	if private.Partition.Empty() {
+		return &in.Relational().FuncDeps
+	}
+	var fdset props.FuncDepSet
+	fdset.CopyFrom(&in.Relational().FuncDeps)
+	fdset.AddConstants(private.Partition)
+	return &fdset
+}
+
+// CanSimplifyWindowOrdering is true if the intra-partition ordering used by
+// the window function can be made less restrictive.
+func (c *CustomFuncs) CanSimplifyWindowOrdering(in memo.RelExpr, private *memo.WindowPrivate) bool {
+	// If any ordering is allowed, nothing to simplify.
+	if private.Ordering.Any() {
+		return false
+	}
+	deps := c.withinPartitionFuncDeps(in, private)
+
+	return private.Ordering.CanSimplify(deps)
+}
+
+// SimplifyWindowOrdering makes the intra-partition ordering used by the window
+// function less restrictive.
+func (c *CustomFuncs) SimplifyWindowOrdering(
+	in memo.RelExpr, private *memo.WindowPrivate,
+) *memo.WindowPrivate {
+	simplified := private.Ordering.Copy()
+	simplified.Simplify(c.withinPartitionFuncDeps(in, private))
+	cpy := *private
+	cpy.Ordering = simplified
+	return &cpy
 }
 
 // CanSimplifyExplainOrdering returns true if the ordering required by the

@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -66,17 +67,18 @@ func (n *dropIndexNode) startExec(params runParams) error {
 		// the mutation list and new version number created by the first
 		// drop need to be visible to the second drop.
 		tableDesc, err := params.p.ResolveMutableTableDescriptor(
-			ctx, index.tn, true /*required*/, requireTableDesc)
+			ctx, index.tn, true /*required*/, ResolveRequireTableDesc)
 		if err != nil {
 			// Somehow the descriptor we had during newPlan() is not there
 			// any more.
-			return errors.Wrapf(err, "table descriptor for %q became unavailable within same txn",
+			return pgerror.NewAssertionErrorWithWrappedErrf(err,
+				"table descriptor for %q became unavailable within same txn",
 				tree.ErrString(index.tn))
 		}
 
 		if err := params.p.dropIndexByName(
 			ctx, index.tn, index.idxName, tableDesc, n.n.IfExists, n.n.DropBehavior, checkIdxConstraint,
-			tree.AsStringWithFlags(n.n, tree.FmtAlwaysQualifyTableNames),
+			tree.AsStringWithFQNames(n.n, params.Ann()),
 		); err != nil {
 			return err
 		}
@@ -146,6 +148,14 @@ func (p *planner) dropIndexByName(
 					tableDesc.Name))
 			}
 			break
+		}
+	}
+
+	// Check for foreign key mutations referencing this index.
+	for _, m := range tableDesc.Mutations {
+		if c := m.GetConstraint(); c != nil && c.ConstraintType == sqlbase.ConstraintToUpdate_FOREIGN_KEY && c.ForeignKeyIndex == idx.ID {
+			return pgerror.Newf(pgerror.CodeObjectNotInPrerequisiteStateError,
+				"referencing constraint %q in the middle of being added, try again later", c.ForeignKey.Name)
 		}
 	}
 

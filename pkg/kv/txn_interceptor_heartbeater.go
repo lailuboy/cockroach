@@ -119,6 +119,7 @@ type txnHeartbeater struct {
 // init initializes the txnHeartbeater. This method exists instead of a
 // constructor because txnHeartbeaters live in a pool in the TxnCoordSender.
 func (h *txnHeartbeater) init(
+	ac log.AmbientContext,
 	mu sync.Locker,
 	txn *roachpb.Transaction,
 	st *cluster.Settings,
@@ -129,6 +130,8 @@ func (h *txnHeartbeater) init(
 	stopper *stop.Stopper,
 	asyncAbortCallbackLocked func(context.Context),
 ) {
+	h.AmbientContext = ac
+	h.AmbientContext.AddLogTag("txn-hb", txn.Short())
 	h.stopper = stopper
 	h.st = st
 	h.clock = clock
@@ -375,24 +378,27 @@ func (h *txnHeartbeater) heartbeat(ctx context.Context) bool {
 
 	// Clone the txn in order to put it in the heartbeat request.
 	txn := h.mu.txn.Clone()
-
 	if txn.Key == nil {
 		log.Fatalf(ctx, "attempting to heartbeat txn without anchor key: %v", txn)
 	}
-
 	ba := roachpb.BatchRequest{}
-	ba.Txn = &txn
-
-	hb := &roachpb.HeartbeatTxnRequest{
+	ba.Txn = txn
+	ba.Add(&roachpb.HeartbeatTxnRequest{
 		RequestHeader: roachpb.RequestHeader{
 			Key: txn.Key,
 		},
 		Now: h.clock.Now(),
-	}
-	ba.Add(hb)
+	})
 
+	// Send the heartbeat request directly through the gatekeeper interceptor.
+	// See comment on h.gatekeeper for a discussion of why.
 	log.VEvent(ctx, 2, "heartbeat")
 	br, pErr := h.gatekeeper.SendLocked(ctx, ba)
+
+	// If the txn is no longer pending, ignore the result of the heartbeat.
+	if h.mu.txn.Status != roachpb.PENDING {
+		return false
+	}
 
 	var respTxn *roachpb.Transaction
 	if pErr != nil {
@@ -438,13 +444,21 @@ func (h *txnHeartbeater) heartbeat(ctx context.Context) bool {
 	// This appears to be benign, but it's still somewhat disconcerting. If this
 	// ever causes any issues, we'll need to be smarter about detecting this race
 	// on the client and conditionally ignoring the result of heartbeat responses.
-	h.mu.txn.Update(respTxn)
-	if h.mu.txn.Status != roachpb.PENDING {
-		if h.mu.txn.Status == roachpb.ABORTED {
-			log.VEventf(ctx, 1, "Heartbeat detected aborted txn. Cleaning up.")
-			h.abortTxnAsyncLocked(ctx)
+	if respTxn != nil {
+		if respTxn.Status == roachpb.STAGING {
+			// Consider STAGING transactions to be PENDING for the purpose of
+			// the heartbeat loop. Interceptors above the txnCommitter should
+			// be oblivious to parallel commits.
+			respTxn.Status = roachpb.PENDING
 		}
-		return false
+		h.mu.txn.Update(respTxn)
+		if h.mu.txn.Status != roachpb.PENDING {
+			if h.mu.txn.Status == roachpb.ABORTED {
+				log.VEventf(ctx, 1, "Heartbeat detected aborted txn. Cleaning up.")
+				h.abortTxnAsyncLocked(ctx)
+			}
+			return false
+		}
 	}
 	return true
 }
@@ -464,7 +478,7 @@ func (h *txnHeartbeater) abortTxnAsyncLocked(ctx context.Context) {
 
 	// Construct a batch with an EndTransaction request.
 	ba := roachpb.BatchRequest{}
-	ba.Header = roachpb.Header{Txn: &txn}
+	ba.Header = roachpb.Header{Txn: txn}
 	ba.Add(&roachpb.EndTransactionRequest{
 		Commit: false,
 		// Resolved intents should maintain an abort span entry to prevent
@@ -475,9 +489,9 @@ func (h *txnHeartbeater) abortTxnAsyncLocked(ctx context.Context) {
 	log.VEventf(ctx, 2, "async abort for txn: %s", txn)
 	if err := h.stopper.RunAsyncTask(
 		ctx, "txnHeartbeater: aborting txn", func(ctx context.Context) {
-			// Send the abort request through the interceptor stack. This is important
-			// because we need the txnIntentCollector to append intents to the
-			// EndTransaction request.
+			// Send the abort request through the interceptor stack. This is
+			// important because we need the txnPipeliner to append intent spans
+			// to the EndTransaction request.
 			h.mu.Lock()
 			defer h.mu.Unlock()
 			_, pErr := h.wrapped.SendLocked(ctx, ba)

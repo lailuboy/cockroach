@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
+	"github.com/cockroachdb/cockroach/pkg/server/goroutinedumper"
 	"github.com/cockroachdb/cockroach/pkg/server/heapprofiler"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
@@ -109,7 +111,7 @@ var (
 
 	forwardClockJumpCheckEnabled = settings.RegisterBoolSetting(
 		"server.clock.forward_jump_check_enabled",
-		"if enabled, forward clock jumps > max_offset/2 will cause a panic.",
+		"if enabled, forward clock jumps > max_offset/2 will cause a panic",
 		false,
 	)
 
@@ -252,6 +254,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			log.Fatal(ctx, err)
 		}
 	}
+	s.registry.AddMetricStruct(s.rpcContext.Metrics())
 
 	s.grpc = newGRPCServer(s.rpcContext)
 
@@ -264,6 +267,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		s.stopper,
 		s.registry,
 		s.cfg.Locality,
+		&s.cfg.DefaultZoneConfig,
 	)
 	s.nodeDialer = nodedialer.New(s.rpcContext, gossip.AddressResolver(s.gossip))
 
@@ -350,19 +354,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	s.internalMemMetrics = sql.MakeMemMetrics("internal", cfg.HistogramWindowInterval())
 	s.registry.AddMetricStruct(s.internalMemMetrics)
 
-	// Set up Lease Manager
-	var lmKnobs sql.LeaseManagerTestingKnobs
-	if leaseManagerTestingKnobs := cfg.TestingKnobs.SQLLeaseManager; leaseManagerTestingKnobs != nil {
-		lmKnobs = *leaseManagerTestingKnobs.(*sql.LeaseManagerTestingKnobs)
-	}
-	s.leaseMgr = sql.NewLeaseManager(
-		s.cfg.AmbientCtx,
-		nil, /* execCfg - will be set later because of circular dependencies */
-		lmKnobs,
-		s.stopper,
-		s.cfg.LeaseManagerConfig,
-	)
-
 	// We do not set memory monitors or a noteworthy limit because the children of
 	// this monitor will be setting their own noteworthy limits.
 	rootSQLMemoryMonitor := mon.MakeMonitor(
@@ -428,6 +419,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	// TODO(bdarnell): make StoreConfig configurable.
 	storeCfg := storage.StoreConfig{
+		DefaultZoneConfig:       &s.cfg.DefaultZoneConfig,
 		Settings:                st,
 		AmbientCtx:              s.cfg.AmbientCtx,
 		RaftConfig:              s.cfg.RaftConfig,
@@ -510,10 +502,28 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	distSQLMetrics := distsqlrun.MakeDistSQLMetrics(cfg.HistogramWindowInterval())
 	s.registry.AddMetricStruct(distSQLMetrics)
 
+	// Set up Lease Manager
+	var lmKnobs sql.LeaseManagerTestingKnobs
+	if leaseManagerTestingKnobs := cfg.TestingKnobs.SQLLeaseManager; leaseManagerTestingKnobs != nil {
+		lmKnobs = *leaseManagerTestingKnobs.(*sql.LeaseManagerTestingKnobs)
+	}
+	s.leaseMgr = sql.NewLeaseManager(
+		s.cfg.AmbientCtx,
+		&s.nodeIDContainer,
+		s.db,
+		s.clock,
+		nil, /* internalExecutor - will be set later because of circular dependencies */
+		st,
+		lmKnobs,
+		s.stopper,
+		s.cfg.LeaseManagerConfig,
+	)
+
 	// Set up the DistSQL server.
 	distSQLCfg := distsqlrun.ServerConfig{
 		AmbientContext: s.cfg.AmbientCtx,
 		Settings:       st,
+		RuntimeStats:   s.runtime,
 		DB:             s.db,
 		Executor:       internalExecutor,
 		FlowDB:         client.NewDB(s.cfg.AmbientCtx, s.tcsFactory, s.clock),
@@ -523,8 +533,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		ClusterID:      &s.rpcContext.ClusterID,
 
 		TempStorage: tempEngine,
-		BulkAdder: func(ctx context.Context, db *client.DB, size int64, ts hlc.Timestamp) (storagebase.BulkAdder, error) {
-			return bulk.MakeFixedTimestampSSTBatcher(db, s.distSender.RangeDescriptorCache(), size, ts)
+		BulkAdder: func(ctx context.Context, db *client.DB, bufferSize, flushSize int64, ts hlc.Timestamp) (storagebase.BulkAdder, error) {
+			return bulk.MakeBulkAdder(db, s.distSender.RangeDescriptorCache(), bufferSize, flushSize, ts)
 		},
 		DiskMonitor: s.cfg.TempStorageConfig.Mon,
 
@@ -588,11 +598,11 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	// Set up Executor
 
-	var sqlExecutorTestingKnobs *sql.ExecutorTestingKnobs
+	var sqlExecutorTestingKnobs sql.ExecutorTestingKnobs
 	if k := s.cfg.TestingKnobs.SQLExecutor; k != nil {
-		sqlExecutorTestingKnobs = k.(*sql.ExecutorTestingKnobs)
+		sqlExecutorTestingKnobs = *k.(*sql.ExecutorTestingKnobs)
 	} else {
-		sqlExecutorTestingKnobs = new(sql.ExecutorTestingKnobs)
+		sqlExecutorTestingKnobs = sql.ExecutorTestingKnobs{}
 	}
 
 	loggerCtx, _ := s.stopper.WithCancelOnStop(ctx)
@@ -600,6 +610,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	execCfg = sql.ExecutorConfig{
 		Settings:                s.st,
 		NodeInfo:                nodeInfo,
+		DefaultZoneConfig:       &s.cfg.DefaultZoneConfig,
+		Locality:                s.cfg.Locality,
 		AmbientCtx:              s.cfg.AmbientCtx,
 		DB:                      s.db,
 		Gossip:                  s.gossip,
@@ -664,8 +676,12 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	if sqlEvalContext := s.cfg.TestingKnobs.SQLEvalContext; sqlEvalContext != nil {
 		execCfg.EvalContextTestingKnobs = *sqlEvalContext.(*tree.EvalContextTestingKnobs)
 	}
+	if pgwireKnobs := s.cfg.TestingKnobs.PGWireTestingKnobs; pgwireKnobs != nil {
+		execCfg.PGWireTestingKnobs = pgwireKnobs.(*sql.PGWireTestingKnobs)
+	}
 
 	s.statsRefresher = stats.MakeRefresher(
+		s.st,
 		internalExecutor,
 		execCfg.TableStatsCache,
 		stats.DefaultAsOfTime,
@@ -713,11 +729,12 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	s.execCfg = &execCfg
 
-	s.leaseMgr.SetExecCfg(&execCfg)
+	s.leaseMgr.SetInternalExecutor(execCfg.InternalExecutor)
 	s.leaseMgr.RefreshLeases(s.stopper, s.db, s.gossip)
 	s.leaseMgr.PeriodicallyRefreshSomeLeases()
 
 	s.node.InitLogger(&execCfg)
+	s.cfg.DefaultZoneConfig = cfg.DefaultZoneConfig
 
 	return s, nil
 }
@@ -1396,30 +1413,20 @@ func (s *Server) Start(ctx context.Context) error {
 			hlcUpperBound,
 			timeutil.SleepUntil,
 		)
-	} else if len(s.cfg.GossipBootstrapResolvers) == 0 {
-		// If the _unfiltered_ list of hosts from the --join flag is
-		// empty, then this node can bootstrap a new cluster. We disallow
-		// this if this node is being started with itself specified as a
-		// --join host, because that's too likely to be operator error.
-		//
-		doBootstrap = true
-		if s.cfg.ReadyFn != nil {
-			// TODO(knz): when CockroachDB stops auto-initializing when --join
-			// is not specified, this needs to be adjusted as well. See issue
-			// #24118 and #28495 for details.
-			//
-			s.cfg.ReadyFn(false /*waitForInit*/)
-		}
 
-		if err := s.bootstrapCluster(ctx); err != nil {
-			return err
+		// Ensure that any subsequent use of `cockroach init` will receive
+		// an error "the cluster was already initialized."
+		if _, err := s.initServer.Bootstrap(ctx, &serverpb.BootstrapRequest{}); err != nil {
+			log.Fatal(ctx, err)
 		}
-
-		log.Infof(ctx, "**** add additional nodes by specifying --join=%s", s.cfg.AdvertiseAddr)
 	} else {
-		// We have no existing stores and we've been told to join a cluster. Wait
-		// for the initServer to bootstrap the cluster or connect to an existing
-		// one.
+		// We have no existing stores. We start an initServer and then wait for
+		// one of the following:
+		//
+		// - gossip connects (i.e. we're joining an existing cluster, perhaps
+		//   freshly bootstrapped but this node doesn't have to know)
+		// - we auto-bootstrap (if no join flags were given)
+		// - a client bootstraps a cluster via node.
 		//
 		// TODO(knz): This may need tweaking when #24118 is addressed.
 
@@ -1454,6 +1461,17 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 
 		log.Info(ctx, "no stores bootstrapped and --join flag specified, awaiting init command or join with an already initialized node.")
+
+		if len(s.cfg.GossipBootstrapResolvers) == 0 {
+			// If the _unfiltered_ list of hosts from the --join flag is
+			// empty, then this node can bootstrap a new cluster. We disallow
+			// this if this node is being started with itself specified as a
+			// --join host, because that's too likely to be operator error.
+			if _, err := s.initServer.Bootstrap(ctx, &serverpb.BootstrapRequest{}); err != nil {
+				return errors.Wrap(err, "while bootstrapping")
+			}
+			log.Infof(ctx, "**** add additional nodes by specifying --join=%s", s.cfg.AdvertiseAddr)
+		}
 
 		initRes, err := s.initServer.awaitBootstrap()
 		close(ready)
@@ -1531,15 +1549,12 @@ func (s *Server) Start(ctx context.Context) error {
 	s.recorder.AddNode(s.registry, s.node.Descriptor, s.node.startedAt, s.cfg.AdvertiseAddr, s.cfg.HTTPAdvertiseAddr)
 
 	// Begin recording runtime statistics.
-	s.startSampleEnvironment(DefaultMetricsSampleInterval)
+	s.startSampleEnvironment(ctx, DefaultMetricsSampleInterval)
 
 	// Begin recording time series data collected by the status monitor.
 	s.tsDB.PollSource(
 		s.cfg.AmbientCtx, s.recorder, DefaultMetricsSampleInterval, ts.Resolution10s, s.stopper,
 	)
-
-	// Begin recording status summaries.
-	s.node.startWriteNodeStatus(DefaultMetricsSampleInterval)
 
 	var graphiteOnce sync.Once
 	graphiteEndpoint.SetOnChange(&s.st.SV, func() {
@@ -1594,6 +1609,9 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	})
 
+	// Begin recording status summaries.
+	s.node.startWriteNodeStatus(DefaultMetricsSampleInterval)
+
 	{
 		var regLiveness jobs.NodeLiveness = s.nodeLiveness
 		if testingLiveness := s.cfg.TestingKnobs.RegistryLiveness; testingLiveness != nil {
@@ -1607,9 +1625,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	// Start the background thread for periodically refreshing table statistics.
-	if err := s.statsRefresher.Start(
-		ctx, &s.st.SV, s.stopper, stats.DefaultRefreshInterval,
-	); err != nil {
+	if err := s.statsRefresher.Start(ctx, s.stopper, stats.DefaultRefreshInterval); err != nil {
 		return err
 	}
 
@@ -1703,12 +1719,7 @@ func (s *Server) Start(ctx context.Context) error {
 			connCtx := logtags.AddTag(pgCtx, "client", conn.RemoteAddr().String())
 			setTCPKeepAlive(connCtx, conn)
 
-			// Unless this is a simple disconnect or context timeout, report the error on
-			// this connection's context, so that we know which remote client caused the
-			// error when looking at the logs. Note that we pass a non-cancelable context
-			// in, but the callee eventually wraps the context so that it can get
-			// canceled and it may return the error here.
-			if err := errors.Cause(s.pgServer.ServeConn(connCtx, conn)); err != nil && !netutil.IsClosedConnection(err) && err != context.Canceled && err != context.DeadlineExceeded {
+			if err := s.pgServer.ServeConn(connCtx, conn); err != nil {
 				log.Error(connCtx, err)
 			}
 		}))
@@ -1737,11 +1748,7 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 			netutil.FatalIfUnexpected(httpServer.ServeWith(pgCtx, s.stopper, unixLn, func(conn net.Conn) {
 				connCtx := logtags.AddTag(pgCtx, "client", conn.RemoteAddr().String())
-				if err := s.pgServer.ServeConn(connCtx, conn); err != nil &&
-					!netutil.IsClosedConnection(err) {
-					// Report the error on this connection's context, so that we
-					// know which remote client caused the error when looking at
-					// the logs.
+				if err := s.pgServer.ServeConn(connCtx, conn); err != nil {
 					log.Error(connCtx, err)
 				}
 			}))
@@ -1771,7 +1778,7 @@ func (s *Server) bootstrapCluster(ctx context.Context) error {
 		}
 	}
 
-	if err := s.node.bootstrap(ctx, s.engines, bootstrapVersion); err != nil {
+	if err := s.node.bootstrapCluster(ctx, s.engines, bootstrapVersion, &s.cfg.DefaultZoneConfig, &s.cfg.DefaultSystemZoneConfig); err != nil {
 		return err
 	}
 	// Force all the system ranges through the replication queue so they
@@ -1853,7 +1860,7 @@ func (s *Server) doDrain(
 // On failure, the system may be in a partially drained state and should be
 // recovered by calling Undrain() with the same (or a larger) slice of modes.
 func (s *Server) Drain(ctx context.Context, on []serverpb.DrainMode) ([]serverpb.DrainMode, error) {
-	return s.doDrain(ctx, on, true)
+	return s.doDrain(ctx, on, true /* setTo */)
 }
 
 // Undrain idempotently deactivates the given DrainModes on the Server in the
@@ -1898,61 +1905,92 @@ func (s *Server) Decommission(ctx context.Context, setTo bool, nodeIDs []roachpb
 	return nil
 }
 
-// startSampleEnvironment begins the heap profiler worker and a worker that
-// periodically instructs the runtime stat sampler to sample the environment.
-func (s *Server) startSampleEnvironment(frequency time.Duration) {
+// startSampleEnvironment begins the heap profiler worker.
+func (s *Server) startSampleEnvironment(ctx context.Context, frequency time.Duration) {
 	// Immediately record summaries once on server startup.
-	ctx := s.AnnotateCtx(context.Background())
-	var heapProfiler *heapprofiler.HeapProfiler
+	ctx = s.AnnotateCtx(ctx)
+	goroutineDumper, err := goroutinedumper.NewGoroutineDumper(s.cfg.GoroutineDumpDirName)
+	if err != nil {
+		log.Infof(ctx, "Could not start goroutine dumper worker due to: %s", err)
+	}
 
-	{
-		systemMemory, err := status.GetTotalMemory(ctx)
-		if err != nil {
-			log.Warningf(ctx, "Could not compute system memory due to: %s", err)
-		} else {
-			heapProfiler, err = heapprofiler.NewHeapProfiler(s.cfg.HeapProfileDirName, systemMemory)
-			if err != nil {
-				log.Infof(ctx, "Could not start heap profiler worker due to: %s", err)
-			}
+	// We're not going to take heap profiles if running with in-memory stores.
+	// This helps some tests that can't write any files.
+	allStoresInMem := true
+	for _, storeSpec := range s.cfg.Stores.Specs {
+		if !storeSpec.InMemory {
+			allStoresInMem = false
+			break
 		}
 	}
 
-	// We run two separate sampling loops, one for memory stats (via
-	// ReadMemStats) and one for all other runtime stats. This is necessary
-	// because as of go1.11, runtime.ReadMemStats() "stops the world" and
-	// requires waiting for any current GC run to finish. With a large heap, a
-	// single GC run may take longer than the default sampling period (10s).
-	s.stopper.RunWorker(ctx, func(ctx context.Context) {
-		timer := timeutil.NewTimer()
-		defer timer.Stop()
-		timer.Reset(frequency)
-		for {
-			select {
-			case <-timer.C:
-				timer.Read = true
-				s.runtime.SampleMemStats(ctx)
-				timer.Reset(frequency)
-			case <-s.stopper.ShouldStop():
-				return
-			}
+	var heapProfiler *heapprofiler.HeapProfiler
+	if s.cfg.HeapProfileDirName != "" && !allStoresInMem {
+		if err := os.MkdirAll(s.cfg.HeapProfileDirName, 0755); err != nil {
+			log.Fatalf(ctx, "Could not create heap profiles dir: %s", err)
 		}
-	})
+		heapProfiler, err = heapprofiler.NewHeapProfiler(
+			s.cfg.HeapProfileDirName, s.ClusterSettings())
+		if err != nil {
+			log.Fatalf(ctx, "Could not start heap profiler worker due to: %s", err)
+		}
+	}
 
 	s.stopper.RunWorker(ctx, func(ctx context.Context) {
+		var goMemStats atomic.Value // *status.GoMemStats
+		goMemStats.Store(&status.GoMemStats{})
+		var collectingMemStats int32 // atomic, 1 when stats call is ongoing
+
 		timer := timeutil.NewTimer()
 		defer timer.Stop()
 		timer.Reset(frequency)
+
 		for {
 			select {
-			case <-timer.C:
-				timer.Read = true
-				s.runtime.SampleEnvironment(ctx)
-				if heapProfiler != nil {
-					heapProfiler.MaybeTakeProfile(ctx, s.ClusterSettings(), s.runtime.Rss.Value())
-				}
-				timer.Reset(frequency)
 			case <-s.stopper.ShouldStop():
 				return
+			case <-timer.C:
+				timer.Read = true
+				timer.Reset(frequency)
+
+				// We read the heap stats on another goroutine and give up after 1s.
+				// This is necessary because as of Go 1.12, runtime.ReadMemStats()
+				// "stops the world" and that requires first waiting for any current GC
+				// run to finish. With a large heap and under extreme conditions, a
+				// single GC run may take longer than the default sampling period of
+				// 10s. Under normal operations and with more recent versions of Go,
+				// this hasn't been observed to be a problem.
+				statsCollected := make(chan struct{})
+				if atomic.CompareAndSwapInt32(&collectingMemStats, 0, 1) {
+					if err := s.stopper.RunAsyncTask(ctx, "get-mem-stats", func(ctx context.Context) {
+						var ms status.GoMemStats
+						runtime.ReadMemStats(&ms.MemStats)
+						ms.Collected = timeutil.Now()
+						log.VEventf(ctx, 2, "memstats: %+v", ms)
+
+						goMemStats.Store(&ms)
+						atomic.StoreInt32(&collectingMemStats, 0)
+						close(statsCollected)
+					}); err != nil {
+						close(statsCollected)
+					}
+				}
+
+				select {
+				case <-statsCollected:
+					// Good; we managed to read the Go memory stats quickly enough.
+				case <-time.After(time.Second):
+				}
+
+				curStats := goMemStats.Load().(*status.GoMemStats)
+				s.runtime.SampleEnvironment(ctx, *curStats)
+				if goroutineDumper != nil {
+					goroutineDumper.MaybeDump(ctx, s.ClusterSettings(), s.runtime.Goroutines.Value())
+				}
+				if heapProfiler != nil {
+					heapProfiler.MaybeTakeProfile(ctx, curStats.MemStats)
+				}
+
 			}
 		}
 	})

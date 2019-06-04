@@ -10,21 +10,23 @@ package changefeedccl
 
 import (
 	"context"
-	"regexp"
+	"net/url"
 	"sort"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -34,7 +36,12 @@ import (
 
 func init() {
 	sql.AddPlanHook(changefeedPlanHook)
-	jobs.AddResumeHook(changefeedResumeHook)
+	jobs.RegisterConstructor(
+		jobspb.TypeChangefeed,
+		func(job *jobs.Job, _ *cluster.Settings) jobs.Resumer {
+			return &changefeedResumer{job: job}
+		},
+	)
 }
 
 type envelopeType string
@@ -45,6 +52,7 @@ const (
 	optCursor                  = `cursor`
 	optEnvelope                = `envelope`
 	optFormat                  = `format`
+	optKeyInValue              = `key_in_value`
 	optResolvedTimestamps      = `resolved`
 	optUpdatedTimestamps       = `updated`
 
@@ -56,12 +64,18 @@ const (
 	optFormatJSON formatType = `json`
 	optFormatAvro formatType = `experimental_avro`
 
-	sinkParamSchemaTopic      = `schema_topic`
-	sinkParamTopicPrefix      = `topic_prefix`
+	sinkParamCACert           = `ca_cert`
 	sinkParamFileSize         = `file_size`
+	sinkParamSchemaTopic      = `schema_topic`
+	sinkParamTLSEnabled       = `tls_enabled`
+	sinkParamTopicPrefix      = `topic_prefix`
 	sinkSchemeBuffer          = ``
 	sinkSchemeExperimentalSQL = `experimental-sql`
 	sinkSchemeKafka           = `kafka`
+	sinkParamSASLEnabled      = `sasl_enabled`
+	sinkParamSASLHandshake    = `sasl_handshake`
+	sinkParamSASLUser         = `sasl_user`
+	sinkParamSASLPassword     = `sasl_password`
 )
 
 var changefeedOptionExpectValues = map[string]sql.KVStringOptValidate{
@@ -69,6 +83,7 @@ var changefeedOptionExpectValues = map[string]sql.KVStringOptValidate{
 	optCursor:                  sql.KVStringOptRequireValue,
 	optEnvelope:                sql.KVStringOptRequireValue,
 	optFormat:                  sql.KVStringOptRequireValue,
+	optKeyInValue:              sql.KVStringOptRequireNoValue,
 	optResolvedTimestamps:      sql.KVStringOptAny,
 	optUpdatedTimestamps:       sql.KVStringOptRequireNoValue,
 }
@@ -76,15 +91,16 @@ var changefeedOptionExpectValues = map[string]sql.KVStringOptValidate{
 // changefeedPlanHook implements sql.PlanHookFn.
 func changefeedPlanHook(
 	_ context.Context, stmt tree.Statement, p sql.PlanHookState,
-) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, error) {
+) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, bool, error) {
 	changefeedStmt, ok := stmt.(*tree.CreateChangefeed)
 	if !ok {
-		return nil, nil, nil, nil
+		return nil, nil, nil, false, nil
 	}
 
 	var sinkURIFn func() (string, error)
 	var header sqlbase.ResultColumns
 	unspecifiedSink := changefeedStmt.SinkURI == nil
+	avoidBuffering := false
 	if unspecifiedSink {
 		// An unspecified sink triggers a fairly radical change in behavior.
 		// Instead of setting up a system.job to emit to a sink in the
@@ -99,11 +115,12 @@ func changefeedPlanHook(
 			{Name: "key", Typ: types.Bytes},
 			{Name: "value", Typ: types.Bytes},
 		}
+		avoidBuffering = true
 	} else {
 		var err error
 		sinkURIFn, err = p.TypeAsString(changefeedStmt.SinkURI, `CREATE CHANGEFEED`)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, false, err
 		}
 		header = sqlbase.ResultColumns{
 			{Name: "job_id", Typ: types.Int},
@@ -112,7 +129,7 @@ func changefeedPlanHook(
 
 	optsFn, err := p.TypeAsStringOpts(changefeedStmt.Options, changefeedOptionExpectValues)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
@@ -144,7 +161,10 @@ func changefeedPlanHook(
 			return err
 		}
 
-		jobDescription := changefeedJobDescription(changefeedStmt, sinkURI, opts)
+		jobDescription, err := changefeedJobDescription(p, changefeedStmt, sinkURI, opts)
+		if err != nil {
+			return err
+		}
 
 		statementTime := hlc.Timestamp{
 			WallTime: p.ExtendedEvalContext().GetStmtTimestamp().UnixNano(),
@@ -207,18 +227,64 @@ func changefeedPlanHook(
 			},
 		}
 
+		// TODO(dan): In an attempt to present the most helpful error message to the
+		// user, the ordering requirements between all these usage validations have
+		// become extremely fragile and non-obvious.
+		//
+		// - `validateDetails` has to run first to fill in defaults for `envelope`
+		//   and `format` if the user didn't specify them.
+		// - Then `getEncoder` is run to return any configuration errors.
+		// - Then the changefeed is opted in to `optKeyInValue` for any cloud
+		//   storage sink. Kafka etc have a key and value field in each message but
+		//   cloud storage sinks don't have anywhere to put the key. So if the key
+		//   is not in the value, then for DELETEs there is no way to recover which
+		//   key was deleted. We could make the user explicitly pass this option for
+		//   every cloud storage sink and error if they don't, but that seems
+		//   user-hostile for insufficient reason. We can't do this any earlier,
+		//   because we might return errors about `key_in_value` being incompatible
+		//   which is confusing when the user didn't type that option.
+		// - Finally, we create a "canary" sink to test sink configuration and
+		//   connectivity. This has to go last because it is strange to return sink
+		//   connectivity errors before we've finished validating all the other
+		//   options. We should probably split sink configuration checking and sink
+		//   connectivity checking into separate methods.
+		//
+		// The only upside in all this nonsense is the tests are decent. I've tuned
+		// this particular order simply by rearranging stuff until the changefeedccl
+		// tests all pass.
+		parsedSink, err := url.Parse(sinkURI)
+		if err != nil {
+			return err
+		}
+		if details, err = validateDetails(details); err != nil {
+			return err
+		}
+
+		if _, err := getEncoder(details.Opts); err != nil {
+			return err
+		}
+		if isCloudStorageSink(parsedSink) {
+			details.Opts[optKeyInValue] = ``
+		}
+
+		// Feature telemetry
+		telemetrySink := parsedSink.Scheme
+		if telemetrySink == `` {
+			telemetrySink = `sinkless`
+		}
+		telemetry.Count(`changefeed.create.sink.` + telemetrySink)
+		telemetry.Count(`changefeed.create.format.` + details.Opts[optFormat])
+		telemetry.CountBucketed(`changefeed.create.num_tables`, int64(len(targets)))
+
 		if details.SinkURI == `` {
-			return distChangefeedFlow(ctx, p, 0 /* jobID */, details, progress, resultsCh)
+			err := distChangefeedFlow(ctx, p, 0 /* jobID */, details, progress, resultsCh)
+			return MaybeStripRetryableErrorMarker(err)
 		}
 
 		settings := p.ExecCfg().Settings
 		if err := utilccl.CheckEnterpriseEnabled(
 			settings, p.ExecCfg().ClusterID(), p.ExecCfg().Organization(), "CHANGEFEED",
 		); err != nil {
-			return err
-		}
-
-		if details, err = validateDetails(details); err != nil {
 			return err
 		}
 
@@ -231,12 +297,7 @@ func changefeedPlanHook(
 			nodeID := p.ExtendedEvalContext().NodeID
 			canarySink, err := getSink(details.SinkURI, nodeID, details.Opts, details.Targets, settings)
 			if err != nil {
-				// In this context, we don't want to retry even retryable errors from the
-				// sync. Unwrap any retryable errors encountered.
-				if rErr, ok := err.(*retryableSinkError); ok {
-					return rErr.cause
-				}
-				return err
+				return MaybeStripRetryableErrorMarker(err)
 			}
 			if err := canarySink.Close(); err != nil {
 				return err
@@ -276,17 +337,19 @@ func changefeedPlanHook(
 		}
 		return nil
 	}
-	return fn, header, nil, nil
+	return fn, header, nil, avoidBuffering, nil
 }
 
 func changefeedJobDescription(
-	changefeed *tree.CreateChangefeed, sinkURI string, opts map[string]string,
-) string {
+	p sql.PlanHookState, changefeed *tree.CreateChangefeed, sinkURI string, opts map[string]string,
+) (string, error) {
+	cleanedSinkURI, err := storageccl.SanitizeExportStorageURI(sinkURI)
+	if err != nil {
+		return "", err
+	}
 	c := &tree.CreateChangefeed{
 		Targets: changefeed.Targets,
-		// If/when we start accepting export storage uris (or ones with
-		// secrets), we'll need to sanitize sinkURI.
-		SinkURI: tree.NewDString(sinkURI),
+		SinkURI: tree.NewDString(cleanedSinkURI),
 	}
 	for k, v := range opts {
 		opt := tree.KVOption{Key: tree.Name(k)}
@@ -296,7 +359,8 @@ func changefeedJobDescription(
 		c.Options = append(c.Options, opt)
 	}
 	sort.Slice(c.Options, func(i, j int) bool { return c.Options[i].Key < c.Options[j].Key })
-	return tree.AsStringWithFlags(c, tree.FmtAlwaysQualifyTableNames)
+	ann := p.ExtendedEvalContext().Annotations
+	return tree.AsStringWithFQNames(c, ann), nil
 }
 
 func validateDetails(details jobspb.ChangefeedDetails) (jobspb.ChangefeedDetails, error) {
@@ -388,18 +452,34 @@ func validateChangefeedTable(
 	return nil
 }
 
-type changefeedResumer struct{}
+type changefeedResumer struct {
+	job *jobs.Job
+}
 
+// Resume is part of the jobs.Resumer interface.
 func (b *changefeedResumer) Resume(
-	ctx context.Context, job *jobs.Job, planHookState interface{}, startedCh chan<- tree.Datums,
+	ctx context.Context, planHookState interface{}, startedCh chan<- tree.Datums,
 ) error {
 	phs := planHookState.(sql.PlanHookState)
-	details := job.Details().(jobspb.ChangefeedDetails)
-	progress := job.Progress()
+	execCfg := phs.ExecCfg()
+	jobID := *b.job.ID()
+	details := b.job.Details().(jobspb.ChangefeedDetails)
+	progress := b.job.Progress()
 
-	// Errors encountered while emitting changes to the Sink may be transient; for
-	// example, a temporary network outage. When one of these errors occurs, we do
-	// not fail the job but rather restart the distSQL flow after a short backoff.
+	// TODO(dan): This is a workaround for not being able to set an initial
+	// progress high-water when creating a job (currently only the progress
+	// details can be set). I didn't want to pick off the refactor to get this
+	// fix in, but it'd be nice to remove this hack.
+	if _, ok := details.Opts[optCursor]; ok {
+		if h := progress.GetHighWater(); h == nil || *h == (hlc.Timestamp{}) {
+			progress.Progress = &jobspb.Progress_HighWater{HighWater: &details.StatementTime}
+		}
+	}
+
+	// We'd like to avoid failing a changefeed unnecessarily, so when an error
+	// bubbles up to this level, we'd like to "retry" the flow if possible. This
+	// could be because the sink is down or because a cockroach node has crashed
+	// or for many other reasons.
 	opts := retry.Options{
 		InitialBackoff: 5 * time.Millisecond,
 		Multiplier:     2,
@@ -407,66 +487,45 @@ func (b *changefeedResumer) Resume(
 	}
 	var err error
 	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
-		// TODO(dan): This is a workaround for not being able to set an initial
-		// progress high-water when creating a job (currently only the progress
-		// details can be set). I didn't want to pick off the refactor to get this
-		// fix in, but it'd be nice to remove this hack.
-		if _, ok := details.Opts[optCursor]; ok {
-			if h := progress.GetHighWater(); h == nil || *h == (hlc.Timestamp{}) {
-				progress.Progress = &jobspb.Progress_HighWater{HighWater: &details.StatementTime}
-			}
+		if err = distChangefeedFlow(ctx, phs, jobID, details, progress, startedCh); err == nil {
+			return nil
+		}
+		if !IsRetryableError(err) {
+			log.Warningf(ctx, `CHANGEFEED job %d returning with error: %+v`, jobID, err)
+			return err
 		}
 
-		err = distChangefeedFlow(ctx, phs, *job.ID(), details, progress, startedCh)
-		if !isRetryableSinkError(err) && !isRetryableRPCError(err) {
-			break
+		log.Warningf(ctx, `CHANGEFEED job %d encountered retryable error: %v`, jobID, err)
+		if metrics, ok := execCfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics); ok {
+			metrics.ErrorRetries.Inc(1)
 		}
-		log.Infof(ctx, `CHANGEFEED job %d encountered retryable error: %v`, *job.ID(), err)
 		// Re-load the job in order to update our progress object, which may have
 		// been updated by the changeFrontier processor since the flow started.
-		reloadedJob, phsErr := phs.ExecCfg().JobRegistry.LoadJob(ctx, *job.ID())
-		if phsErr != nil {
-			err = phsErr
-			break
+		reloadedJob, reloadErr := execCfg.JobRegistry.LoadJob(ctx, jobID)
+		if reloadErr != nil {
+			log.Warningf(ctx, `CHANGEFEED job %d could not reload job progress; `+
+				`continuing from last known high-water of %s: %v`,
+				jobID, progress.GetHighWater(), reloadErr)
+		} else {
+			progress = reloadedJob.Progress()
 		}
-		progress = reloadedJob.Progress()
+
 		// startedCh is normally used to signal back to the creator of the job that
 		// the job has started; however, in this case nothing will ever receive
 		// on the channel, causing the changefeed flow to block. Replace it with
 		// a dummy channel.
 		startedCh = make(chan tree.Datums, 1)
-		if metrics, ok := phs.ExecCfg().JobRegistry.MetricsStruct().Changefeed.(*Metrics); ok {
-			metrics.SinkErrorRetries.Inc(1)
-		}
-		continue
 	}
-	if err != nil {
-		log.Infof(ctx, `CHANGEFEED job %d returning with error: %v`, *job.ID(), err)
-	}
-	return err
+	// We only hit this if `r.Next()` returns false, which right now only happens
+	// on context cancellation.
+	return errors.Wrap(err, `ran out of retries`)
 }
 
-func (b *changefeedResumer) OnFailOrCancel(context.Context, *client.Txn, *jobs.Job) error { return nil }
-func (b *changefeedResumer) OnSuccess(context.Context, *client.Txn, *jobs.Job) error      { return nil }
-func (b *changefeedResumer) OnTerminal(
-	context.Context, *jobs.Job, jobs.Status, chan<- tree.Datums,
-) {
-}
+// OnFailOrCancel is part of the jobs.Resumer interface.
+func (b *changefeedResumer) OnFailOrCancel(context.Context, *client.Txn) error { return nil }
 
-func changefeedResumeHook(typ jobspb.Type, _ *cluster.Settings) jobs.Resumer {
-	if typ != jobspb.TypeChangefeed {
-		return nil
-	}
-	return &changefeedResumer{}
-}
+// OnSuccess is part of the jobs.Resumer interface.
+func (b *changefeedResumer) OnSuccess(context.Context, *client.Txn) error { return nil }
 
-// Retryable RPC Error represents a gRPC error which indicates a retryable
-// situation such as a connected node going down. In this case the DistSQL flow
-// should be retried.
-const retryableErrorStr = "rpc error|node unavailable"
-
-var retryableErrorRegex = regexp.MustCompile(retryableErrorStr)
-
-func isRetryableRPCError(err error) bool {
-	return retryableErrorRegex.MatchString(err.Error())
-}
+// OnTerminal is part of the jobs.Resumer interface.
+func (b *changefeedResumer) OnTerminal(context.Context, jobs.Status, chan<- tree.Datums) {}

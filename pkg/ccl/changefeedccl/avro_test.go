@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"strings"
 	"testing"
 	"time"
@@ -25,9 +26,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -74,9 +77,9 @@ func parseValues(tableDesc *sqlbase.TableDescriptor, values string) ([]sqlbase.E
 	for _, rowTuple := range valuesClause.Rows {
 		var row sqlbase.EncDatumRow
 		for colIdx, expr := range rowTuple {
-			col := tableDesc.Columns[colIdx]
+			col := &tableDesc.Columns[colIdx]
 			typedExpr, err := sqlbase.SanitizeVarFreeExpr(
-				expr, col.Type.ToDatumType(), "avro", semaCtx, false /* allowImpure */)
+				expr, &col.Type, "avro", semaCtx, false /* allowImpure */)
 			if err != nil {
 				return nil, err
 			}
@@ -84,7 +87,7 @@ func parseValues(tableDesc *sqlbase.TableDescriptor, values string) ([]sqlbase.E
 			if err != nil {
 				return nil, errors.Wrap(err, typedExpr.String())
 			}
-			row = append(row, sqlbase.DatumToEncDatum(col.Type, datum))
+			row = append(row, sqlbase.DatumToEncDatum(&col.Type, datum))
 		}
 		rows = append(rows, row)
 	}
@@ -126,6 +129,12 @@ func avroFieldMetadataToColDesc(metadata string) (*sqlbase.ColumnDescriptor, err
 	return col, err
 }
 
+// randTime generates a random time.Time whose .UnixNano result doesn't
+// overflow an int64.
+func randTime(rng *rand.Rand) time.Time {
+	return timeutil.Unix(0, rng.Int63())
+}
+
 func TestAvroSchema(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	rng, _ := randutil.NewPseudoRand()
@@ -153,49 +162,67 @@ func TestAvroSchema(t *testing.T) {
 		},
 	}
 	// Generate a test for each column type with a random datum of that type.
-	for semTypeID, semTypeName := range sqlbase.ColumnType_SemanticType_name {
-		typ := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_SemanticType(semTypeID)}
-		switch typ.SemanticType {
-		case sqlbase.ColumnType_NAME, sqlbase.ColumnType_OID, sqlbase.ColumnType_TUPLE:
+	for _, typ := range types.OidToType {
+		switch typ.Family() {
+		case types.AnyFamily, types.OidFamily, types.TupleFamily:
 			// These aren't expected to be needed for changefeeds.
 			continue
-		case sqlbase.ColumnType_INTERVAL, sqlbase.ColumnType_ARRAY, sqlbase.ColumnType_BIT,
-			sqlbase.ColumnType_COLLATEDSTRING:
+		case types.IntervalFamily, types.ArrayFamily, types.BitFamily,
+			types.CollatedStringFamily:
 			// Implement these as customer demand dictates.
 			continue
 		}
 		datum := sqlbase.RandDatum(rng, typ, false /* nullOk */)
 		if datum == tree.DNull {
-			// DNull is returned by RandDatum for ColumnType_NULL or if the
+			// DNull is returned by RandDatum for types.UNKNOWN or if the
 			// column type is unimplemented in RandDatum. In either case, the
 			// correct thing to do is skip this one.
 			continue
 		}
-		switch typ.SemanticType {
-		case sqlbase.ColumnType_TIMESTAMP:
+		switch typ.Family() {
+		case types.TimestampFamily:
 			// Truncate to millisecond instead of microsecond because of a bug
 			// in the avro lib's deserialization code. The serialization seems
 			// to be fine and we only use deserialization for testing, so we
 			// should patch the bug but it's not currently affecting changefeed
 			// correctness.
-			t := datum.(*tree.DTimestamp).Time.Truncate(time.Millisecond)
+			// TODO(mjibson): goavro mishandles timestamps
+			// whose nanosecond representation overflows an
+			// int64, so restrict input to fit.
+			t := randTime(rng).Truncate(time.Millisecond)
 			datum = tree.MakeDTimestamp(t, time.Microsecond)
-		case sqlbase.ColumnType_DECIMAL:
+		case types.TimestampTZFamily:
+			// See comments above for TimestampFamily.
+			t := randTime(rng).Truncate(time.Millisecond)
+			datum = tree.MakeDTimestampTZ(t, time.Microsecond)
+		case types.DecimalFamily:
 			// TODO(dan): Make RandDatum respect Precision and Width instead.
 			// TODO(dan): The precision is really meant to be in [1,10], but it
 			// sure looks like there's an off by one error in the avro library
 			// that makes this test flake if it picks precision of 1.
-			typ.Precision = rng.Int31n(10) + 2
-			typ.Width = rng.Int31n(typ.Precision + 1)
-			coeff := rng.Int63n(int64(math.Pow10(int(typ.Precision))))
-			datum = &tree.DDecimal{Decimal: *apd.New(coeff, -typ.Width)}
+			precision := rng.Int31n(10) + 2
+			scale := rng.Int31n(precision + 1)
+			typ = types.MakeDecimal(precision, scale)
+			coeff := rng.Int63n(int64(math.Pow10(int(precision))))
+			datum = &tree.DDecimal{Decimal: *apd.New(coeff, -scale)}
+		case types.DateFamily:
+			// TODO(mjibson): goavro mishandles dates whose
+			// nanosecond representation overflows an int64,
+			// so restrict input to fit.
+			var err error
+			datum, err = tree.NewDDateFromTime(randTime(rng))
+			if err != nil {
+				panic(err)
+			}
 		}
 		serializedDatum := tree.Serialize(datum)
+		// name can be "char" (with quotes), so needs to be escaped.
+		escapedName := fmt.Sprintf("%s_table", strings.Replace(typ.String(), "\"", "", -1))
 		// schema is used in a fmt.Sprintf to fill in the table name, so we have
 		// to escape any stray %s.
 		escapedDatum := strings.Replace(serializedDatum, `%`, `%%`, -1)
 		randTypeTest := test{
-			name:   semTypeName,
+			name:   escapedName,
 			schema: fmt.Sprintf(`(a INT PRIMARY KEY, b %s)`, typ.SQLString()),
 			values: fmt.Sprintf(`(1, %s)`, escapedDatum),
 		}
@@ -266,7 +293,7 @@ func TestAvroSchema(t *testing.T) {
 			`DATE`:         `["null",{"type":"int","logicalType":"date"}]`,
 			`FLOAT8`:       `["null","double"]`,
 			`INET`:         `["null","string"]`,
-			`INT`:          `["null","long"]`,
+			`INT8`:         `["null","long"]`,
 			`JSONB`:        `["null","string"]`,
 			`STRING`:       `["null","string"]`,
 			`TIME`:         `["null",{"type":"long","logicalType":"time-micros"}]`,
@@ -276,17 +303,12 @@ func TestAvroSchema(t *testing.T) {
 			`DECIMAL(3,2)`: `["null",{"type":"bytes","logicalType":"decimal","precision":3,"scale":2}]`,
 		}
 
-		for semTypeID := range sqlbase.ColumnType_SemanticType_name {
-			typ := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_SemanticType(semTypeID)}
-			switch typ.SemanticType {
-			case sqlbase.ColumnType_INTERVAL, sqlbase.ColumnType_NAME, sqlbase.ColumnType_OID,
-				sqlbase.ColumnType_ARRAY, sqlbase.ColumnType_BIT, sqlbase.ColumnType_TUPLE,
-				sqlbase.ColumnType_COLLATEDSTRING, sqlbase.ColumnType_INT2VECTOR,
-				sqlbase.ColumnType_OIDVECTOR, sqlbase.ColumnType_NULL:
+		for _, typ := range types.Scalar {
+			switch typ.Family() {
+			case types.IntervalFamily, types.OidFamily, types.BitFamily:
 				continue
-			case sqlbase.ColumnType_DECIMAL:
-				typ.Precision = 3
-				typ.Width = 2
+			case types.DecimalFamily:
+				typ = types.MakeDecimal(3, 2)
 			}
 
 			colType := typ.SQLString()
@@ -499,7 +521,6 @@ func TestAvroMigration(t *testing.T) {
 			readerSchema:   `(a INT PRIMARY KEY, b INT)`,
 			expectedValues: `(1, NULL)`,
 		},
-		// TODO(dan): add a column with a default value
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

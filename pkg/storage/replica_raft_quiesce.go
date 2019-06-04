@@ -80,7 +80,7 @@ func (r *Replica) unquiesceWithOptionsLocked(campaignOnWake bool) {
 		}
 		// NB: we know there's a non-nil RaftStatus because internalRaftGroup isn't nil.
 		r.mu.lastUpdateTimes.updateOnUnquiesce(
-			r.mu.state.Desc.Replicas, r.raftStatusRLocked().Progress, timeutil.Now(),
+			r.mu.state.Desc.Replicas().Unwrap(), r.raftStatusRLocked().Progress, timeutil.Now(),
 		)
 	}
 }
@@ -97,7 +97,8 @@ func (r *Replica) unquiesceAndWakeLeaderLocked() {
 		r.store.unquiescedReplicas.Unlock()
 		r.maybeCampaignOnWakeLocked(ctx)
 		// Propose an empty command which will wake the leader.
-		_ = r.mu.internalRaftGroup.Propose(encodeRaftCommandV1(makeIDKey(), nil))
+		data := encodeRaftCommand(raftVersionStandard, makeIDKey(), nil)
+		_ = r.mu.internalRaftGroup.Propose(data)
 	}
 }
 
@@ -257,7 +258,7 @@ func shouldReplicaQuiesce(
 	}
 
 	var foundSelf bool
-	for _, rep := range q.descRLocked().Replicas {
+	for _, rep := range q.descRLocked().Replicas().Unwrap() {
 		if uint64(rep.ReplicaID) == status.ID {
 			foundSelf = true
 		}

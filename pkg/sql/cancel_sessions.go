@@ -21,8 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 type cancelSessionsNode struct {
@@ -31,16 +30,18 @@ type cancelSessionsNode struct {
 }
 
 func (p *planner) CancelSessions(ctx context.Context, n *tree.CancelSessions) (planNode, error) {
-	rows, err := p.newPlan(ctx, n.Sessions, []types.T{types.String})
+	rows, err := p.newPlan(ctx, n.Sessions, []*types.T{types.String})
 	if err != nil {
 		return nil, err
 	}
 	cols := planColumns(rows)
 	if len(cols) != 1 {
-		return nil, errors.Errorf("CANCEL SESSIONS expects a single column source, got %d columns", len(cols))
+		return nil, pgerror.Newf(pgerror.CodeSyntaxError,
+			"CANCEL SESSIONS expects a single column source, got %d columns", len(cols))
 	}
-	if !cols[0].Typ.Equivalent(types.String) {
-		return nil, errors.Errorf("CANCEL SESSIONS requires string values, not type %s", cols[0].Typ)
+	if cols[0].Typ.Family() != types.StringFamily {
+		return nil, pgerror.Newf(pgerror.CodeDatatypeMismatchError,
+			"CANCEL SESSIONS requires string values, not type %s", cols[0].Typ)
 	}
 
 	return &cancelSessionsNode{
@@ -70,12 +71,12 @@ func (n *cancelSessionsNode) Next(params runParams) (bool, error) {
 	statusServer := params.extendedEvalCtx.StatusServer
 	sessionIDString, ok := tree.AsDString(datum)
 	if !ok {
-		return false, pgerror.NewAssertionErrorf("%q: expected *DString, found %T", datum, datum)
+		return false, pgerror.AssertionFailedf("%q: expected *DString, found %T", datum, datum)
 	}
 
 	sessionID, err := StringToClusterWideID(string(sessionIDString))
 	if err != nil {
-		return false, errors.Wrapf(err, "invalid session ID %s", datum)
+		return false, pgerror.Wrapf(err, pgerror.CodeSyntaxError, "invalid session ID %s", datum)
 	}
 
 	// Get the lowest 32 bits of the session ID.
@@ -93,7 +94,8 @@ func (n *cancelSessionsNode) Next(params runParams) (bool, error) {
 	}
 
 	if !response.Canceled && !n.ifExists {
-		return false, fmt.Errorf("could not cancel session %s: %s", sessionID, response.Error)
+		return false, pgerror.Newf(pgerror.CodeDataExceptionError,
+			"could not cancel session %s: %s", sessionID, response.Error)
 	}
 
 	return true, nil

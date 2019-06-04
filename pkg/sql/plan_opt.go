@@ -16,19 +16,18 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
 )
 
 var queryCacheEnabled = settings.RegisterBoolSetting(
@@ -50,12 +49,9 @@ func (p *planner) prepareUsingOptimizer(
 	ctx context.Context,
 ) (_ planFlags, isCorrelated bool, _ error) {
 	stmt := p.stmt
-	if err := checkOptSupportForTopStatement(stmt.AST); err != nil {
-		return 0, false, err
-	}
 
-	var opc optPlanningCtx
-	opc.init(p, stmt.AST)
+	opc := &p.optPlanningCtx
+	opc.reset()
 
 	if opc.useCache {
 		cachedData, ok := p.execCfg.QueryCache.Find(&p.queryCacheSession, stmt.SQL)
@@ -76,7 +72,8 @@ func (p *planner) prepareUsingOptimizer(
 					stmt.Prepared.Columns = pm.Columns
 					stmt.Prepared.Types = pm.Types
 					stmt.Prepared.Memo = cachedData.Memo
-					return opc.flags, false, nil
+					stmt.Prepared.IsCorrelated = cachedData.IsCorrelated
+					return opc.flags, cachedData.IsCorrelated, nil
 				}
 				opc.log(ctx, "query cache hit but memo is stale (prepare)")
 			}
@@ -102,19 +99,20 @@ func (p *planner) prepareUsingOptimizer(
 		resultCols[i].Name = col.Alias
 		resultCols[i].Typ = md.ColumnMeta(col.ID).Type
 		if err := checkResultType(resultCols[i].Typ); err != nil {
-			return 0, false, err
+			return 0, isCorrelated, err
 		}
 	}
 
 	// Verify that all placeholder types have been set.
 	if err := p.semaCtx.Placeholders.Types.AssertAllSet(); err != nil {
-		return 0, false, err
+		return 0, isCorrelated, err
 	}
 
 	stmt.Prepared.Columns = resultCols
 	stmt.Prepared.Types = p.semaCtx.Placeholders.Types
 	if opc.allowMemoReuse {
 		stmt.Prepared.Memo = memo
+		stmt.Prepared.IsCorrelated = isCorrelated
 		if opc.useCache {
 			// execPrepare sets the PrepareMetadata.InferredTypes field after this
 			// point. However, once the PrepareMetadata goes into the cache, it
@@ -127,11 +125,12 @@ func (p *planner) prepareUsingOptimizer(
 				SQL:             stmt.SQL,
 				Memo:            memo,
 				PrepareMetadata: &pm,
+				IsCorrelated:    isCorrelated,
 			}
 			p.execCfg.QueryCache.Add(&p.queryCacheSession, &cachedData)
 		}
 	}
-	return opc.flags, false, nil
+	return opc.flags, isCorrelated, nil
 }
 
 // makeOptimizerPlan is an alternative to makePlan which uses the cost-based
@@ -141,12 +140,9 @@ func (p *planner) prepareUsingOptimizer(
 // used in the fallback case to create a better error.
 func (p *planner) makeOptimizerPlan(ctx context.Context) (_ *planTop, isCorrelated bool, _ error) {
 	stmt := p.stmt
-	if err := checkOptSupportForTopStatement(stmt.AST); err != nil {
-		return nil, false, err
-	}
 
-	var opc optPlanningCtx
-	opc.init(p, stmt.AST)
+	opc := &p.optPlanningCtx
+	opc.reset()
 
 	execMemo, isCorrelated, err := opc.buildExecMemo(ctx)
 	if err != nil {
@@ -158,7 +154,7 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) (_ *planTop, isCorrelat
 	execFactory := makeExecFactory(p)
 	plan, err := execbuilder.New(&execFactory, execMemo, root, p.EvalContext()).Build()
 	if err != nil {
-		return nil, false, err
+		return nil, isCorrelated, err
 	}
 
 	result := plan.(*planTop)
@@ -168,33 +164,25 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) (_ *planTop, isCorrelat
 	cols := planColumns(result.plan)
 	if stmt.ExpectedTypes != nil {
 		if !stmt.ExpectedTypes.TypesEqual(cols) {
-			return nil, false, pgerror.NewError(
+			return nil, false, pgerror.New(
 				pgerror.CodeFeatureNotSupportedError, "cached plan must not change result type",
 			)
 		}
 	}
 
-	return result, false, nil
-}
-
-func checkOptSupportForTopStatement(AST tree.Statement) error {
-	// Start with fast check to see if top-level statement is supported.
-	switch AST.(type) {
-	case *tree.ParenSelect, *tree.Select, *tree.SelectClause,
-		*tree.UnionClause, *tree.ValuesClause, *tree.Explain,
-		*tree.Insert, *tree.Update, *tree.Delete, *tree.CreateTable,
-		*tree.CannedOptPlan:
-		return nil
-
-	default:
-		return pgerror.Unimplemented("statement", fmt.Sprintf("unsupported statement: %T", AST))
-	}
+	return result, isCorrelated, nil
 }
 
 type optPlanningCtx struct {
 	p *planner
 
+	// catalog is initialized once, and reset for each query. This allows the
+	// catalog objects to be reused across queries in the same session.
 	catalog optCatalog
+
+	// -- Fields below are reinitialized for each query ---
+
+	optimizer xform.Optimizer
 
 	// When set, we are allowed to reuse a memo, or store a memo for later reuse.
 	allowMemoReuse bool
@@ -206,17 +194,25 @@ type optPlanningCtx struct {
 	flags planFlags
 }
 
-func (opc *optPlanningCtx) init(p *planner, AST tree.Statement) {
+// init performs one-time initialization of the planning context; reset() must
+// also be called before each use.
+func (opc *optPlanningCtx) init(p *planner) {
 	opc.p = p
-	opc.catalog.init(p.execCfg.TableStatsCache, p)
-	p.optimizer.Init(p.EvalContext())
+	opc.catalog.init(p)
+}
+
+// reset initializes the planning context for the statement in the planner.
+func (opc *optPlanningCtx) reset() {
+	p := opc.p
+	opc.catalog.reset()
+	opc.optimizer.Init(p.EvalContext())
 	opc.flags = planFlagOptUsed
 
 	// We only allow memo caching for SELECT/INSERT/UPDATE/DELETE. We could
 	// support it for all statements in principle, but it would increase the
 	// surface of potential issues (conditions we need to detect to invalidate a
 	// cached memo).
-	switch AST.(type) {
+	switch p.stmt.AST.(type) {
 	case *tree.ParenSelect, *tree.Select, *tree.SelectClause, *tree.UnionClause, *tree.ValuesClause,
 		*tree.Insert, *tree.Update, *tree.Delete, *tree.CannedOptPlan:
 		// If the current transaction has uncommitted DDL statements, we cannot rely
@@ -228,7 +224,7 @@ func (opc *optPlanningCtx) init(p *planner, AST tree.Statement) {
 		opc.allowMemoReuse = !p.Tables().hasUncommittedTables()
 		opc.useCache = opc.allowMemoReuse && queryCacheEnabled.Get(&p.execCfg.Settings.SV)
 
-		if _, isCanned := AST.(*tree.CannedOptPlan); isCanned {
+		if _, isCanned := p.stmt.AST.(*tree.CannedOptPlan); isCanned {
 			// It's unsafe to use the cache, since PREPARE AS OPT PLAN doesn't track
 			// dependencies and check permissions.
 			opc.useCache = false
@@ -263,16 +259,22 @@ func (opc *optPlanningCtx) buildReusableMemo(
 	_, isCanned := opc.p.stmt.AST.(*tree.CannedOptPlan)
 	if isCanned {
 		if !p.EvalContext().SessionData.AllowPrepareAsOptPlan {
-			return nil, false, errors.Errorf(
+			return nil, false, pgerror.New(pgerror.CodeInsufficientPrivilegeError,
 				"PREPARE AS OPT PLAN is a testing facility that should not be used directly",
 			)
 		}
 
 		if p.SessionData().User != security.RootUser {
-			return nil, false, errors.Errorf(
+			return nil, false, pgerror.New(pgerror.CodeInsufficientPrivilegeError,
 				"PREPARE AS OPT PLAN may only be used by root",
 			)
 		}
+	}
+
+	if p.SessionData().SaveTablesPrefix != "" && p.SessionData().User != security.RootUser {
+		return nil, false, pgerror.New(pgerror.CodeInsufficientPrivilegeError,
+			"sub-expression tables creation may only be used by root",
+		)
 	}
 
 	// Build the Memo (optbuild) and apply normalization rules to it. If the
@@ -281,11 +283,16 @@ func (opc *optPlanningCtx) buildReusableMemo(
 	// contain placeholders, then also apply exploration rules to the Memo so
 	// that there's even less to do during the EXECUTE phase.
 	//
-	f := p.optimizer.Factory()
+	f := opc.optimizer.Factory()
 	bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), &opc.catalog, f, opc.p.stmt.AST)
 	bld.KeepPlaceholders = true
 	if err := bld.Build(); err != nil {
 		return nil, bld.IsCorrelated, err
+	}
+
+	if bld.DisableMemoReuse {
+		opc.allowMemoReuse = false
+		opc.useCache = false
 	}
 
 	if isCanned {
@@ -293,21 +300,24 @@ func (opc *optPlanningCtx) buildReusableMemo(
 			// We don't support placeholders inside the canned plan. The main reason
 			// is that they would be invisible to the parser (which is reports the
 			// number of placeholders, used to initialize the relevant structures).
-			return nil, false, errors.Errorf("placeholders are not supported with PREPARE AS OPT PLAN")
+			return nil, false, pgerror.Newf(pgerror.CodeSyntaxError,
+				"placeholders are not supported with PREPARE AS OPT PLAN")
 		}
 		// With a canned plan, the memo is already optimized.
 	} else {
 		// If the memo doesn't have placeholders, then fully optimize it, since
 		// it can be reused without further changes to build the execution tree.
 		if !f.Memo().HasPlaceholders() {
-			p.optimizer.Optimize()
+			if _, err := opc.optimizer.Optimize(); err != nil {
+				return nil, bld.IsCorrelated, err
+			}
 		}
 	}
 
 	// Detach the prepared memo from the factory and transfer its ownership
 	// to the prepared statement. DetachMemo will re-initialize the optimizer
 	// to an empty memo.
-	return p.optimizer.DetachMemo(), false, nil
+	return opc.optimizer.DetachMemo(), false, nil
 }
 
 // reuseMemo returns an optimized memo using a cached memo as a starting point.
@@ -323,7 +333,7 @@ func (opc *optPlanningCtx) reuseMemo(cachedMemo *memo.Memo) (*memo.Memo, error) 
 		// (see buildReusableMemo).
 		return cachedMemo, nil
 	}
-	f := opc.p.optimizer.Factory()
+	f := opc.optimizer.Factory()
 	// Finish optimization by assigning any remaining placeholders and
 	// applying exploration rules. Reinitialize the optimizer and construct a
 	// new memo that is copied from the prepared memo, but with placeholders
@@ -331,7 +341,9 @@ func (opc *optPlanningCtx) reuseMemo(cachedMemo *memo.Memo) (*memo.Memo, error) 
 	if err := f.AssignPlaceholders(cachedMemo); err != nil {
 		return nil, err
 	}
-	opc.p.optimizer.Optimize()
+	if _, err := opc.optimizer.Optimize(); err != nil {
+		return nil, err
+	}
 	return f.Memo(), nil
 }
 
@@ -398,20 +410,22 @@ func (opc *optPlanningCtx) buildExecMemo(
 
 	// We are executing a statement for which there is no reusable memo
 	// available.
-	f := opc.p.optimizer.Factory()
+	f := opc.optimizer.Factory()
 	bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), &opc.catalog, f, opc.p.stmt.AST)
 	if err := bld.Build(); err != nil {
 		return nil, bld.IsCorrelated, err
 	}
 	if _, isCanned := opc.p.stmt.AST.(*tree.CannedOptPlan); !isCanned {
-		p.optimizer.Optimize()
+		if _, err := opc.optimizer.Optimize(); err != nil {
+			return nil, bld.IsCorrelated, err
+		}
 	}
 
 	// If this statement doesn't have placeholders, add it to the cache. Note
 	// that non-prepared statements from pgwire clients cannot have
 	// placeholders.
-	if opc.useCache && !bld.HadPlaceholders {
-		memo := p.optimizer.DetachMemo()
+	if opc.useCache && !bld.HadPlaceholders && !bld.DisableMemoReuse {
+		memo := opc.optimizer.DetachMemo()
 		cachedData := querycache.CachedData{
 			SQL:  opc.p.stmt.SQL,
 			Memo: memo,

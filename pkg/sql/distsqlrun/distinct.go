@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -34,7 +35,7 @@ type Distinct struct {
 	ProcessorBase
 
 	input            RowSource
-	types            []sqlbase.ColumnType
+	types            []types.T
 	haveLastGroupKey bool
 	lastGroupKey     sqlbase.EncDatumRow
 	arena            stringarena.Arena
@@ -72,7 +73,7 @@ func NewDistinct(
 	output RowReceiver,
 ) (RowSourcedProcessor, error) {
 	if len(spec.DistinctColumns) == 0 {
-		return nil, pgerror.NewAssertionErrorf("0 distinct columns specified for distinct processor")
+		return nil, pgerror.AssertionFailedf("0 distinct columns specified for distinct processor")
 	}
 
 	var distinctCols, orderedCols util.FastIntSet
@@ -88,7 +89,7 @@ func NewDistinct(
 		distinctCols.Add(int(col))
 	}
 	if !orderedCols.SubsetOf(distinctCols) {
-		return nil, pgerror.NewAssertionErrorf("ordered cols must be a subset of distinct cols")
+		return nil, pgerror.AssertionFailedf("ordered cols must be a subset of distinct cols")
 	}
 
 	ctx := flowCtx.EvalCtx.Ctx()
@@ -118,7 +119,7 @@ func NewDistinct(
 		d, post, d.types, flowCtx, processorID, output, memMonitor, /* memMonitor */
 		ProcStateOpts{
 			InputsToDrain: []RowSource{d.input},
-			TrailingMetaCallback: func(context.Context) []ProducerMetadata {
+			TrailingMetaCallback: func(context.Context) []distsqlpb.ProducerMetadata {
 				d.close()
 				return nil
 			},
@@ -198,7 +199,7 @@ func (d *Distinct) close() {
 }
 
 // Next is part of the RowSource interface.
-func (d *Distinct) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (d *Distinct) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	for d.State == StateRunning {
 		row, meta := d.input.Next()
 		if meta != nil {
@@ -245,17 +246,15 @@ func (d *Distinct) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 			d.seen = make(map[string]struct{})
 		}
 
-		if len(encoding) > 0 {
-			if _, ok := d.seen[string(encoding)]; ok {
-				continue
-			}
-			s, err := d.arena.AllocBytes(d.Ctx, encoding)
-			if err != nil {
-				d.MoveToDraining(err)
-				break
-			}
-			d.seen[s] = struct{}{}
+		if _, ok := d.seen[string(encoding)]; ok {
+			continue
 		}
+		s, err := d.arena.AllocBytes(d.Ctx, encoding)
+		if err != nil {
+			d.MoveToDraining(err)
+			break
+		}
+		d.seen[s] = struct{}{}
 
 		if outRow := d.ProcessRowHelper(row); outRow != nil {
 			return outRow, nil
@@ -268,7 +267,7 @@ func (d *Distinct) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 //
 // sortedDistinct is simpler than distinct. All it has to do is keep track
 // of the last row it saw, emitting if the new row is different.
-func (d *SortedDistinct) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (d *SortedDistinct) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	for d.State == StateRunning {
 		row, meta := d.input.Next()
 		if meta != nil {

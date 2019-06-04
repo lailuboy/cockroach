@@ -9,7 +9,6 @@
 package importccl
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"sort"
@@ -25,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/bulk"
 	"github.com/cockroachdb/cockroach/pkg/storage/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
@@ -35,12 +35,12 @@ import (
 	"github.com/pkg/errors"
 )
 
-var sstOutputTypes = []sqlbase.ColumnType{
-	{SemanticType: sqlbase.ColumnType_STRING},
-	{SemanticType: sqlbase.ColumnType_BYTES},
-	{SemanticType: sqlbase.ColumnType_BYTES},
-	{SemanticType: sqlbase.ColumnType_BYTES},
-	{SemanticType: sqlbase.ColumnType_BYTES},
+var sstOutputTypes = []types.T{
+	*types.String,
+	*types.Bytes,
+	*types.Bytes,
+	*types.Bytes,
+	*types.Bytes,
 }
 
 func newSSTWriterProcessor(
@@ -65,6 +65,10 @@ func newSSTWriterProcessor(
 	if err := sp.out.Init(&distsqlpb.PostProcessSpec{}, sstOutputTypes, flowCtx.NewEvalCtx(), output); err != nil {
 		return nil, err
 	}
+	if sp.spec.Destination != "" {
+		return nil, errors.Errorf("writing external sst is not supported")
+	}
+
 	return sp, nil
 }
 
@@ -84,7 +88,7 @@ type sstWriter struct {
 
 var _ distsqlrun.Processor = &sstWriter{}
 
-func (sp *sstWriter) OutputTypes() []sqlbase.ColumnType {
+func (sp *sstWriter) OutputTypes() []types.T {
 	return sstOutputTypes
 }
 
@@ -103,7 +107,7 @@ func (sp *sstWriter) Run(ctx context.Context) {
 
 		// Sort incoming KVs, which will be from multiple spans, into a single
 		// RocksDB instance.
-		types := sp.input.OutputTypes()
+		typs := sp.input.OutputTypes()
 		input := distsqlrun.MakeNoMetadataRowSource(sp.input, sp.output)
 		alloc := &sqlbase.DatumAlloc{}
 		store := sp.tempStorage.NewSortedDiskMultiMap()
@@ -122,7 +126,7 @@ func (sp *sstWriter) Run(ctx context.Context) {
 				return errors.Errorf("expected 2 datums, got %d", len(row))
 			}
 			for i, ed := range row {
-				if err := ed.EnsureDecoded(&types[i], alloc); err != nil {
+				if err := ed.EnsureDecoded(&typs[i], alloc); err != nil {
 					return err
 				}
 				datum := ed.Datum.(*tree.DBytes)
@@ -172,44 +176,33 @@ func (sp *sstWriter) Run(ctx context.Context) {
 						end = sst.span.EndKey
 					}
 
-					if sp.spec.Destination == "" {
-						if err := sp.db.AdminSplit(ctx, end, end); err != nil {
-							return err
-						}
+					if err := sp.db.AdminSplit(ctx, end, end, false /* manual */); err != nil {
+						return err
+					}
 
-						log.VEventf(ctx, 1, "scattering key %s", roachpb.PrettyPrintKey(nil, end))
-						scatterReq := &roachpb.AdminScatterRequest{
-							RequestHeader: roachpb.RequestHeaderFromSpan(sst.span),
-						}
-						if _, pErr := client.SendWrapped(ctx, sp.db.NonTransactionalSender(), scatterReq); pErr != nil {
-							// TODO(dan): Unfortunately, Scatter is still too unreliable to
-							// fail the IMPORT when Scatter fails. I'm uncomfortable that
-							// this could break entirely and not start failing the tests,
-							// but on the bright side, it doesn't affect correctness, only
-							// throughput.
-							log.Errorf(ctx, "failed to scatter span %s: %s", roachpb.PrettyPrintKey(nil, end), pErr)
-						}
-						if err := bulk.AddSSTable(ctx, sp.db, sst.span.Key, sst.span.EndKey, sst.data); err != nil {
-							return err
-						}
-					} else {
-						checksum, err = storageccl.SHA512ChecksumData(sst.data)
-						if err != nil {
-							return err
-						}
-						conf, err := storageccl.ExportStorageConfFromURI(sp.spec.Destination)
-						if err != nil {
-							return err
-						}
-						es, err := storageccl.MakeExportStorage(ctx, conf, sp.settings)
-						if err != nil {
-							return err
-						}
-						err = es.WriteFile(ctx, name, bytes.NewReader(sst.data))
-						es.Close()
-						if err != nil {
-							return err
-						}
+					log.VEventf(ctx, 1, "scattering key %s", roachpb.PrettyPrintKey(nil, end))
+					scatterReq := &roachpb.AdminScatterRequest{
+						RequestHeader: roachpb.RequestHeaderFromSpan(sst.span),
+						// TODO(dan): This is a bit of a hack, but it seems to be an
+						// effective one (see the PR that added it for graphs). As of the
+						// commit that added this, scatter is not very good at actually
+						// balancing leases. This is likely for two reasons: 1) there's
+						// almost certainly some regression in scatter's behavior, it used
+						// to work much better and 2) scatter has to operate by balancing
+						// leases for all ranges in a cluster, but in IMPORT, we really
+						// just want it to be balancing the span being imported into.
+						RandomizeLeases: true,
+					}
+					if _, pErr := client.SendWrapped(ctx, sp.db.NonTransactionalSender(), scatterReq); pErr != nil {
+						// TODO(dan): Unfortunately, Scatter is still too unreliable to
+						// fail the IMPORT when Scatter fails. I'm uncomfortable that
+						// this could break entirely and not start failing the tests,
+						// but on the bright side, it doesn't affect correctness, only
+						// throughput.
+						log.Errorf(ctx, "failed to scatter span %s: %s", roachpb.PrettyPrintKey(nil, end), pErr)
+					}
+					if err := bulk.AddSSTable(ctx, sp.db, sst.span.Key, sst.span.EndKey, sst.data); err != nil {
+						return err
 					}
 
 					countsBytes, err := protoutil.Marshal(&sst.counts)
@@ -219,23 +212,23 @@ func (sp *sstWriter) Run(ctx context.Context) {
 
 					row := sqlbase.EncDatumRow{
 						sqlbase.DatumToEncDatum(
-							sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_STRING},
+							types.String,
 							tree.NewDString(name),
 						),
 						sqlbase.DatumToEncDatum(
-							sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BYTES},
+							types.Bytes,
 							tree.NewDBytes(tree.DBytes(countsBytes)),
 						),
 						sqlbase.DatumToEncDatum(
-							sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BYTES},
+							types.Bytes,
 							tree.NewDBytes(tree.DBytes(checksum)),
 						),
 						sqlbase.DatumToEncDatum(
-							sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BYTES},
+							types.Bytes,
 							tree.NewDBytes(tree.DBytes(sst.span.Key)),
 						),
 						sqlbase.DatumToEncDatum(
-							sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BYTES},
+							types.Bytes,
 							tree.NewDBytes(tree.DBytes(end)),
 						),
 					}

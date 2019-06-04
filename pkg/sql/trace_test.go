@@ -71,6 +71,7 @@ func TestTrace(t *testing.T) {
 						"WHERE operation IS NOT NULL ORDER BY op")
 			},
 			expSpans: []string{
+				"exec cmd: exec stmt",
 				"flow",
 				"session recording",
 				"sql txn",
@@ -125,6 +126,7 @@ func TestTrace(t *testing.T) {
 			expSpans: []string{
 				"session recording",
 				"sql txn",
+				"exec cmd: exec stmt",
 				"flow",
 				"table reader",
 				"consuming rows",
@@ -135,7 +137,7 @@ func TestTrace(t *testing.T) {
 			// Depending on whether the data is local or not, we may not see these
 			// spans.
 			optionalSpans: []string{
-				"/cockroach.sql.distsqlpb.DistSQL/SetupFlow",
+				"/cockroach.sql.distsqlrun.DistSQL/SetupFlow",
 				"noop",
 			},
 		},
@@ -159,6 +161,7 @@ func TestTrace(t *testing.T) {
 						"WHERE operation IS NOT NULL ORDER BY op")
 			},
 			expSpans: []string{
+				"exec cmd: exec stmt",
 				"flow",
 				"session recording",
 				"sql txn",
@@ -191,6 +194,7 @@ func TestTrace(t *testing.T) {
 			expSpans: []string{
 				"session recording",
 				"sql txn",
+				"exec cmd: exec stmt",
 				"flow",
 				"table reader",
 				"consuming rows",
@@ -201,32 +205,8 @@ func TestTrace(t *testing.T) {
 			// Depending on whether the data is local or not, we may not see these
 			// spans.
 			optionalSpans: []string{
-				"/cockroach.sql.distsqlpb.DistSQL/SetupFlow",
+				"/cockroach.sql.distsqlrun.DistSQL/SetupFlow",
 				"noop",
-			},
-		},
-		{
-			name: "ShowTraceForSplitBatch",
-			getRows: func(_ *testing.T, sqlDB *gosql.DB) (*gosql.Rows, error) {
-				if _, err := sqlDB.Exec("SET distsql = off"); err != nil {
-					t.Fatal(err)
-				}
-
-				// Deleting from a multi-range table will result in a 2PC transaction
-				// and will split the underlying BatchRequest/BatchResponse. Tracing
-				// in the presence of multi-part batches is what we want to test here.
-				if _, err := sqlDB.Exec("SET tracing = on; DELETE FROM test.bar; SET tracing = off"); err != nil {
-					t.Fatal(err)
-				}
-
-				return sqlDB.Query(
-					"SELECT DISTINCT operation AS op FROM [SHOW TRACE FOR SESSION] " +
-						"WHERE message LIKE '%1 DelRng%' ORDER BY op")
-			},
-			expSpans: []string{
-				"dist sender send",
-				"kv.DistSender: sending partial batch",
-				"/cockroach.roachpb.Internal/Batch",
 			},
 		},
 	}
@@ -239,9 +219,6 @@ func TestTrace(t *testing.T) {
 	clusterDB := cluster.ServerConn(0)
 	if _, err := clusterDB.Exec(`
 		CREATE DATABASE test;
-
-		-- Prevent the merge queue from immediately discarding our splits.
-		SET CLUSTER SETTING kv.range_merge.queue_enabled = false;
 
 		--- test.foo is a single range table.
 		CREATE TABLE test.foo (id INT PRIMARY KEY);
@@ -377,7 +354,7 @@ func TestTraceFieldDecomposition(t *testing.T) {
 	params := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			SQLExecutor: &sql.ExecutorTestingKnobs{
-				BeforeExecute: func(ctx context.Context, stmt string, isParallel bool) {
+				BeforeExecute: func(ctx context.Context, stmt string) {
 					if strings.Contains(stmt, query) {
 						// We need to check a tag containing brackets (e.g. an
 						// IPv6 address).  See #18558.

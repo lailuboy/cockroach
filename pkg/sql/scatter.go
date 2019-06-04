@@ -22,8 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/pkg/errors"
 )
 
@@ -37,7 +37,7 @@ type scatterNode struct {
 // (`ALTER TABLE/INDEX ... SCATTER ...` statement)
 // Privileges: INSERT on table.
 func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error) {
-	tableDesc, index, err := p.getTableAndIndex(ctx, n.Table, n.Index, privilege.INSERT)
+	tableDesc, index, err := p.getTableAndIndex(ctx, &n.TableOrIndex, privilege.INSERT)
 	if err != nil {
 		return nil, err
 	}
@@ -61,13 +61,13 @@ func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error
 		// Calculate the desired types for the select statement:
 		//  - column values; it is OK if the select statement returns fewer columns
 		//  (the relevant prefix is used).
-		desiredTypes := make([]types.T, len(index.ColumnIDs))
+		desiredTypes := make([]*types.T, len(index.ColumnIDs))
 		for i, colID := range index.ColumnIDs {
 			c, err := tableDesc.FindColumnByID(colID)
 			if err != nil {
 				return nil, err
 			}
-			desiredTypes[i] = c.Type.ToDatumType()
+			desiredTypes[i] = &c.Type
 		}
 		fromVals := make([]tree.Datum, len(n.From))
 		for i, expr := range n.From {

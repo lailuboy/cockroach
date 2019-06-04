@@ -3,10 +3,6 @@
 statement ok
 CREATE TABLE data (a INT, b INT, c FLOAT, d DECIMAL, PRIMARY KEY (a, b, c, d))
 
-# Prevent the merge queue from immediately discarding our splits.
-statement ok
-SET CLUSTER SETTING kv.range_merge.queue_enabled = false;
-
 # Split into ten parts.
 statement ok
 ALTER TABLE data SPLIT AT SELECT i FROM generate_series(1, 9) AS g(i)
@@ -568,3 +564,19 @@ query R
 SELECT sum(a) FROM data WHERE FALSE
 ----
 NULL
+
+# Regression test for #37211 (incorrect ordering between aggregator stages).
+statement ok
+CREATE TABLE uv (u INT PRIMARY KEY, v INT);
+INSERT INTO uv SELECT x, x*10 FROM generate_series(2, 8) AS g(x);
+
+query R
+SELECT sum(v) FROM data INNER LOOKUP JOIN uv ON (a=u) GROUP BY u ORDER BY u
+----
+20000
+30000
+40000
+50000
+60000
+70000
+80000

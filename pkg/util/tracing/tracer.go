@@ -74,7 +74,7 @@ var lightstepToken = settings.RegisterStringSetting(
 
 var zipkinCollector = settings.RegisterStringSetting(
 	"trace.zipkin.collector",
-	"if set, traces go to the given Zipkin instance (example: '127.0.0.1:9411'); ignored if trace.lightstep.token is set.",
+	"if set, traces go to the given Zipkin instance (example: '127.0.0.1:9411'); ignored if trace.lightstep.token is set",
 	envutil.EnvOrDefaultString("COCKROACH_TEST_ZIPKIN_COLLECTOR", ""),
 )
 
@@ -604,7 +604,7 @@ func (t *Tracer) Extract(format interface{}, carrier interface{}) (opentracing.S
 		// Using a shadow tracer only works if all hosts use the same shadow tracer.
 		// If that's not the case, ignore the shadow context.
 		if shadowTr := t.getShadowTracer(); shadowTr != nil &&
-			strings.ToLower(shadowType) == strings.ToLower(shadowTr.Typ()) {
+			strings.EqualFold(shadowType, shadowTr.Typ()) {
 			sc.shadowTr = shadowTr
 			// Extract the shadow context using the un-encapsulated textmap.
 			sc.shadowCtx, err = shadowTr.Extract(format, shadowCarrier)

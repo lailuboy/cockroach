@@ -48,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/diagnosticspb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -94,9 +95,9 @@ const (
 	// permitted in responses.
 	omittedKeyStr = "omitted (due to the 'server.remote_debugging.mode' setting)"
 
-	// heapDir is the directory name where the heap profiler stores profiles
-	// when there is a potential OOM situation.
-	heapDir = "heap_profiler"
+	// goroutineDir is the directory name where the goroutinedumper stores
+	// goroutine dumps.
+	goroutinesDir = "goroutine_dump"
 )
 
 var (
@@ -211,7 +212,7 @@ func (s *statusServer) dialNode(
 	if err != nil {
 		return nil, err
 	}
-	conn, err := s.rpcCtx.GRPCDial(addr.String()).Connect(ctx)
+	conn, err := s.rpcCtx.GRPCDialNode(addr.String(), nodeID).Connect(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -242,6 +243,49 @@ func (s *statusServer) Gossip(
 		return nil, err
 	}
 	return status.Gossip(ctx, req)
+}
+
+func (s *statusServer) EngineStats(
+	ctx context.Context, req *serverpb.EngineStatsRequest,
+) (*serverpb.EngineStatsResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.AnnotateCtx(ctx)
+	nodeID, local, err := s.parseNodeID(req.NodeId)
+	if err != nil {
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+	}
+
+	if !local {
+		status, err := s.dialNode(ctx, nodeID)
+		if err != nil {
+			return nil, err
+		}
+		return status.EngineStats(ctx, req)
+	}
+
+	resp := new(serverpb.EngineStatsResponse)
+	err = s.stores.VisitStores(func(store *storage.Store) error {
+		if rocksdb, ok := store.Engine().(*engine.RocksDB); ok {
+			tickersAndHistograms, err := rocksdb.GetTickersAndHistograms()
+			if err != nil {
+				return grpcstatus.Errorf(codes.Internal, err.Error())
+			}
+			resp.Stats = append(
+				resp.Stats,
+				serverpb.EngineStatsInfo{
+					StoreID:              store.Ident.StoreID,
+					TickersAndHistograms: tickersAndHistograms,
+				},
+			)
+		} else {
+			return grpcstatus.Errorf(codes.Internal, "engine is not rocksdb")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // Allocator returns simulated allocator info for the ranges on the given node.
@@ -633,7 +677,9 @@ func (s *statusServer) GetFiles(
 	//TODO(ridwanmsharif): Serve logfiles so debug-zip can fetch them
 	// intead of reading indididual entries.
 	case serverpb.FileType_HEAP: // Requesting for saved Heap Profiles.
-		dir = filepath.Join(s.admin.server.cfg.HeapProfileDirName, heapDir)
+		dir = filepath.Join(s.admin.server.cfg.HeapProfileDirName, base.HeapProfileDir)
+	case serverpb.FileType_GOROUTINES: // Requesting for saved Goroutine dumps.
+		dir = filepath.Join(s.admin.server.cfg.GoroutineDumpDirName, goroutinesDir)
 	default:
 		return nil, grpcstatus.Errorf(codes.InvalidArgument, "unknown file type: %s", req.Type)
 	}
@@ -1083,7 +1129,7 @@ func (s *statusServer) RaftDebug(
 			desc := node.Range.State.Desc
 			// Check for whether replica should be GCed.
 			containsNode := false
-			for _, replica := range desc.Replicas {
+			for _, replica := range desc.Replicas().Unwrap() {
 				if replica.NodeID == node.NodeID {
 					containsNode = true
 				}
@@ -1209,6 +1255,7 @@ func (s *statusServer) Ranges(
 				LeaderNotLeaseHolder:   metrics.Leader && metrics.LeaseValid && !metrics.Leaseholder,
 				NoRaftLeader:           !storage.HasRaftLeader(raftStatus) && !metrics.Quiescent,
 				Underreplicated:        metrics.Underreplicated,
+				Overreplicated:         metrics.Overreplicated,
 				NoLease:                metrics.Leader && !metrics.LeaseValid && !metrics.Quiescent,
 				QuiescentEqualsTicking: raftStatus != nil && metrics.Quiescent == metrics.Ticking,
 				RaftLogTooLarge:        metrics.RaftLogTooLarge,
@@ -1696,7 +1743,7 @@ func (s *statusServer) Diagnostics(
 		return status.Diagnostics(ctx, req)
 	}
 
-	return s.admin.server.getReportingInfo(ctx), nil
+	return s.admin.server.getReportingInfo(ctx, telemetry.ReadOnly), nil
 }
 
 // Stores returns details for each store.

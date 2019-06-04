@@ -15,22 +15,19 @@
 package optbuilder
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 func checkFrom(expr tree.Expr, inScope *scope) {
 	if len(inScope.cols) == 0 {
-		panic(builderError{pgerror.NewErrorf(pgerror.CodeInvalidNameError,
-			"cannot use %q without a FROM clause", tree.ErrString(expr))})
+		panic(pgerror.Newf(pgerror.CodeInvalidNameError,
+			"cannot use %q without a FROM clause", tree.ErrString(expr)))
 	}
 }
 
@@ -43,8 +40,7 @@ func (b *Builder) expandStar(
 	case *tree.TupleStar:
 		texpr := inScope.resolveType(t.Expr, types.Any)
 		typ := texpr.ResolvedType()
-		tType, ok := typ.(types.TTuple)
-		if !ok || tType.Labels == nil {
+		if typ.Family() != types.TupleFamily || typ.TupleLabels() == nil {
 			panic(builderError{tree.NewTypeIsNotCompositeError(typ)})
 		}
 
@@ -69,15 +65,15 @@ func (b *Builder) expandStar(
 		//     -- (and we hope a later opt will merge the subqueries)
 		tTuple, isTuple := texpr.(*tree.Tuple)
 
-		aliases = tType.Labels
-		exprs = make([]tree.TypedExpr, len(tType.Types))
-		for i := range tType.Types {
+		aliases = typ.TupleLabels()
+		exprs = make([]tree.TypedExpr, len(typ.TupleContents()))
+		for i := range typ.TupleContents() {
 			if isTuple {
 				// De-tuplify: ((a,b,c)).* -> a, b, c
 				exprs[i] = tTuple.Exprs[i].(tree.TypedExpr)
 			} else {
 				// Can't de-tuplify: (Expr).* -> (Expr).a, (Expr).b, (Expr).c
-				exprs[i] = tree.NewTypedColumnAccessExpr(texpr, tType.Labels[i], i)
+				exprs[i] = tree.NewTypedColumnAccessExpr(texpr, typ.TupleLabels()[i], i)
 			}
 		}
 
@@ -110,7 +106,7 @@ func (b *Builder) expandStar(
 		}
 
 	default:
-		panic(fmt.Sprintf("unhandled type: %T", expr))
+		panic(pgerror.AssertionFailedf("unhandled type: %T", expr))
 	}
 
 	return aliases, exprs
@@ -158,7 +154,7 @@ func (b *Builder) expandStarAndResolveType(
 //
 // The new column is returned as a scopeColumn object.
 func (b *Builder) synthesizeColumn(
-	scope *scope, alias string, typ types.T, expr tree.TypedExpr, scalar opt.ScalarExpr,
+	scope *scope, alias string, typ *types.T, expr tree.TypedExpr, scalar opt.ScalarExpr,
 ) *scopeColumn {
 	name := tree.Name(alias)
 	colID := b.factory.Metadata().AddColumn(alias, typ)
@@ -238,30 +234,30 @@ func colIndex(numOriginalCols int, expr tree.Expr, context string) int {
 			}
 			ord = val
 		} else {
-			panic(builderError{pgerror.NewErrorf(
+			panic(pgerror.Newf(
 				pgerror.CodeSyntaxError,
 				"non-integer constant in %s: %s", context, expr,
-			)})
+			))
 		}
 	case *tree.DInt:
 		if *i >= 0 {
 			ord = int64(*i)
 		}
 	case *tree.StrVal:
-		panic(builderError{pgerror.NewErrorf(
+		panic(pgerror.Newf(
 			pgerror.CodeSyntaxError, "non-integer constant in %s: %s", context, expr,
-		)})
+		))
 	case tree.Datum:
-		panic(builderError{pgerror.NewErrorf(
+		panic(pgerror.Newf(
 			pgerror.CodeSyntaxError, "non-integer constant in %s: %s", context, expr,
-		)})
+		))
 	}
 	if ord != -1 {
 		if ord < 1 || ord > int64(numOriginalCols) {
-			panic(builderError{pgerror.NewErrorf(
+			panic(pgerror.Newf(
 				pgerror.CodeInvalidColumnReferenceError,
 				"%s position %s is not in select list", context, expr,
-			)})
+			))
 		}
 		ord--
 	}
@@ -307,8 +303,8 @@ func colIdxByProjectionAlias(expr tree.Expr, op string, scope *scope) int {
 					// `SELECT b, * FROM t ORDER BY b`. Otherwise, reject with an
 					// ambiguity error.
 					if scope.cols[j].getExprStr() != scope.cols[index].getExprStr() {
-						panic(builderError{pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
-							"%s \"%s\" is ambiguous", op, target)})
+						panic(pgerror.Newf(pgerror.CodeAmbiguousAliasError,
+							"%s \"%s\" is ambiguous", op, target))
 					}
 					// Use the index of the first matching column.
 					continue
@@ -324,7 +320,7 @@ func colIdxByProjectionAlias(expr tree.Expr, op string, scope *scope) int {
 // makeBackfillError returns an error indicating that the column of the given
 // name is currently being backfilled and cannot be referenced.
 func makeBackfillError(name tree.Name) error {
-	return pgerror.NewErrorf(pgerror.CodeInvalidColumnReferenceError,
+	return pgerror.Newf(pgerror.CodeInvalidColumnReferenceError,
 		"column %q is being backfilled", tree.ErrString(&name))
 }
 
@@ -383,12 +379,12 @@ func colsToColList(cols []scopeColumn) opt.ColList {
 func (b *Builder) assertNoAggregationOrWindowing(expr tree.Expr, op string) {
 	if b.exprTransformCtx.AggregateInExpr(expr, b.semaCtx.SearchPath) {
 		panic(builderError{
-			pgerror.NewErrorf(pgerror.CodeGroupingError, "aggregate functions are not allowed in %s", op),
+			pgerror.Newf(pgerror.CodeGroupingError, "aggregate functions are not allowed in %s", op),
 		})
 	}
 	if b.exprTransformCtx.WindowFuncInExpr(expr) {
 		panic(builderError{
-			pgerror.NewErrorf(pgerror.CodeWindowingError, "window functions are not allowed in %s", op),
+			pgerror.Newf(pgerror.CodeWindowingError, "window functions are not allowed in %s", op),
 		})
 	}
 }
@@ -397,23 +393,24 @@ func (b *Builder) assertNoAggregationOrWindowing(expr tree.Expr, op string) {
 // catalog object with the given name. If the current user does not have the
 // CREATE privilege, then resolveSchemaForCreate raises an error.
 func (b *Builder) resolveSchemaForCreate(name *tree.TableName) (cat.Schema, cat.SchemaName) {
-	sch, resName, err := b.catalog.ResolveSchema(b.ctx, &name.TableNamePrefix)
+	flags := cat.Flags{AvoidDescriptorCaches: true}
+	sch, resName, err := b.catalog.ResolveSchema(b.ctx, flags, &name.TableNamePrefix)
 	if err != nil {
 		// Remap invalid schema name error text so that it references the catalog
 		// object that could not be created.
-		if pgerr, ok := err.(*pgerror.Error); ok && pgerr.Code == pgerror.CodeInvalidSchemaNameError {
-			panic(builderError{pgerror.NewErrorf(pgerror.CodeInvalidSchemaNameError,
+		if pgerr, ok := pgerror.GetPGCause(err); ok && pgerr.Code == pgerror.CodeInvalidSchemaNameError {
+			panic(pgerror.Newf(pgerror.CodeInvalidSchemaNameError,
 				"cannot create %q because the target database or schema does not exist",
 				tree.ErrString(name)).
-				SetHintf("verify that the current database and search_path are valid and/or the target database exists")})
+				SetHintf("verify that the current database and search_path are valid and/or the target database exists"))
 		}
 		panic(builderError{err})
 	}
 
 	// Only allow creation of objects in the public schema.
 	if resName.Schema() != tree.PublicSchema {
-		panic(builderError{pgerror.NewErrorf(pgerror.CodeInvalidNameError,
-			"schema cannot be modified: %q", tree.ErrString(&resName))})
+		panic(pgerror.Newf(pgerror.CodeInvalidNameError,
+			"schema cannot be modified: %q", tree.ErrString(&resName)))
 	}
 
 	if err := b.catalog.CheckPrivilege(b.ctx, sch, privilege.CREATE); err != nil {
@@ -446,7 +443,7 @@ func (b *Builder) resolveTable(
 func (b *Builder) resolveDataSource(
 	tn *tree.TableName, priv privilege.Kind,
 ) (cat.DataSource, cat.DataSourceName) {
-	ds, resName, err := b.catalog.ResolveDataSource(b.ctx, tn)
+	ds, resName, err := b.catalog.ResolveDataSource(b.ctx, cat.Flags{}, tn)
 	if err != nil {
 		panic(builderError{err})
 	}
@@ -461,7 +458,8 @@ func (b *Builder) resolveDataSource(
 func (b *Builder) resolveDataSourceRef(ref *tree.TableRef, priv privilege.Kind) cat.DataSource {
 	ds, err := b.catalog.ResolveDataSourceByID(b.ctx, cat.StableID(ref.TableID))
 	if err != nil {
-		panic(builderError{errors.Wrapf(err, "%s", tree.ErrString(ref))})
+		panic(builderError{pgerror.Wrapf(err, pgerror.CodeUndefinedObjectError,
+			"%s", tree.ErrString(ref))})
 	}
 	b.checkPrivilege(ds.Name(), ds, priv)
 	return ds

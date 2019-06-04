@@ -19,8 +19,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
@@ -227,8 +227,11 @@ func (n *sortNode) Close(ctx context.Context) {
 }
 
 func ensureColumnOrderable(c sqlbase.ResultColumn) error {
-	if _, ok := c.Typ.(types.TArray); ok || c.Typ == types.JSON {
-		return pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, "can't order by column type %s", c.Typ)
+	if c.Typ.Family() == types.ArrayFamily {
+		return pgerror.UnimplementedWithIssuef(32707, "can't order by column type %s", c.Typ)
+	}
+	if c.Typ.Family() == types.JsonFamily {
+		return pgerror.UnimplementedWithIssue(32706, "can't order by column type jsonb")
 	}
 	return nil
 }
@@ -315,7 +318,7 @@ func (p *planner) rewriteIndexOrderings(
 
 		case tree.OrderByIndex:
 			tn := o.Table
-			desc, err := ResolveExistingObject(ctx, p, &tn, true /*required*/, requireTableDesc)
+			desc, err := ResolveExistingObject(ctx, p, &tn, true /*required*/, ResolveRequireTableDesc)
 			if err != nil {
 				return nil, err
 			}
@@ -365,7 +368,7 @@ func (p *planner) rewriteIndexOrderings(
 			for _, id := range idxDesc.ExtraColumnIDs {
 				col, err := desc.FindColumnByID(id)
 				if err != nil {
-					return nil, pgerror.NewAssertionErrorf("column with ID %d not found", id)
+					return nil, pgerror.AssertionFailedf("column with ID %d not found", id)
 				}
 
 				newOrderBy = append(newOrderBy, &tree.Order{
@@ -410,7 +413,7 @@ func (p *planner) colIndex(numOriginalCols int, expr tree.Expr, context string) 
 			}
 			ord = val
 		} else {
-			return -1, pgerror.NewErrorf(
+			return -1, pgerror.Newf(
 				pgerror.CodeSyntaxError,
 				"non-integer constant in %s: %s", context, expr,
 			)
@@ -420,17 +423,17 @@ func (p *planner) colIndex(numOriginalCols int, expr tree.Expr, context string) 
 			ord = int64(*i)
 		}
 	case *tree.StrVal:
-		return -1, pgerror.NewErrorf(
+		return -1, pgerror.Newf(
 			pgerror.CodeSyntaxError, "non-integer constant in %s: %s", context, expr,
 		)
 	case tree.Datum:
-		return -1, pgerror.NewErrorf(
+		return -1, pgerror.Newf(
 			pgerror.CodeSyntaxError, "non-integer constant in %s: %s", context, expr,
 		)
 	}
 	if ord != -1 {
 		if ord < 1 || ord > int64(numOriginalCols) {
-			return -1, pgerror.NewErrorf(
+			return -1, pgerror.Newf(
 				pgerror.CodeInvalidColumnReferenceError,
 				"%s position %s is not in select list", context, expr,
 			)

@@ -388,9 +388,9 @@ func TestTransactionBumpEpoch(t *testing.T) {
 	origNow := makeTS(10, 1)
 	txn := MakeTransaction("test", Key("a"), 1, origNow, 0)
 	// Advance the txn timestamp.
-	txn.Timestamp.Add(10, 2)
+	txn.Timestamp = txn.Timestamp.Add(10, 2)
 	txn.BumpEpoch()
-	if a, e := txn.Epoch, uint32(1); a != e {
+	if a, e := txn.Epoch, enginepb.TxnEpoch(1); a != e {
 		t.Errorf("expected epoch %d; got %d", e, a)
 	}
 	if txn.EpochZeroTimestamp == (hlc.Timestamp{}) {
@@ -491,7 +491,8 @@ var nonZeroTxn = Transaction{
 	ObservedTimestamps:       []ObservedTimestamp{{NodeID: 1, Timestamp: makeTS(1, 2)}},
 	DeprecatedWriting:        true,
 	WriteTooOld:              true,
-	Intents:                  []Span{{Key: []byte("a"), EndKey: []byte("b")}},
+	IntentSpans:              []Span{{Key: []byte("a"), EndKey: []byte("b")}},
+	InFlightWrites:           []SequencedWrite{{Key: []byte("c"), Sequence: 1}},
 	EpochZeroTimestamp:       makeTS(1, 1),
 	OrigTimestampWasObserved: true,
 }
@@ -537,8 +538,48 @@ func TestTransactionUpdateEpochZero(t *testing.T) {
 	}
 }
 
+func TestTransactionUpdateStaging(t *testing.T) {
+	txn := nonZeroTxn
+	txn.Status = PENDING
+
+	txn2 := nonZeroTxn
+	txn2.Status = STAGING
+
+	// In same epoch, PENDING < STAGING.
+	txn.Update(&txn2)
+	if a, e := txn.Status, STAGING; a != e {
+		t.Errorf("expected status %s; got %s", e, a)
+	}
+
+	txn2.Status = PENDING
+	txn.Update(&txn2)
+	if a, e := txn.Status, STAGING; a != e {
+		t.Errorf("expected status %s; got %s", e, a)
+	}
+
+	// In later epoch, PENDING > STAGING.
+	txn2.Epoch++
+	txn.Update(&txn2)
+	if a, e := txn.Status, PENDING; a != e {
+		t.Errorf("expected status %s; got %s", e, a)
+	}
+
+	txn2.Status = STAGING
+	txn.Update(&txn2)
+	if a, e := txn.Status, STAGING; a != e {
+		t.Errorf("expected status %s; got %s", e, a)
+	}
+
+	txn2.Status = COMMITTED
+	txn.Update(&txn2)
+	if a, e := txn.Status, COMMITTED; a != e {
+		t.Errorf("expected status %s; got %s", e, a)
+	}
+}
+
 func TestTransactionClone(t *testing.T) {
-	txn := nonZeroTxn.Clone()
+	txnPtr := nonZeroTxn.Clone()
+	txn := *txnPtr
 
 	fields := util.EqualPtrFields(reflect.ValueOf(nonZeroTxn), reflect.ValueOf(txn), "")
 	sort.Strings(fields)
@@ -547,8 +588,12 @@ func TestTransactionClone(t *testing.T) {
 	// listed below. If this test fails, please update the list below and/or
 	// Transaction.Clone().
 	expFields := []string{
-		"Intents.EndKey",
-		"Intents.Key",
+		"InFlightWrites",
+		"InFlightWrites.Key",
+		"IntentSpans",
+		"IntentSpans.EndKey",
+		"IntentSpans.Key",
+		"ObservedTimestamps",
 		"TxnMeta.Key",
 	}
 	if !reflect.DeepEqual(expFields, fields) {
@@ -592,8 +637,8 @@ func TestTransactionRecordRoundtrips(t *testing.T) {
 	if !reflect.DeepEqual(txnRecord.OrigTimestamp, txn.OrigTimestamp) {
 		t.Fatalf("txnRecord.OrigTimestamp = %v, txn.OrigTimestamp = %v", txnRecord.OrigTimestamp, txn.OrigTimestamp)
 	}
-	if !reflect.DeepEqual(txnRecord.Intents, txn.Intents) {
-		t.Fatalf("txnRecord.Intents = %v, txn.Intents = %v", txnRecord.Intents, txn.Intents)
+	if !reflect.DeepEqual(txnRecord.IntentSpans, txn.IntentSpans) {
+		t.Fatalf("txnRecord.IntentSpans = %v, txn.IntentSpans = %v", txnRecord.IntentSpans, txn.IntentSpans)
 	}
 
 	// Verify that converting through a Transaction message and back
@@ -644,10 +689,10 @@ func checkVal(val, expected, errFraction float64) bool {
 // to be higher than a priority with user priority = 1.
 func TestMakePriority(t *testing.T) {
 	// Verify min & max.
-	if a, e := MakePriority(MinUserPriority), int32(MinTxnPriority); a != e {
+	if a, e := MakePriority(MinUserPriority), enginepb.MinTxnPriority; a != e {
 		t.Errorf("expected min txn priority %d; got %d", e, a)
 	}
-	if a, e := MakePriority(MaxUserPriority), int32(MaxTxnPriority); a != e {
+	if a, e := MakePriority(MaxUserPriority), enginepb.MaxTxnPriority; a != e {
 		t.Errorf("expected max txn priority %d; got %d", e, a)
 	}
 
@@ -666,14 +711,14 @@ func TestMakePriority(t *testing.T) {
 
 	// Generate values for all priorities.
 	const trials = 100000
-	values := make([][trials]int32, len(userPs))
+	values := make([][trials]enginepb.TxnPriority, len(userPs))
 	for i, userPri := range userPs {
 		for tr := 0; tr < trials; tr++ {
 			p := MakePriority(userPri)
-			if p == MinTxnPriority {
+			if p == enginepb.MinTxnPriority {
 				t.Fatalf("unexpected min txn priority")
 			}
-			if p == MaxTxnPriority {
+			if p == enginepb.MaxTxnPriority {
 				t.Fatalf("unexpected max txn priority")
 			}
 			values[i][tr] = p
@@ -724,7 +769,7 @@ func TestMakePriority(t *testing.T) {
 func TestMakePriorityExplicit(t *testing.T) {
 	explicitPs := []struct {
 		userPri UserPriority
-		expPri  int32
+		expPri  enginepb.TxnPriority
 	}{
 		{-math.MaxInt32, math.MaxInt32},
 		{-math.MaxInt32 + 1, math.MaxInt32 - 1},
@@ -750,9 +795,9 @@ func TestMakePriorityLimits(t *testing.T) {
 		math.MaxFloat64,
 	}
 	for _, userPri := range userPs {
-		expected := int32(MinTxnPriority)
+		expected := enginepb.MinTxnPriority
 		if userPri > 1 {
-			expected = int32(MaxTxnPriority)
+			expected = enginepb.MaxTxnPriority
 		}
 		if actual := MakePriority(userPri); actual != expected {
 			t.Errorf("%f: expected txn priority %d; got %d", userPri, expected, actual)

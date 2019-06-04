@@ -27,6 +27,9 @@
 #   - no interleaved relationship (parent1 - parent2, parent2 - child1)
 #   - TODO(richardwu): sibling-sibling (child1 - child2)
 
+statement ok
+SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false
+
 #################
 # Create tables #
 #################
@@ -167,10 +170,6 @@ FROM
 ####################
 # Split our ranges #
 ####################
-
-# Prevent the merge queue from immediately discarding our splits.
-statement ok
-SET CLUSTER SETTING kv.range_merge.queue_enabled = false;
 
 # Split at parent1 key into five parts.
 statement ok

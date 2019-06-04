@@ -31,8 +31,10 @@ import (
 // particular point is reached) or to change the behavior by returning
 // an error (which aborts all further processing for the command).
 type StoreTestingKnobs struct {
-	EvalKnobs           storagebase.BatchEvalTestingKnobs
-	IntentResolverKnobs storagebase.IntentResolverTestingKnobs
+	EvalKnobs               storagebase.BatchEvalTestingKnobs
+	IntentResolverKnobs     storagebase.IntentResolverTestingKnobs
+	TxnWaitKnobs            txnwait.TestingKnobs
+	ConsistencyTestingKnobs ConsistencyTestingKnobs
 
 	// TestingRequestFilter is called before evaluating each command on a
 	// replica. The filter is run before the request acquires latches, so
@@ -172,12 +174,17 @@ type StoreTestingKnobs struct {
 	SystemLogsGCPeriod time.Duration
 	// SystemLogsGCGCDone is used to notify when system logs GC is done.
 	SystemLogsGCGCDone chan<- struct{}
-	// TxnWait contains knobs for txnwait.Queue instances.
-	TxnWait txnwait.TestingKnobs
 	// DontRetryPushTxnFailures will propagate a push txn failure immediately
 	// instead of utilizing the txn wait queue to wait for the transaction to
 	// finish or be pushed by a higher priority contender.
 	DontRetryPushTxnFailures bool
+	// DontRecoverIndeterminateCommits will propagate indeterminate commit
+	// errors from failed txn pushes immediately instead of utilizing the txn
+	// recovery manager to recovery from the indeterminate state.
+	DontRecoverIndeterminateCommits bool
+	// TraceAllRaftEvents enables raft event tracing even when the current
+	// vmodule would not have enabled it.
+	TraceAllRaftEvents bool
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

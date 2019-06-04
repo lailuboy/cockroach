@@ -50,7 +50,7 @@ func (p *planner) CreateUser(ctx context.Context, n *tree.CreateUser) (planNode,
 func (p *planner) CreateUserNode(
 	ctx context.Context, nameE, passwordE tree.Expr, ifNotExists bool, isRole bool, opName string,
 ) (*CreateUserNode, error) {
-	tDesc, err := ResolveExistingObject(ctx, p, userTableName, true /*required*/, requireTableDesc)
+	tDesc, err := ResolveExistingObject(ctx, p, userTableName, true /*required*/, ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +83,7 @@ func (n *CreateUserNode) startExec(params runParams) error {
 
 	// Reject the "public" role. It does not have an entry in the users table but is reserved.
 	if normalizedUsername == sqlbase.PublicRole {
-		return pgerror.NewErrorf(pgerror.CodeReservedNameError, "role name %q is reserved", sqlbase.PublicRole)
+		return pgerror.Newf(pgerror.CodeReservedNameError, "role name %q is reserved", sqlbase.PublicRole)
 	}
 
 	var opName string
@@ -102,7 +102,7 @@ func (n *CreateUserNode) startExec(params runParams) error {
 		normalizedUsername,
 	)
 	if err != nil {
-		return errors.Wrapf(err, "error looking up user")
+		return pgerror.Wrapf(err, pgerror.CodeDataExceptionError, "error looking up user")
 	}
 	if row != nil {
 		isRole := bool(*row[0].(*tree.DBool))
@@ -115,7 +115,7 @@ func (n *CreateUserNode) startExec(params runParams) error {
 		if isRole {
 			msg = "a role"
 		}
-		return pgerror.NewErrorf(pgerror.CodeDuplicateObjectError,
+		return pgerror.Newf(pgerror.CodeDuplicateObjectError,
 			"%s named %s already exists",
 			msg, normalizedUsername)
 	}
@@ -132,7 +132,7 @@ func (n *CreateUserNode) startExec(params runParams) error {
 	if err != nil {
 		return err
 	} else if n.run.rowsAffected != 1 {
-		return pgerror.NewAssertionErrorf("%d rows affected by user creation; expected exactly one row affected",
+		return pgerror.AssertionFailedf("%d rows affected by user creation; expected exactly one row affected",
 			n.run.rowsAffected,
 		)
 	}

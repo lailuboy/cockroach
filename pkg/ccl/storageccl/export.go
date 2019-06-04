@@ -33,7 +33,7 @@ func init() {
 }
 
 func declareKeysExport(
-	desc roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+	desc *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
 	batcheval.DefaultDeclareKeys(desc, header, req, spans)
 	spans.Add(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeLastGCKey(header.RangeID)})
@@ -68,10 +68,10 @@ func evalExport(
 		reply.StartTime = gcThreshold
 	}
 
-	if err := cArgs.EvalCtx.GetLimiters().ConcurrentExports.Begin(ctx); err != nil {
+	if err := cArgs.EvalCtx.GetLimiters().ConcurrentExportRequests.Begin(ctx); err != nil {
 		return result.Result{}, err
 	}
-	defer cArgs.EvalCtx.GetLimiters().ConcurrentExports.Finish()
+	defer cArgs.EvalCtx.GetLimiters().ConcurrentExportRequests.Finish()
 
 	makeExportStorage := !args.ReturnSST || (args.Storage != roachpb.ExportStorage{})
 	if makeExportStorage || log.V(1) {
@@ -116,9 +116,10 @@ func evalExport(
 	// TODO(dan): Move all this iteration into cpp to avoid the cgo calls.
 	// TODO(dan): Consider checking ctx periodically during the MVCCIterate call.
 	iter := engineccl.NewMVCCIncrementalIterator(batch, engineccl.IterOptions{
-		StartTime:  args.StartTime,
-		EndTime:    h.Timestamp,
-		UpperBound: args.EndKey,
+		StartTime:                           args.StartTime,
+		EndTime:                             h.Timestamp,
+		UpperBound:                          args.EndKey,
+		EnableTimeBoundIteratorOptimization: args.EnableTimeBoundIteratorOptimization,
 	})
 	defer iter.Close()
 	for iter.Seek(engine.MakeMVCCMetadataKey(args.Key)); ; iterFn(iter) {

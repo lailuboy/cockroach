@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // SchemaID uniquely identifies the usage of a schema within the scope of a
@@ -93,6 +93,10 @@ type Metadata struct {
 	// want to verify the resolution of both names.
 	deps []mdDep
 
+	// views stores the list of referenced views. This information is only
+	// needed for EXPLAIN (opt, env).
+	views []cat.View
+
 	// NOTE! When adding fields here, update CopyFrom.
 }
 
@@ -132,6 +136,7 @@ func (md *Metadata) Init() {
 	md.schemas = md.schemas[:0]
 	md.cols = md.cols[:0]
 	md.tables = md.tables[:0]
+	md.views = md.views[:0]
 	md.deps = md.deps[:0]
 }
 
@@ -142,12 +147,13 @@ func (md *Metadata) Init() {
 // the copy.
 func (md *Metadata) CopyFrom(from *Metadata) {
 	if len(md.schemas) != 0 || len(md.cols) != 0 || len(md.tables) != 0 ||
-		len(md.sequences) != 0 || len(md.deps) != 0 {
-		panic("CopyFrom requires empty destination")
+		len(md.sequences) != 0 || len(md.deps) != 0 || len(md.views) != 0 {
+		panic(pgerror.AssertionFailedf("CopyFrom requires empty destination"))
 	}
 	md.schemas = append(md.schemas, from.schemas...)
 	md.cols = append(md.cols, from.cols...)
 	md.tables = append(md.tables, from.tables...)
+	md.views = append(md.views, from.views...)
 
 	// Clear table annotations. These objects can be mutable and can't be safely
 	// shared between different metadata instances.
@@ -218,7 +224,7 @@ func (md *Metadata) CheckDependencies(
 		case cat.DataSource:
 			name := *md.deps[i].dsName()
 			// Resolve data source object.
-			new, _, err := catalog.ResolveDataSource(ctx, &name)
+			new, _, err := catalog.ResolveDataSource(ctx, cat.Flags{}, &name)
 			if err != nil {
 				return false, err
 			}
@@ -227,14 +233,14 @@ func (md *Metadata) CheckDependencies(
 		case cat.Schema:
 			name := *md.deps[i].schemaName()
 			// Resolve schema object.
-			new, _, err := catalog.ResolveSchema(ctx, &name)
+			new, _, err := catalog.ResolveSchema(ctx, cat.Flags{}, &name)
 			if err != nil {
 				return false, err
 			}
 			toCheck = new
 
 		default:
-			return false, pgerror.NewAssertionErrorf("unknown dependency type: %v", obj)
+			return false, pgerror.AssertionFailedf("unknown dependency type: %v", obj)
 		}
 
 		// Ensure that it's the same object, and there were no schema or table
@@ -339,7 +345,7 @@ func (md *Metadata) TableByStableID(id cat.StableID) cat.Table {
 
 // AddColumn assigns a new unique id to a column within the query and records
 // its alias and type. If the alias is empty, a "column<ID>" alias is created.
-func (md *Metadata) AddColumn(alias string, typ types.T) ColumnID {
+func (md *Metadata) AddColumn(alias string, typ *types.T) ColumnID {
 	if alias == "" {
 		alias = fmt.Sprintf("column%d", len(md.cols)+1)
 	}
@@ -455,6 +461,12 @@ func (md *Metadata) Sequence(seqID SequenceID) cat.Sequence {
 	return md.sequences[seqID.index()]
 }
 
+// AllSequences returns the metadata for all sequences. The result must not be
+// modified.
+func (md *Metadata) AllSequences() []cat.Sequence {
+	return md.sequences
+}
+
 // ValuesID uniquely identifies the usage of a values clause within the scope of a
 // query.
 //
@@ -466,4 +478,15 @@ type ValuesID uint64
 func (md *Metadata) NextValuesID() ValuesID {
 	md.values++
 	return md.values
+}
+
+// AddView adds a new reference to a view used by the query.
+func (md *Metadata) AddView(v cat.View) {
+	md.views = append(md.views, v)
+}
+
+// AllViews returns the metadata for all views. The result must not be
+// modified.
+func (md *Metadata) AllViews() []cat.View {
+	return md.views
 }

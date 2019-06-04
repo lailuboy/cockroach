@@ -16,7 +16,6 @@ package idxconstraint
 
 import (
 	"context"
-	"fmt"
 	"regexp"
 	"strings"
 
@@ -24,8 +23,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
@@ -138,8 +138,8 @@ func (c *indexConstraintCtx) makeStringPrefixSpan(
 // verifyType checks that the type of the index column <offset> matches the
 // given type. We disallow mixed-type comparisons because it would result in
 // incorrect encodings (#4313).
-func (c *indexConstraintCtx) verifyType(offset int, typ types.T) bool {
-	return typ == types.Unknown || c.colType(offset).Equivalent(typ)
+func (c *indexConstraintCtx) verifyType(offset int, typ *types.T) bool {
+	return typ.Family() == types.UnknownFamily || c.colType(offset).Equivalent(typ)
 }
 
 // makeSpansForSingleColumn creates spans for a single index column from a
@@ -432,7 +432,7 @@ func (c *indexConstraintCtx) makeSpansForTupleInequality(
 	case opt.GeOp:
 		less, boundary = false, includeBoundary
 	default:
-		panic(fmt.Sprintf("unsupported op %s", e.Op()))
+		panic(pgerror.AssertionFailedf("unsupported op %s", log.Safe(e.Op())))
 	}
 
 	// The spans are "tight" unless we used just a prefix.
@@ -604,12 +604,17 @@ func (c *indexConstraintCtx) makeSpansForExpr(
 
 	switch t := e.(type) {
 	case *memo.FiltersExpr:
-		if len(*t) == 1 {
+		switch len(*t) {
+		case 0:
+			c.unconstrained(offset, out)
+			return true
+		case 1:
 			return c.makeSpansForExpr(offset, (*t)[0].Condition, out)
+		default:
+			// We don't have enough information to know if the spans are "tight".
+			c.makeSpansForAnd(offset, t, out)
+			return false
 		}
-		// We don't have enough information to know if the spans are "tight".
-		c.makeSpansForAnd(offset, t, out)
-		return false
 
 	case *memo.FiltersItem:
 		// Pass through the call.
@@ -625,15 +630,18 @@ func (c *indexConstraintCtx) makeSpansForExpr(
 
 	case *memo.VariableExpr:
 		// Support (@1) as (@1 = TRUE) if @1 is boolean.
-		if c.colType(offset) == types.Bool && c.isIndexColumn(t, offset) {
+		if c.colType(offset).Family() == types.BoolFamily && c.isIndexColumn(t, offset) {
 			return c.makeSpansForSingleColumnDatum(offset, opt.EqOp, tree.DBoolTrue, out)
 		}
 
 	case *memo.NotExpr:
 		// Support (NOT @1) as (@1 = FALSE) if @1 is boolean.
-		if c.colType(offset) == types.Bool && c.isIndexColumn(t.Input, offset) {
+		if c.colType(offset).Family() == types.BoolFamily && c.isIndexColumn(t.Input, offset) {
 			return c.makeSpansForSingleColumnDatum(offset, opt.EqOp, tree.DBoolFalse, out)
 		}
+
+	case *memo.RangeExpr:
+		return c.makeSpansForExpr(offset, t.And, out)
 	}
 
 	if e.ChildCount() < 2 {
@@ -986,7 +994,7 @@ func (c *indexConstraintCtx) getMaxSimplifyPrefix(idxConstraint *constraint.Cons
 func (c *indexConstraintCtx) simplifyFilter(
 	scalar opt.ScalarExpr, final *constraint.Constraint, maxSimplifyPrefix int,
 ) opt.ScalarExpr {
-	// Special handling for And, Or, and Filters.
+	// Special handling for And, Or, and Range.
 	switch t := scalar.(type) {
 	case *memo.AndExpr:
 		left := c.simplifyFilter(t.Left, final, maxSimplifyPrefix)
@@ -997,6 +1005,9 @@ func (c *indexConstraintCtx) simplifyFilter(
 		left := c.simplifyFilter(t.Left, final, maxSimplifyPrefix)
 		right := c.simplifyFilter(t.Right, final, maxSimplifyPrefix)
 		return c.factory.ConstructOr(left, right)
+
+	case *memo.RangeExpr:
+		return c.factory.ConstructRange(c.simplifyFilter(t.And, final, maxSimplifyPrefix))
 	}
 
 	// We try to create tight spans for the expression (as allowed by
@@ -1206,6 +1217,6 @@ func (c *indexConstraintCtx) isNullable(offset int) bool {
 }
 
 // colType returns the type of the index column <offset>.
-func (c *indexConstraintCtx) colType(offset int) types.T {
+func (c *indexConstraintCtx) colType(offset int) *types.T {
 	return c.md.ColumnMeta(c.columns[offset].ID()).Type
 }

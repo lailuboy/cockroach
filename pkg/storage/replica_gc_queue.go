@@ -214,7 +214,7 @@ func (rgcq *replicaGCQueue) process(
 		//
 		// TODO(knz): we should really have a separate type for assertion
 		// errors that trigger telemetry, like
-		// pgerror.NewAssertionErrorf() does.
+		// pgerror.AssertionFailedf() does.
 		return errors.Errorf("expected 1 range descriptor, got %d", len(rs))
 	}
 	replyDesc := rs[0]
@@ -288,6 +288,12 @@ func (rgcq *replicaGCQueue) process(
 
 		rgcq.metrics.RemoveReplicaCount.Inc(1)
 		log.VEventf(ctx, 1, "destroying local data")
+		// Note that this seems racy - we didn't hold any locks between reading
+		// the range descriptor above and deciding to remove the replica - but
+		// we pass in the NextReplicaID to detect situations in which the
+		// replica became "non-gc'able" in the meantime by checking (with raftMu
+		// held throughout) whether the replicaID is still smaller than the
+		// NextReplicaID.
 		if err := repl.store.RemoveReplica(ctx, repl, replyDesc.NextReplicaID, RemoveOptions{
 			DestroyData: true,
 		}); err != nil {
@@ -321,9 +327,7 @@ func (rgcq *replicaGCQueue) process(
 					leftDesc, leftReplyDesc)
 				// Chances are that the left replica needs to be GC'd. Since we don't
 				// have definitive proof, queue it with a low priority.
-				if _, err := rgcq.Add(leftRepl, replicaGCPriorityDefault); err != nil {
-					log.Errorf(ctx, "unable to add %s to replica GC queue: %s", leftRepl, err)
-				}
+				rgcq.AddAsync(ctx, leftRepl, replicaGCPriorityDefault)
 				return nil
 			}
 		}

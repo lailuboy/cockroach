@@ -59,6 +59,7 @@ type indexJoiner struct {
 
 var _ Processor = &indexJoiner{}
 var _ RowSource = &indexJoiner{}
+var _ distsqlpb.MetadataSource = &indexJoiner{}
 
 const indexJoinerProcName = "index joiner"
 
@@ -90,12 +91,9 @@ func newIndexJoiner(
 		nil, /* memMonitor */
 		ProcStateOpts{
 			InputsToDrain: []RowSource{ij.input},
-			TrailingMetaCallback: func(ctx context.Context) []ProducerMetadata {
+			TrailingMetaCallback: func(ctx context.Context) []distsqlpb.ProducerMetadata {
 				ij.InternalClose()
-				if meta := getTxnCoordMeta(ctx, ij.flowCtx.txn); meta != nil {
-					return []ProducerMetadata{{TxnCoordMeta: meta}}
-				}
-				return nil
+				return ij.generateMeta(ctx)
 			},
 		},
 	); err != nil {
@@ -134,7 +132,7 @@ func (ij *indexJoiner) Start(ctx context.Context) context.Context {
 }
 
 // Next is part of the RowSource interface.
-func (ij *indexJoiner) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (ij *indexJoiner) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	for ij.State == StateRunning {
 		if !ij.fetcherReady {
 			// Retrieve a batch of rows from the input.
@@ -227,4 +225,16 @@ func (ij *indexJoiner) outputStatsToTrace() {
 	if sp := opentracing.SpanFromContext(ij.Ctx); sp != nil {
 		tracing.SetSpanStats(sp, jrs)
 	}
+}
+
+func (ij *indexJoiner) generateMeta(ctx context.Context) []distsqlpb.ProducerMetadata {
+	if meta := getTxnCoordMeta(ctx, ij.flowCtx.txn); meta != nil {
+		return []distsqlpb.ProducerMetadata{{TxnCoordMeta: meta}}
+	}
+	return nil
+}
+
+// DrainMeta is part of the MetadataSource interface.
+func (ij *indexJoiner) DrainMeta(ctx context.Context) []distsqlpb.ProducerMetadata {
+	return ij.generateMeta(ctx)
 }

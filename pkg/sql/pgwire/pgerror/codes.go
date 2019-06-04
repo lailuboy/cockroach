@@ -297,3 +297,43 @@ const (
 	CodeDataCorruptedError  = "XX001"
 	CodeIndexCorruptedError = "XX002"
 )
+
+// The following errors are CockroachDB-specific.
+
+var (
+	// CodeUncategorizedError is used for errors that flow out to a client
+	// when there's no code known yet.
+	CodeUncategorizedError = "XXUUU"
+
+	// CodeRangeUnavailable signals that some data from the cluster cannot be
+	// accessed (e.g. because all replicas awol).
+	// We're using the postgres "Internal Error" error class "XX".
+	CodeRangeUnavailable = "XXC00"
+
+	// CodeCCLRequired signals that a CCL binary is required to complete this
+	// task.
+	CodeCCLRequired = "XXC01"
+
+	// CodeCCLValidLicenseRequired signals that a valid CCL license is
+	// required to complete this task.
+	CodeCCLValidLicenseRequired = "XXC02"
+
+	// CodeTransactionCommittedWithSchemaChangeFailure signals that the
+	// non-DDL payload of a transaction was committed successfully but
+	// some DDL operation failed, without rolling back the rest of the
+	// transaction.
+	//
+	// We define a separate code instead of reusing a code from
+	// PostgreSQL (like StatementCompletionUnknown) because that makes
+	// it easier to document the error (this code only occurs in this
+	// particular situation) in a way that's unique to CockroachDB.
+	//
+	// We also use a "XX" code for this for several reasons:
+	// - it needs to override any other pg code set "underneath" in the cause.
+	// - it forces implementers of logic tests to be mindful about
+	//   this situation. The logic test runner will remind the implementer
+	//   that:
+	//       serious error with code "XXA00" occurred; if expected,
+	//       must use 'error pgcode XXA00 ...'
+	CodeTransactionCommittedWithSchemaChangeFailure = "XXA00"
+)

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -29,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/lib/pq/oid"
-	"github.com/pkg/errors"
 )
 
 // This file contains utils and interfaces used by a connExecutor to communicate
@@ -117,7 +117,9 @@ type StmtBuf struct {
 // buffer.
 type Command interface {
 	fmt.Stringer
-	command()
+	// command returns a string representation of the command type (e.g.
+	// "prepare", "exec stmt").
+	command() string
 }
 
 // ExecStmt is the command for running a query sent through the "simple" pgwire
@@ -138,12 +140,17 @@ type ExecStmt struct {
 }
 
 // command implements the Command interface.
-func (ExecStmt) command() {}
+func (ExecStmt) command() string { return "exec stmt" }
 
 func (e ExecStmt) String() string {
 	// We have the original SQL, but we still use String() because it obfuscates
 	// passwords.
-	return fmt.Sprintf("ExecStmt: %s", e.AST.String())
+	s := "(empty)"
+	// e.AST could be nil in the case of a completely empty query.
+	if e.AST != nil {
+		s = e.AST.String()
+	}
+	return fmt.Sprintf("ExecStmt: %s", s)
 }
 
 var _ Command = ExecStmt{}
@@ -160,7 +167,7 @@ type ExecPortal struct {
 }
 
 // command implements the Command interface.
-func (ExecPortal) command() {}
+func (ExecPortal) command() string { return "exec portal" }
 
 func (e ExecPortal) String() string {
 	return fmt.Sprintf("ExecPortal name: %q", e.Name)
@@ -187,12 +194,17 @@ type PrepareStmt struct {
 }
 
 // command implements the Command interface.
-func (PrepareStmt) command() {}
+func (PrepareStmt) command() string { return "prepare" }
 
 func (p PrepareStmt) String() string {
 	// We have the original SQL, but we still use String() because it obfuscates
 	// passwords.
-	return fmt.Sprintf("PrepareStmt: %s", p.AST.String())
+	s := "(empty)"
+	// p.AST could be nil in the case of a completely empty query.
+	if p.AST != nil {
+		s = p.AST.String()
+	}
+	return fmt.Sprintf("PrepareStmt: %s", s)
 }
 
 var _ Command = PrepareStmt{}
@@ -205,7 +217,7 @@ type DescribeStmt struct {
 }
 
 // command implements the Command interface.
-func (DescribeStmt) command() {}
+func (DescribeStmt) command() string { return "describe" }
 
 func (d DescribeStmt) String() string {
 	return fmt.Sprintf("Describe: %q", d.Name)
@@ -245,7 +257,7 @@ type BindStmt struct {
 }
 
 // command implements the Command interface.
-func (BindStmt) command() {}
+func (BindStmt) command() string { return "bind" }
 
 func (b BindStmt) String() string {
 	return fmt.Sprintf("BindStmt: %q->%q", b.PreparedStatementName, b.PortalName)
@@ -260,7 +272,7 @@ type DeletePreparedStmt struct {
 }
 
 // command implements the Command interface.
-func (DeletePreparedStmt) command() {}
+func (DeletePreparedStmt) command() string { return "delete" }
 
 func (d DeletePreparedStmt) String() string {
 	return fmt.Sprintf("DeletePreparedStmt: %q", d.Name)
@@ -280,7 +292,7 @@ var _ Command = DeletePreparedStmt{}
 type Sync struct{}
 
 // command implements the Command interface.
-func (Sync) command() {}
+func (Sync) command() string { return "sync" }
 
 func (Sync) String() string {
 	return "Sync"
@@ -293,7 +305,7 @@ var _ Command = Sync{}
 type Flush struct{}
 
 // command implements the Command interface.
-func (Flush) command() {}
+func (Flush) command() string { return "flush" }
 
 func (Flush) String() string {
 	return "Flush"
@@ -313,7 +325,7 @@ type CopyIn struct {
 }
 
 // command implements the Command interface.
-func (CopyIn) command() {}
+func (CopyIn) command() string { return "copy" }
 
 func (CopyIn) String() string {
 	return "CopyIn"
@@ -328,7 +340,7 @@ var _ Command = CopyIn{}
 type DrainRequest struct{}
 
 // command implements the Command interface.
-func (DrainRequest) command() {}
+func (DrainRequest) command() string { return "drain" }
 
 func (DrainRequest) String() string {
 	return "Drain"
@@ -345,7 +357,7 @@ type SendError struct {
 }
 
 // command implements the Command interface.
-func (SendError) command() {}
+func (SendError) command() string { return "send error" }
 
 func (s SendError) String() string {
 	return fmt.Sprintf("SendError: %s", s.Err)
@@ -388,7 +400,7 @@ func (buf *StmtBuf) Push(ctx context.Context, cmd Command) error {
 	buf.mu.Lock()
 	defer buf.mu.Unlock()
 	if buf.mu.closed {
-		return fmt.Errorf("buffer is closed")
+		return pgerror.AssertionFailedf("buffer is closed")
 	}
 	buf.mu.data = append(buf.mu.data, cmd)
 	buf.mu.lastPos++
@@ -422,8 +434,8 @@ func (buf *StmtBuf) curCmd() (Command, CmdPos, error) {
 			return buf.mu.data[cmdIdx], curPos, nil
 		}
 		if cmdIdx != len(buf.mu.data) {
-			return nil, 0, errors.Errorf(
-				"can only wait for next command; corrupt cursor: %d", curPos)
+			return nil, 0, pgerror.AssertionFailedf(
+				"can only wait for next command; corrupt cursor: %d", log.Safe(curPos))
 		}
 		// Wait for the next Command to arrive to the buffer.
 		buf.mu.cond.Wait()
@@ -438,9 +450,9 @@ func (buf *StmtBuf) curCmd() (Command, CmdPos, error) {
 // error.
 func (buf *StmtBuf) translatePosLocked(pos CmdPos) (int, error) {
 	if pos < buf.mu.startPos {
-		return 0, errors.Errorf(
+		return 0, pgerror.AssertionFailedf(
 			"position %d no longer in buffer (buffer starting at %d)",
-			pos, buf.mu.startPos)
+			log.Safe(pos), log.Safe(buf.mu.startPos))
 	}
 	return int(pos - buf.mu.startPos), nil
 }
@@ -500,7 +512,7 @@ func (buf *StmtBuf) seekToNextBatch() error {
 	}
 	if cmdIdx == len(buf.mu.data) {
 		buf.mu.Unlock()
-		return errors.Errorf("invalid seek start point")
+		return pgerror.AssertionFailedf("invalid seek start point")
 	}
 	buf.mu.Unlock()
 
@@ -588,7 +600,7 @@ type ClientComm interface {
 	// CreateErrorResult creates a result on which only errors can be communicated
 	// to the client.
 	CreateErrorResult(pos CmdPos) ErrorResult
-	// CreateEmptyQueryResult creates a result for an emptry-string query.
+	// CreateEmptyQueryResult creates a result for an empty-string query.
 	CreateEmptyQueryResult(pos CmdPos) EmptyQueryResult
 	// CreateCopyInResult creates a result for a Copy-in command.
 	CreateCopyInResult(pos CmdPos) CopyInResult
@@ -706,6 +718,12 @@ type RestrictedCommandResult interface {
 	// RowsAffected returns either the number of times AddRow was called, or the
 	// sum of all n passed into IncrementRowsAffected.
 	RowsAffected() int
+
+	// DisableBuffering can be called during execution to ensure that
+	// the results accumulated so far, and all subsequent rows added
+	// to this CommandResult, will be flushed immediately to the client.
+	// This is currently used for sinkless changefeeds.
+	DisableBuffering()
 }
 
 // DescribeResult represents the result of a Describe command (for either
@@ -872,6 +890,10 @@ func (r *bufferedCommandResult) AddRow(ctx context.Context, row tree.Datums) err
 	copy(rowCopy, row)
 	r.rows = append(r.rows, rowCopy)
 	return nil
+}
+
+func (r *bufferedCommandResult) DisableBuffering() {
+	panic("cannot disable buffering here")
 }
 
 // SetError is part of the RestrictedCommandResult interface.

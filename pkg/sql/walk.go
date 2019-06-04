@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -227,6 +228,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 	case *indexJoinNode:
 		if v.observer.attr != nil {
 			v.observer.attr(name, "table", fmt.Sprintf("%s@%s", n.table.desc.Name, n.table.index.Name))
+			v.expr(name, "filter", -1, n.table.filter)
 		}
 		v.visitConcrete(n.index)
 
@@ -259,6 +261,15 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			}
 		}
 
+	case *applyJoinNode:
+		if v.observer.attr != nil {
+			v.observer.attr(name, "type", joinTypeStr(n.joinType))
+		}
+		if v.observer.expr != nil {
+			v.expr(name, "pred", -1, n.pred.onCond)
+		}
+		n.input.plan = v.visit(n.input.plan)
+
 	case *joinNode:
 		if v.observer.attr != nil {
 			jType := joinTypeStr(n.joinType)
@@ -288,11 +299,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 				for i := range eqCols {
 					eqCols[i].Name = fmt.Sprintf("(%s=%s)", n.pred.leftColNames[i], n.pred.rightColNames[i])
 				}
-				var order physicalProps
-				for _, o := range n.mergeJoinOrdering {
-					order.addOrderColumn(o.ColIdx, o.Direction)
-				}
-				v.observer.attr(name, "mergeJoinOrder", order.AsString(eqCols))
+				v.observer.attr(name, "mergeJoinOrder", formatOrdering(n.mergeJoinOrdering, eqCols))
 			}
 		}
 		if v.observer.expr != nil {
@@ -352,11 +359,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			// We use n.ordering and not plan.Ordering() because
 			// plan.Ordering() does not include the added sort columns not
 			// present in the output.
-			var order physicalProps
-			for _, o := range n.ordering {
-				order.addOrderColumn(o.ColIdx, o.Direction)
-			}
-			v.observer.attr(name, "order", order.AsString(columns))
+			v.observer.attr(name, "order", formatOrdering(n.ordering, columns))
 		}
 		n.plan = v.visit(n.plan)
 
@@ -383,10 +386,14 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 				v.observer.attr(name, fmt.Sprintf("aggregate %d", i), buf.String())
 			}
 			if len(n.groupCols) > 0 {
-				v.observer.attr(name, "group by", colListStr(n.groupCols))
+				var cols []string
+				for _, c := range n.groupCols {
+					cols = append(cols, inputCols[c].Name)
+				}
+				v.observer.attr(name, "group by", strings.Join(cols, ", "))
 			}
-			if len(n.orderedGroupCols) > 0 {
-				v.observer.attr(name, "ordered", colListStr(n.orderedGroupCols))
+			if len(n.groupColOrdering) > 0 {
+				v.observer.attr(name, "ordered", formatOrdering(n.groupColOrdering, inputCols))
 			}
 			if n.isScalar {
 				v.observer.attr(name, "scalar", "")
@@ -413,6 +420,9 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 	case *splitNode:
 		n.rows = v.visit(n.rows)
 
+	case *unsplitNode:
+		n.rows = v.visit(n.rows)
+
 	case *relocateNode:
 		n.rows = v.visit(n.rows)
 
@@ -421,11 +431,11 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			var buf bytes.Buffer
 			buf.WriteString(n.run.ti.tableDesc().Name)
 			buf.WriteByte('(')
-			for i, col := range n.run.insertCols {
+			for i := range n.run.insertCols {
 				if i > 0 {
 					buf.WriteString(", ")
 				}
-				buf.WriteString(col.Name)
+				buf.WriteString(n.run.insertCols[i].Name)
 			}
 			buf.WriteByte(')')
 			v.observer.attr(name, "into", buf.String())
@@ -449,11 +459,11 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			var buf bytes.Buffer
 			buf.WriteString(n.run.tw.tableDesc().Name)
 			buf.WriteByte('(')
-			for i, col := range n.run.insertCols {
+			for i := range n.run.insertCols {
 				if i > 0 {
 					buf.WriteString(", ")
 				}
-				buf.WriteString(col.Name)
+				buf.WriteString(n.run.insertCols[i].Name)
 			}
 			buf.WriteByte(')')
 			v.observer.attr(name, "into", buf.String())
@@ -480,11 +490,11 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			v.observer.attr(name, "table", n.run.tu.tableDesc().Name)
 			if len(n.run.tu.ru.UpdateCols) > 0 {
 				var buf bytes.Buffer
-				for i, col := range n.run.tu.ru.UpdateCols {
+				for i := range n.run.tu.ru.UpdateCols {
 					if i > 0 {
 						buf.WriteString(", ")
 					}
-					buf.WriteString(col.Name)
+					buf.WriteString(n.run.tu.ru.UpdateCols[i].Name)
 				}
 				v.observer.attr(name, "set", buf.String())
 			}
@@ -567,6 +577,12 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 		}
 		n.source = v.visit(n.source)
 
+	case *saveTableNode:
+		if v.observer.attr != nil {
+			v.observer.attr(name, "target", n.target.String())
+		}
+		n.source = v.visit(n.source)
+
 	case *showTraceReplicaNode:
 		n.plan = v.visit(n.plan)
 
@@ -602,6 +618,12 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 		if v.observer.followRowSourceToPlanNode && n.originalPlanNode != nil {
 			v.visit(n.originalPlanNode)
 		}
+
+	case *errorIfRowsNode:
+		n.plan = v.visit(n.plan)
+
+	case *bufferNode:
+		n.plan = v.visit(n.plan)
 	}
 }
 
@@ -623,6 +645,14 @@ func (v *planVisitor) metadataExpr(nodeName string, fieldName string, n int, exp
 	v.observer.expr(observeMetadata, nodeName, fieldName, n, expr)
 }
 
+func formatOrdering(ordering sqlbase.ColumnOrdering, cols sqlbase.ResultColumns) string {
+	var order physicalProps
+	for _, o := range ordering {
+		order.addOrderColumn(o.ColIdx, o.Direction)
+	}
+	return order.AsString(cols)
+}
+
 // nodeName returns the name of the given planNode as string.  The
 // node's current state is taken into account, e.g. sortNode has
 // either name "sort" or "nosort" depending on whether sorting is
@@ -642,6 +672,12 @@ func nodeName(plan planNode) string {
 		if n.emitAll {
 			return "append"
 		}
+
+	case *joinNode:
+		if len(n.mergeJoinOrdering) > 0 {
+			return "merge-join"
+		}
+		return "hash-join"
 	}
 
 	name, ok := planNodeNames[reflect.TypeOf(plan)]
@@ -670,29 +706,6 @@ func joinTypeStr(t sqlbase.JoinType) string {
 	panic(fmt.Sprintf("unknown join type %s", t))
 }
 
-func colListStr(cols []int) string {
-	// Display the columns as @1-@x if possible.
-	shorthand := true
-	for i, idx := range cols {
-		if idx != i {
-			shorthand = false
-			break
-		}
-	}
-	if shorthand && len(cols) > 1 {
-		return fmt.Sprintf("@1-@%d", len(cols))
-	}
-
-	var buf bytes.Buffer
-	for i, idx := range cols {
-		if i > 0 {
-			buf.WriteByte(',')
-		}
-		fmt.Fprintf(&buf, "@%d", idx+1)
-	}
-	return buf.String()
-}
-
 // planNodeNames is the mapping from node type to strings.  The
 // strings are constant and not precomputed so that the type names can
 // be changed without changing the output of "EXPLAIN".
@@ -701,6 +714,8 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&alterSequenceNode{}):        "alter sequence",
 	reflect.TypeOf(&alterTableNode{}):           "alter table",
 	reflect.TypeOf(&alterUserSetPasswordNode{}): "alter user",
+	reflect.TypeOf(&applyJoinNode{}):            "apply-join",
+	reflect.TypeOf(&bufferNode{}):               "buffer node",
 	reflect.TypeOf(&commentOnColumnNode{}):      "comment on column",
 	reflect.TypeOf(&commentOnDatabaseNode{}):    "comment on database",
 	reflect.TypeOf(&commentOnTableNode{}):       "comment on table",
@@ -724,6 +739,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&dropTableNode{}):            "drop table",
 	reflect.TypeOf(&DropUserNode{}):             "drop user/role",
 	reflect.TypeOf(&dropViewNode{}):             "drop view",
+	reflect.TypeOf(&errorIfRowsNode{}):          "errorIfRows",
 	reflect.TypeOf(&explainDistSQLNode{}):       "explain distsql",
 	reflect.TypeOf(&explainPlanNode{}):          "explain plan",
 	reflect.TypeOf(&filterNode{}):               "filter",
@@ -745,6 +761,8 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&renderNode{}):               "render",
 	reflect.TypeOf(&rowCountNode{}):             "count",
 	reflect.TypeOf(&rowSourceToPlanNode{}):      "row source to plan node",
+	reflect.TypeOf(&saveTableNode{}):            "save table",
+	reflect.TypeOf(&scanBufferNode{}):           "scan buffer node",
 	reflect.TypeOf(&scanNode{}):                 "scan",
 	reflect.TypeOf(&scatterNode{}):              "scatter",
 	reflect.TypeOf(&scrubNode{}):                "scrub",
@@ -756,9 +774,9 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&showFingerprintsNode{}):     "showFingerprints",
 	reflect.TypeOf(&showTraceNode{}):            "show trace for",
 	reflect.TypeOf(&showTraceReplicaNode{}):     "replica trace",
-	reflect.TypeOf(&showZoneConfigNode{}):       "show zone configuration",
 	reflect.TypeOf(&sortNode{}):                 "sort",
 	reflect.TypeOf(&splitNode{}):                "split",
+	reflect.TypeOf(&unsplitNode{}):              "unsplit",
 	reflect.TypeOf(&spoolNode{}):                "spool",
 	reflect.TypeOf(&truncateNode{}):             "truncate",
 	reflect.TypeOf(&unaryNode{}):                "emptyrow",

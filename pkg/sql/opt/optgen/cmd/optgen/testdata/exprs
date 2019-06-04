@@ -45,16 +45,15 @@ define Sort {
 package memo
 
 import (
-	"fmt"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // ProjectExpr is a projection operator.
@@ -87,7 +86,7 @@ func (e *ProjectExpr) Child(nth int) opt.Expr {
 	case 1:
 		return &e.Projections
 	}
-	panic("child index out of range")
+	panic(pgerror.AssertionFailedf("child index out of range"))
 }
 
 func (e *ProjectExpr) Private() interface{} {
@@ -109,7 +108,7 @@ func (e *ProjectExpr) SetChild(nth int, child opt.Expr) {
 		e.Projections = *child.(*ProjectionsExpr)
 		return
 	}
-	panic("child index out of range")
+	panic(pgerror.AssertionFailedf("child index out of range"))
 }
 
 func (e *ProjectExpr) Memo() *Memo {
@@ -150,14 +149,14 @@ func (e *ProjectExpr) bestProps() *bestProps {
 
 func (e *ProjectExpr) setNext(member RelExpr) {
 	if e.next != nil {
-		panic(fmt.Sprintf("expression already has its next defined: %s", e))
+		panic(pgerror.AssertionFailedf("expression already has its next defined: %s", e))
 	}
 	e.next = member
 }
 
 func (e *ProjectExpr) setGroup(member RelExpr) {
 	if e.grp != nil {
-		panic(fmt.Sprintf("expression is already in a group: %s", e))
+		panic(pgerror.AssertionFailedf("expression is already in a group: %s", e))
 	}
 	e.grp = member.group()
 	LastGroupMember(member).setNext(e)
@@ -195,7 +194,7 @@ var EmptyProjectionsExpr = ProjectionsExpr{}
 var _ opt.ScalarExpr = &ProjectionsExpr{}
 
 func (e *ProjectionsExpr) ID() opt.ScalarID {
-	panic("lists have no id")
+	panic(pgerror.AssertionFailedf("lists have no id"))
 }
 
 func (e *ProjectionsExpr) Op() opt.Operator {
@@ -224,7 +223,7 @@ func (e *ProjectionsExpr) SetChild(nth int, child opt.Expr) {
 	(*e)[nth] = *child.(*ProjectionsItem)
 }
 
-func (e *ProjectionsExpr) DataType() types.T {
+func (e *ProjectionsExpr) DataType() *types.T {
 	return types.Any
 }
 
@@ -232,7 +231,7 @@ type ProjectionsItem struct {
 	Element opt.ScalarExpr
 	ColPrivate
 
-	Typ types.T
+	Typ *types.T
 	id  opt.ScalarID
 }
 
@@ -255,7 +254,7 @@ func (e *ProjectionsItem) Child(nth int) opt.Expr {
 	case 0:
 		return e.Element
 	}
-	panic("child index out of range")
+	panic(pgerror.AssertionFailedf("child index out of range"))
 }
 
 func (e *ProjectionsItem) Private() interface{} {
@@ -274,10 +273,10 @@ func (e *ProjectionsItem) SetChild(nth int, child opt.Expr) {
 		e.Element = child.(opt.ScalarExpr)
 		return
 	}
-	panic("child index out of range")
+	panic(pgerror.AssertionFailedf("child index out of range"))
 }
 
-func (e *ProjectionsItem) DataType() types.T {
+func (e *ProjectionsItem) DataType() *types.T {
 	return e.Typ
 }
 
@@ -313,7 +312,7 @@ func (e *SortExpr) Child(nth int) opt.Expr {
 	if nth == 0 {
 		return e.Input
 	}
-	panic("child index out of range")
+	panic(pgerror.AssertionFailedf("child index out of range"))
 }
 
 func (e *SortExpr) Private() interface{} {
@@ -331,7 +330,7 @@ func (e *SortExpr) SetChild(nth int, child opt.Expr) {
 		e.Input = child.(RelExpr)
 		return
 	}
-	panic("child index out of range")
+	panic(pgerror.AssertionFailedf("child index out of range"))
 }
 
 func (e *SortExpr) Memo() *Memo {
@@ -371,11 +370,11 @@ func (e *SortExpr) group() exprGroup {
 }
 
 func (e *SortExpr) setNext(member RelExpr) {
-	panic("setNext cannot be called on enforcers")
+	panic(pgerror.AssertionFailedf("setNext cannot be called on enforcers"))
 }
 
 func (e *SortExpr) setGroup(member exprGroup) {
-	panic("setGroup cannot be called on enforcers")
+	panic(pgerror.AssertionFailedf("setGroup cannot be called on enforcers"))
 }
 
 func (m *Memo) MemoizeProject(
@@ -408,7 +407,8 @@ func (m *Memo) AddProjectToGroup(e *ProjectExpr, grp RelExpr) *ProjectExpr {
 		m.memEstimate += size
 		m.checkExpr(e)
 	} else if interned.group() != grp.group() {
-		panic(fmt.Sprintf("%s expression cannot be added to multiple groups: %s", e.Op(), interned))
+		// This is a group collision, do nothing.
+		return nil
 	}
 	return interned
 }
@@ -422,7 +422,7 @@ func (in *interner) InternExpr(e opt.Expr) opt.Expr {
 	case *ProjectionsItem:
 		return in.InternProjectionsItem(t)
 	default:
-		panic(fmt.Sprintf("unhandled op: %s", e.Op()))
+		panic(pgerror.AssertionFailedf("unhandled op: %s", e.Op()))
 	}
 }
 
@@ -491,7 +491,7 @@ func (b *logicalPropsBuilder) buildProps(e RelExpr, rel *props.Relational) {
 	case *ProjectExpr:
 		b.buildProjectProps(t, rel)
 	default:
-		panic(fmt.Sprintf("unhandled type: %s", t.Op()))
+		panic(pgerror.AssertionFailedf("unhandled type: %s", t.Op()))
 	}
 }
 ----

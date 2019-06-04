@@ -212,6 +212,8 @@ enum TransactionRetryReason {
   RETRY_POSSIBLE_REPLAY = 4;
   // An asynchronous write was observed to have failed.
   RETRY_ASYNC_WRITE_FAILURE = 5;
+  // The transaction exceeded its deadline.
+  RETRY_COMMIT_DEADLINE_EXCEEDED = 6;
 }
 
 // A TransactionRetryError indicates that the transaction must be
@@ -220,6 +222,7 @@ message TransactionRetryError {
   option (gogoproto.equal) = true;
 
   optional TransactionRetryReason reason = 1 [(gogoproto.nullable) = false];
+  optional string extra_msg = 2 [(gogoproto.nullable) = false];
 }
 
 // A TransactionStatusError indicates that the transaction status is
@@ -447,6 +450,8 @@ message IntentMissingError {
 
   // The non-matching intent that was found at that key, if any.
   optional Intent wrong_intent = 1;
+  // The key where the intent was expected.
+  optional bytes key = 2 [(gogoproto.casttype) = "Key"];
 }
 
 // A MergeInProgressError indicates that the request could not be completed
@@ -480,6 +485,18 @@ message RangeFeedRetryError {
     REASON_SLOW_CONSUMER = 5;
   }
   optional Reason reason = 1 [(gogoproto.nullable) = false];
+}
+
+// A IndeterminateCommitError indicates that a transaction was encountered with
+// a STAGING status. In this state, it is unclear by observing the transaction
+// record alone whether the transaction should be committed or aborted. To make
+// this determination, the transaction recovery process must be initiated. This
+// process makes a ruling on the final state of the transaction based on the
+// outcome of its in-flight writes at the time of staging.
+message IndeterminateCommitError {
+  option (gogoproto.equal) = true;
+
+  optional Transaction staging_txn = 1 [(gogoproto.nullable) = false];
 }
 
 // ErrorDetail is a union type containing all available errors.
@@ -522,6 +539,7 @@ message ErrorDetail {
     IntentMissingError intent_missing = 36;
     MergeInProgressError merge_in_progress = 37;
     RangeFeedRetryError rangefeed_retry = 38;
+    IndeterminateCommitError indeterminate_commit = 39;
   }
 }
 

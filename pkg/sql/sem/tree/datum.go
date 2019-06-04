@@ -20,6 +20,7 @@ import (
 	"math"
 	"math/big"
 	"net"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,14 +30,14 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stringencoding"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -44,7 +45,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/lib/pq/oid"
-	"github.com/pkg/errors"
 	"golang.org/x/text/collate"
 	"golang.org/x/text/language"
 )
@@ -65,6 +65,9 @@ var (
 
 	// DZero is the zero-valued integer Datum.
 	DZero = NewDInt(0)
+
+	// DTimeRegex is a compiled regex for parsing the 24:00 time value
+	DTimeRegex = regexp.MustCompile("^24:00($|(:00$)|(:00.0+$))")
 )
 
 // Datum represents a SQL value.
@@ -202,7 +205,7 @@ func MakeDBool(d DBool) *DBool {
 func MustBeDBool(e Expr) DBool {
 	b, ok := AsDBool(e)
 	if !ok {
-		panic(pgerror.NewAssertionErrorf("expected *DBool, found %T", e))
+		panic(pgerror.AssertionFailedf("expected *DBool, found %T", e))
 	}
 	return b
 }
@@ -221,17 +224,18 @@ func AsDBool(e Expr) (DBool, bool) {
 // makeParseError returns a parse error using the provided string and type. An
 // optional error can be provided, which will be appended to the end of the
 // error string.
-func makeParseError(s string, typ types.T, err error) error {
-	var suffix string
+func makeParseError(s string, typ *types.T, err error) error {
 	if err != nil {
-		suffix = fmt.Sprintf(": %v", err)
+		return pgerror.Wrapf(err, pgerror.CodeInvalidTextRepresentationError,
+			"could not parse %q as type %s", s, typ)
 	}
-	return pgerror.NewErrorf(
-		pgerror.CodeInvalidTextRepresentationError, "could not parse %q as type %s%s", s, typ, suffix)
+	return pgerror.Newf(pgerror.CodeInvalidTextRepresentationError,
+		"could not parse %q as type %s", s, typ)
 }
 
-func makeUnsupportedComparisonMessage(d1, d2 Datum) string {
-	return fmt.Sprintf("unsupported comparison: %s to %s", d1.ResolvedType(), d2.ResolvedType())
+func makeUnsupportedComparisonMessage(d1, d2 Datum) error {
+	return pgerror.AssertionFailedWithDepthf(1,
+		"unsupported comparison: %s to %s", log.Safe(d1.ResolvedType()), log.Safe(d2.ResolvedType()))
 }
 
 func isCaseInsensitivePrefix(prefix, s string) bool {
@@ -284,7 +288,7 @@ func ParseDBool(s string) (*DBool, error) {
 			}
 		}
 	}
-	return nil, makeParseError(s, types.Bool, pgerror.NewError(pgerror.CodeInvalidTextRepresentationError, "invalid bool value"))
+	return nil, makeParseError(s, types.Bool, pgerror.New(pgerror.CodeInvalidTextRepresentationError, "invalid bool value"))
 }
 
 // ParseDByte parses a string representation of hex encoded binary
@@ -305,7 +309,7 @@ func ParseDByte(s string) (*DBytes, error) {
 func ParseDUuidFromString(s string) (*DUuid, error) {
 	uv, err := uuid.FromString(s)
 	if err != nil {
-		return nil, makeParseError(s, types.UUID, err)
+		return nil, makeParseError(s, types.Uuid, err)
 	}
 	return NewDUuid(DUuid{uv}), nil
 }
@@ -315,7 +319,7 @@ func ParseDUuidFromString(s string) (*DUuid, error) {
 func ParseDUuidFromBytes(b []byte) (*DUuid, error) {
 	uv, err := uuid.FromBytes(b)
 	if err != nil {
-		return nil, makeParseError(string(b), types.UUID, err)
+		return nil, makeParseError(string(b), types.Uuid, err)
 	}
 	return NewDUuid(DUuid{uv}), nil
 }
@@ -339,11 +343,11 @@ func GetBool(d Datum) (DBool, error) {
 	if d == DNull {
 		return DBool(false), nil
 	}
-	return false, pgerror.NewAssertionErrorf("cannot convert %s to type %s", d.ResolvedType(), types.Bool)
+	return false, pgerror.AssertionFailedf("cannot convert %s to type %s", d.ResolvedType(), types.Bool)
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DBool) ResolvedType() types.T {
+func (*DBool) ResolvedType() *types.T {
 	return types.Bool
 }
 
@@ -454,7 +458,7 @@ func MakeDBitArray(bitLen uint) DBitArray {
 func MustBeDBitArray(e Expr) *DBitArray {
 	b, ok := AsDBitArray(e)
 	if !ok {
-		panic(pgerror.NewAssertionErrorf("expected *DBitArray, found %T", e))
+		panic(pgerror.AssertionFailedf("expected *DBitArray, found %T", e))
 	}
 	return b
 }
@@ -470,7 +474,7 @@ func AsDBitArray(e Expr) (*DBitArray, bool) {
 	return nil, false
 }
 
-var errCannotCastNegativeIntToBitArray = pgerror.NewErrorf(pgerror.CodeCannotCoerceError,
+var errCannotCastNegativeIntToBitArray = pgerror.Newf(pgerror.CodeCannotCoerceError,
 	"cannot cast negative integer to bit varying with unbounded width")
 
 // NewDBitArrayFromInt creates a bit array from the specified integer
@@ -501,8 +505,8 @@ func (d *DBitArray) AsDInt(n uint) *DInt {
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DBitArray) ResolvedType() types.T {
-	return types.BitArray
+func (*DBitArray) ResolvedType() *types.T {
+	return types.VarBit
 }
 
 // Compare implements the Datum interface.
@@ -613,13 +617,13 @@ func AsDInt(e Expr) (DInt, bool) {
 func MustBeDInt(e Expr) DInt {
 	i, ok := AsDInt(e)
 	if !ok {
-		panic(pgerror.NewAssertionErrorf("expected *DInt, found %T", e))
+		panic(pgerror.AssertionFailedf("expected *DInt, found %T", e))
 	}
 	return i
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DInt) ResolvedType() types.T {
+func (*DInt) ResolvedType() *types.T {
 	return types.Int
 }
 
@@ -724,7 +728,7 @@ func ParseDFloat(s string) (*DFloat, error) {
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DFloat) ResolvedType() types.T {
+func (*DFloat) ResolvedType() *types.T {
 	return types.Float
 }
 
@@ -893,7 +897,7 @@ func (d *DDecimal) SetString(s string) error {
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DDecimal) ResolvedType() types.T {
+func (*DDecimal) ResolvedType() *types.T {
 	return types.Decimal
 }
 
@@ -911,7 +915,7 @@ func (d *DDecimal) Compare(ctx *EvalContext, other Datum) int {
 		v.SetFinite(int64(*t), 0)
 	case *DFloat:
 		if _, err := v.SetFloat64(float64(*t)); err != nil {
-			panic(err)
+			panic(pgerror.NewAssertionErrorWithWrappedErrf(err, "decimal compare, unexpected error"))
 		}
 	default:
 		panic(makeUnsupportedComparisonMessage(d, other))
@@ -1049,13 +1053,13 @@ func AsDString(e Expr) (DString, bool) {
 func MustBeDString(e Expr) DString {
 	i, ok := AsDString(e)
 	if !ok {
-		panic(pgerror.NewAssertionErrorf("expected *DString, found %T", e))
+		panic(pgerror.AssertionFailedf("expected *DString, found %T", e))
 	}
 	return i
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DString) ResolvedType() types.T {
+func (*DString) ResolvedType() *types.T {
 	return types.String
 }
 
@@ -1186,12 +1190,12 @@ func (*DCollatedString) AmbiguousFormat() bool { return false }
 func (d *DCollatedString) Format(ctx *FmtCtx) {
 	lex.EncodeSQLString(&ctx.Buffer, d.Contents)
 	ctx.WriteString(" COLLATE ")
-	lex.EncodeUnrestrictedSQLIdent(&ctx.Buffer, d.Locale, lex.EncNoFlags)
+	lex.EncodeLocaleName(&ctx.Buffer, d.Locale)
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (d *DCollatedString) ResolvedType() types.T {
-	return types.TCollatedString{Locale: d.Locale}
+func (d *DCollatedString) ResolvedType() *types.T {
+	return types.MakeCollatedString(types.String, d.Locale)
 }
 
 // Compare implements the Datum interface.
@@ -1261,7 +1265,7 @@ func NewDBytes(d DBytes) *DBytes {
 func MustBeDBytes(e Expr) DBytes {
 	i, ok := AsDBytes(e)
 	if !ok {
-		panic(pgerror.NewAssertionErrorf("expected *DBytes, found %T", e))
+		panic(pgerror.AssertionFailedf("expected *DBytes, found %T", e))
 	}
 	return i
 }
@@ -1277,7 +1281,7 @@ func AsDBytes(e Expr) (DBytes, bool) {
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DBytes) ResolvedType() types.T {
+func (*DBytes) ResolvedType() *types.T {
 	return types.Bytes
 }
 
@@ -1379,8 +1383,8 @@ func NewDUuid(d DUuid) *DUuid {
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DUuid) ResolvedType() types.T {
-	return types.UUID
+func (*DUuid) ResolvedType() *types.T {
+	return types.Uuid
 }
 
 // Compare implements the Datum interface.
@@ -1489,13 +1493,13 @@ func AsDIPAddr(e Expr) (DIPAddr, bool) {
 func MustBeDIPAddr(e Expr) DIPAddr {
 	i, ok := AsDIPAddr(e)
 	if !ok {
-		panic(pgerror.NewAssertionErrorf("expected *DIPAddr, found %T", e))
+		panic(pgerror.AssertionFailedf("expected *DIPAddr, found %T", e))
 	}
 	return i
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DIPAddr) ResolvedType() types.T {
+func (*DIPAddr) ResolvedType() *types.T {
 	return types.INet
 }
 
@@ -1621,19 +1625,25 @@ func (d *DIPAddr) Size() uintptr {
 
 // DDate is the date Datum represented as the number of days after
 // the Unix epoch.
-type DDate int64
+type DDate struct {
+	pgdate.Date
+}
 
 // NewDDate is a helper routine to create a *DDate initialized from its
 // argument.
-func NewDDate(d DDate) *DDate {
-	return &d
+func NewDDate(d pgdate.Date) *DDate {
+	return &DDate{Date: d}
 }
 
-// NewDDateFromTime constructs a *DDate from a time.Time in the provided time zone.
-func NewDDateFromTime(t time.Time, loc *time.Location) *DDate {
-	Year, Month, Day := t.In(loc).Date()
-	secs := time.Date(Year, Month, Day, 0, 0, 0, 0, time.UTC).Unix()
-	return NewDDate(DDate(secs / SecondsInDay))
+// MakeDDate makes a DDate from a pgdate.Date.
+func MakeDDate(d pgdate.Date) DDate {
+	return DDate{Date: d}
+}
+
+// NewDDateFromTime constructs a *DDate from a time.Time.
+func NewDDateFromTime(t time.Time) (*DDate, error) {
+	d, err := pgdate.MakeDateFromTime(t)
+	return NewDDate(d), err
 }
 
 // ParseTimeContext provides the information necessary for
@@ -1690,15 +1700,11 @@ func relativeParseTime(ctx ParseTimeContext) time.Time {
 func ParseDDate(ctx ParseTimeContext, s string) (*DDate, error) {
 	now := relativeParseTime(ctx)
 	t, err := pgdate.ParseDate(now, 0 /* mode */, s)
-	if err != nil {
-		return nil, err
-	}
-
-	return NewDDateFromTime(t, time.UTC), nil
+	return NewDDate(t), err
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DDate) ResolvedType() types.T {
+func (*DDate) ResolvedType() *types.T {
 	return types.Date
 }
 
@@ -1717,45 +1723,68 @@ func (d *DDate) Compare(ctx *EvalContext, other Datum) int {
 	default:
 		panic(makeUnsupportedComparisonMessage(d, other))
 	}
-	if *d < v {
-		return -1
-	}
-	if v < *d {
-		return 1
-	}
-	return 0
+	return d.Date.Compare(v.Date)
 }
+
+var (
+	dMaxDate  = NewDDate(pgdate.PosInfDate)
+	dMinDate  = NewDDate(pgdate.NegInfDate)
+	dLowDate  = NewDDate(pgdate.LowDate)
+	dHighDate = NewDDate(pgdate.HighDate)
+)
 
 // Prev implements the Datum interface.
 func (d *DDate) Prev(_ *EvalContext) (Datum, bool) {
-	return NewDDate(*d - 1), true
+	switch d.Date {
+	case pgdate.PosInfDate:
+		return dHighDate, true
+	case pgdate.LowDate:
+		return dMinDate, true
+	case pgdate.NegInfDate:
+		return nil, false
+	}
+	n, err := d.AddDays(-1)
+	if err != nil {
+		return nil, false
+	}
+	return NewDDate(n), true
 }
 
 // Next implements the Datum interface.
 func (d *DDate) Next(_ *EvalContext) (Datum, bool) {
-	return NewDDate(*d + 1), true
+	switch d.Date {
+	case pgdate.NegInfDate:
+		return dLowDate, true
+	case pgdate.HighDate:
+		return dMaxDate, true
+	case pgdate.PosInfDate:
+		return nil, false
+	}
+	n, err := d.AddDays(1)
+	if err != nil {
+		return nil, false
+	}
+	return NewDDate(n), true
 }
 
 // IsMax implements the Datum interface.
 func (d *DDate) IsMax(_ *EvalContext) bool {
-	return *d == math.MaxInt64
+	return d.Date == pgdate.PosInfDate
 }
 
 // IsMin implements the Datum interface.
 func (d *DDate) IsMin(_ *EvalContext) bool {
-	return *d == math.MinInt64
+	return d.Date == pgdate.NegInfDate
 }
 
 // Max implements the Datum interface.
 func (d *DDate) Max(_ *EvalContext) (Datum, bool) {
-	// TODO(knz): figure a good way to find a maximum.
-	return nil, false
+	return dMaxDate, true
 }
 
 // Min implements the Datum interface.
 func (d *DDate) Min(_ *EvalContext) (Datum, bool) {
-	// TODO(knz): figure a good way to find a minimum.
-	return nil, false
+	return dMinDate, false
 }
 
 // AmbiguousFormat implements the Datum interface.
@@ -1768,7 +1797,7 @@ func (d *DDate) Format(ctx *FmtCtx) {
 	if !bareStrings {
 		ctx.WriteByte('\'')
 	}
-	ctx.WriteString(timeutil.Unix(int64(*d)*SecondsInDay, 0).Format(dateFormat))
+	d.Date.Format(&ctx.Buffer)
 	if !bareStrings {
 		ctx.WriteByte('\'')
 	}
@@ -1792,6 +1821,13 @@ func MakeDTime(t timeofday.TimeOfDay) *DTime {
 // provided string, or an error if parsing is unsuccessful.
 func ParseDTime(ctx ParseTimeContext, s string) (*DTime, error) {
 	now := relativeParseTime(ctx)
+
+	// special case on 24:00 and 24:00:00 as the parser
+	// does not handle these correctly.
+	if DTimeRegex.MatchString(s) {
+		return MakeDTime(timeofday.Time2400), nil
+	}
+
 	t, err := pgdate.ParseTime(now, 0 /* mode */, s)
 	if err != nil {
 		// Build our own error message to avoid exposing the dummy date.
@@ -1801,7 +1837,7 @@ func ParseDTime(ctx ParseTimeContext, s string) (*DTime, error) {
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DTime) ResolvedType() types.T {
+func (*DTime) ResolvedType() *types.T {
 	return types.Time
 }
 
@@ -1882,8 +1918,6 @@ func MakeDTimestamp(t time.Time, precision time.Duration) *DTimestamp {
 
 // time.Time formats.
 const (
-	dateFormat = "2006-01-02"
-
 	// TimestampOutputFormat is used to output all timestamps.
 	TimestampOutputFormat = "2006-01-02 15:04:05.999999-07:00"
 )
@@ -1921,13 +1955,13 @@ func AsDTimestamp(e Expr) (DTimestamp, bool) {
 func MustBeDTimestamp(e Expr) DTimestamp {
 	t, ok := AsDTimestamp(e)
 	if !ok {
-		panic(pgerror.NewAssertionErrorf("expected *DTimestamp, found %T", e))
+		panic(pgerror.AssertionFailedf("expected *DTimestamp, found %T", e))
 	}
 	return t
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DTimestamp) ResolvedType() types.T {
+func (*DTimestamp) ResolvedType() *types.T {
 	return types.Timestamp
 }
 
@@ -1935,7 +1969,11 @@ func timeFromDatum(ctx *EvalContext, d Datum) (time.Time, bool) {
 	d = UnwrapDatum(ctx, d)
 	switch t := d.(type) {
 	case *DDate:
-		return MakeDTimestampTZFromDate(ctx.GetLocation(), t).Time, true
+		ts, err := MakeDTimestampTZFromDate(ctx.GetLocation(), t)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return ts.Time, true
 	case *DTimestampTZ:
 		return t.stripTimeZone(ctx).Time, true
 	case *DTimestamp:
@@ -2039,9 +2077,12 @@ func MakeDTimestampTZ(t time.Time, precision time.Duration) *DTimestampTZ {
 }
 
 // MakeDTimestampTZFromDate creates a DTimestampTZ from a DDate.
-func MakeDTimestampTZFromDate(loc *time.Location, d *DDate) *DTimestampTZ {
-	year, month, day := timeutil.Unix(int64(*d)*SecondsInDay, 0).Date()
-	return MakeDTimestampTZ(time.Date(year, month, day, 0, 0, 0, 0, loc), time.Microsecond)
+func MakeDTimestampTZFromDate(loc *time.Location, d *DDate) (*DTimestampTZ, error) {
+	t, err := d.ToTime()
+	if err != nil {
+		return nil, err
+	}
+	return MakeDTimestampTZ(t, time.Microsecond), nil
 }
 
 // ParseDTimestampTZ parses and returns the *DTimestampTZ Datum value represented by
@@ -2058,7 +2099,7 @@ func ParseDTimestampTZ(
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DTimestampTZ) ResolvedType() types.T {
+func (*DTimestampTZ) ResolvedType() *types.T {
 	return types.TimestampTZ
 }
 
@@ -2245,7 +2286,7 @@ func parseDInterval(s string, field DurationField) (*DInterval, error) {
 		case Millisecond:
 			ret.SetNanos(int64(float64(time.Millisecond.Nanoseconds()) * f))
 		default:
-			panic(fmt.Sprintf("unhandled DurationField constant %d", field))
+			return nil, pgerror.AssertionFailedf("unhandled DurationField constant %d", field)
 		}
 		return ret, nil
 	} else if strings.IndexFunc(s, unicode.IsLetter) == -1 {
@@ -2268,7 +2309,7 @@ func parseDInterval(s string, field DurationField) (*DInterval, error) {
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DInterval) ResolvedType() types.T {
+func (*DInterval) ResolvedType() *types.T {
 	return types.Interval
 }
 
@@ -2358,7 +2399,7 @@ func NewDJSON(j json.JSON) *DJSON {
 func ParseDJSON(s string) (Datum, error) {
 	j, err := json.ParseJSON(s)
 	if err != nil {
-		return nil, errors.Wrap(err, "could not parse JSON")
+		return nil, pgerror.Wrapf(err, pgerror.CodeSyntaxError, "could not parse JSON")
 	}
 	return NewDJSON(j), nil
 }
@@ -2398,7 +2439,7 @@ func AsDJSON(e Expr) (*DJSON, bool) {
 func MustBeDJSON(e Expr) DJSON {
 	i, ok := AsDJSON(e)
 	if !ok {
-		panic(pgerror.NewAssertionErrorf("expected *DJSON, found %T", e))
+		panic(pgerror.AssertionFailedf("expected *DJSON, found %T", e))
 	}
 	return *i
 }
@@ -2456,13 +2497,13 @@ func AsJSON(d Datum) (json.JSON, error) {
 			return json.NullJSONValue, nil
 		}
 
-		return nil, pgerror.NewAssertionErrorf("unexpected type %T for AsJSON", d)
+		return nil, pgerror.AssertionFailedf("unexpected type %T for AsJSON", d)
 	}
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (*DJSON) ResolvedType() types.T {
-	return types.JSON
+func (*DJSON) ResolvedType() *types.T {
+	return types.Jsonb
 }
 
 // Compare implements the Datum interface.
@@ -2552,23 +2593,18 @@ type DTuple struct {
 	//
 	// The Labels sub-field can be left nil. If populated, it must have
 	// the same arity as D.
-	//
-	// TODO(knz): this ought to be a pointer when #26680 is resolved.
-	// Also when it becomes a pointer a nil value should be valid and
-	// the tuple type auto-computed when ResolvedType() is called the
-	// first time.
-	typ types.TTuple
+	typ *types.T
 }
 
 // NewDTuple creates a *DTuple with the provided datums. When creating a new
 // DTuple with Datums that are known to be sorted in ascending order, chain
 // this call with DTuple.SetSorted.
-func NewDTuple(typ types.TTuple, d ...Datum) *DTuple {
+func NewDTuple(typ *types.T, d ...Datum) *DTuple {
 	return &DTuple{D: d, typ: typ}
 }
 
 // NewDTupleWithLen creates a *DTuple with the provided length.
-func NewDTupleWithLen(typ types.TTuple, l int) *DTuple {
+func NewDTupleWithLen(typ *types.T, l int) *DTuple {
 	return &DTuple{D: make(Datums, l), typ: typ}
 }
 
@@ -2587,12 +2623,13 @@ func AsDTuple(e Expr) (*DTuple, bool) {
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (d *DTuple) ResolvedType() types.T {
-	if d.typ.Types == nil {
-		d.typ.Types = make([]types.T, len(d.D))
+func (d *DTuple) ResolvedType() *types.T {
+	if d.typ == nil {
+		contents := make([]types.T, len(d.D))
 		for i, v := range d.D {
-			d.typ.Types[i] = v.ResolvedType()
+			contents[i] = *v.ResolvedType()
 		}
+		d.typ = types.MakeTuple(contents)
 	}
 	return d.typ
 }
@@ -2741,7 +2778,8 @@ func (d *DTuple) Format(ctx *FmtCtx) {
 		return
 	}
 
-	showLabels := len(d.typ.Labels) > 0
+	typ := d.ResolvedType()
+	showLabels := len(typ.TupleLabels()) > 0
 	if showLabels {
 		ctx.WriteByte('(')
 	}
@@ -2751,15 +2789,14 @@ func (d *DTuple) Format(ctx *FmtCtx) {
 	for i, v := range d.D {
 		ctx.WriteString(comma)
 		ctx.FormatNode(v)
-		if parsable && (v == DNull) && len(d.typ.Types) > i {
-			coltype, err := coltypes.DatumTypeToColumnType(d.typ.Types[i])
-			// If err != nil, we can't determine the column type to write this
-			// annotation. This will primarily happen if the Tuple has types.Unknown
-			// for this slot. Somebody else will provide an error message in this
-			// case, if necessary, so just skip the annotation and continue.
-			if err == nil {
+		if parsable && (v == DNull) && len(typ.TupleContents()) > i {
+			// If Tuple has types.Unknown for this slot, then we can't determine
+			// the column type to write this annotation. Somebody else will provide
+			// an error message in this case, if necessary, so just skip the
+			// annotation and continue.
+			if typ.TupleContents()[i].Family() != types.UnknownFamily {
 				ctx.WriteString("::")
-				coltype.Format(&ctx.Buffer, ctx.flags.EncodeFlags())
+				ctx.WriteString(typ.TupleContents()[i].SQLString())
 			}
 		}
 		comma = ", "
@@ -2773,9 +2810,9 @@ func (d *DTuple) Format(ctx *FmtCtx) {
 	if showLabels {
 		ctx.WriteString(" AS ")
 		comma := ""
-		for i := range d.typ.Labels {
+		for i := range typ.TupleLabels() {
 			ctx.WriteString(comma)
-			ctx.FormatNode((*Name)(&d.typ.Labels[i]))
+			ctx.FormatNode((*Name)(&typ.TupleLabels()[i]))
 			comma = ", "
 		}
 		ctx.WriteByte(')')
@@ -2802,7 +2839,7 @@ func (d *DTuple) SetSorted() *DTuple {
 // AssertSorted asserts that the DTuple is sorted.
 func (d *DTuple) AssertSorted() {
 	if !d.sorted {
-		panic(fmt.Sprintf("expected sorted tuple, found %#v", d))
+		panic(pgerror.AssertionFailedf("expected sorted tuple, found %#v", d))
 	}
 }
 
@@ -2816,10 +2853,10 @@ func (d *DTuple) AssertSorted() {
 func (d *DTuple) SearchSorted(ctx *EvalContext, target Datum) (int, bool) {
 	d.AssertSorted()
 	if target == DNull {
-		panic(fmt.Sprintf("NULL target (d: %s)", d))
+		panic(pgerror.AssertionFailedf("NULL target (d: %s)", d))
 	}
 	if t, ok := target.(*DTuple); ok && t.ContainsNull() {
-		panic(fmt.Sprintf("target containing NULLs: %#v (d: %s)", target, d))
+		panic(pgerror.AssertionFailedf("target containing NULLs: %#v (d: %s)", target, d))
 	}
 	i := sort.Search(len(d.D), func(i int) bool {
 		return d.D[i].Compare(ctx, target) >= 0
@@ -2886,7 +2923,7 @@ func (d *DTuple) ContainsNull() bool {
 type dNull struct{}
 
 // ResolvedType implements the TypedExpr interface.
-func (dNull) ResolvedType() types.T {
+func (dNull) ResolvedType() *types.T {
 	return types.Unknown
 }
 
@@ -2949,15 +2986,18 @@ func (d dNull) Size() uintptr {
 // DArray is the array Datum. Any Datum inserted into a DArray are treated as
 // text during serialization.
 type DArray struct {
-	ParamTyp types.T
+	ParamTyp *types.T
 	Array    Datums
 	// HasNulls is set to true if any of the datums within the array are null.
 	// This is used in the binary array serialization format.
 	HasNulls bool
+	// HasNonNulls is set to true if any of the datums within the are non-null.
+	// This is used in expression serialization (FmtParsable).
+	HasNonNulls bool
 }
 
 // NewDArray returns a DArray containing elements of the specified type.
-func NewDArray(paramTyp types.T) *DArray {
+func NewDArray(paramTyp *types.T) *DArray {
 	return &DArray{ParamTyp: paramTyp}
 }
 
@@ -2980,14 +3020,14 @@ func AsDArray(e Expr) (*DArray, bool) {
 func MustBeDArray(e Expr) *DArray {
 	i, ok := AsDArray(e)
 	if !ok {
-		panic(pgerror.NewAssertionErrorf("expected *DArray, found %T", e))
+		panic(pgerror.AssertionFailedf("expected *DArray, found %T", e))
 	}
 	return i
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (d *DArray) ResolvedType() types.T {
-	return types.TArray{Typ: d.ParamTyp}
+func (d *DArray) ResolvedType() *types.T {
+	return types.MakeArray(d.ParamTyp)
 }
 
 // Compare implements the Datum interface.
@@ -3054,9 +3094,15 @@ func (d *DArray) IsMin(_ *EvalContext) bool {
 
 // AmbiguousFormat implements the Datum interface.
 func (d *DArray) AmbiguousFormat() bool {
-	// The type of the array is ambiguous if it is empty; when serializing we need
-	// to annotate it with the type.
-	return len(d.Array) == 0
+	// The type of the array is ambiguous if it is empty or all-null; when
+	// serializing we need to annotate it with the type.
+	if d.ParamTyp.Family() == types.UnknownFamily {
+		// If the array's type is unknown, marking it as ambiguous would cause the
+		// expression formatter to try to annotate it with UNKNOWN[], which is not
+		// a valid type. So an array of unknown type is (paradoxically) unambiguous.
+		return false
+	}
+	return !d.HasNonNulls
 }
 
 // Format implements the NodeFormatter interface.
@@ -3078,7 +3124,7 @@ func (d *DArray) Format(ctx *FmtCtx) {
 
 const maxArrayLength = math.MaxInt32
 
-var arrayTooLongError = pgerror.NewErrorf(
+var arrayTooLongError = pgerror.Newf(
 	pgerror.CodeDataExceptionError, "ARRAYs can be at most 2^31-1 elements long")
 
 // Validate checks that the given array is valid,
@@ -3105,19 +3151,19 @@ func (d *DArray) Size() uintptr {
 	return sz
 }
 
-var errNonHomogeneousArray = pgerror.NewError(pgerror.CodeArraySubscriptError, "multidimensional arrays must have array expressions with matching dimensions")
+var errNonHomogeneousArray = pgerror.New(pgerror.CodeArraySubscriptError, "multidimensional arrays must have array expressions with matching dimensions")
 
 // Append appends a Datum to the array, whose parameterized type must be
 // consistent with the type of the Datum.
 func (d *DArray) Append(v Datum) error {
 	if v != DNull && !d.ParamTyp.Equivalent(v.ResolvedType()) {
-		return pgerror.NewAssertionErrorf("cannot append %s to array containing %s", d.ParamTyp,
+		return pgerror.AssertionFailedf("cannot append %s to array containing %s", d.ParamTyp,
 			v.ResolvedType())
 	}
 	if d.Len() >= maxArrayLength {
 		return arrayTooLongError
 	}
-	if _, ok := d.ParamTyp.(types.TArray); ok {
+	if d.ParamTyp.Family() == types.ArrayFamily {
 		if v == DNull {
 			return errNonHomogeneousArray
 		}
@@ -3134,6 +3180,8 @@ func (d *DArray) Append(v Datum) error {
 	}
 	if v == DNull {
 		d.HasNulls = true
+	} else {
+		d.HasNonNulls = true
 	}
 	d.Array = append(d.Array, v)
 	return d.Validate()
@@ -3146,14 +3194,14 @@ type DOid struct {
 	DInt
 	// semanticType indicates the particular variety of OID this datum is, whether raw
 	// oid or a reg* type.
-	semanticType *coltypes.TOid
+	semanticType *types.T
 	// name is set to the resolved name of this OID, if available.
 	name string
 }
 
 // MakeDOid is a helper routine to create a DOid initialized from a DInt.
 func MakeDOid(d DInt) DOid {
-	return DOid{DInt: d, semanticType: coltypes.Oid, name: ""}
+	return DOid{DInt: d, semanticType: types.Oid, name: ""}
 }
 
 // NewDOid is a helper routine to create a *DOid initialized from a DInt.
@@ -3164,7 +3212,7 @@ func NewDOid(d DInt) *DOid {
 
 // NewDOidWithName is a helper routine to create a *DOid initialized from a DInt
 // and a string.
-func NewDOidWithName(d DInt, typ *coltypes.TOid, name string) *DOid {
+func NewDOidWithName(d DInt, typ *types.T, name string) *DOid {
 	return &DOid{
 		DInt:         d,
 		semanticType: typ,
@@ -3176,7 +3224,7 @@ func NewDOidWithName(d DInt, typ *coltypes.TOid, name string) *DOid {
 // returns it.
 func (d *DOid) AsRegProc(name string) *DOid {
 	d.name = name
-	d.semanticType = coltypes.RegProc
+	d.semanticType = types.RegProc
 	return d
 }
 
@@ -3204,7 +3252,7 @@ func (d *DOid) Compare(ctx *EvalContext, other Datum) int {
 
 // Format implements the Datum interface.
 func (d *DOid) Format(ctx *FmtCtx) {
-	if d.semanticType == coltypes.Oid || d.name == "" {
+	if d.semanticType.Oid() == oid.T_oid || d.name == "" {
 		// If we call FormatNode directly when the disambiguateDatumTypes flag
 		// is set, then we get something like 123:::INT:::OID. This is the
 		// important flag set by FmtParsable which is supposed to be
@@ -3213,7 +3261,7 @@ func (d *DOid) Format(ctx *FmtCtx) {
 		d.DInt.Format(ctx)
 	} else if ctx.HasFlags(fmtDisambiguateDatumTypes) {
 		ctx.WriteString("crdb_internal.create_")
-		ctx.WriteString(d.semanticType.Name)
+		ctx.WriteString(d.semanticType.SQLStandardName())
 		ctx.WriteByte('(')
 		d.DInt.Format(ctx)
 		ctx.WriteByte(',')
@@ -3245,8 +3293,8 @@ func (d *DOid) Prev(ctx *EvalContext) (Datum, bool) {
 }
 
 // ResolvedType implements the Datum interface.
-func (d *DOid) ResolvedType() types.T {
-	return coltypes.TOidToType(d.semanticType)
+func (d *DOid) ResolvedType() *types.T {
+	return d.semanticType
 }
 
 // Size implements the Datum interface.
@@ -3265,14 +3313,11 @@ func (d *DOid) Min(ctx *EvalContext) (Datum, bool) {
 }
 
 // DOidWrapper is a Datum implementation which is a wrapper around a Datum, allowing
-// custom Oid values to be attached to the Datum and its types.T (see tOidWrapper).
+// custom Oid values to be attached to the Datum and its types.T.
 // The reason the Datum type was introduced was to permit the introduction of Datum
 // types with new Object IDs while maintaining identical behavior to current Datum
-// types. Specifically, it obviates the need to:
-// - define a new tree.Datum type.
-// - define a new types.T type.
-// - support operations and functions for the new types.T.
-// - support mixed-type operations between the new types.T and the old types.T.
+// types. Specifically, it obviates the need to define a new tree.Datum type for
+// each possible Oid value.
 //
 // Instead, DOidWrapper allows a standard Datum to be wrapped with a new Oid.
 // This approach provides two major advantages:
@@ -3298,13 +3343,13 @@ func wrapWithOid(d Datum, oid oid.Oid) Datum {
 	case *DString:
 	case *DArray:
 	case dNull, *DOidWrapper:
-		panic(pgerror.NewAssertionErrorf("cannot wrap %T with an Oid", v))
+		panic(pgerror.AssertionFailedf("cannot wrap %T with an Oid", v))
 	default:
 		// Currently only *DInt, *DString, *DArray are hooked up to work with
 		// *DOidWrapper. To support another base Datum type, replace all type
 		// assertions to that type with calls to functions like AsDInt and
 		// MustBeDInt.
-		panic(pgerror.NewAssertionErrorf("unsupported Datum type passed to wrapWithOid: %T", d))
+		panic(pgerror.AssertionFailedf("unsupported Datum type passed to wrapWithOid: %T", d))
 	}
 	return &DOidWrapper{
 		Wrapped: d,
@@ -3333,8 +3378,8 @@ func UnwrapDatum(evalCtx *EvalContext, d Datum) Datum {
 }
 
 // ResolvedType implements the TypedExpr interface.
-func (d *DOidWrapper) ResolvedType() types.T {
-	return types.WrapTypeWithOid(d.Wrapped.ResolvedType(), d.Oid)
+func (d *DOidWrapper) ResolvedType() *types.T {
+	return types.OidToType[d.Oid]
 }
 
 // Compare implements the Datum interface.
@@ -3407,11 +3452,11 @@ func (d *Placeholder) AmbiguousFormat() bool {
 func (d *Placeholder) mustGetValue(ctx *EvalContext) Datum {
 	e, ok := ctx.Placeholders.Value(d.Idx)
 	if !ok {
-		panic("fail")
+		panic(pgerror.AssertionFailedf("fail"))
 	}
 	out, err := e.Eval(ctx)
 	if err != nil {
-		panic(fmt.Sprintf("fail %s", err))
+		panic(pgerror.NewAssertionErrorWithWrappedErrf(err, "fail"))
 	}
 	return out
 }
@@ -3453,7 +3498,7 @@ func (d *Placeholder) Min(ctx *EvalContext) (Datum, bool) {
 
 // Size implements the Datum interface.
 func (d *Placeholder) Size() uintptr {
-	panic("shouldn't get called")
+	panic(pgerror.AssertionFailedf("shouldn't get called"))
 }
 
 // NewDNameFromDString is a helper routine to create a *DName (implemented as
@@ -3489,42 +3534,29 @@ func NewDOidVectorFromDArray(d *DArray) Datum {
 // sizes.
 //
 // It holds for every Datum d that d.Size() >= DatumSize(d.ResolvedType())
-func DatumTypeSize(t types.T) (uintptr, bool) {
+func DatumTypeSize(t *types.T) (uintptr, bool) {
 	// The following are composite types.
-	switch ty := t.(type) {
-	case types.TOid:
-		// Note: we have multiple Type instances of tOid (TypeOid,
-		// TypeRegClass, etc). Instead of listing all of them in
-		// baseDatumTypeSizes below, we use a single case here.
-		return unsafe.Sizeof(DInt(0)), fixedSize
-
-	case types.TOidWrapper:
-		return DatumTypeSize(ty.T)
-
-	case types.TCollatedString:
-		return unsafe.Sizeof(DCollatedString{"", "", nil}), variableSize
-
-	case types.TTuple:
+	switch t.Family() {
+	case types.TupleFamily:
+		if types.IsWildcardTupleType(t) {
+			return uintptr(0), false
+		}
 		sz := uintptr(0)
 		variable := false
-		for _, typ := range ty.Types {
-			typsz, typvariable := DatumTypeSize(typ)
+		for i := range t.TupleContents() {
+			typsz, typvariable := DatumTypeSize(&t.TupleContents()[i])
 			sz += typsz
 			variable = variable || typvariable
 		}
 		return sz, variable
-
-	case types.TArray:
-		// TODO(jordan,justin): This seems suspicious.
-		return unsafe.Sizeof(DString("")), variableSize
 	}
 
 	// All the primary types have fixed size information.
-	if bSzInfo, ok := baseDatumTypeSizes[t]; ok {
+	if bSzInfo, ok := baseDatumTypeSizes[t.Family()]; ok {
 		return bSzInfo.sz, bSzInfo.variable
 	}
 
-	panic(fmt.Sprintf("unknown type: %T", t))
+	panic(pgerror.AssertionFailedf("unknown type: %T", t))
 }
 
 const (
@@ -3532,26 +3564,32 @@ const (
 	variableSize = true
 )
 
-var baseDatumTypeSizes = map[types.T]struct {
+var baseDatumTypeSizes = map[types.Family]struct {
 	sz       uintptr
 	variable bool
 }{
-	types.Unknown:     {unsafe.Sizeof(dNull{}), fixedSize},
-	types.Bool:        {unsafe.Sizeof(DBool(false)), fixedSize},
-	types.BitArray:    {unsafe.Sizeof(DBitArray{}), variableSize},
-	types.Int:         {unsafe.Sizeof(DInt(0)), fixedSize},
-	types.Float:       {unsafe.Sizeof(DFloat(0.0)), fixedSize},
-	types.Decimal:     {unsafe.Sizeof(DDecimal{}), variableSize},
-	types.String:      {unsafe.Sizeof(DString("")), variableSize},
-	types.Bytes:       {unsafe.Sizeof(DBytes("")), variableSize},
-	types.Date:        {unsafe.Sizeof(DDate(0)), fixedSize},
-	types.Time:        {unsafe.Sizeof(DTime(0)), fixedSize},
-	types.Timestamp:   {unsafe.Sizeof(DTimestamp{}), fixedSize},
-	types.TimestampTZ: {unsafe.Sizeof(DTimestampTZ{}), fixedSize},
-	types.Interval:    {unsafe.Sizeof(DInterval{}), fixedSize},
-	types.JSON:        {unsafe.Sizeof(DJSON{}), variableSize},
-	types.UUID:        {unsafe.Sizeof(DUuid{}), fixedSize},
-	types.INet:        {unsafe.Sizeof(DIPAddr{}), fixedSize},
+	types.UnknownFamily:        {unsafe.Sizeof(dNull{}), fixedSize},
+	types.BoolFamily:           {unsafe.Sizeof(DBool(false)), fixedSize},
+	types.BitFamily:            {unsafe.Sizeof(DBitArray{}), variableSize},
+	types.IntFamily:            {unsafe.Sizeof(DInt(0)), fixedSize},
+	types.FloatFamily:          {unsafe.Sizeof(DFloat(0.0)), fixedSize},
+	types.DecimalFamily:        {unsafe.Sizeof(DDecimal{}), variableSize},
+	types.StringFamily:         {unsafe.Sizeof(DString("")), variableSize},
+	types.CollatedStringFamily: {unsafe.Sizeof(DCollatedString{"", "", nil}), variableSize},
+	types.BytesFamily:          {unsafe.Sizeof(DBytes("")), variableSize},
+	types.DateFamily:           {unsafe.Sizeof(DDate{}), fixedSize},
+	types.TimeFamily:           {unsafe.Sizeof(DTime(0)), fixedSize},
+	types.TimestampFamily:      {unsafe.Sizeof(DTimestamp{}), fixedSize},
+	types.TimestampTZFamily:    {unsafe.Sizeof(DTimestampTZ{}), fixedSize},
+	types.IntervalFamily:       {unsafe.Sizeof(DInterval{}), fixedSize},
+	types.JsonFamily:           {unsafe.Sizeof(DJSON{}), variableSize},
+	types.UuidFamily:           {unsafe.Sizeof(DUuid{}), fixedSize},
+	types.INetFamily:           {unsafe.Sizeof(DIPAddr{}), fixedSize},
+	types.OidFamily:            {unsafe.Sizeof(DInt(0)), fixedSize},
+
 	// TODO(jordan,justin): This seems suspicious.
-	types.Any: {unsafe.Sizeof(DString("")), variableSize},
+	types.ArrayFamily: {unsafe.Sizeof(DString("")), variableSize},
+
+	// TODO(jordan,justin): This seems suspicious.
+	types.AnyFamily: {unsafe.Sizeof(DString("")), variableSize},
 }

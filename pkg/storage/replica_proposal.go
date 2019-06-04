@@ -26,16 +26,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/storage/rditer"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
+	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/kr/pretty"
@@ -48,7 +50,10 @@ import (
 // evaluated, proposed to raft, and for the result of the command to
 // be returned to the caller.
 type ProposalData struct {
-	// The caller's context, used for logging proposals and reproposals.
+	// The caller's context, used for logging proposals, reproposals, message
+	// sends, and command application. In order to enable safely tracing events
+	// beneath, modifying this ctx field in *ProposalData requires holding the
+	// raftMu.
 	ctx context.Context
 
 	// An optional tracing span bound to the proposal. Will be cleaned
@@ -110,7 +115,7 @@ type ProposalData struct {
 // counted on to invoke endCmds itself.)
 func (proposal *ProposalData) finishApplication(pr proposalResult) {
 	if proposal.endCmds != nil {
-		proposal.endCmds.done(pr.Reply, pr.Err, pr.ProposalRetry)
+		proposal.endCmds.done(pr.Reply, pr.Err)
 		proposal.endCmds = nil
 	}
 	if proposal.sp != nil {
@@ -165,9 +170,33 @@ func (r *Replica) computeChecksumPostApply(ctx context.Context, cc storagepb.Com
 	r.mu.checksums[cc.ChecksumID] = ReplicaChecksum{started: true, notify: notify}
 	desc := *r.mu.state.Desc
 	r.mu.Unlock()
+
+	if cc.Version != batcheval.ReplicaChecksumVersion {
+		r.computeChecksumDone(ctx, cc.ChecksumID, nil, nil)
+		log.Infof(ctx, "incompatible ComputeChecksum versions (requested: %d, have: %d)",
+			cc.Version, batcheval.ReplicaChecksumVersion)
+		return
+	}
+
 	// Caller is holding raftMu, so an engine snapshot is automatically
 	// Raft-consistent (i.e. not in the middle of an AddSSTable).
 	snap := r.store.engine.NewSnapshot()
+	if cc.Checkpoint {
+		checkpointBase := filepath.Join(r.store.engine.GetAuxiliaryDir(), "checkpoints")
+		_ = os.MkdirAll(checkpointBase, 0700)
+		sl := stateloader.Make(r.RangeID)
+		rai, _, err := sl.LoadAppliedIndex(ctx, snap)
+		if err != nil {
+			log.Warningf(ctx, "unable to load applied index, continuing anyway")
+		}
+		// NB: the names here will match on all nodes, which is nice for debugging.
+		checkpointDir := filepath.Join(checkpointBase, fmt.Sprintf("r%d_at_%d", r.RangeID, rai))
+		if err := r.store.engine.CreateCheckpoint(checkpointDir); err != nil {
+			log.Warningf(ctx, "unable to create checkpoint %s: %s", checkpointDir, err)
+		} else {
+			log.Infof(ctx, "created checkpoint %s", checkpointDir)
+		}
+	}
 
 	// Compute SHA asynchronously and store it in a map by UUID.
 	if err := stopper.RunAsyncTask(ctx, "storage.Replica: computing checksum", func(ctx context.Context) {
@@ -176,7 +205,7 @@ func (r *Replica) computeChecksumPostApply(ctx context.Context, cc storagepb.Com
 		if cc.SaveSnapshot {
 			snapshot = &roachpb.RaftSnapshotData{}
 		}
-		result, err := r.sha512(ctx, desc, snap, snapshot)
+		result, err := r.sha512(ctx, desc, snap, snapshot, cc.Mode)
 		if err != nil {
 			log.Errorf(ctx, "%v", err)
 			result = nil
@@ -247,10 +276,7 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 		// requests, this is kosher). This means that we don't use the old
 		// lease's expiration but instead use the new lease's start to initialize
 		// the timestamp cache low water.
-		desc := r.Desc()
-		for _, keyRange := range rditer.MakeReplicatedKeyRanges(desc) {
-			r.store.tsCache.SetLowWater(keyRange.Start.Key, keyRange.End.Key, newLease.Start)
-		}
+		setTimestampCacheLowWaterMark(r.store.tsCache, r.Desc(), newLease.Start)
 
 		// Reset the request counts used to make lease placement decisions whenever
 		// starting a new lease.
@@ -371,7 +397,7 @@ func addSSTablePreApply(
 	ctx context.Context,
 	st *cluster.Settings,
 	eng engine.Engine,
-	sideloaded sideloadStorage,
+	sideloaded SideloadStorage,
 	term, index uint64,
 	sst storagepb.ReplicatedEvalResult_AddSSTable,
 	limiter *rate.Limiter,
@@ -393,6 +419,8 @@ func addSSTablePreApply(
 		log.Fatalf(ctx, "sideloaded SSTable at term %d, index %d is missing", term, index)
 	}
 
+	eng.PreIngestDelay(ctx)
+
 	// as of VersionUnreplicatedRaftTruncatedState we were on rocksdb 5.17 so this
 	// cluster version should indicate that we will never use rocksdb < 5.16 to
 	// read these SSTs, so it is safe to use https://github.com/facebook/rocksdb/pull/4172
@@ -408,6 +436,7 @@ func addSSTablePreApply(
 	} else {
 		ingestPath := path + ".ingested"
 
+		canLinkToRaftFile := false
 		// The SST may already be on disk, thanks to the sideloading mechanism.  If
 		// so we can try to add that file directly, via a new hardlink if the file-
 		// system support it, rather than writing a new copy of it. However, this is
@@ -417,7 +446,21 @@ func addSSTablePreApply(
 		// tell Rocks that it is not allowed to modify the file, in which case it
 		// will return and error if it would have tried to do so, at which point we
 		// can fall back to writing a new copy for Rocks to ingest.
-		if _, err := os.Stat(path); err == nil {
+		if _, links, err := sysutil.StatAndLinkCount(path); err == nil {
+			// HACK: RocksDB does not like ingesting the same file (by inode) twice.
+			// See facebook/rocksdb#5133. We can tell that we have tried to ingest
+			// this file already if it has more than one link – one from the file raft
+			// wrote and one from rocks. In that case, we should not try to give
+			// rocks a link to the same file again.
+			if links == 1 {
+				canLinkToRaftFile = true
+			} else {
+				log.Warningf(ctx, "SSTable at index %d term %d may have already been ingested (link count %d) -- falling back to ingesting a copy",
+					index, term, links)
+			}
+		}
+
+		if canLinkToRaftFile {
 			// If the fs supports it, make a hard-link for rocks to ingest. We cannot
 			// pass it the path in the sideload store as it deletes the passed path on
 			// success.
@@ -432,8 +475,18 @@ func addSSTablePreApply(
 					log.Fatalf(ctx, "failed to move ingest sst: %v", rmErr)
 				}
 				const seqNoMsg = "Global seqno is required, but disabled"
-				if err, ok := ingestErr.(*engine.RocksDBError); ok && !strings.Contains(ingestErr.Error(), seqNoMsg) {
-					log.Fatalf(ctx, "while ingesting %s: %s", ingestPath, err)
+				const seqNoOnReIngest = "external file have non zero sequence number"
+				// Repeated ingestion is still possible even with the link count checked
+				// above, since rocks might have already compacted away the file.
+				// However it does not flush compacted files from its cache, so it can
+				// still react poorly to attempting to ingest again. If we get an error
+				// that indicates we can't ingest, we'll make a copy and try again. That
+				// attempt must succeed or we'll fatal, so any persistent error is still
+				// going to be surfaced.
+				ingestErrMsg := ingestErr.Error()
+				isSeqNoErr := strings.Contains(ingestErrMsg, seqNoMsg) || strings.Contains(ingestErrMsg, seqNoOnReIngest)
+				if _, ok := ingestErr.(*engine.RocksDBError); !ok || !isSeqNoErr {
+					log.Fatalf(ctx, "while ingesting %s: %s", ingestPath, ingestErr)
 				}
 			}
 		}
@@ -507,11 +560,21 @@ func (r *Replica) handleReplicatedEvalResult(
 	r.store.metrics.addMVCCStats(deltaStats)
 	rResult.Delta = enginepb.MVCCStatsDelta{}
 
-	if r.store.splitQueue != nil && needsSplitBySize { // the bootstrap store has a nil split queue
-		r.store.splitQueue.MaybeAdd(r, r.store.Clock().Now())
+	// NB: the bootstrap store has a nil split queue.
+	// TODO(tbg): the above is probably a lie now.
+	if r.store.splitQueue != nil && needsSplitBySize && r.splitQueueThrottle.ShouldProcess(timeutil.Now()) {
+		r.store.splitQueue.MaybeAddAsync(ctx, r, r.store.Clock().Now())
 	}
-	if r.store.mergeQueue != nil && needsMergeBySize { // the bootstrap store has a nil merge queue
-		r.store.mergeQueue.MaybeAdd(r, r.store.Clock().Now())
+
+	// The bootstrap store has a nil merge queue.
+	// TODO(tbg): the above is probably a lie now.
+	if r.store.mergeQueue != nil && needsMergeBySize && r.mergeQueueThrottle.ShouldProcess(timeutil.Now()) {
+		// TODO(tbg): for ranges which are small but protected from merges by
+		// other means (zone configs etc), this is called on every command, and
+		// fires off a goroutine each time. Make this trigger (and potentially
+		// the split one above, though it hasn't been observed to be as
+		// bothersome) less aggressive.
+		r.store.mergeQueue.MaybeAddAsync(ctx, r, r.store.Clock().Now())
 	}
 
 	// The above are always present. The following are not always present but
@@ -537,7 +600,7 @@ func (r *Replica) handleReplicatedEvalResult(
 			// could rot.
 			{
 				log.Eventf(ctx, "truncating sideloaded storage up to (and including) index %d", newTruncState.Index)
-				if size, err := r.raftMu.sideloaded.TruncateTo(ctx, newTruncState.Index+1); err != nil {
+				if size, _, err := r.raftMu.sideloaded.TruncateTo(ctx, newTruncState.Index+1); err != nil {
 					// We don't *have* to remove these entries for correctness. Log a
 					// loud error, but keep humming along.
 					log.Errorf(ctx, "while removing sideloaded files during log truncation: %s", err)
@@ -603,7 +666,7 @@ func (r *Replica) handleReplicatedEvalResult(
 		}
 		r.mu.Unlock()
 		if checkRaftLog {
-			r.store.raftLogQueue.MaybeAdd(r, r.store.Clock().Now())
+			r.store.raftLogQueue.MaybeAddAsync(ctx, r, r.store.Clock().Now())
 		}
 	}
 
@@ -690,10 +753,9 @@ func (r *Replica) handleReplicatedEvalResult(
 			// that the other nodes have finished this command as well (since
 			// processing the removal from the queue looks up the Range at the
 			// lease holder, being too early here turns this into a no-op).
-			if _, err := r.store.replicaGCQueue.Add(r, replicaGCPriorityRemoved); err != nil {
-				// Log the error; the range should still be GC'd eventually.
-				log.Errorf(ctx, "unable to add to replica GC queue: %s", err)
-			}
+			// Lock ordering dictates that we don't hold any mutexes when adding,
+			// so we fire it off in a task.
+			r.store.replicaGCQueue.AddAsync(ctx, r, replicaGCPriorityRemoved)
 		}
 		rResult.ChangeReplicas = nil
 	}
@@ -754,7 +816,7 @@ func (r *Replica) handleLocalEvalResult(ctx context.Context, lResult result.Loca
 	}
 
 	if lResult.MaybeAddToSplitQueue {
-		r.store.splitQueue.MaybeAdd(r, r.store.Clock().Now())
+		r.store.splitQueue.MaybeAddAsync(ctx, r, r.store.Clock().Now())
 		lResult.MaybeAddToSplitQueue = false
 	}
 
@@ -808,14 +870,12 @@ func (r *Replica) handleEvalResultRaftMuLocked(
 }
 
 // proposalResult indicates the result of a proposal. Exactly one of
-// Reply, Err and ProposalRetry is set, and it represents the result of
-// the proposal.
+// Reply and Err is set, and it represents the result of the proposal.
 type proposalResult struct {
-	Reply         *roachpb.BatchResponse
-	Err           *roachpb.Error
-	ProposalRetry proposalReevaluationReason
-	Intents       []result.IntentsWithArg
-	EndTxns       []result.EndTxnIntents
+	Reply   *roachpb.BatchResponse
+	Err     *roachpb.Error
+	Intents []result.IntentsWithArg
+	EndTxns []result.EndTxnIntents
 }
 
 // evaluateProposal generates a Result from the given request by

@@ -16,6 +16,7 @@
 package aws
 
 import (
+	"bytes"
 	"encoding/json"
 	"io/ioutil"
 	"log"
@@ -37,7 +38,7 @@ import (
 // mounting options. The script cannot take arguments since it is to be invoked
 // by the aws tool which cannot pass args.
 const awsStartupScriptTemplate = `#!/usr/bin/env bash
-# Script for setting up a GCE machine for roachprod use.
+# Script for setting up a AWS machine for roachprod use.
 
 set -x
 sudo apt-get update
@@ -48,7 +49,8 @@ mount_opts="discard,defaults"
 
 disks=()
 mountpoint="/mnt/data1"
-for d in $(ls /dev/nvme?n1); do
+# On different machine types, the drives are either called nvme... or xvdd.
+for d in $(ls /dev/nvme?n1 /dev/xvdd); do
   if ! mount | grep ${d}; then
     disks+=("${d}")
     echo "Disk ${d} not mounted, creating..."
@@ -85,10 +87,40 @@ echo -e "\nmakestep 0.1 3" | sudo tee -a /etc/chrony/chrony.conf
 sudo /etc/init.d/chrony restart
 sudo chronyc -a waitsync 30 0.01 | sudo tee -a /root/chrony.log
 
+# sshguard can prevent frequent ssh connections to the same host. Disable it.
+sudo service sshguard stop
+# increase the number of concurrent unauthenticated connections to the sshd
+# daemon. See https://en.wikibooks.org/wiki/OpenSSH/Cookbook/Load_Balancing.
+# By default, only 10 unauthenticated connections are permitted before sshd
+# starts randomly dropping connections.
+sudo sh -c 'echo "MaxStartups 64:30:128" >> /etc/ssh/sshd_config'
+# Crank up the logging for issues such as:
+# https://github.com/cockroachdb/cockroach/issues/36929
+sudo sed -i'' 's/LogLevel.*$/LogLevel DEBUG3/' /etc/ssh/sshd_config
+sudo service sshd restart
 # increase the default maximum number of open file descriptors for
 # root and non-root users. Load generators running a lot of concurrent
 # workers bump into this often.
 sudo sh -c 'echo "root - nofile 65536\n* - nofile 65536" > /etc/security/limits.d/10-roachprod-nofiles.conf'
+
+# Enable core dumps
+cat <<EOF > /etc/security/limits.d/core_unlimited.conf
+* soft core unlimited
+* hard core unlimited
+root soft core unlimited
+root hard core unlimited
+EOF
+
+mkdir -p /mnt/data1/cores
+chmod a+w /mnt/data1/cores
+CORE_PATTERN="/mnt/data1/cores/core.%e.%p.%h.%t"
+echo "$CORE_PATTERN" > /proc/sys/kernel/core_pattern
+sed -i'~' 's/enabled=1/enabled=0/' /etc/default/apport
+sed -i'~' '/.*kernel\\.core_pattern.*/c\\' /etc/sysctl.conf
+echo "kernel.core_pattern=$CORE_PATTERN" >> /etc/sysctl.conf
+
+sysctl --system  # reload sysctl settings
+
 sudo touch /mnt/data1/.roachprod-initialized
 `
 
@@ -105,7 +137,7 @@ func writeStartupScript(extraMountOpts string) (string, error) {
 
 	args := tmplParams{ExtraMountOpts: extraMountOpts}
 
-	tmpfile, err := ioutil.TempFile("", "gce-startup-script")
+	tmpfile, err := ioutil.TempFile("", "aws-startup-script")
 	if err != nil {
 		return "", err
 	}
@@ -118,75 +150,39 @@ func writeStartupScript(extraMountOpts string) (string, error) {
 	return tmpfile.Name(), nil
 }
 
-// runCommand is used to invoke an AWS command for which no output is expected.
-func runCommand(args []string) error {
-	cmd := exec.Command("aws", args...)
+// runCommand is used to invoke an AWS command.
+func (p *Provider) runCommand(args []string) ([]byte, error) {
 
-	_, err := cmd.Output()
+	if p.opts.Profile != "" {
+		args = append(args[:len(args):len(args)], "--profile", p.opts.Profile)
+	}
+	var stderrBuf bytes.Buffer
+	cmd := exec.Command("aws", args...)
+	cmd.Stderr = &stderrBuf
+	output, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			log.Println(string(exitErr.Stderr))
 		}
-		return errors.Wrapf(err, "failed to run: aws %s", strings.Join(args, " "))
+		return nil, errors.Wrapf(err, "failed to run: aws %s: stderr: %v",
+			strings.Join(args, " "), stderrBuf.String())
 	}
-	return nil
+	return output, nil
 }
 
 // runJSONCommand invokes an aws command and parses the json output.
-func runJSONCommand(args []string, parsed interface{}) error {
-	// force json output in case the user has overridden the default behavior
+func (p *Provider) runJSONCommand(args []string, parsed interface{}) error {
+	// Force json output in case the user has overridden the default behavior.
 	args = append(args[:len(args):len(args)], "--output", "json")
-	cmd := exec.Command("aws", args...)
-
-	rawJSON, err := cmd.Output()
+	rawJSON, err := p.runCommand(args)
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			log.Println(string(exitErr.Stderr))
-		}
-		return errors.Wrapf(err, "failed to run: aws %s", strings.Join(args, " "))
+		return err
 	}
-
 	if err := json.Unmarshal(rawJSON, &parsed); err != nil {
 		return errors.Wrapf(err, "failed to parse json %s", rawJSON)
 	}
 
 	return nil
-}
-
-// split returns a key and value for 'key:value' pairs.
-func split(data string) (key, value string, err error) {
-	parts := strings.Split(data, ":")
-	if len(parts) != 2 {
-		return "", "", errors.Errorf("Could not split: %s", data)
-	}
-
-	return parts[0], parts[1], nil
-}
-
-// splitMap splits a list of `key:value` pairs into a map.
-func splitMap(data []string) (map[string]string, error) {
-	ret := make(map[string]string, len(data))
-	for _, part := range data {
-		key, value, err := split(part)
-		if err != nil {
-			return nil, err
-		}
-		ret[key] = value
-	}
-	return ret, nil
-}
-
-// orderedKeyList returns just the ordered keys of a list of 'key:value' pairs.
-func orderedKeyList(data []string) ([]string, error) {
-	ret := make([]string, 0, len(data))
-	for _, part := range data {
-		key, _, err := split(part)
-		if err != nil {
-			return nil, err
-		}
-		ret = append(ret, key)
-	}
-	return ret, nil
 }
 
 // regionMap collates VM instances by their region.

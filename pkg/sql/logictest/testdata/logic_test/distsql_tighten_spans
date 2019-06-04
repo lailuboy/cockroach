@@ -99,10 +99,6 @@ INSERT INTO decimal_t VALUES
 # Also split at the beginning of each index (0 for ASC, 100 for DESC) to
 # prevent interfering with previous indexes/tables.
 
-# Prevent the merge queue from immediately discarding our splits.
-statement ok
-SET CLUSTER SETTING kv.range_merge.queue_enabled = false;
-
 # p1 table (interleaved index)
 statement ok
 ALTER TABLE p1 SPLIT AT VALUES(2)
@@ -176,7 +172,7 @@ query TTTI colnames
 SELECT start_key, end_key, replicas, lease_holder FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE p2]
 ----
 start_key  end_key    replicas  lease_holder
-NULL       /0         {5}       5
+NULL       /0         {1}       1
 /0         /2         {1}       1
 /2         /2/#/55/2  {2}       2
 /2/#/55/2  NULL       {3}       3

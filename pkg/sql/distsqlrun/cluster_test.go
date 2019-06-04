@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -207,7 +208,7 @@ func TestClusterFlow(t *testing.T) {
 	var clients []distsqlpb.DistSQLClient
 	for i := 0; i < 3; i++ {
 		s := tc.Server(i)
-		conn, err := s.RPCContext().GRPCDial(s.ServingAddr()).Connect(ctx)
+		conn, err := s.RPCContext().GRPCDialNode(s.ServingAddr(), s.NodeID()).Connect(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -240,7 +241,7 @@ func TestClusterFlow(t *testing.T) {
 
 	var decoder StreamDecoder
 	var rows sqlbase.EncDatumRows
-	var metas []ProducerMetadata
+	var metas []distsqlpb.ProducerMetadata
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
@@ -272,15 +273,15 @@ func TestClusterFlow(t *testing.T) {
 	}
 	expected := strings.Join(results, " ")
 	expected = "[" + expected + "]"
-	if rowStr := rows.String([]sqlbase.ColumnType{sqlbase.StrType}); rowStr != expected {
+	if rowStr := rows.String([]types.T{*types.String}); rowStr != expected {
 		t.Errorf("Result: %s\n Expected: %s\n", rowStr, expected)
 	}
 }
 
 // ignoreMisplannedRanges takes a slice of metadata and returns the entries that
 // are not about range info from mis-planned ranges.
-func ignoreMisplannedRanges(metas []ProducerMetadata) []ProducerMetadata {
-	res := make([]ProducerMetadata, 0)
+func ignoreMisplannedRanges(metas []distsqlpb.ProducerMetadata) []distsqlpb.ProducerMetadata {
+	res := make([]distsqlpb.ProducerMetadata, 0)
 	for _, m := range metas {
 		if len(m.Ranges) == 0 {
 			res = append(res, m)
@@ -291,8 +292,8 @@ func ignoreMisplannedRanges(metas []ProducerMetadata) []ProducerMetadata {
 
 // ignoreTxnCoordMeta takes a slice of metadata and returns the entries excluding
 // the transaction coordinator metadata.
-func ignoreTxnCoordMeta(metas []ProducerMetadata) []ProducerMetadata {
-	res := make([]ProducerMetadata, 0)
+func ignoreTxnCoordMeta(metas []distsqlpb.ProducerMetadata) []distsqlpb.ProducerMetadata {
+	res := make([]distsqlpb.ProducerMetadata, 0)
 	for _, m := range metas {
 		if m.TxnCoordMeta == nil {
 			res = append(res, m)
@@ -350,17 +351,16 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 	// value.
 
 	// All our rows have a single integer column.
-	types := make([]sqlbase.ColumnType, 1)
-	types[0].SemanticType = sqlbase.ColumnType_INT
+	typs := []types.T{*types.Int}
 
 	// The left values rows are consecutive values.
 	leftRows := make(sqlbase.EncDatumRows, 20)
 	for i := range leftRows {
 		leftRows[i] = sqlbase.EncDatumRow{
-			sqlbase.DatumToEncDatum(types[0], tree.NewDInt(tree.DInt(i))),
+			sqlbase.DatumToEncDatum(&typs[0], tree.NewDInt(tree.DInt(i))),
 		}
 	}
-	leftValuesSpec, err := generateValuesSpec(types, leftRows, 10 /* rows per chunk */)
+	leftValuesSpec, err := generateValuesSpec(typs, leftRows, 10 /* rows per chunk */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,12 +371,12 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 	for i := 1; i <= 20; i++ {
 		for j := 1; j <= 4*rowChannelBufSize; j++ {
 			rightRows = append(rightRows, sqlbase.EncDatumRow{
-				sqlbase.DatumToEncDatum(types[0], tree.NewDInt(tree.DInt(i))),
+				sqlbase.DatumToEncDatum(&typs[0], tree.NewDInt(tree.DInt(i))),
 			})
 		}
 	}
 
-	rightValuesSpec, err := generateValuesSpec(types, rightRows, 10 /* rows per chunk */)
+	rightValuesSpec, err := generateValuesSpec(typs, rightRows, 10 /* rows per chunk */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -434,12 +434,12 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 						{
 							Type:        distsqlpb.InputSyncSpec_UNORDERED,
 							Streams:     []distsqlpb.StreamEndpointSpec{{Type: distsqlpb.StreamEndpointSpec_LOCAL, StreamID: 1}},
-							ColumnTypes: types,
+							ColumnTypes: typs,
 						},
 						{
 							Type:        distsqlpb.InputSyncSpec_UNORDERED,
 							Streams:     []distsqlpb.StreamEndpointSpec{{Type: distsqlpb.StreamEndpointSpec_LOCAL, StreamID: 2}},
-							ColumnTypes: types,
+							ColumnTypes: typs,
 						},
 					},
 					Core: distsqlpb.ProcessorCoreUnion{MergeJoiner: &joinerSpec},
@@ -465,7 +465,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 							{Type: distsqlpb.StreamEndpointSpec_LOCAL, StreamID: 4},
 							{Type: distsqlpb.StreamEndpointSpec_LOCAL, StreamID: 3},
 						},
-						ColumnTypes: types,
+						ColumnTypes: typs,
 					}},
 					Core: distsqlpb.ProcessorCoreUnion{Noop: &distsqlpb.NoopCoreSpec{}},
 					Output: []distsqlpb.OutputRouterSpec{{
@@ -477,7 +477,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 		},
 	}
 	s := tc.Server(0)
-	conn, err := s.RPCContext().GRPCDial(s.ServingAddr()).Connect(context.Background())
+	conn, err := s.RPCContext().GRPCDialNode(s.ServingAddr(), s.NodeID()).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -493,7 +493,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 
 	var decoder StreamDecoder
 	var rows sqlbase.EncDatumRows
-	var metas []ProducerMetadata
+	var metas []distsqlpb.ProducerMetadata
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
@@ -605,9 +605,9 @@ func BenchmarkInfrastructure(b *testing.B) {
 						for j := 0; j < numRows; j++ {
 							row := make(sqlbase.EncDatumRow, 3)
 							lastVal += rng.Intn(10)
-							row[0] = sqlbase.DatumToEncDatum(sqlbase.IntType, tree.NewDInt(tree.DInt(lastVal)))
-							row[1] = sqlbase.DatumToEncDatum(sqlbase.IntType, tree.NewDInt(tree.DInt(rng.Intn(100000))))
-							row[2] = sqlbase.DatumToEncDatum(sqlbase.IntType, tree.NewDInt(tree.DInt(rng.Intn(100000))))
+							row[0] = sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(lastVal)))
+							row[1] = sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(rng.Intn(100000))))
+							row[2] = sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(rng.Intn(100000))))
 							if err := se.AddRow(row); err != nil {
 								b.Fatal(err)
 							}
@@ -705,7 +705,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 					var clients []distsqlpb.DistSQLClient
 					for i := 0; i < numNodes; i++ {
 						s := tc.Server(i)
-						conn, err := s.RPCContext().GRPCDial(s.ServingAddr()).Connect(context.Background())
+						conn, err := s.RPCContext().GRPCDialNode(s.ServingAddr(), s.NodeID()).Connect(context.Background())
 						if err != nil {
 							b.Fatal(err)
 						}
@@ -737,7 +737,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 
 						var decoder StreamDecoder
 						var rows sqlbase.EncDatumRows
-						var metas []ProducerMetadata
+						var metas []distsqlpb.ProducerMetadata
 						for {
 							msg, err := stream.Recv()
 							if err != nil {
@@ -762,7 +762,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 						}
 						var a sqlbase.DatumAlloc
 						for i := range rows {
-							if err := rows[i][0].EnsureDecoded(&sqlbase.IntType, &a); err != nil {
+							if err := rows[i][0].EnsureDecoded(types.Int, &a); err != nil {
 								b.Fatal(err)
 							}
 							if i > 0 {

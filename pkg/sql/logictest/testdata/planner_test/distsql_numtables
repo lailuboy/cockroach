@@ -13,10 +13,6 @@ INSERT INTO NumToSquare SELECT i, i*i FROM generate_series(1, 100) AS g(i)
 statement ok
 CREATE TABLE NumToStr (y INT PRIMARY KEY, str STRING)
 
-# Prevent the merge queue from immediately discarding our splits.
-statement ok
-SET CLUSTER SETTING kv.range_merge.queue_enabled = false;
-
 # Split into five parts.
 statement ok
 ALTER TABLE NumToStr SPLIT AT SELECT (i * 100 * 100 / 5)::int FROM generate_series(1, 4) AS g(i)
@@ -85,21 +81,21 @@ https://cockroachdb.github.io/distsqlplan/decode.html#eJy8lU2L2zAQhu_9FWFOu6AQS7
 query TTTTT
 EXPLAIN (VERBOSE) SELECT x, str FROM NumToSquare JOIN NumToStr ON x = y WHERE x % 2 = 0
 ----
-render          ·               ·                          (x, str)                                 x!=NULL; key(x)
- │              render 0        test.public.numtosquare.x  ·                                        ·
- │              render 1        test.public.numtostr.str   ·                                        ·
- └── join       ·               ·                          (x, xsquared[omitted], y[omitted], str)  x=y; x!=NULL; key(x)
-      │         type            inner                      ·                                        ·
-      │         equality        (x) = (y)                  ·                                        ·
-      │         mergeJoinOrder  +"(x=y)"                   ·                                        ·
-      ├── scan  ·               ·                          (x, xsquared[omitted])                   x!=NULL; key(x); +x
-      │         table           numtosquare@primary        ·                                        ·
-      │         spans           ALL                        ·                                        ·
-      │         filter          (x % 2) = 0                ·                                        ·
-      └── scan  ·               ·                          (y, str)                                 y!=NULL; key(y); +y
-·               table           numtostr@primary           ·                                        ·
-·               spans           ALL                        ·                                        ·
-·               filter          (y % 2) = 0                ·                                        ·
+render           ·               ·                          (x, str)                                 x!=NULL; key(x)
+ │               render 0        test.public.numtosquare.x  ·                                        ·
+ │               render 1        test.public.numtostr.str   ·                                        ·
+ └── merge-join  ·               ·                          (x, xsquared[omitted], y[omitted], str)  x=y; x!=NULL; key(x)
+      │          type            inner                      ·                                        ·
+      │          equality        (x) = (y)                  ·                                        ·
+      │          mergeJoinOrder  +"(x=y)"                   ·                                        ·
+      ├── scan   ·               ·                          (x, xsquared[omitted])                   x!=NULL; key(x); +x
+      │          table           numtosquare@primary        ·                                        ·
+      │          spans           ALL                        ·                                        ·
+      │          filter          (x % 2) = 0                ·                                        ·
+      └── scan   ·               ·                          (y, str)                                 y!=NULL; key(y); +y
+·                table           numtostr@primary           ·                                        ·
+·                spans           ALL                        ·                                        ·
+·                filter          (y % 2) = 0                ·                                        ·
 
 query T
 SELECT url FROM [EXPLAIN (DISTSQL) SELECT x, str FROM NumToSquare JOIN NumToStr ON x = y WHERE x % 2 = 0]

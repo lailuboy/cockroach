@@ -22,13 +22,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/lib/pq/oid"
-	"github.com/pkg/errors"
 )
 
 func (ex *connExecutor) execPrepare(
@@ -42,7 +40,7 @@ func (ex *connExecutor) execPrepare(
 	// The anonymous statement can be overwritten.
 	if parseCmd.Name != "" {
 		if _, ok := ex.extraTxnState.prepStmtsNamespace.prepStmts[parseCmd.Name]; ok {
-			err := pgerror.NewErrorf(
+			err := pgerror.Newf(
 				pgerror.CodeDuplicatePreparedStatementError,
 				"prepared statement %q already exists", parseCmd.Name,
 			)
@@ -75,7 +73,7 @@ func (ex *connExecutor) execPrepare(
 		// both map to TypeInt), so we need to maintain the types sent by
 		// the client.
 		if inferredTypes[i] == 0 {
-			t, _ := ps.ValueType(types.PlaceholderIdx(i))
+			t, _ := ps.ValueType(tree.PlaceholderIdx(i))
 			inferredTypes[i] = t.Oid()
 		}
 	}
@@ -158,7 +156,7 @@ func (ex *connExecutor) prepare(
 	txn := client.NewTxn(ctx, ex.server.cfg.DB, ex.server.cfg.NodeID.Get(), client.RootTxn)
 
 	p := &ex.planner
-	ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime() /* stmtTS */)
+	ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime() /* stmtTS */, stmt.NumAnnotations)
 	p.stmt = &stmt
 	flags, err := ex.populatePrepared(ctx, txn, placeholderHints, p)
 	if err != nil {
@@ -233,7 +231,7 @@ func (ex *connExecutor) populatePrepared(
 	// plan.
 	prepared.AnonymizedStr = anonymizeStmt(stmt.AST)
 	if err := p.prepare(ctx, stmt.AST); err != nil {
-		enhanceErrWithCorrelation(err, isCorrelated)
+		err = enhanceErrWithCorrelation(err, isCorrelated)
 		return 0, err
 	}
 
@@ -275,7 +273,7 @@ func (ex *connExecutor) execBind(
 	// The unnamed portal can be freely overwritten.
 	if portalName != "" {
 		if _, ok := ex.extraTxnState.prepStmtsNamespace.portals[portalName]; ok {
-			return retErr(pgerror.NewErrorf(
+			return retErr(pgerror.Newf(
 				pgerror.CodeDuplicateCursorError, "portal %q already exists", portalName))
 		}
 	} else {
@@ -285,7 +283,7 @@ func (ex *connExecutor) execBind(
 
 	ps, ok := ex.extraTxnState.prepStmtsNamespace.prepStmts[bindCmd.PreparedStatementName]
 	if !ok {
-		return retErr(pgerror.NewErrorf(
+		return retErr(pgerror.Newf(
 			pgerror.CodeInvalidSQLStatementNameError,
 			"unknown prepared statement %q", bindCmd.PreparedStatementName))
 	}
@@ -338,7 +336,7 @@ func (ex *connExecutor) execBind(
 			ex.state.sqlTimestamp.In(ex.sessionData.DataConversion.Location))
 
 		for i, arg := range bindCmd.Args {
-			k := types.PlaceholderIdx(i)
+			k := tree.PlaceholderIdx(i)
 			t := ps.InferredTypes[i]
 			if arg == nil {
 				// nil indicates a NULL argument value.
@@ -346,11 +344,11 @@ func (ex *connExecutor) execBind(
 			} else {
 				d, err := pgwirebase.DecodeOidDatum(ptCtx, t, qArgFormatCodes[i], arg)
 				if err != nil {
-					if _, ok := err.(*pgerror.Error); ok {
+					if _, ok := pgerror.GetPGCause(err); ok {
 						return retErr(err)
 					}
-					return retErr(pgwirebase.NewProtocolViolationErrorf(
-						"error in argument for %s: %s", k, err.Error()))
+					return retErr(pgerror.Wrapf(err, pgerror.CodeProtocolViolationError,
+						"error in argument for %s", k))
 
 				}
 				qargs[k] = d
@@ -470,7 +468,7 @@ func (ex *connExecutor) execDescribe(
 	case pgwirebase.PrepareStatement:
 		ps, ok := ex.extraTxnState.prepStmtsNamespace.prepStmts[descCmd.Name]
 		if !ok {
-			return retErr(pgerror.NewErrorf(
+			return retErr(pgerror.Newf(
 				pgerror.CodeInvalidSQLStatementNameError,
 				"unknown prepared statement %q", descCmd.Name))
 		}
@@ -485,7 +483,7 @@ func (ex *connExecutor) execDescribe(
 	case pgwirebase.PreparePortal:
 		portal, ok := ex.extraTxnState.prepStmtsNamespace.portals[descCmd.Name]
 		if !ok {
-			return retErr(pgerror.NewErrorf(
+			return retErr(pgerror.Newf(
 				pgerror.CodeInvalidCursorNameError, "unknown portal %q", descCmd.Name))
 		}
 
@@ -495,7 +493,8 @@ func (ex *connExecutor) execDescribe(
 			res.SetPortalOutput(ctx, portal.Stmt.Columns, portal.OutFormats)
 		}
 	default:
-		return retErr(errors.Errorf("unknown describe type: %s", descCmd.Type))
+		return retErr(pgerror.AssertionFailedf(
+			"unknown describe type: %s", log.Safe(descCmd.Type)))
 	}
 	return nil, nil
 }

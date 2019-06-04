@@ -343,7 +343,7 @@ func TestAdminAPIDatabaseSQLInjection(t *testing.T) {
 
 	const fakedb = "system;DROP DATABASE system;"
 	const path = "databases/" + fakedb
-	const errPattern = `database \\"` + fakedb + `\\" does not exist`
+	const errPattern = `target database or schema does not exist`
 	if err := getAdminJSONProto(s, path, nil); !testutils.IsError(err, errPattern) {
 		t.Fatalf("unexpected error: %v\nexpected: %s", err, errPattern)
 	}
@@ -514,13 +514,13 @@ func TestAdminAPITableDetails(t *testing.T) {
 							nulls_allowed INT8,
 							nulls_not_allowed INT8 NOT NULL DEFAULT 1000,
 							default2 INT8 DEFAULT 2,
-							string_default STRING DEFAULT 'default_string'
+							string_default STRING DEFAULT 'default_string',
+						  INDEX descidx (default2 DESC)
 						)`, escDBName, escTblName),
 				fmt.Sprintf("CREATE USER readonly"),
 				fmt.Sprintf("CREATE USER app"),
 				fmt.Sprintf("GRANT SELECT ON %s.%s TO readonly", escDBName, escTblName),
 				fmt.Sprintf("GRANT SELECT,UPDATE,DELETE ON %s.%s TO app", escDBName, escTblName),
-				fmt.Sprintf("CREATE INDEX descidx ON %s.%s (default2 DESC)", escDBName, escTblName),
 			}
 
 			for _, q := range setupQueries {
@@ -542,7 +542,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 				{Name: "nulls_not_allowed", Type: "INT8", Nullable: false, DefaultValue: "1000:::INT8"},
 				{Name: "default2", Type: "INT8", Nullable: true, DefaultValue: "2:::INT8"},
 				{Name: "string_default", Type: "STRING", Nullable: true, DefaultValue: "'default_string':::STRING"},
-				{Name: "rowid", Type: "INT", Nullable: false, DefaultValue: "unique_rowid()", Hidden: true},
+				{Name: "rowid", Type: "INT8", Nullable: false, DefaultValue: "unique_rowid()", Hidden: true},
 			}
 			testutils.SortStructs(expColumns, "Name")
 			testutils.SortStructs(resp.Columns, "Name")
@@ -703,8 +703,8 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	}
 
 	// Verify zone matches cluster default.
-	verifyDbZone(config.DefaultZoneConfig(), serverpb.ZoneConfigurationLevel_CLUSTER)
-	verifyTblZone(config.DefaultZoneConfig(), serverpb.ZoneConfigurationLevel_CLUSTER)
+	verifyDbZone(s.(*TestServer).Cfg.DefaultZoneConfig, serverpb.ZoneConfigurationLevel_CLUSTER)
+	verifyTblZone(s.(*TestServer).Cfg.DefaultZoneConfig, serverpb.ZoneConfigurationLevel_CLUSTER)
 
 	// Get ID path for table. This will be an array of three IDs, containing the ID of the root namespace,
 	// the database, and the table (in that order).

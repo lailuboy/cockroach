@@ -361,7 +361,7 @@ error (42601): multiple ORDER BY clauses not allowed
 build
 SELECT CASE a WHEN 1 THEN b ELSE c END as val FROM t ORDER BY val
 ----
-error: incompatible value type: expected c to be of type int, found type bool
+error (22023): incompatible value type: expected c to be of type int, found type bool
 
 build
 SELECT * FROM t ORDER BY 0
@@ -396,22 +396,22 @@ error (42P01): no data source matches prefix: a
 build
 SELECT generate_series FROM generate_series(1, 100) ORDER BY ARRAY[generate_series]
 ----
-error (0A000): can't order by column type int[]
+error (0A000): unimplemented: can't order by column type int[]
 
 build
 SELECT ARRAY[generate_series] FROM generate_series(1, 100) ORDER BY ARRAY[generate_series]
 ----
-error (0A000): can't order by column type int[]
+error (0A000): unimplemented: can't order by column type int[]
 
 build
 SELECT ARRAY[generate_series] FROM generate_series(1, 100) ORDER BY 1
 ----
-error (0A000): can't order by column type int[]
+error (0A000): unimplemented: can't order by column type int[]
 
 build
 SELECT ARRAY[generate_series] AS a FROM generate_series(1, 100) ORDER BY a
 ----
-error (0A000): can't order by column type int[]
+error (0A000): unimplemented: can't order by column type int[]
 
 build
 SELECT generate_series, ARRAY[generate_series] FROM generate_series(1, 1) ORDER BY 1
@@ -600,7 +600,7 @@ TABLE abc
  ├── a int not null
  ├── b int not null
  ├── c int not null
- ├── d string
+ ├── d char
  ├── INDEX primary
  │    ├── a int not null
  │    ├── b int not null
@@ -626,21 +626,21 @@ build
 SELECT d FROM abc ORDER BY lower(d)
 ----
 sort
- ├── columns: d:4(string)  [hidden: column5:5(string)]
+ ├── columns: d:4(char)  [hidden: column5:5(string)]
  ├── ordering: +5
  └── project
-      ├── columns: column5:5(string) d:4(string)
+      ├── columns: column5:5(string) d:4(char)
       ├── scan abc
-      │    └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+      │    └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
       └── projections
            └── function: lower [type=string]
-                └── variable: d [type=string]
+                └── variable: d [type=char]
 
 build
 SELECT * FROM abc ORDER BY a
 ----
 scan abc
- ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+ ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
  └── ordering: +1
 
 build
@@ -652,7 +652,7 @@ sort
  └── project
       ├── columns: a:1(int!null) b:2(int!null)
       └── scan abc
-           └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+           └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
 
 build
 SELECT a, b FROM abc ORDER BY b, c
@@ -663,7 +663,7 @@ sort
  └── project
       ├── columns: a:1(int!null) b:2(int!null) c:3(int!null)
       └── scan abc
-           └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+           └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
 
 build
 SELECT a, b FROM abc ORDER BY b, c, a DESC
@@ -672,10 +672,10 @@ project
  ├── columns: a:1(int!null) b:2(int!null)  [hidden: c:3(int!null)]
  ├── ordering: +2,+3,-1
  └── sort
-      ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+      ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
       ├── ordering: +2,+3
       └── scan abc
-           └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+           └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
 
 build
 SELECT a FROM abc ORDER BY a DESC
@@ -684,7 +684,7 @@ project
  ├── columns: a:1(int!null)
  ├── ordering: -1
  └── scan abc,rev
-      ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+      ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
       └── ordering: -1
 
 build
@@ -698,7 +698,7 @@ limit
  │    ├── columns: a:1(int!null)
  │    ├── ordering: -1
  │    └── scan abc,rev
- │         ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+ │         ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
  │         └── ordering: -1
  └── const: 1 [type=int]
 
@@ -713,7 +713,7 @@ offset
  │    ├── columns: a:1(int!null)
  │    ├── ordering: -1
  │    └── scan abc,rev
- │         ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+ │         ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
  │         └── ordering: -1
  └── const: 1 [type=int]
 
@@ -726,9 +726,9 @@ sort
  └── project
       ├── columns: c:3(int!null)
       └── select
-           ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+           ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
            ├── scan abc
-           │    └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+           │    └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
            └── filters
                 └── eq [type=bool]
                      ├── variable: b [type=int]
@@ -743,9 +743,9 @@ sort
  └── project
       ├── columns: c:3(int!null)
       └── select
-           ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+           ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
            ├── scan abc
-           │    └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+           │    └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
            └── filters
                 └── eq [type=bool]
                      ├── variable: b [type=int]
@@ -761,10 +761,10 @@ project
       ├── columns: a:1(int!null) b:2(int!null) c:3(int!null)
       ├── ordering: +2,+3 opt(1)
       └── select
-           ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+           ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
            ├── ordering: +2,+3 opt(1)
            ├── scan abc
-           │    ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+           │    ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
            │    └── ordering: +2,+3 opt(1)
            └── filters
                 └── eq [type=bool]
@@ -780,12 +780,12 @@ sort
  └── project
       ├── columns: a:1(int!null) b:2(int!null) c:3(int!null)
       └── scan abc
-           └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(string)
+           └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(char)
 
 build
 SELECT a FROM abc ORDER BY PRIMARY KEY a
 ----
-error: no data source matches prefix: "a"
+error (42P01): no data source matches prefix: "a"
 
 build
 SELECT a FROM abcview ORDER BY INDEX abcview@bc
@@ -978,7 +978,7 @@ error (42P01): no data source matches prefix: t.public.abcd
 build
 SELECT a FROM abcd AS foo ORDER BY INDEX foo@abc DESC
 ----
-error: no data source matches prefix: "foo"
+error (42P01): no data source matches prefix: "foo"
 
 build
 SELECT a FROM abcd ORDER BY INDEX abcd@bcd
@@ -1002,7 +1002,7 @@ sort
 build
 SELECT a FROM abcd ORDER BY INDEX abcd@nonexistent
 ----
-error: index "nonexistent" not found
+error (42704): index "nonexistent" not found
 
 build
 SELECT a FROM t.public.abcd ORDER BY INDEX t.public.abcd@bcd
@@ -1092,4 +1092,4 @@ project
 build
 SELECT ARRAY[a] FROM abcd ORDER BY 1
 ----
-error (0A000): can't order by column type int[]
+error (0A000): unimplemented: can't order by column type int[]

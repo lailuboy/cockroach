@@ -21,19 +21,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // TestRandomOracle defeats TestUnused for RandomChoice.
@@ -84,7 +81,7 @@ func TestClosest(t *testing.T) {
 	}
 	o := of.Oracle(nil)
 	info, err := o.ChoosePreferredReplica(context.TODO(), roachpb.RangeDescriptor{
-		Replicas: []roachpb.ReplicaDescriptor{
+		InternalReplicas: []roachpb.ReplicaDescriptor{
 			{NodeID: 1, StoreID: 1},
 			{NodeID: 2, StoreID: 2},
 			{NodeID: 3, StoreID: 3},
@@ -100,17 +97,11 @@ func TestClosest(t *testing.T) {
 
 func makeGossip(t *testing.T, stopper *stop.Stopper) (*gossip.Gossip, *hlc.Clock) {
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: tracing.NewTracer()},
-		&base.Config{Insecure: true},
-		clock,
-		stopper,
-		&cluster.MakeTestingClusterSettings().Version,
-	)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
 	server := rpc.NewServer(rpcContext)
 
 	const nodeID = 1
-	g := gossip.NewTest(nodeID, rpcContext, server, stopper, metric.NewRegistry())
+	g := gossip.NewTest(nodeID, rpcContext, server, stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
 	if err := g.SetNodeDescriptor(newNodeDesc(nodeID)); err != nil {
 		t.Fatal(err)
 	}

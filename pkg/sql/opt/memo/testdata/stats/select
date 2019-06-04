@@ -82,11 +82,11 @@ SELECT * FROM b WHERE x = 1 AND z = 2 AND rowid >= 5 AND rowid <= 8
 ----
 project
  ├── columns: x:1(int!null) z:2(int!null)
- ├── stats: [rows=0.00222222222]
+ ├── stats: [rows=8e-06]
  ├── fd: ()-->(1,2)
  └── select
       ├── columns: x:1(int!null) z:2(int!null) rowid:3(int!null)
-      ├── stats: [rows=0.00222222222, distinct(1)=0.00222222222, null(1)=0, distinct(2)=0.00222222222, null(2)=0, distinct(3)=0.00222222222, null(3)=0]
+      ├── stats: [rows=8e-06, distinct(1)=8e-06, null(1)=0, distinct(2)=8e-06, null(2)=0, distinct(3)=8e-06, null(3)=0]
       ├── key: (3)
       ├── fd: ()-->(1,2)
       ├── scan b
@@ -95,10 +95,9 @@ project
       │    ├── key: (3)
       │    └── fd: (3)-->(1,2)
       └── filters
+           ├── (rowid >= 5) AND (rowid <= 8) [type=bool, outer=(3), constraints=(/3: [/5 - /8]; tight)]
            ├── x = 1 [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
-           ├── z = 2 [type=bool, outer=(2), constraints=(/2: [/2 - /2]; tight), fd=()-->(2)]
-           ├── rowid >= 5 [type=bool, outer=(3), constraints=(/3: [/5 - ]; tight)]
-           └── rowid <= 8 [type=bool, outer=(3), constraints=(/3: (/NULL - /8]; tight)]
+           └── z = 2 [type=bool, outer=(2), constraints=(/2: [/2 - /2]; tight), fd=()-->(2)]
 
 # Can't determine stats from filter.
 norm
@@ -111,7 +110,7 @@ select
  ├── fd: (1)-->(2)
  ├── scan a
  │    ├── columns: x:1(int!null) y:2(int)
- │    ├── stats: [rows=4000, distinct(1)=5000, null(1)=0]
+ │    ├── stats: [rows=4000, distinct(1)=4000, null(1)=0]
  │    ├── key: (1)
  │    └── fd: (1)-->(2)
  └── filters
@@ -128,7 +127,7 @@ select
  ├── fd: ()-->(2)
  ├── scan a
  │    ├── columns: x:1(int!null) y:2(int)
- │    ├── stats: [rows=4000, distinct(1)=5000, null(1)=0, distinct(2)=400, null(2)=0]
+ │    ├── stats: [rows=4000, distinct(1)=4000, null(1)=0, distinct(2)=400, null(2)=0]
  │    ├── key: (1)
  │    └── fd: (1)-->(2)
  └── filters
@@ -142,12 +141,12 @@ SELECT * FROM a WHERE x IS NULL
 select
  ├── columns: x:1(int!null) y:2(int)
  ├── cardinality: [0 - 1]
- ├── stats: [rows=0.8, distinct(1)=0.8, null(1)=0]
+ ├── stats: [rows=1, distinct(1)=1, null(1)=0]
  ├── key: ()
  ├── fd: ()-->(1,2)
  ├── scan a
  │    ├── columns: x:1(int!null) y:2(int)
- │    ├── stats: [rows=4000, distinct(1)=5000, null(1)=0]
+ │    ├── stats: [rows=4000, distinct(1)=4000, null(1)=0]
  │    ├── key: (1)
  │    └── fd: (1)-->(2)
  └── filters
@@ -158,22 +157,21 @@ SELECT sum(x) FROM b WHERE x > 1000 AND x <= 2000 GROUP BY z
 ----
 project
  ├── columns: sum:4(decimal)
- ├── stats: [rows=99.9992331]
+ ├── stats: [rows=100]
  └── group-by
       ├── columns: z:2(int!null) sum:4(decimal)
       ├── grouping columns: z:2(int!null)
-      ├── stats: [rows=99.9992331, distinct(2)=99.9992331, null(2)=0]
+      ├── stats: [rows=100, distinct(2)=100, null(2)=0]
       ├── key: (2)
       ├── fd: (2)-->(4)
       ├── select
       │    ├── columns: x:1(int!null) z:2(int!null)
-      │    ├── stats: [rows=1111.11111, distinct(1)=1049.38272, null(1)=0, distinct(2)=99.9992331, null(2)=0]
+      │    ├── stats: [rows=2000, distinct(1)=1000, null(1)=0, distinct(2)=100, null(2)=0]
       │    ├── scan b
       │    │    ├── columns: x:1(int) z:2(int!null)
       │    │    └── stats: [rows=10000, distinct(1)=5000, null(1)=0, distinct(2)=100, null(2)=0]
       │    └── filters
-      │         ├── x > 1000 [type=bool, outer=(1), constraints=(/1: [/1001 - ]; tight)]
-      │         └── x <= 2000 [type=bool, outer=(1), constraints=(/1: (/NULL - /2000]; tight)]
+      │         └── (x > 1000) AND (x <= 2000) [type=bool, outer=(1), constraints=(/1: [/1001 - /2000]; tight)]
       └── aggregations
            └── sum [type=decimal, outer=(1)]
                 └── variable: x [type=int]
@@ -225,6 +223,9 @@ TABLE tab0
  └── INDEX primary
       └── pk int not null
 
+# Note: it's not clear that this still tests the above issue, but I have left
+# it here anyway as an interesting test case. I've added another query below
+# to regression-test the divide-by-zero issue.
 opt
 SELECT pk FROM tab0 WHERE
   col0 = 1 AND
@@ -232,37 +233,54 @@ SELECT pk FROM tab0 WHERE
   (col0 = 1 OR col0 IN (SELECT col3 FROM tab0)) AND
   (col0 = 1 OR col0 IN (SELECT col3 FROM tab0))
 ----
+values
+ ├── columns: pk:1(int)
+ ├── cardinality: [0 - 0]
+ ├── stats: [rows=0]
+ ├── key: ()
+ └── fd: ()-->(1)
+
+exec-ddl
+ALTER TABLE tab0 INJECT STATISTICS '[
+{
+  "columns": ["col0"],
+  "created_at": "2018-01-01 1:00:00.00000+00:00",
+  "row_count": 100,
+  "distinct_count": 0,
+  "null_count": 100
+},
+{
+  "columns": ["col3"],
+  "created_at": "2018-01-01 1:00:00.00000+00:00",
+  "row_count": 100,
+  "distinct_count": 10
+}
+]'
+----
+
+opt
+SELECT count(*) FROM (SELECT * FROM tab0 WHERE col3 = 10) GROUP BY col0
+----
 project
- ├── columns: pk:1(int!null)
- ├── stats: [rows=1.1]
- ├── key: (1)
- └── select
-      ├── columns: pk:1(int!null) col0:2(int!null)
-      ├── stats: [rows=1.1, distinct(1)=1.1, null(1)=0, distinct(2)=1, null(2)=0]
-      ├── key: (1)
-      ├── fd: ()-->(2)
-      ├── scan tab0
-      │    ├── columns: pk:1(int!null) col0:2(int)
-      │    ├── stats: [rows=1000, distinct(1)=1000, null(1)=0, distinct(2)=100, null(2)=10]
-      │    ├── key: (1)
-      │    └── fd: (1)-->(2)
-      └── filters
-           ├── col0 = 1 [type=bool, outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
-           ├── col0 = 2 [type=bool, outer=(2), constraints=(/2: [/2 - /2]; tight), fd=()-->(2)]
-           ├── or [type=bool, outer=(2)]
-           │    ├── col0 = 1 [type=bool]
-           │    └── any: eq [type=bool]
-           │         ├── scan tab0
-           │         │    ├── columns: col3:12(int)
-           │         │    └── stats: [rows=1000]
-           │         └── variable: col0 [type=int]
-           └── or [type=bool, outer=(2)]
-                ├── col0 = 1 [type=bool]
-                └── any: eq [type=bool]
-                     ├── scan tab0
-                     │    ├── columns: col3:19(int)
-                     │    └── stats: [rows=1000]
-                     └── variable: col0 [type=int]
+ ├── columns: count:8(int)
+ ├── stats: [rows=1.99997344]
+ └── group-by
+      ├── columns: col0:2(int) count_rows:8(int)
+      ├── grouping columns: col0:2(int)
+      ├── stats: [rows=1.99997344, distinct(2)=0.999973439, null(2)=1.99997344]
+      ├── key: (2)
+      ├── fd: (2)-->(8)
+      ├── select
+      │    ├── columns: col0:2(int) col3:5(int!null)
+      │    ├── stats: [rows=10, distinct(2)=0.999973439, null(2)=10, distinct(5)=1, null(5)=0]
+      │    ├── fd: ()-->(5)
+      │    ├── scan tab0
+      │    │    ├── columns: col0:2(int) col3:5(int)
+      │    │    └── stats: [rows=100, distinct(2)=1, null(2)=100, distinct(5)=10, null(5)=0]
+      │    └── filters
+      │         └── col3 = 10 [type=bool, outer=(5), constraints=(/5: [/10 - /10]; tight), fd=()-->(5)]
+      └── aggregations
+           └── count-rows [type=int]
 
 
 exec-ddl
@@ -370,7 +388,7 @@ SELECT * FROM district WHERE d_id > 1 AND d_id < 10 AND d_w_id=10 AND d_name='bo
 ----
 select
  ├── columns: d_id:1(int!null) d_w_id:2(int!null) d_name:3(string!null)
- ├── stats: [rows=0.0111111111, distinct(1)=0.0111055572, null(1)=0, distinct(2)=0.0111111111, null(2)=0, distinct(3)=0.0111111111, null(3)=0]
+ ├── stats: [rows=0.08, distinct(1)=0.08, null(1)=0, distinct(2)=0.08, null(2)=0, distinct(3)=0.08, null(3)=0]
  ├── key: (1)
  ├── fd: ()-->(2,3)
  ├── scan district
@@ -379,8 +397,7 @@ select
  │    ├── key: (1,2)
  │    └── fd: (1,2)-->(3)
  └── filters
-      ├── d_id > 1 [type=bool, outer=(1), constraints=(/1: [/2 - ]; tight)]
-      ├── d_id < 10 [type=bool, outer=(1), constraints=(/1: (/NULL - /9]; tight)]
+      ├── (d_id > 1) AND (d_id < 10) [type=bool, outer=(1), constraints=(/1: [/2 - /9]; tight)]
       ├── d_w_id = 10 [type=bool, outer=(2), constraints=(/2: [/10 - /10]; tight), fd=()-->(2)]
       └── d_name = 'bobs_burgers' [type=bool, outer=(3), constraints=(/3: [/'bobs_burgers' - /'bobs_burgers']; tight), fd=()-->(3)]
 
@@ -540,15 +557,14 @@ SELECT * FROM order_history WHERE item_id = order_id AND item_id < 5 AND item_id
 ----
 select
  ├── columns: order_id:1(int!null) item_id:2(int!null) customer_id:3(int) year:4(int)
- ├── stats: [rows=1.1, distinct(1)=1.1, null(1)=0, distinct(2)=1.1, null(2)=0]
+ ├── stats: [rows=0.99, distinct(1)=0.99, null(1)=0, distinct(2)=0.99, null(2)=0]
  ├── fd: (1)==(2), (2)==(1)
  ├── scan order_history
  │    ├── columns: order_id:1(int) item_id:2(int) customer_id:3(int) year:4(int)
  │    └── stats: [rows=1000, distinct(1)=100, null(1)=10, distinct(2)=100, null(2)=10]
  └── filters
-      ├── item_id = order_id [type=bool, outer=(1,2), constraints=(/1: (/NULL - ]; /2: (/NULL - ]), fd=(1)==(2), (2)==(1)]
-      ├── item_id < 5 [type=bool, outer=(2), constraints=(/2: (/NULL - /4]; tight)]
-      └── item_id > 0 [type=bool, outer=(2), constraints=(/2: [/1 - ]; tight)]
+      ├── (item_id < 5) AND (item_id > 0) [type=bool, outer=(2), constraints=(/2: [/1 - /4]; tight)]
+      └── item_id = order_id [type=bool, outer=(1,2), constraints=(/1: (/NULL - ]; /2: (/NULL - ]), fd=(1)==(2), (2)==(1)]
 
 # Test equality condition with another condition on a different attribute.
 norm
@@ -556,15 +572,14 @@ SELECT * FROM order_history WHERE item_id = order_id AND customer_id < 5 AND cus
 ----
 select
  ├── columns: order_id:1(int!null) item_id:2(int!null) customer_id:3(int!null) year:4(int)
- ├── stats: [rows=1.1, distinct(1)=1.1, null(1)=0, distinct(2)=1.1, null(2)=0, distinct(3)=1.1, null(3)=0]
+ ├── stats: [rows=0.99, distinct(1)=0.99, null(1)=0, distinct(2)=0.99, null(2)=0, distinct(3)=0.99, null(3)=0]
  ├── fd: (1)==(2), (2)==(1)
  ├── scan order_history
  │    ├── columns: order_id:1(int) item_id:2(int) customer_id:3(int) year:4(int)
  │    └── stats: [rows=1000, distinct(1)=100, null(1)=10, distinct(2)=100, null(2)=10, distinct(3)=100, null(3)=10]
  └── filters
-      ├── item_id = order_id [type=bool, outer=(1,2), constraints=(/1: (/NULL - ]; /2: (/NULL - ]), fd=(1)==(2), (2)==(1)]
-      ├── customer_id < 5 [type=bool, outer=(3), constraints=(/3: (/NULL - /4]; tight)]
-      └── customer_id > 0 [type=bool, outer=(3), constraints=(/3: [/1 - ]; tight)]
+      ├── (customer_id < 5) AND (customer_id > 0) [type=bool, outer=(3), constraints=(/3: [/1 - /4]; tight)]
+      └── item_id = order_id [type=bool, outer=(1,2), constraints=(/1: (/NULL - ]; /2: (/NULL - ]), fd=(1)==(2), (2)==(1)]
 
 # Test equality condition with another filter condition without a constraint.
 norm
@@ -601,7 +616,7 @@ SELECT * FROM c WHERE x >= 0 AND x < 100
 ----
 select
  ├── columns: x:1(int!null) z:2(int!null)
- ├── stats: [rows=110, distinct(1)=110, null(1)=0, distinct(2)=69.2053852, null(2)=0]
+ ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=65.5215193, null(2)=0]
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── scan c
@@ -610,8 +625,7 @@ select
  │    ├── lax-key: (1,2)
  │    └── fd: (1)~~>(2)
  └── filters
-      ├── x >= 0 [type=bool, outer=(1), constraints=(/1: [/0 - ]; tight)]
-      └── x < 100 [type=bool, outer=(1), constraints=(/1: (/NULL - /99]; tight)]
+      └── (x >= 0) AND (x < 100) [type=bool, outer=(1), constraints=(/1: [/0 - /99]; tight)]
 
 exec-ddl
 CREATE TABLE uvw (u INT, v INT, w INT)
@@ -717,14 +731,14 @@ TABLE lineitem
  ├── l_extendedprice float not null
  ├── l_discount float not null
  ├── l_tax float not null
- ├── l_returnflag string not null
- ├── l_linestatus string not null
+ ├── l_returnflag char not null
+ ├── l_linestatus char not null
  ├── l_shipdate date not null
  ├── l_commitdate date not null
  ├── l_receiptdate date not null
- ├── l_shipinstruct string not null
- ├── l_shipmode string not null
- ├── l_comment string not null
+ ├── l_shipinstruct char not null
+ ├── l_shipmode char not null
+ ├── l_comment varchar not null
  ├── INDEX primary
  │    ├── l_orderkey int not null
  │    └── l_linenumber int not null
@@ -772,7 +786,7 @@ WHERE
     AND l_shipdate < DATE '1995-10-01';
 ----
 index-join lineitem
- ├── columns: l_orderkey:1(int!null) l_partkey:2(int!null) l_suppkey:3(int!null) l_linenumber:4(int!null) l_quantity:5(float!null) l_extendedprice:6(float!null) l_discount:7(float!null) l_tax:8(float!null) l_returnflag:9(string!null) l_linestatus:10(string!null) l_shipdate:11(date!null) l_commitdate:12(date!null) l_receiptdate:13(date!null) l_shipinstruct:14(string!null) l_shipmode:15(string!null) l_comment:16(string!null)
+ ├── columns: l_orderkey:1(int!null) l_partkey:2(int!null) l_suppkey:3(int!null) l_linenumber:4(int!null) l_quantity:5(float!null) l_extendedprice:6(float!null) l_discount:7(float!null) l_tax:8(float!null) l_returnflag:9(char!null) l_linestatus:10(char!null) l_shipdate:11(date!null) l_commitdate:12(date!null) l_receiptdate:13(date!null) l_shipinstruct:14(char!null) l_shipmode:15(char!null) l_comment:16(varchar!null)
  ├── stats: [rows=111.111111, distinct(1)=69.2053852, null(1)=0, distinct(2)=69.2053852, null(2)=0, distinct(3)=69.2053852, null(3)=0, distinct(4)=69.2053852, null(4)=0, distinct(5)=69.2053852, null(5)=0, distinct(6)=69.2053852, null(6)=0, distinct(7)=69.2053852, null(7)=0, distinct(8)=69.2053852, null(8)=0, distinct(9)=69.2053852, null(9)=0, distinct(10)=69.2053852, null(10)=0, distinct(11)=69.2053852, null(11)=0, distinct(12)=69.2053852, null(12)=0, distinct(13)=69.2053852, null(13)=0, distinct(14)=69.2053852, null(14)=0, distinct(15)=69.2053852, null(15)=0, distinct(16)=69.2053852, null(16)=0]
  ├── key: (1,4)
  ├── fd: (1,4)-->(2,3,5-16)
@@ -791,7 +805,7 @@ WHERE
     AND l_shipdate::timestamptz < DATE '1995-10-01';
 ----
 index-join lineitem
- ├── columns: l_orderkey:1(int!null) l_partkey:2(int!null) l_suppkey:3(int!null) l_linenumber:4(int!null) l_quantity:5(float!null) l_extendedprice:6(float!null) l_discount:7(float!null) l_tax:8(float!null) l_returnflag:9(string!null) l_linestatus:10(string!null) l_shipdate:11(date!null) l_commitdate:12(date!null) l_receiptdate:13(date!null) l_shipinstruct:14(string!null) l_shipmode:15(string!null) l_comment:16(string!null)
+ ├── columns: l_orderkey:1(int!null) l_partkey:2(int!null) l_suppkey:3(int!null) l_linenumber:4(int!null) l_quantity:5(float!null) l_extendedprice:6(float!null) l_discount:7(float!null) l_tax:8(float!null) l_returnflag:9(char!null) l_linestatus:10(char!null) l_shipdate:11(date!null) l_commitdate:12(date!null) l_receiptdate:13(date!null) l_shipinstruct:14(char!null) l_shipmode:15(char!null) l_comment:16(varchar!null)
  ├── stats: [rows=111.111111, distinct(1)=69.2053852, null(1)=0, distinct(2)=69.2053852, null(2)=0, distinct(3)=69.2053852, null(3)=0, distinct(4)=69.2053852, null(4)=0, distinct(5)=69.2053852, null(5)=0, distinct(6)=69.2053852, null(6)=0, distinct(7)=69.2053852, null(7)=0, distinct(8)=69.2053852, null(8)=0, distinct(9)=69.2053852, null(9)=0, distinct(10)=69.2053852, null(10)=0, distinct(11)=69.2053852, null(11)=0, distinct(12)=69.2053852, null(12)=0, distinct(13)=69.2053852, null(13)=0, distinct(14)=69.2053852, null(14)=0, distinct(15)=69.2053852, null(15)=0, distinct(16)=69.2053852, null(16)=0]
  ├── key: (1,4)
  ├── fd: (1,4)-->(2,3,5-16)
@@ -1080,11 +1094,11 @@ SELECT * FROM b WHERE x = 1 AND z = 2 AND rowid >= 5 AND rowid <= 8
 ----
 project
  ├── columns: x:1(int!null) z:2(int!null)
- ├── stats: [rows=0.00177777778]
+ ├── stats: [rows=6.4e-06]
  ├── fd: ()-->(1,2)
  └── select
       ├── columns: x:1(int!null) z:2(int!null) rowid:3(int!null)
-      ├── stats: [rows=0.00177777778, distinct(1)=0.00177777778, null(1)=0, distinct(2)=0.00177777778, null(2)=0, distinct(3)=0.00177777778, null(3)=0]
+      ├── stats: [rows=6.4e-06, distinct(1)=6.4e-06, null(1)=0, distinct(2)=6.4e-06, null(2)=0, distinct(3)=6.4e-06, null(3)=0]
       ├── key: (3)
       ├── fd: ()-->(1,2)
       ├── scan b
@@ -1093,10 +1107,9 @@ project
       │    ├── key: (3)
       │    └── fd: (3)-->(1,2)
       └── filters
+           ├── (rowid >= 5) AND (rowid <= 8) [type=bool, outer=(3), constraints=(/3: [/5 - /8]; tight)]
            ├── x = 1 [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
-           ├── z = 2 [type=bool, outer=(2), constraints=(/2: [/2 - /2]; tight), fd=()-->(2)]
-           ├── rowid >= 5 [type=bool, outer=(3), constraints=(/3: [/5 - ]; tight)]
-           └── rowid <= 8 [type=bool, outer=(3), constraints=(/3: (/NULL - /8]; tight)]
+           └── z = 2 [type=bool, outer=(2), constraints=(/2: [/2 - /2]; tight), fd=()-->(2)]
 
 # Can't determine stats from filter.
 norm
@@ -1140,7 +1153,7 @@ SELECT * FROM c WHERE x >= 0 AND x < 100
 ----
 select
  ├── columns: x:1(int!null) z:2(int!null)
- ├── stats: [rows=555.555556, distinct(1)=555.555556, null(1)=0, distinct(2)=555.555556, null(2)=0]
+ ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=100, null(2)=0]
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── scan c
@@ -1149,8 +1162,7 @@ select
  │    ├── lax-key: (1,2)
  │    └── fd: (1)~~>(2)
  └── filters
-      ├── x >= 0 [type=bool, outer=(1), constraints=(/1: [/0 - ]; tight)]
-      └── x < 100 [type=bool, outer=(1), constraints=(/1: (/NULL - /99]; tight)]
+      └── (x >= 0) AND (x < 100) [type=bool, outer=(1), constraints=(/1: [/0 - /99]; tight)]
 
 # Bump up null counts
 exec-ddl
@@ -1296,17 +1308,103 @@ SELECT * FROM nulls WHERE y = 3
 ----
 project
  ├── columns: x:1(int) y:2(int!null)
- ├── stats: [rows=9.9, distinct(1)=0, null(1)=9.9]
+ ├── stats: [rows=9.9, distinct(1)=0.99995224, null(1)=9.9]
  ├── fd: ()-->(2)
  └── select
       ├── columns: x:1(int) y:2(int!null) rowid:3(int!null)
-      ├── stats: [rows=9.9, distinct(1)=0, null(1)=9.9, distinct(2)=1, null(2)=0, distinct(3)=9.9, null(3)=0]
+      ├── stats: [rows=9.9, distinct(1)=0.99995224, null(1)=9.9, distinct(2)=1, null(2)=0, distinct(3)=9.9, null(3)=0]
       ├── key: (3)
       ├── fd: ()-->(2), (3)-->(1)
       ├── scan nulls
       │    ├── columns: x:1(int) y:2(int) rowid:3(int!null)
-      │    ├── stats: [rows=1000, distinct(1)=0, null(1)=1000, distinct(2)=100, null(2)=10, distinct(3)=1000, null(3)=0]
+      │    ├── stats: [rows=1000, distinct(1)=1, null(1)=1000, distinct(2)=100, null(2)=10, distinct(3)=1000, null(3)=0]
       │    ├── key: (3)
       │    └── fd: (3)-->(1,2)
       └── filters
            └── y = 3 [type=bool, outer=(2), constraints=(/2: [/3 - /3]; tight), fd=()-->(2)]
+
+# Sample testcase using exprgen.
+expr colstat=1 colstat=2
+(Select 
+  (FakeRel
+    [
+      (OutputCols [ (NewColumn "a" "int") (NewColumn "b" "int") (NewColumn "c" "int")] )
+      (Cardinality "-")
+      (Stats `[
+        {
+          "columns": ["a"],
+          "distinct_count": 100,
+          "null_count": 0, 
+          "row_count": 100, 
+          "created_at": "2018-01-01 1:00:00.00000+00:00"
+        },
+        {
+          "columns": ["b"],
+          "distinct_count": 20,
+          "null_count": 5, 
+          "row_count": 100, 
+          "created_at": "2018-01-01 1:00:00.00000+00:00"
+        }
+      ]`)
+    ]
+  )
+  [ (Eq (Var "b") (Const 1)) ]
+)
+----
+select
+ ├── columns: a:1(int) b:2(int!null) c:3(int)
+ ├── stats: [rows=4.75, distinct(1)=4.75, null(1)=0, distinct(2)=1, null(2)=0]
+ ├── fd: ()-->(2)
+ ├── fake-rel
+ │    ├── columns: a:1(int) b:2(int) c:3(int)
+ │    └── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=20, null(2)=5]
+ └── filters
+      └── b = 1 [type=bool, outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+
+# Regression test for #37754.
+norm
+SELECT
+    1
+FROM
+    (
+        VALUES
+            (true, NULL, B'001000101101110'),
+            (true, e'19\x1e':::STRING, NULL)
+    )
+        AS t (_bool, _string, _bit)
+GROUP BY
+    _string, _bit
+HAVING
+    min(_bool)
+----
+project
+ ├── columns: "?column?":5(int!null)
+ ├── cardinality: [0 - 2]
+ ├── stats: [rows=1]
+ ├── fd: ()-->(5)
+ ├── select
+ │    ├── columns: column2:2(string) column3:3(varbit) min:4(bool!null)
+ │    ├── cardinality: [0 - 2]
+ │    ├── stats: [rows=1, distinct(4)=1, null(4)=0]
+ │    ├── key: (2,3)
+ │    ├── fd: ()-->(4)
+ │    ├── group-by
+ │    │    ├── columns: column2:2(string) column3:3(varbit) min:4(bool)
+ │    │    ├── grouping columns: column2:2(string) column3:3(varbit)
+ │    │    ├── cardinality: [1 - 2]
+ │    │    ├── stats: [rows=1, distinct(4)=0, null(4)=1, distinct(2,3)=0, null(2,3)=1]
+ │    │    ├── key: (2,3)
+ │    │    ├── fd: (2,3)-->(4)
+ │    │    ├── values
+ │    │    │    ├── columns: column1:1(bool) column2:2(string) column3:3(varbit)
+ │    │    │    ├── cardinality: [2 - 2]
+ │    │    │    ├── stats: [rows=2, distinct(2,3)=0, null(2,3)=2]
+ │    │    │    ├── (true, NULL, B'001000101101110') [type=tuple{bool, string, varbit}]
+ │    │    │    └── (true, e'19\x1e', NULL) [type=tuple{bool, string, varbit}]
+ │    │    └── aggregations
+ │    │         └── min [type=bool, outer=(1)]
+ │    │              └── variable: column1 [type=bool]
+ │    └── filters
+ │         └── variable: min [type=bool, outer=(4), constraints=(/4: [/true - /true]; tight), fd=()-->(4)]
+ └── projections
+      └── const: 1 [type=int]

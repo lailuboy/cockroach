@@ -25,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 )
 
@@ -78,8 +78,6 @@ func TestDatumOrdering(t *testing.T) {
 		{`3.14:::float`, `3.1399999999999997`, `3.1400000000000006`, `NaN`, `+Inf`},
 		{`9.223372036854776e+18:::float`, `9.223372036854775e+18`, `9.223372036854778e+18`, `NaN`, `+Inf`},
 		{`'NaN':::float`, valIsMin, `-Inf`, `NaN`, `+Inf`},
-		{`-(1:::float/0)`, `NaN`, `-1.7976931348623157e+308`, `NaN`, `+Inf`},
-		{`(1:::float/0)`, `1.7976931348623157e+308`, valIsMax, `NaN`, `+Inf`},
 		{`-1.7976931348623157e+308:::float`, `-Inf`, `-1.7976931348623155e+308`, `NaN`, `+Inf`},
 		{`1.7976931348623157e+308:::float`, `1.7976931348623155e+308`, `+Inf`, `NaN`, `+Inf`},
 
@@ -94,9 +92,9 @@ func TestDatumOrdering(t *testing.T) {
 		{`'abc':::bytes`, noPrev, `'\x61626300'`, `'\x'`, noMax},
 
 		// Dates
-		{`'2006-01-02':::date`, `'2006-01-01'`, `'2006-01-03'`, noMin, noMax},
-		{`'0000-01-01':::date`, `'-0001-12-31'`, `'0000-01-02'`, noMin, noMax},
-		{`'4000-01-01':::date`, `'3999-12-31'`, `'4000-01-02'`, noMin, noMax},
+		{`'2006-01-02':::date`, `'2006-01-01'`, `'2006-01-03'`, `'-infinity'`, `'infinity'`},
+		{`'0001-01-01':::date`, `'0001-12-31 BC'`, `'0001-01-02'`, `'-infinity'`, `'infinity'`},
+		{`'4000-01-01 BC':::date`, `'4001-12-31 BC'`, `'4000-01-02 BC'`, `'-infinity'`, `'infinity'`},
 		{`'2006-01-02 03:04:05.123123':::timestamp`,
 			`'2006-01-02 03:04:05.123122+00:00'`, `'2006-01-02 03:04:05.123124+00:00'`, noMin, noMax},
 
@@ -106,6 +104,8 @@ func TestDatumOrdering(t *testing.T) {
 		{`'12:00:00':::time`, `'11:59:59.999999'`, `'12:00:00.000001'`,
 			`'00:00:00'`, `'23:59:59.999999'`},
 		{`'23:59:59.999999':::time`, `'23:59:59.999998'`, valIsMax,
+			`'00:00:00'`, `'23:59:59.999999'`},
+		{`'24:00':::time`, `'23:59:59.999999'`, `'00:00:00.000001'`,
 			`'00:00:00'`, `'23:59:59.999999'`},
 
 		// Intervals
@@ -486,6 +486,9 @@ func TestParseDTime(t *testing.T) {
 		{"04:05:06.000001", timeofday.New(4, 5, 6, 1)},
 		{"04:05:06-07", timeofday.New(4, 5, 6, 0)},
 		{"4:5:6", timeofday.New(4, 5, 6, 0)},
+		{"24:00:00", timeofday.Time2400},
+		{"24:00:00.000", timeofday.Time2400},
+		{"24:00:00.000000", timeofday.Time2400},
 	}
 	for _, td := range testData {
 		actual, err := tree.ParseDTime(nil, td.str)
@@ -504,7 +507,6 @@ func TestParseDTimeError(t *testing.T) {
 		"",
 		"foo",
 		"01",
-		"24:00:00",
 	}
 	for _, s := range testData {
 		actual, _ := tree.ParseDTime(nil, s)
@@ -676,7 +678,7 @@ func TestIsDistinctFrom(t *testing.T) {
 }
 
 func TestAllTypesAsJSON(t *testing.T) {
-	for _, typ := range types.AnyNonArray {
+	for _, typ := range types.Scalar {
 		d := tree.SampleDatum(typ)
 		_, err := tree.AsJSON(d)
 		if err != nil {

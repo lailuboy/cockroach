@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
+	"github.com/cockroachdb/cockroach/pkg/storage/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/rangefeed"
@@ -42,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/txnwait"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -197,12 +199,7 @@ type Replica struct {
 		// depending on which lock is being held.
 		stateLoader stateloader.StateLoader
 		// on-disk storage for sideloaded SSTables. nil when there's no ReplicaID.
-		sideloaded sideloadStorage
-
-		// rangefeed is an instance of a rangefeed Processor that is capable of
-		// routing rangefeed events to a set of subscribers. Will be nil if no
-		// subscribers are registered.
-		rangefeed *rangefeed.Processor
+		sideloaded SideloadStorage
 	}
 
 	// Contains the lease history when enabled.
@@ -250,11 +247,20 @@ type Replica struct {
 		// already finished snapshot "pending" for extended periods of time
 		// (preventing log truncation).
 		snapshotLogTruncationConstraints map[uuid.UUID]snapTruncationInfo
-		// raftLogSize is the approximate size in bytes of the persisted raft log.
-		// On server restart, this value is assumed to be zero to avoid costly scans
-		// of the raft log. This will be correct when all log entries predating this
-		// process have been truncated.
+		// raftLogSize is the approximate size in bytes of the persisted raft
+		// log, including sideloaded entries' payloads. The value itself is not
+		// persisted and is computed lazily, paced by the raft log truncation
+		// queue which will recompute the log size when it finds it
+		// uninitialized. This recomputation mechanism isn't relevant for ranges
+		// which see regular write activity (for those the log size will deviate
+		// from zero quickly, and so it won't be recomputed but will undercount
+		// until the first truncation is carried out), but it prevents a large
+		// dormant Raft log from sitting around forever, which has caused problems
+		// in the past.
 		raftLogSize int64
+		// If raftLogSizeTrusted is false, don't trust the above raftLogSize until
+		// it has been recomputed.
+		raftLogSizeTrusted bool
 		// raftLogLastCheckSize is the value of raftLogSize the last time the Raft
 		// log was checked for truncation or at the time of the last Raft log
 		// truncation.
@@ -286,8 +292,14 @@ type Replica struct {
 		//
 		// The *ProposalData in the map are "owned" by it. Elements from the
 		// map must only be referenced while Replica.mu is held, except if the
-		// element is removed from the map first. The notable exception is the
-		// contained RaftCommand, which we treat as immutable.
+		// element is removed from the map first.
+		//
+		// Due to Raft reproposals, multiple in-flight Raft entries can have
+		// the same CmdIDKey, all corresponding to the same KV request. However,
+		// not all Raft entries with a given command ID will correspond directly
+		// to the *RaftCommand contained in its associated *ProposalData. This
+		// is because the *RaftCommand can be mutated during reproposals by
+		// Replica.tryReproposeWithNewLeaseIndex.
 		proposals         map[storagebase.CmdIDKey]*ProposalData
 		internalRaftGroup *raft.RawNode
 		// The ID of the replica within the Raft group. May be 0 if the replica has
@@ -307,6 +319,9 @@ type Replica struct {
 		// we know that the replica has caught up.
 		lastReplicaAdded     roachpb.ReplicaID
 		lastReplicaAddedTime time.Time
+		// initialMaxClosed is the initial maxClosed timestamp for the replica as known
+		// from its left-hand-side upon creation.
+		initialMaxClosed hlc.Timestamp
 
 		// The most recently updated time for each follower of this range. This is updated
 		// every time a Raft message is received from a peer.
@@ -411,6 +426,26 @@ type Replica struct {
 		// not have all the log entries.
 		draining bool
 	}
+
+	rangefeedMu struct {
+		syncutil.RWMutex
+		// proc is an instance of a rangefeed Processor that is capable of
+		// routing rangefeed events to a set of subscribers. Will be nil if no
+		// subscribers are registered.
+		//
+		// Requires Replica.rangefeedMu be held when mutating the pointer.
+		// Requires Replica.raftMu be held when providing logical ops and
+		//  informing the processor of closed timestamp updates. This properly
+		//  synchronizes updates that are linearized and driven by the Raft log.
+		proc *rangefeed.Processor
+	}
+
+	// Throttle how often we offer this Replica to the split and merge queues.
+	// We have triggers downstream of Raft that do so based on limited
+	// information and without explicit throttling some replicas will offer once
+	// per applied Raft command, which is silly and also clogs up the queues'
+	// semaphores.
+	splitQueueThrottle, mergeQueueThrottle util.EveryN
 
 	// loadBasedSplitter keeps information about load-based splitting.
 	loadBasedSplitter split.Decider
@@ -705,7 +740,7 @@ func maxReplicaID(desc *roachpb.RangeDescriptor) roachpb.ReplicaID {
 		return 0
 	}
 	var maxID roachpb.ReplicaID
-	for _, repl := range desc.Replicas {
+	for _, repl := range desc.Replicas().Unwrap() {
 		if repl.ReplicaID > maxID {
 			maxID = repl.ReplicaID
 		}
@@ -851,18 +886,46 @@ func (r *Replica) raftStatusRLocked() *raft.Status {
 // State returns a copy of the internal state of the Replica, along with some
 // auxiliary information.
 func (r *Replica) State() storagepb.RangeInfo {
+	var ri storagepb.RangeInfo
+
+	// NB: this acquires an RLock(). Reentrant RLocks are deadlock prone, so do
+	// this first before RLocking below. Performance of this extra lock
+	// acquisition is not a concern.
+	ri.ActiveClosedTimestamp = r.maxClosed(context.Background())
+
+	// NB: numRangefeedRegistrations doesn't require Replica.mu to be locked.
+	// However, it does require coordination between multiple goroutines, so
+	// it's best to keep it out of the Replica.mu critical section.
+	ri.RangefeedRegistrations = int64(r.numRangefeedRegistrations())
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	var ri storagepb.RangeInfo
 	ri.ReplicaState = *(protoutil.Clone(&r.mu.state)).(*storagepb.ReplicaState)
 	ri.LastIndex = r.mu.lastIndex
 	ri.NumPending = uint64(len(r.mu.proposals))
 	ri.RaftLogSize = r.mu.raftLogSize
+	ri.RaftLogSizeTrusted = r.mu.raftLogSizeTrusted
 	ri.NumDropped = uint64(r.mu.droppedMessages)
 	if r.mu.proposalQuota != nil {
 		ri.ApproximateProposalQuota = r.mu.proposalQuota.approximateQuota()
 	}
 	ri.RangeMaxBytes = *r.mu.zone.RangeMaxBytes
+	if desc := ri.ReplicaState.Desc; desc != nil {
+		for _, replDesc := range desc.Replicas().Unwrap() {
+			r.store.cfg.ClosedTimestamp.Storage.VisitDescending(replDesc.NodeID, func(e ctpb.Entry) (done bool) {
+				mlai, found := e.MLAI[r.RangeID]
+				if !found {
+					return false // not done
+				}
+				if ri.NewestClosedTimestamp.ClosedTimestamp.Less(e.ClosedTimestamp) {
+					ri.NewestClosedTimestamp.NodeID = replDesc.NodeID
+					ri.NewestClosedTimestamp.MLAI = int64(mlai)
+					ri.NewestClosedTimestamp.ClosedTimestamp = e.ClosedTimestamp
+				}
+				return true // done
+			})
+		}
+	}
 	return ri
 }
 
@@ -975,13 +1038,11 @@ type endCmds struct {
 
 // done releases the latches acquired by the command and updates
 // the timestamp cache using the final timestamp of each command.
-func (ec *endCmds) done(
-	br *roachpb.BatchResponse, pErr *roachpb.Error, retry proposalReevaluationReason,
-) {
+func (ec *endCmds) done(br *roachpb.BatchResponse, pErr *roachpb.Error) {
 	// Update the timestamp cache if the request is not being re-evaluated. Each
 	// request is considered in turn; only those marked as affecting the cache are
 	// processed. Inconsistent reads are excluded.
-	if retry == proposalNoReevaluation && ec.ba.ReadConsistency == roachpb.CONSISTENT {
+	if ec.ba.ReadConsistency == roachpb.CONSISTENT {
 		ec.repl.updateTimestampCache(&ec.ba, br, pErr)
 	}
 
@@ -1007,14 +1068,20 @@ func (r *Replica) collectSpans(ba *roachpb.BatchRequest) (*spanset.SpanSet, erro
 	if ba.IsReadOnly() {
 		spans.Reserve(spanset.SpanReadOnly, spanset.SpanGlobal, len(ba.Requests))
 	} else {
-		spans.Reserve(spanset.SpanReadWrite, spanset.SpanGlobal, len(ba.Requests))
+		guess := len(ba.Requests)
+		if et, ok := ba.GetArg(roachpb.EndTransaction); ok {
+			// EndTransaction declares a global write for each of its intent spans.
+			guess += len(et.(*roachpb.EndTransactionRequest).IntentSpans) - 1
+		}
+		spans.Reserve(spanset.SpanReadWrite, spanset.SpanGlobal, guess)
 	}
 
 	desc := r.Desc()
+	batcheval.DeclareKeysForBatch(desc, ba.Header, spans)
 	for _, union := range ba.Requests {
 		inner := union.GetInner()
 		if cmd, ok := batcheval.LookupCommand(inner.Method()); ok {
-			cmd.DeclareKeys(*desc, ba.Header, inner, spans)
+			cmd.DeclareKeys(desc, ba.Header, inner, spans)
 		} else {
 			return nil, errors.Errorf("unrecognized command %s", inner.Method())
 		}
@@ -1134,14 +1201,10 @@ func (r *Replica) beginCmds(
 	// Handle load-based splitting.
 	if r.SplitByLoadEnabled() {
 		shouldInitSplit := r.loadBasedSplitter.Record(timeutil.Now(), len(ba.Requests), func() roachpb.Span {
-			boundarySpan := spans.BoundarySpan(spanset.SpanGlobal)
-			if boundarySpan == nil {
-				return roachpb.Span{}
-			}
-			return *boundarySpan
+			return spans.BoundarySpan(spanset.SpanGlobal)
 		})
 		if shouldInitSplit {
-			r.store.splitQueue.MaybeAdd(r, r.store.Clock().Now())
+			r.store.splitQueue.MaybeAddAsync(ctx, r, r.store.Clock().Now())
 		}
 	}
 
@@ -1193,6 +1256,11 @@ func (r *Replica) executeAdminBatch(
 		reply, pErr = r.AdminSplit(ctx, *tArgs, "manual")
 		resp = &reply
 
+	case *roachpb.AdminUnsplitRequest:
+		var reply roachpb.AdminUnsplitResponse
+		reply, pErr = r.AdminUnsplit(ctx, *tArgs, "manual")
+		resp = &reply
+
 	case *roachpb.AdminMergeRequest:
 		var reply roachpb.AdminMergeResponse
 		reply, pErr = r.AdminMerge(ctx, *tArgs, "manual")
@@ -1204,15 +1272,27 @@ func (r *Replica) executeAdminBatch(
 
 	case *roachpb.AdminChangeReplicasRequest:
 		var err error
+		expDesc := tArgs.ExpDesc
+		if expDesc == nil {
+			expDesc = r.Desc()
+		}
 		for _, target := range tArgs.Targets {
-			err = r.ChangeReplicas(
-				ctx, tArgs.ChangeType, target, r.Desc(), storagepb.ReasonAdminRequest, "")
+			// Update expDesc to the outcome of the previous run to enable detection
+			// of concurrent updates while applying a series of changes.
+			expDesc, err = r.ChangeReplicas(
+				ctx, tArgs.ChangeType, target, expDesc, storagepb.ReasonAdminRequest, "")
 			if err != nil {
 				break
 			}
 		}
 		pErr = roachpb.NewError(err)
-		resp = &roachpb.AdminChangeReplicasResponse{}
+		if err != nil {
+			resp = &roachpb.AdminChangeReplicasResponse{}
+		} else {
+			resp = &roachpb.AdminChangeReplicasResponse{
+				Desc: expDesc,
+			}
+		}
 
 	case *roachpb.AdminRelocateRangeRequest:
 		err := r.store.AdminRelocateRange(ctx, *r.Desc(), tArgs.Targets)
@@ -1287,6 +1367,7 @@ func (r *Replica) limitTxnMaxTimestamp(
 	// a timestamp on file for this Node which is smaller than MaxTimestamp,
 	// we can lower MaxTimestamp accordingly. If MaxTimestamp drops below
 	// OrigTimestamp, we effectively can't see uncertainty restarts anymore.
+	// TODO(nvanbenschoten): This should use the lease's node id.
 	obsTS, ok := ba.Txn.GetObservedTimestamp(ba.Replica.NodeID)
 	if !ok {
 		return
@@ -1296,19 +1377,21 @@ func (r *Replica) limitTxnMaxTimestamp(
 	// ensures we avoid incorrect assumptions about when data was
 	// written, in absolute time on a different node, which held the
 	// lease before this replica acquired it.
+	// TODO(nvanbenschoten): Do we ever need to call this when
+	//   status.State != VALID?
 	if status.State == storagepb.LeaseState_VALID {
 		obsTS.Forward(status.Lease.Start)
 	}
 	if obsTS.Less(ba.Txn.MaxTimestamp) {
 		// Copy-on-write to protect others we might be sharing the Txn with.
-		shallowTxn := *ba.Txn
+		txnClone := ba.Txn.Clone()
 		// The uncertainty window is [OrigTimestamp, maxTS), so if that window
 		// is empty, there won't be any uncertainty restarts.
 		if !ba.Txn.OrigTimestamp.Less(obsTS) {
 			log.Event(ctx, "read has no clock uncertainty")
 		}
-		shallowTxn.MaxTimestamp.Backward(obsTS)
-		ba.Txn = &shallowTxn
+		txnClone.MaxTimestamp.Backward(obsTS)
+		ba.Txn = txnClone
 	}
 }
 
@@ -1366,37 +1449,40 @@ func (r *Replica) maybeWatchForMerge(ctx context.Context) error {
 			// roachpb.PUSH_TOUCH, though it might appear more semantically correct,
 			// returns immediately and causes us to spin hot, whereas
 			// roachpb.PUSH_ABORT efficiently blocks until the transaction completes.
-			res, pErr := client.SendWrapped(ctx, r.DB().NonTransactionalSender(), &roachpb.PushTxnRequest{
+			b := &client.Batch{}
+			b.Header.Timestamp = r.Clock().Now()
+			b.AddRawRequest(&roachpb.PushTxnRequest{
 				RequestHeader: roachpb.RequestHeader{Key: intent.Txn.Key},
 				PusherTxn: roachpb.Transaction{
-					TxnMeta: enginepb.TxnMeta{Priority: roachpb.MinTxnPriority},
+					TxnMeta: enginepb.TxnMeta{Priority: enginepb.MinTxnPriority},
 				},
-				PusheeTxn: intent.Txn,
-				Now:       r.Clock().Now(),
-				PushType:  roachpb.PUSH_ABORT,
+				PusheeTxn:       intent.Txn,
+				DeprecatedNow:   b.Header.Timestamp,
+				PushType:        roachpb.PUSH_ABORT,
+				InclusivePushTo: true,
 			})
-			if pErr != nil {
+			if err := r.DB().Run(ctx, b); err != nil {
 				select {
 				case <-r.store.stopper.ShouldQuiesce():
 					// The server is shutting down. The error while pushing the
 					// transaction was probably caused by the shutdown, so ignore it.
 					return
 				default:
-					log.Warningf(ctx, "error while watching for merge to complete: PushTxn: %s", pErr)
+					log.Warningf(ctx, "error while watching for merge to complete: PushTxn: %s", err)
 					// We can't safely unblock traffic until we can prove that the merge
 					// transaction is committed or aborted. Nothing to do but try again.
 					continue
 				}
 			}
-			pushTxnRes = res.(*roachpb.PushTxnResponse)
+			pushTxnRes = b.RawResponse().Responses[0].GetInner().(*roachpb.PushTxnResponse)
 			break
 		}
 
 		var mergeCommitted bool
 		switch pushTxnRes.PusheeTxn.Status {
-		case roachpb.PENDING:
-			log.Fatalf(ctx, "PushTxn returned while merge transaction %s was still pending",
-				intent.Txn.ID.Short())
+		case roachpb.PENDING, roachpb.STAGING:
+			log.Fatalf(ctx, "PushTxn returned while merge transaction %s was still %s",
+				intent.Txn.ID.Short(), pushTxnRes.PusheeTxn.Status)
 		case roachpb.COMMITTED:
 			// If PushTxn claims that the transaction committed, then the transaction
 			// definitely committed.
@@ -1528,7 +1614,8 @@ func (r *Replica) getReplicaDescriptorByIDRLocked(
 		return fallback, nil
 	}
 	return roachpb.ReplicaDescriptor{},
-		errors.Errorf("replica %d not present in %v, %v", replicaID, fallback, r.mu.state.Desc.Replicas)
+		errors.Errorf("replica %d not present in %v, %v",
+			replicaID, fallback, r.mu.state.Desc.Replicas())
 }
 
 // checkIfTxnAborted checks the txn AbortSpan for the given
@@ -1553,7 +1640,7 @@ func checkIfTxnAborted(
 		}
 		newTxn.Status = roachpb.ABORTED
 		return roachpb.NewErrorWithTxn(
-			roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_ABORT_SPAN), &newTxn)
+			roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_ABORT_SPAN), newTxn)
 	}
 	return nil
 }

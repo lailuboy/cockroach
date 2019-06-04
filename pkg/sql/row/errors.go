@@ -16,7 +16,6 @@ package row
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -45,7 +44,7 @@ func (f *singleKVFetcher) nextBatch(
 
 // getRangesInfo implements the kvBatchFetcher interface.
 func (f *singleKVFetcher) getRangesInfo() []roachpb.RangeInfo {
-	panic("getRangesInfo() called on singleKVFetcher")
+	panic(pgerror.AssertionFailedf("getRangesInfo() called on singleKVFetcher"))
 }
 
 // ConvertBatchError returns a user friendly constraint violation error.
@@ -58,7 +57,7 @@ func ConvertBatchError(
 	}
 	j := origPErr.Index.Index
 	if j >= int32(len(b.Results)) {
-		panic(fmt.Sprintf("index %d outside of results: %+v", j, b.Results))
+		return pgerror.AssertionFailedf("index %d outside of results: %+v", j, b.Results)
 	}
 	result := b.Results[j]
 	if cErr, ok := origPErr.GetDetail().(*roachpb.ConditionFailedError); ok && len(result.Rows) > 0 {
@@ -135,7 +134,7 @@ func NewUniquenessConstraintViolationError(
 		valStrs = append(valStrs, val.String())
 	}
 
-	return pgerror.NewErrorf(pgerror.CodeUniqueViolationError,
+	return pgerror.Newf(pgerror.CodeUniqueViolationError,
 		"duplicate key value (%s)=(%s) violates unique constraint %q",
 		strings.Join(index.ColumnNames, ","),
 		strings.Join(valStrs, ","),

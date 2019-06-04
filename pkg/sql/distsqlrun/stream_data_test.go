@@ -22,6 +22,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
@@ -29,8 +30,11 @@ import (
 // The encoder/decoder don't maintain the ordering between rows and metadata
 // records.
 func testGetDecodedRows(
-	tb testing.TB, sd *StreamDecoder, decodedRows sqlbase.EncDatumRows, metas []ProducerMetadata,
-) (sqlbase.EncDatumRows, []ProducerMetadata) {
+	tb testing.TB,
+	sd *StreamDecoder,
+	decodedRows sqlbase.EncDatumRows,
+	metas []distsqlpb.ProducerMetadata,
+) (sqlbase.EncDatumRows, []distsqlpb.ProducerMetadata) {
 	for {
 		row, meta, err := sd.GetRow(nil /* rowBuf */)
 		if err != nil {
@@ -48,12 +52,12 @@ func testGetDecodedRows(
 	return decodedRows, metas
 }
 
-func testRowStream(tb testing.TB, rng *rand.Rand, types []sqlbase.ColumnType, records []rowOrMeta) {
+func testRowStream(tb testing.TB, rng *rand.Rand, types []types.T, records []rowOrMeta) {
 	var se StreamEncoder
 	var sd StreamDecoder
 
 	var decodedRows sqlbase.EncDatumRows
-	var metas []ProducerMetadata
+	var metas []distsqlpb.ProducerMetadata
 	numRows := 0
 	numMeta := 0
 
@@ -94,7 +98,7 @@ func testRowStream(tb testing.TB, rng *rand.Rand, types []sqlbase.ColumnType, re
 
 type rowOrMeta struct {
 	row  sqlbase.EncDatumRow
-	meta ProducerMetadata
+	meta distsqlpb.ProducerMetadata
 }
 
 // TestStreamEncodeDecode generates random streams of EncDatums and passes them
@@ -104,7 +108,7 @@ func TestStreamEncodeDecode(t *testing.T) {
 	rng, _ := randutil.NewPseudoRand()
 	for test := 0; test < 100; test++ {
 		rowLen := rng.Intn(20)
-		types := sqlbase.RandColumnTypes(rng, rowLen)
+		types := sqlbase.RandEncodableColumnTypes(rng, rowLen)
 		info := make([]distsqlpb.DatumInfo, rowLen)
 		for i := range info {
 			info[i].Type = types[i]
@@ -116,8 +120,8 @@ func TestStreamEncodeDecode(t *testing.T) {
 			if rng.Intn(10) != 0 {
 				rows[i].row = make(sqlbase.EncDatumRow, rowLen)
 				for j := range rows[i].row {
-					rows[i].row[j] = sqlbase.DatumToEncDatum(info[j].Type,
-						sqlbase.RandDatum(rng, info[j].Type, true))
+					rows[i].row[j] = sqlbase.DatumToEncDatum(&info[j].Type,
+						sqlbase.RandDatum(rng, &info[j].Type, true))
 				}
 			} else {
 				rows[i].meta.Err = fmt.Errorf("test error %d", i)

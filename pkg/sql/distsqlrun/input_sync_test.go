@@ -20,8 +20,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/pkg/errors"
@@ -30,10 +32,9 @@ import (
 func TestOrderedSync(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	columnTypeInt := &sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
 	v := [6]sqlbase.EncDatum{}
 	for i := range v {
-		v[i] = sqlbase.DatumToEncDatum(*columnTypeInt, tree.NewDInt(tree.DInt(i)))
+		v[i] = sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(i)))
 	}
 
 	asc := encoding.Ascending
@@ -140,18 +141,59 @@ func TestOrderedSync(t *testing.T) {
 	}
 }
 
+func TestOrderedSyncDrainBeforeNext(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	expectedMeta := &distsqlpb.ProducerMetadata{Err: errors.New("expected metadata")}
+
+	var sources []RowSource
+	for i := 0; i < 4; i++ {
+		rowBuf := NewRowBuffer(sqlbase.OneIntCol, nil /* rows */, RowBufferArgs{})
+		sources = append(sources, rowBuf)
+		rowBuf.Push(nil, expectedMeta)
+	}
+
+	ctx := context.Background()
+	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	defer evalCtx.Stop(ctx)
+	o, err := makeOrderedSync(sqlbase.ColumnOrdering{}, evalCtx, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.Start(ctx)
+
+	// Call ConsumerDone before Next has been called.
+	o.ConsumerDone()
+
+	metasFound := 0
+	for {
+		_, meta := o.Next()
+		if meta == nil {
+			break
+		}
+
+		if meta != expectedMeta {
+			t.Fatalf("unexpected meta %v, expected %v", meta, expectedMeta)
+		}
+
+		metasFound++
+	}
+	if metasFound != len(sources) {
+		t.Fatalf("unexpected number of metadata items %d, expected %d", metasFound, len(sources))
+	}
+}
+
 func TestUnorderedSync(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	columnTypeInt := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
 	mrc := &RowChannel{}
-	mrc.InitWithNumSenders([]sqlbase.ColumnType{columnTypeInt}, 5)
+	mrc.InitWithNumSenders([]types.T{*types.Int}, 5)
 	producerErr := make(chan error, 100)
 	for i := 1; i <= 5; i++ {
 		go func(i int) {
 			for j := 1; j <= 100; j++ {
-				a := sqlbase.DatumToEncDatum(columnTypeInt, tree.NewDInt(tree.DInt(i)))
-				b := sqlbase.DatumToEncDatum(columnTypeInt, tree.NewDInt(tree.DInt(j)))
+				a := sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(i)))
+				b := sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(j)))
 				row := sqlbase.EncDatumRow{a, b}
 				if status := mrc.Push(row, nil /* meta */); status != NeedMoreRows {
 					producerErr <- errors.Errorf("producer error: unexpected response: %d", status)
@@ -194,12 +236,12 @@ func TestUnorderedSync(t *testing.T) {
 
 	// Test case when one source closes with an error.
 	mrc = &RowChannel{}
-	mrc.InitWithNumSenders([]sqlbase.ColumnType{columnTypeInt}, 5)
+	mrc.InitWithNumSenders([]types.T{*types.Int}, 5)
 	for i := 1; i <= 5; i++ {
 		go func(i int) {
 			for j := 1; j <= 100; j++ {
-				a := sqlbase.DatumToEncDatum(columnTypeInt, tree.NewDInt(tree.DInt(i)))
-				b := sqlbase.DatumToEncDatum(columnTypeInt, tree.NewDInt(tree.DInt(j)))
+				a := sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(i)))
+				b := sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(j)))
 				row := sqlbase.EncDatumRow{a, b}
 				if status := mrc.Push(row, nil /* meta */); status != NeedMoreRows {
 					producerErr <- errors.Errorf("producer error: unexpected response: %d", status)
@@ -207,7 +249,7 @@ func TestUnorderedSync(t *testing.T) {
 			}
 			if i == 3 {
 				err := fmt.Errorf("Test error")
-				mrc.Push(nil /* row */, &ProducerMetadata{Err: err})
+				mrc.Push(nil /* row */, &distsqlpb.ProducerMetadata{Err: err})
 			}
 			mrc.ProducerDone()
 		}(i)

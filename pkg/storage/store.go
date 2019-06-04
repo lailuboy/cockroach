@@ -50,6 +50,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/storage/tscache"
+	"github.com/cockroachdb/cockroach/pkg/storage/txnrecovery"
 	"github.com/cockroachdb/cockroach/pkg/storage/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -113,13 +114,29 @@ var logSSTInfoTicks = envutil.EnvOrDefaultInt(
 var bulkIOWriteLimit = settings.RegisterByteSizeSetting(
 	"kv.bulk_io_write.max_rate",
 	"the rate limit (bytes/sec) to use for writes to disk on behalf of bulk io ops",
-	math.MaxInt64,
+	1<<40,
 )
 
 // importRequestsLimit limits concurrent import requests.
 var importRequestsLimit = settings.RegisterPositiveIntSetting(
 	"kv.bulk_io_write.concurrent_import_requests",
 	"number of import requests a store will handle concurrently before queuing",
+	1,
+)
+
+// addSSTableRequestMaxRate is the maximum number of AddSSTable requests per second.
+var addSSTableRequestMaxRate = settings.RegisterNonNegativeFloatSetting(
+	"kv.bulk_io_write.addsstable_max_rate",
+	"maximum number of AddSSTable requests per second for a single store",
+	float64(rate.Inf),
+)
+
+const addSSTableRequestBurst = 32
+
+// addSSTableRequestLimit limits concurrent AddSSTable requests.
+var addSSTableRequestLimit = settings.RegisterPositiveIntSetting(
+	"kv.bulk_io_write.concurrent_addsstable_requests",
+	"number of AddSSTable requests a store will handle concurrently before queuing",
 	1,
 )
 
@@ -150,6 +167,8 @@ func TestStoreConfig(clock *hlc.Clock) StoreConfig {
 	}
 	st := cluster.MakeTestingClusterSettings()
 	sc := StoreConfig{
+		DefaultZoneConfig:           config.DefaultZoneConfigRef(),
+		DefaultSystemZoneConfig:     config.DefaultSystemZoneConfigRef(),
 		Settings:                    st,
 		AmbientCtx:                  log.AmbientContext{Tracer: st.Tracer},
 		Clock:                       clock,
@@ -389,8 +408,10 @@ type Store struct {
 	consistencyQueue   *consistencyQueue           // Replica consistency check queue
 	metrics            *StoreMetrics
 	intentResolver     *intentresolver.IntentResolver
+	recoveryMgr        txnrecovery.Manager
 	raftEntryCache     *raftentry.Cache
 	limiters           batcheval.Limiters
+	txnWaitMetrics     *txnwait.Metrics
 
 	// gossipRangeCountdown and leaseRangeCountdown are countdowns of
 	// changes to range and leaseholder counts, after which the store
@@ -437,8 +458,8 @@ type Store struct {
 	draining atomic.Value
 
 	// Locking notes: To avoid deadlocks, the following lock order must be
-	// obeyed: Replica.raftMu < Replica.readOnlyCmdMu < Store.mu < Replica.mu
-	// < Replica.unreachablesMu < Store.coalescedMu < Store.scheduler.mu.
+	// obeyed: baseQueue.mu < Replica.raftMu < Replica.readOnlyCmdMu < Store.mu
+	// < Replica.mu < Replica.unreachablesMu < Store.coalescedMu < Store.scheduler.mu.
 	// (It is not required to acquire every lock in sequence, but when multiple
 	// locks are held at the same time, it is incorrect to acquire a lock with
 	// "lesser" value in this sequence after one with "greater" value).
@@ -488,6 +509,11 @@ type Store struct {
 	//   (which copies the timestamp cache) while still allowing
 	//   multiple reads in parallel (#3148). TODO(bdarnell): this lock
 	//   only needs to be held during splitTrigger, not all triggers.
+	//
+	// * baseQueue.mu: The mutex contained in each of the store's queues (such
+	//   as the replicate queue, replica GC queue, GC queue, ...). The mutex is
+	//   typically acquired when deciding whether to add a replica to the respective
+	//   queue.
 	//
 	// * Store.mu: Protects the Store's map of its Replicas. Acquired and
 	//   released briefly at the start of each request; metadata operations like
@@ -595,16 +621,18 @@ type StoreConfig struct {
 	AmbientCtx log.AmbientContext
 	base.RaftConfig
 
-	Settings             *cluster.Settings
-	Clock                *hlc.Clock
-	DB                   *client.DB
-	Gossip               *gossip.Gossip
-	NodeLiveness         *NodeLiveness
-	StorePool            *StorePool
-	Transport            *RaftTransport
-	NodeDialer           *nodedialer.Dialer
-	RPCContext           *rpc.Context
-	RangeDescriptorCache kvbase.RangeDescriptorCache
+	DefaultZoneConfig       *config.ZoneConfig
+	DefaultSystemZoneConfig *config.ZoneConfig
+	Settings                *cluster.Settings
+	Clock                   *hlc.Clock
+	DB                      *client.DB
+	Gossip                  *gossip.Gossip
+	NodeLiveness            *NodeLiveness
+	StorePool               *StorePool
+	Transport               *RaftTransport
+	NodeDialer              *nodedialer.Dialer
+	RPCContext              *rpc.Context
+	RangeDescriptorCache    kvbase.RangeDescriptorCache
 
 	ClosedTimestamp *container.Container
 
@@ -667,8 +695,6 @@ type StoreConfig struct {
 
 	TestingKnobs StoreTestingKnobs
 
-	ConsistencyTestingKnobs ConsistencyTestingKnobs
-
 	// concurrentSnapshotApplyLimit specifies the maximum number of empty
 	// snapshots and the maximum number of non-empty snapshots that are permitted
 	// to be applied concurrently.
@@ -697,7 +723,8 @@ type ConsistencyTestingKnobs struct {
 	BadChecksumPanic func(roachpb.StoreIdent)
 	// If non-nil, BadChecksumReportDiff is called by CheckConsistency() on a
 	// checksum mismatch to report the diff between snapshots.
-	BadChecksumReportDiff func(roachpb.StoreIdent, ReplicaSnapshotDiffSlice)
+	BadChecksumReportDiff      func(roachpb.StoreIdent, ReplicaSnapshotDiffSlice)
+	ConsistencyQueueResultHook func(response roachpb.CheckConsistencyResponse)
 }
 
 // Valid returns true if the StoreConfig is populated correctly.
@@ -752,12 +779,14 @@ func (sc *StoreConfig) LeaseExpiration() int64 {
 }
 
 // NewStore returns a new instance of a store.
-func NewStore(cfg StoreConfig, eng engine.Engine, nodeDesc *roachpb.NodeDescriptor) *Store {
+func NewStore(
+	ctx context.Context, cfg StoreConfig, eng engine.Engine, nodeDesc *roachpb.NodeDescriptor,
+) *Store {
 	// TODO(tschottdorf): find better place to set these defaults.
 	cfg.SetDefaults()
 
 	if !cfg.Valid() {
-		log.Fatalf(context.Background(), "invalid store configuration: %+v", &cfg)
+		log.Fatalf(ctx, "invalid store configuration: %+v", &cfg)
 	}
 	s := &Store{
 		cfg:      cfg,
@@ -803,6 +832,9 @@ func NewStore(cfg StoreConfig, eng engine.Engine, nodeDesc *roachpb.NodeDescript
 	s.tsCache = tscache.New(cfg.Clock, cfg.TimestampCachePageSize)
 	s.metrics.registry.AddMetricStruct(s.tsCache.Metrics())
 
+	s.txnWaitMetrics = txnwait.NewMetrics(cfg.HistogramWindowInterval)
+	s.metrics.registry.AddMetricStruct(s.txnWaitMetrics)
+
 	s.compactor = compactor.NewCompactor(
 		s.cfg.Settings,
 		s.engine.(engine.WithSSTables),
@@ -823,13 +855,13 @@ func NewStore(cfg StoreConfig, eng engine.Engine, nodeDesc *roachpb.NodeDescript
 	bulkIOWriteLimit.SetOnChange(&cfg.Settings.SV, func() {
 		s.limiters.BulkIOWriteRate.SetLimit(rate.Limit(bulkIOWriteLimit.Get(&cfg.Settings.SV)))
 	})
-	s.limiters.ConcurrentImports = limit.MakeConcurrentRequestLimiter(
+	s.limiters.ConcurrentImportRequests = limit.MakeConcurrentRequestLimiter(
 		"importRequestLimiter", int(importRequestsLimit.Get(&cfg.Settings.SV)),
 	)
 	importRequestsLimit.SetOnChange(&cfg.Settings.SV, func() {
-		s.limiters.ConcurrentImports.SetLimit(int(importRequestsLimit.Get(&cfg.Settings.SV)))
+		s.limiters.ConcurrentImportRequests.SetLimit(int(importRequestsLimit.Get(&cfg.Settings.SV)))
 	})
-	s.limiters.ConcurrentExports = limit.MakeConcurrentRequestLimiter(
+	s.limiters.ConcurrentExportRequests = limit.MakeConcurrentRequestLimiter(
 		"exportRequestLimiter", int(ExportRequestsLimit.Get(&cfg.Settings.SV)),
 	)
 	// On low-CPU instances, a default limit value may still allow ExportRequests
@@ -843,7 +875,23 @@ func NewStore(cfg StoreConfig, eng engine.Engine, nodeDesc *roachpb.NodeDescript
 		if limit > exportCores {
 			limit = exportCores
 		}
-		s.limiters.ConcurrentExports.SetLimit(limit)
+		s.limiters.ConcurrentExportRequests.SetLimit(limit)
+	})
+	s.limiters.AddSSTableRequestRate = rate.NewLimiter(
+		rate.Limit(addSSTableRequestMaxRate.Get(&cfg.Settings.SV)), addSSTableRequestBurst)
+	addSSTableRequestMaxRate.SetOnChange(&cfg.Settings.SV, func() {
+		rateLimit := addSSTableRequestMaxRate.Get(&cfg.Settings.SV)
+		if math.IsInf(rateLimit, 0) {
+			// This value causes the burst limit to be ignored
+			rateLimit = float64(rate.Inf)
+		}
+		s.limiters.AddSSTableRequestRate.SetLimit(rate.Limit(rateLimit))
+	})
+	s.limiters.ConcurrentAddSSTableRequests = limit.MakeConcurrentRequestLimiter(
+		"addSSTableRequestLimiter", int(addSSTableRequestLimit.Get(&cfg.Settings.SV)),
+	)
+	importRequestsLimit.SetOnChange(&cfg.Settings.SV, func() {
+		s.limiters.ConcurrentAddSSTableRequests.SetLimit(int(addSSTableRequestLimit.Get(&cfg.Settings.SV)))
 	})
 	s.limiters.ConcurrentRangefeedIters = limit.MakeConcurrentRequestLimiter(
 		"rangefeedIterLimiter", int(concurrentRangefeedItersLimit.Get(&cfg.Settings.SV)),
@@ -995,7 +1043,7 @@ func (s *Store) SetDraining(drain bool) {
 						break
 					}
 
-					needsLeaseTransfer := len(r.Desc().Replicas) > 1 &&
+					needsLeaseTransfer := len(r.Desc().Replicas().Unwrap()) > 1 &&
 						drainingLease.OwnedBy(s.StoreID()) &&
 						r.IsLeaseValid(drainingLease, s.Clock().Now())
 
@@ -1257,7 +1305,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 		return err
 	}
 
-	// create the intent resolver
+	// Create the intent resolver.
 	s.intentResolver = intentresolver.New(intentresolver.Config{
 		Clock:                s.cfg.Clock,
 		DB:                   s.db,
@@ -1267,8 +1315,13 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 		TestingKnobs:         s.cfg.TestingKnobs.IntentResolverKnobs,
 		RangeDescriptorCache: s.cfg.RangeDescriptorCache,
 	})
-
 	s.metrics.registry.AddMetricStruct(s.intentResolver.Metrics)
+
+	// Create the recovery manager.
+	s.recoveryMgr = txnrecovery.NewManager(
+		s.cfg.AmbientCtx, s.cfg.Clock, s.db, stopper,
+	)
+	s.metrics.registry.AddMetricStruct(s.recoveryMgr.Metrics())
 
 	s.rangeIDAlloc = idAlloc
 
@@ -1313,11 +1366,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 			if _, ok := desc.GetReplicaDescriptor(s.StoreID()); !ok {
 				// We are no longer a member of the range, but we didn't GC the replica
 				// before shutting down. Add the replica to the GC queue.
-				if added, err := s.replicaGCQueue.Add(rep, replicaGCPriorityRemoved); err != nil {
-					log.Errorf(ctx, "%s: unable to add replica to GC queue: %s", rep, err)
-				} else if added {
-					log.Infof(ctx, "%s: added to replica GC queue", rep)
-				}
+				s.replicaGCQueue.AddAsync(ctx, rep, replicaGCPriorityRemoved)
 			}
 
 			// Note that we do not create raft groups at this time; they will be created
@@ -1601,7 +1650,7 @@ func (s *Store) startClosedTimestampRangefeedSubscriber(ctx context.Context) {
 					if err != nil {
 						continue
 					}
-					repl.handleClosedTimestampUpdate()
+					repl.handleClosedTimestampUpdate(ctx)
 				}
 				replIDs = replIDs[:0]
 			case <-s.stopper.ShouldQuiesce():
@@ -1626,8 +1675,8 @@ func (s *Store) removeReplicaWithRangefeed(rangeID roachpb.RangeID) {
 // systemGossipUpdate is a callback for gossip updates to
 // the system config which affect range split boundaries.
 func (s *Store) systemGossipUpdate(sysCfg *config.SystemConfig) {
+	ctx := s.AnnotateCtx(context.Background())
 	s.computeInitialMetrics.Do(func() {
-		ctx := s.AnnotateCtx(context.Background())
 		// Metrics depend in part on the system config. Compute them as soon as we
 		// get the first system config, then periodically in the background
 		// (managed by the Node).
@@ -1637,8 +1686,12 @@ func (s *Store) systemGossipUpdate(sysCfg *config.SystemConfig) {
 		log.Event(ctx, "computed initial metrics")
 	})
 
+	// We'll want to offer all replicas to the split and merge queues. Be a little
+	// careful about not spawning too many individual goroutines.
+
 	// For every range, update its zone config and check if it needs to
 	// be split or merged.
+	now := s.cfg.Clock.Now()
 	newStoreReplicaVisitor(s).Visit(func(repl *Replica) bool {
 		key := repl.Desc().StartKey
 		zone, err := sysCfg.GetZoneConfigForKey(key)
@@ -1646,11 +1699,15 @@ func (s *Store) systemGossipUpdate(sysCfg *config.SystemConfig) {
 			if log.V(1) {
 				log.Infof(context.TODO(), "failed to get zone config for key %s", key)
 			}
-			zone = config.DefaultZoneConfigRef()
+			zone = s.cfg.DefaultZoneConfig
 		}
 		repl.SetZoneConfig(zone)
-		s.mergeQueue.MaybeAdd(repl, s.cfg.Clock.Now())
-		s.splitQueue.MaybeAdd(repl, s.cfg.Clock.Now())
+		s.splitQueue.Async(ctx, "gossip update", true /* wait */, func(ctx context.Context, h queueHelper) {
+			h.MaybeAdd(ctx, repl, now)
+		})
+		s.mergeQueue.Async(ctx, "gossip update", true /* wait */, func(ctx context.Context, h queueHelper) {
+			h.MaybeAdd(ctx, repl, now)
+		})
 		return true // more
 	})
 }
@@ -2018,16 +2075,17 @@ func (s *Store) NewRangeDescriptor(
 	if err != nil {
 		return nil, err
 	}
+	replicas = append([]roachpb.ReplicaDescriptor(nil), replicas...)
+	for i := range replicas {
+		replicas[i].ReplicaID = roachpb.ReplicaID(i + 1)
+	}
 	desc := &roachpb.RangeDescriptor{
 		RangeID:       roachpb.RangeID(id),
 		StartKey:      start,
 		EndKey:        end,
-		Replicas:      append([]roachpb.ReplicaDescriptor(nil), replicas...),
 		NextReplicaID: roachpb.ReplicaID(len(replicas) + 1),
 	}
-	for i := range desc.Replicas {
-		desc.Replicas[i].ReplicaID = roachpb.ReplicaID(i + 1)
-	}
+	desc.SetReplicas(roachpb.MakeReplicaDescriptors(replicas))
 	return desc, nil
 }
 
@@ -2069,14 +2127,27 @@ func splitPostApply(
 	}
 
 	// Finish initialization of the RHS.
+
+	// This initialMaxClosedValue is created here to ensure that follower reads
+	// do not regress following the split. After the split occurs there will be no
+	// information in the closedts subsystem about the newly minted RHS range from
+	// its leaseholder's store. Furthermore, the RHS will have a lease start time
+	// equal to that of the LHS which might be quite old. This means that
+	// timestamps which follow the least StartTime for the LHS part are below the
+	// current closed timestamp for the LHS would no longer be readable on the RHS
+	// after the split. It is critical that this call to maxClosed happen during
+	// the splitPostApply so that it refers to a LAI that is equal to the index at
+	// which this lease was applied. If it were to refer to a LAI after the split
+	// then the value of initialMaxClosed might be unsafe.
+	initialMaxClosed := r.maxClosed(ctx)
 	r.mu.Lock()
 	rightRng.mu.Lock()
 	// Copy the minLeaseProposedTS from the LHS.
 	rightRng.mu.minLeaseProposedTS = r.mu.minLeaseProposedTS
+	rightRng.mu.initialMaxClosed = initialMaxClosed
 	rightLease := *rightRng.mu.state.Lease
 	rightRng.mu.Unlock()
 	r.mu.Unlock()
-	log.Event(ctx, "copied timestamp cache")
 
 	// We need to explicitly wake up the Raft group on the right-hand range or
 	// else the range could be underreplicated for an indefinite period of time.
@@ -2114,17 +2185,17 @@ func splitPostApply(
 	// While performing the split, zone config changes or a newly created table
 	// might require the range to be split again. Enqueue both the left and right
 	// ranges to speed up such splits. See #10160.
-	r.store.splitQueue.MaybeAdd(r, now)
-	r.store.splitQueue.MaybeAdd(rightRng, now)
+	r.store.splitQueue.MaybeAddAsync(ctx, r, now)
+	r.store.splitQueue.MaybeAddAsync(ctx, rightRng, now)
 
 	// If the range was not properly replicated before the split, the replicate
 	// queue may not have picked it up (due to the need for a split). Enqueue
 	// both the left and right ranges to speed up a potentially necessary
 	// replication. See #7022 and #7800.
-	r.store.replicateQueue.MaybeAdd(r, now)
-	r.store.replicateQueue.MaybeAdd(rightRng, now)
+	r.store.replicateQueue.MaybeAddAsync(ctx, r, now)
+	r.store.replicateQueue.MaybeAddAsync(ctx, rightRng, now)
 
-	if len(split.RightDesc.Replicas) == 1 {
+	if len(split.RightDesc.Replicas().Unwrap()) == 1 {
 		// TODO(peter): In single-node clusters, we enqueue the right-hand side of
 		// the split (the new range) for Raft processing so that the corresponding
 		// Raft group is created. This shouldn't be necessary for correctness, but
@@ -2179,7 +2250,7 @@ func (s *Store) SplitRange(
 	// TODO(nvanbenschoten): It should be possible to only reject registrations
 	// that overlap with the new range of the split and keep registrations that
 	// are only interested in keys that are still on the original range running.
-	leftRepl.disconnectRangefeedWithReasonRaftMuLocked(
+	leftRepl.disconnectRangefeedWithReason(
 		roachpb.RangeFeedRetryError_REASON_RANGE_SPLIT,
 	)
 
@@ -2242,10 +2313,10 @@ func (s *Store) MergeRange(
 	// NB: removeReplicaImpl also disconnects any initialized rangefeeds with
 	// REASON_REPLICA_REMOVED. That's ok because we will have already
 	// disconnected the rangefeed here.
-	leftRepl.disconnectRangefeedWithReasonRaftMuLocked(
+	leftRepl.disconnectRangefeedWithReason(
 		roachpb.RangeFeedRetryError_REASON_RANGE_MERGED,
 	)
-	rightRepl.disconnectRangefeedWithReasonRaftMuLocked(
+	rightRepl.disconnectRangefeedWithReason(
 		roachpb.RangeFeedRetryError_REASON_RANGE_MERGED,
 	)
 
@@ -2291,7 +2362,7 @@ func (s *Store) MergeRange(
 		// timestamps in the timestamp cache. For a full discussion, see the comment
 		// on TestStoreRangeMergeTimestampCacheCausality.
 		_ = s.Clock().Update(freezeStart)
-		s.tsCache.SetLowWater(rightDesc.StartKey.AsRawKey(), rightDesc.EndKey.AsRawKey(), freezeStart)
+		setTimestampCacheLowWaterMark(s.tsCache, &rightDesc, freezeStart)
 	}
 
 	// Update the subsuming range's descriptor.
@@ -2468,7 +2539,7 @@ func (s *Store) removeReplicaImpl(
 	s.mu.Unlock()
 
 	// The replica will no longer exist, so cancel any rangefeed registrations.
-	rep.disconnectRangefeedWithReasonRaftMuLocked(
+	rep.disconnectRangefeedWithReason(
 		roachpb.RangeFeedRetryError_REASON_REPLICA_REMOVED,
 	)
 
@@ -2717,8 +2788,48 @@ func (s *Store) Send(
 		}
 	}
 
+	// Limit the number of concurrent AddSSTable requests, since they're expensive
+	// and block all other writes to the same span.
+	if ba.IsSingleAddSSTableRequest() {
+		if err := s.limiters.ConcurrentAddSSTableRequests.Begin(ctx); err != nil {
+			return nil, roachpb.NewError(err)
+		}
+		defer s.limiters.ConcurrentAddSSTableRequests.Finish()
+
+		if err := s.limiters.AddSSTableRequestRate.Wait(ctx); err != nil {
+			return nil, roachpb.NewError(err)
+		}
+		s.engine.PreIngestDelay(ctx)
+	}
+
 	if err := ba.SetActiveTimestamp(s.Clock().Now); err != nil {
 		return nil, roachpb.NewError(err)
+	}
+
+	// In 2.1 it was possible for nodes to send PushTxn requests without
+	// properly reflecting the time that they wanted the push to happen
+	// in the batch's header timestamp. Ensure that this timestamp is
+	// sufficiently advanced to prevent lost timestamp cache updates.
+	// TODO(nvanbenschoten): Remove this all in 19.2.
+	if !s.cfg.Settings.Version.IsActive(cluster.VersionPushTxnToInclusive) {
+		for _, union := range ba.Requests {
+			if pushReq, ok := union.GetInner().(*roachpb.PushTxnRequest); ok {
+				ba.Timestamp.Forward(pushReq.DeprecatedNow)
+
+				// While here, correct the request's PushTo arg. Before
+				// VersionPushTxnToInclusive, pushers would provide _their_
+				// timestamp instead of one logical tick past their timestamp
+				// for the PushTo arg. Handle this by bumping the PushTo arg.
+				// We only do this if the InclusivePushTo arg is false, which
+				// allows us to distinguish between 2.1 nodes and 19.1. nodes.
+				// Since we only observe this field when the cluster version
+				// is not active, we don't need to send it or observe it in
+				// 19.2.
+				if !pushReq.InclusivePushTo {
+					pushReq.PushTo = pushReq.PushTo.Next()
+				}
+			}
+		}
 	}
 
 	if s.cfg.TestingKnobs.ClockBeforeSend != nil {
@@ -2755,18 +2866,13 @@ func (s *Store) Send(
 			// this node.
 			if pErr != nil {
 				pErr.OriginNode = ba.Replica.NodeID
-				if txn := pErr.GetTxn(); txn != nil {
-					// Clone the txn, as we'll modify it.
-					pErr.SetTxn(txn)
-				} else {
+				if txn := pErr.GetTxn(); txn == nil {
 					pErr.SetTxn(ba.Txn)
 				}
-				pErr.GetTxn().UpdateObservedTimestamp(ba.Replica.NodeID, now)
 			} else {
 				if br.Txn == nil {
 					br.Txn = ba.Txn
 				}
-				br.Txn.UpdateObservedTimestamp(ba.Replica.NodeID, now)
 				// Update our clock with the outgoing response txn timestamp
 				// (if timestamp has been forwarded).
 				if ba.Timestamp.Less(br.Txn.Timestamp) {
@@ -2798,9 +2904,9 @@ func (s *Store) Send(
 		// restart (at least in the absence of a prior observed timestamp from
 		// this node, in which case the following is a no-op).
 		if _, ok := ba.Txn.GetObservedTimestamp(ba.Replica.NodeID); !ok {
-			shallowTxn := *ba.Txn
-			shallowTxn.UpdateObservedTimestamp(ba.Replica.NodeID, now)
-			ba.Txn = &shallowTxn
+			txnClone := ba.Txn.Clone()
+			txnClone.UpdateObservedTimestamp(ba.Replica.NodeID, now)
+			ba.Txn = txnClone
 		}
 	}
 
@@ -2814,9 +2920,9 @@ func (s *Store) Send(
 	defer func() {
 		if cleanupAfterWriteIntentError != nil {
 			// This request wrote an intent only if there was no error, the request
-			// is transactional, the transaction is still pending, and the request
+			// is transactional, the transaction is not yet finalized, and the request
 			// wasn't read-only.
-			if pErr == nil && ba.Txn != nil && br.Txn.Status == roachpb.PENDING && !ba.IsReadOnly() {
+			if pErr == nil && ba.Txn != nil && !br.Txn.Status.IsFinalized() && !ba.IsReadOnly() {
 				cleanupAfterWriteIntentError(nil, &br.Txn.TxnMeta)
 			} else {
 				cleanupAfterWriteIntentError(nil, nil)
@@ -2889,7 +2995,8 @@ func (s *Store) Send(
 				// If we're not retrying on push txn failures return a txn retry error
 				// after the first failure to guarantee a retry.
 				if ba.Txn != nil {
-					err := roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN)
+					err := roachpb.NewTransactionRetryError(
+						roachpb.RETRY_REASON_UNKNOWN, "DontRetryPushTxnFailures testing knob")
 					return nil, roachpb.NewErrorWithTxn(err, ba.Txn)
 				}
 				return nil, pErr
@@ -2898,6 +3005,25 @@ func (s *Store) Send(
 			// Enqueue unsuccessfully pushed transaction on the txnWaitQueue and
 			// retry the command.
 			repl.txnWaitQueue.Enqueue(&t.PusheeTxn)
+			pErr = nil
+
+		case *roachpb.IndeterminateCommitError:
+			if s.cfg.TestingKnobs.DontRecoverIndeterminateCommits {
+				return nil, pErr
+			}
+			// On an indeterminate commit error, attempt to recover and finalize
+			// the stuck transaction. Retry immediately if successful.
+			if _, err := s.recoveryMgr.ResolveIndeterminateCommit(ctx, t); err != nil {
+				// Do not propagate ambiguous results; assume success and retry original op.
+				if _, ok := err.(*roachpb.AmbiguousResultError); !ok {
+					// Preserve the error index.
+					index := pErr.Index
+					pErr = roachpb.NewError(err)
+					pErr.Index = index
+					return nil, pErr
+				}
+			}
+			// We've recovered the transaction that blocked the push; retry command.
 			pErr = nil
 
 		case *roachpb.WriteIntentError:
@@ -2916,20 +3042,25 @@ func (s *Store) Send(
 				// Make a copy of the header for the upcoming push; we will update
 				// the timestamp.
 				h := ba.Header
-				// We must push at least to h.Timestamp, but in fact we want to
-				// go all the way up to a timestamp which was taken off the HLC
-				// after our operation started. This allows us to not have to
-				// restart for uncertainty as we come back and read.
-				h.Timestamp.Forward(now)
-				// We are going to hand the header (and thus the transaction proto)
-				// to the RPC framework, after which it must not be changed (since
-				// that could race). Since the subsequent execution of the original
-				// request might mutate the transaction, make a copy here.
-				//
-				// See #9130.
 				if h.Txn != nil {
-					clonedTxn := h.Txn.Clone()
-					h.Txn = &clonedTxn
+					// We must push at least to h.Timestamp, but in fact we want to
+					// go all the way up to a timestamp which was taken off the HLC
+					// after our operation started. This allows us to not have to
+					// restart for uncertainty as we come back and read.
+					obsTS, ok := h.Txn.GetObservedTimestamp(ba.Replica.NodeID)
+					if !ok {
+						// This was set earlier in this method, so it's
+						// completely unexpected to not be found now.
+						log.Fatalf(ctx, "missing observed timestamp: %+v", h.Txn)
+					}
+					h.Timestamp.Forward(obsTS)
+					// We are going to hand the header (and thus the transaction proto)
+					// to the RPC framework, after which it must not be changed (since
+					// that could race). Since the subsequent execution of the original
+					// request might mutate the transaction, make a copy here.
+					//
+					// See #9130.
+					h.Txn = h.Txn.Clone()
 				}
 				// Handle the case where we get more than one write intent error;
 				// we need to cleanup the previous attempt to handle it to allow
@@ -2991,30 +3122,14 @@ func (s *Store) RangeFeed(
 		return roachpb.NewError(err)
 	}
 	if !repl.IsInitialized() {
-		repl.mu.RLock()
-		replicaID := repl.mu.replicaID
-		repl.mu.RUnlock()
-
-		// If we have an uninitialized copy of the range, then we are
-		// probably a valid member of the range, we're just in the
-		// process of getting our snapshot. If we returned
-		// RangeNotFoundError, the client would invalidate its cache,
-		// but we can be smarter: the replica that caused our
-		// uninitialized replica to be created is most likely the
-		// leader.
-		return roachpb.NewError(&roachpb.NotLeaseHolderError{
-			RangeID:     args.RangeID,
-			LeaseHolder: repl.creatingReplica,
-			// The replica doesn't have a range descriptor yet, so we have to build
-			// a ReplicaDescriptor manually.
-			Replica: roachpb.ReplicaDescriptor{
-				NodeID:    repl.store.nodeDesc.NodeID,
-				StoreID:   repl.store.StoreID(),
-				ReplicaID: replicaID,
-			},
-		})
+		// (*Store).Send has an optimization for uninitialized replicas to send back
+		// a NotLeaseHolderError with a hint of where an initialized replica might
+		// be found. RangeFeeds can always be served from followers and so don't
+		// otherwise return NotLeaseHolderError. For simplicity we also don't return
+		// one here.
+		return roachpb.NewError(roachpb.NewRangeNotFoundError(args.RangeID, s.StoreID()))
 	}
-	return repl.RangeFeed(args, stream, s.limiters.ConcurrentRangefeedIters)
+	return repl.RangeFeed(args, stream)
 }
 
 // maybeWaitForPushee potentially diverts the incoming request to
@@ -3048,7 +3163,9 @@ func (s *Store) maybeWaitForPushee(
 		// request may have been waiting to push the txn. If we don't
 		// move the timestamp forward to the current time, we may fail
 		// to push a txn which has expired.
-		pushReqCopy.Now.Forward(s.Clock().Now())
+		now := s.Clock().Now()
+		ba.Timestamp.Forward(now)
+		pushReqCopy.DeprecatedNow.Forward(now)
 		ba.Requests = nil
 		ba.Add(&pushReqCopy)
 	} else if ba.IsSingleQueryTxnRequest() {
@@ -3488,9 +3605,7 @@ func (s *Store) HandleRaftResponse(ctx context.Context, resp *RaftMessageRespons
 			}
 			repl.mu.Unlock()
 
-			if _, err := s.replicaGCQueue.Add(repl, replicaGCPriorityRemoved); err != nil {
-				log.Errorf(ctx, "unable to add to replica GC queue: %s", err)
-			}
+			s.replicaGCQueue.AddAsync(ctx, repl, replicaGCPriorityRemoved)
 		case *roachpb.RaftGroupDeletedError:
 			if replErr != nil {
 				// RangeNotFoundErrors are expected here; nothing else is.
@@ -3505,9 +3620,7 @@ func (s *Store) HandleRaftResponse(ctx context.Context, resp *RaftMessageRespons
 			// also mean that it is so far behind it no longer knows where any of the
 			// other replicas are (#23994). Add it to the replica GC queue to do a
 			// proper check.
-			if _, err := s.replicaGCQueue.Add(repl, replicaGCPriorityDefault); err != nil {
-				log.Errorf(ctx, "unable to add to replica GC queue: %s", err)
-			}
+			s.replicaGCQueue.AddAsync(ctx, repl, replicaGCPriorityDefault)
 		case *roachpb.StoreNotFoundError:
 			log.Warningf(ctx, "raft error: node %d claims to not contain store %d for replica %s: %s",
 				resp.FromReplica.NodeID, resp.FromReplica.StoreID, resp.FromReplica, val)
@@ -3540,6 +3653,7 @@ func (s *Store) processRequestQueue(ctx context.Context, rangeID roachpb.RangeID
 	q.Unlock()
 
 	var lastRepl *Replica
+	var hadError bool
 	for i, info := range infos {
 		last := i == len(infos)-1
 		pErr := s.withReplicaForRequest(info.respStream.Context(), info.req,
@@ -3561,21 +3675,32 @@ func (s *Store) processRequestQueue(ctx context.Context, rangeID roachpb.RangeID
 				return pErr
 			})
 		if pErr != nil {
-			// If we're unable to process the request, clear the request queue. This
-			// only happens if we couldn't create the replica because the request was
-			// targeted to a removed range. This is also racy and could cause us to
-			// drop messages to the deleted range occasionally (#18355), but raft
-			// will just retry.
-			q.Lock()
-			if len(q.infos) == 0 {
-				s.replicaQueues.Delete(int64(rangeID))
-			}
-			q.Unlock()
+			hadError = true
 			if err := info.respStream.Send(newRaftMessageResponse(info.req, pErr)); err != nil {
 				// Seems excessive to log this on every occurrence as the other side
 				// might have closed.
 				log.VEventf(ctx, 1, "error sending error: %s", err)
 			}
+		}
+	}
+
+	if hadError {
+		// If we're unable to process a request, consider dropping the request queue
+		// to free up space in the map.
+		// This is relevant if requests failed because the target replica could not
+		// be created (for example due to the Raft tombstone). The particular code
+		// here takes into account that we don't want to drop the queue if there
+		// are other messages waiting on it, or if the target replica exists. Raft
+		// tolerates the occasional dropped message, but our unit tests are less
+		// forgiving.
+		//
+		// See https://github.com/cockroachdb/cockroach/issues/30951#issuecomment-428010411.
+		if _, exists := s.mu.replicas.Load(int64(rangeID)); !exists {
+			q.Lock()
+			if len(q.infos) == 0 {
+				s.replicaQueues.Delete(int64(rangeID))
+			}
+			q.Unlock()
 		}
 	}
 
@@ -3665,7 +3790,7 @@ func (s *Store) nodeIsLiveCallback(nodeID roachpb.NodeID) {
 
 	s.mu.replicas.Range(func(k int64, v unsafe.Pointer) bool {
 		r := (*Replica)(v)
-		for _, rep := range r.Desc().Replicas {
+		for _, rep := range r.Desc().Replicas().Unwrap() {
 			if rep.NodeID == nodeID {
 				r.unquiesce()
 			}
@@ -4010,6 +4135,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		rangeCount                int64
 		unavailableRangeCount     int64
 		underreplicatedRangeCount int64
+		overreplicatedRangeCount  int64
 		behindCount               int64
 	)
 
@@ -4020,6 +4146,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 	}
 	clusterNodes := s.ClusterNodeCount()
 
+	var minMaxClosedTS hlc.Timestamp
 	newStoreReplicaVisitor(s).Visit(func(rep *Replica) bool {
 		metrics := rep.Metrics(ctx, timestamp, livenessMap, clusterNodes)
 		if metrics.Leader {
@@ -4049,6 +4176,9 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 			if metrics.Underreplicated {
 				underreplicatedRangeCount++
 			}
+			if metrics.Overreplicated {
+				overreplicatedRangeCount++
+			}
 		}
 		behindCount += metrics.BehindCount
 		if qps, dur := rep.leaseholderStats.avgQPS(); dur >= MinStatsDuration {
@@ -4056,6 +4186,9 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		}
 		if wps, dur := rep.writeStats.avgQPS(); dur >= MinStatsDuration {
 			averageWritesPerSecond += wps
+		}
+		if mc := rep.maxClosed(ctx); minMaxClosedTS.IsEmpty() || mc.Less(minMaxClosedTS) {
+			minMaxClosedTS = mc
 		}
 		return true // more
 	})
@@ -4073,7 +4206,13 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 	s.metrics.RangeCount.Update(rangeCount)
 	s.metrics.UnavailableRangeCount.Update(unavailableRangeCount)
 	s.metrics.UnderReplicatedRangeCount.Update(underreplicatedRangeCount)
+	s.metrics.OverReplicatedRangeCount.Update(overreplicatedRangeCount)
 	s.metrics.RaftLogFollowerBehindCount.Update(behindCount)
+
+	if !minMaxClosedTS.IsEmpty() {
+		nanos := timeutil.Since(minMaxClosedTS.GoTime()).Nanoseconds()
+		s.metrics.ClosedTimestampMaxBehindNanos.Update(nanos)
+	}
 
 	return nil
 }
@@ -4096,6 +4235,13 @@ func (s *Store) ComputeMetrics(ctx context.Context, tick int) error {
 		return err
 	}
 	s.metrics.updateRocksDBStats(*stats)
+
+	// Get engine Env stats.
+	envStats, err := s.engine.GetEnvStats()
+	if err != nil {
+		return err
+	}
+	s.metrics.updateEnvStats(*envStats)
 
 	// If we're using RocksDB, log the sstable overview.
 	if rocksdb, ok := s.engine.(*engine.RocksDB); ok {
@@ -4177,15 +4323,11 @@ func (s *Store) ComputeStatsForKeySpan(startKey, endKey roachpb.RKey) (StoreKeyS
 func (s *Store) AllocatorDryRun(
 	ctx context.Context, repl *Replica,
 ) ([]tracing.RecordedSpan, error) {
-	sysCfg := s.cfg.Gossip.GetSystemConfig()
-	if sysCfg == nil {
-		return nil, errors.New("allocator dry runs require a valid system config")
-	}
 	ctx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, "allocator dry run")
 	defer cancel()
 	canTransferLease := func() bool { return true }
 	_, err := s.replicateQueue.processOneChange(
-		ctx, repl, sysCfg, canTransferLease, true /* dryRun */)
+		ctx, repl, canTransferLease, true /* dryRun */)
 	if err != nil {
 		log.Eventf(ctx, "error simulating allocator on replica %s: %s", repl, err)
 	}
@@ -4204,7 +4346,7 @@ func (s *Store) ManuallyEnqueue(
 	var queue queueImpl
 	var needsLease bool
 	for _, replicaQueue := range s.scanner.queues {
-		if strings.ToLower(replicaQueue.Name()) == strings.ToLower(queueName) {
+		if strings.EqualFold(replicaQueue.Name(), queueName) {
 			queue = replicaQueue.(queueImpl)
 			needsLease = replicaQueue.NeedsLease()
 		}
@@ -4273,119 +4415,15 @@ func ReadClusterVersion(ctx context.Context, reader engine.Reader) (cluster.Clus
 	return cv, err
 }
 
-// The methods below can be used to control a store's queues. Stopping a queue
-// is only meant to happen in tests.
-
-func (s *Store) setGCQueueActive(active bool) {
-	s.gcQueue.SetDisabled(!active)
-}
-func (s *Store) setMergeQueueActive(active bool) {
-	s.mergeQueue.SetDisabled(!active)
-}
-func (s *Store) setRaftLogQueueActive(active bool) {
-	s.raftLogQueue.SetDisabled(!active)
-}
-func (s *Store) setReplicaGCQueueActive(active bool) {
-	s.replicaGCQueue.SetDisabled(!active)
-}
-
-// SetReplicateQueueActive controls the replication queue. Only
-// intended for tests.
-func (s *Store) SetReplicateQueueActive(active bool) {
-	s.replicateQueue.SetDisabled(!active)
-}
-func (s *Store) setSplitQueueActive(active bool) {
-	s.splitQueue.SetDisabled(!active)
-}
-func (s *Store) setTimeSeriesMaintenanceQueueActive(active bool) {
-	s.tsMaintenanceQueue.SetDisabled(!active)
-}
-func (s *Store) setRaftSnapshotQueueActive(active bool) {
-	s.raftSnapshotQueue.SetDisabled(!active)
-}
-func (s *Store) setConsistencyQueueActive(active bool) {
-	s.consistencyQueue.SetDisabled(!active)
-}
-func (s *Store) setScannerActive(active bool) {
-	s.scanner.SetDisabled(!active)
-}
-
 // GetTxnWaitKnobs is part of txnwait.StoreInterface.
 func (s *Store) GetTxnWaitKnobs() txnwait.TestingKnobs {
-	return s.TestingKnobs().TxnWait
+	return s.TestingKnobs().TxnWaitKnobs
 }
 
-func mustForceScanAndProcess(ctx context.Context, s *Store, q *baseQueue) {
-	if err := forceScanAndProcess(s, q); err != nil {
-		log.Fatal(ctx, err)
-	}
-}
-
-func forceScanAndProcess(s *Store, q *baseQueue) error {
-	// Check that the system config is available. It is needed by many queues. If
-	// it's not available, some queues silently fail to process any replicas,
-	// which is undesirable for this method.
-	if cfg := s.Gossip().GetSystemConfig(); cfg == nil {
-		return errors.Errorf("system config not available in gossip")
-	}
-
-	newStoreReplicaVisitor(s).Visit(func(repl *Replica) bool {
-		q.MaybeAdd(repl, s.cfg.Clock.Now())
-		return true
-	})
-
-	q.DrainQueue(s.stopper)
-	return nil
-}
-
-// ForceReplicationScanAndProcess iterates over all ranges and
-// enqueues any that need to be replicated.
-func (s *Store) ForceReplicationScanAndProcess() error {
-	return forceScanAndProcess(s, s.replicateQueue.baseQueue)
-}
-
-// MustForceReplicaGCScanAndProcess iterates over all ranges and enqueues any that
-// may need to be GC'd.
-func (s *Store) MustForceReplicaGCScanAndProcess() {
-	mustForceScanAndProcess(context.TODO(), s, s.replicaGCQueue.baseQueue)
-}
-
-// MustForceMergeScanAndProcess iterates over all ranges and enqueues any that
-// may need to be merged.
-func (s *Store) MustForceMergeScanAndProcess() {
-	mustForceScanAndProcess(context.TODO(), s, s.mergeQueue.baseQueue)
-}
-
-// ForceSplitScanAndProcess iterates over all ranges and enqueues any that
-// may need to be split.
-func (s *Store) ForceSplitScanAndProcess() error {
-	return forceScanAndProcess(s, s.splitQueue.baseQueue)
-}
-
-// MustForceRaftLogScanAndProcess iterates over all ranges and enqueues any that
-// need their raft logs truncated and then process each of them.
-func (s *Store) MustForceRaftLogScanAndProcess() {
-	mustForceScanAndProcess(context.TODO(), s, s.raftLogQueue.baseQueue)
-}
-
-// ForceTimeSeriesMaintenanceQueueProcess iterates over all ranges, enqueuing
-// any that need time series maintenance, then processes the time series
-// maintenance queue.
-func (s *Store) ForceTimeSeriesMaintenanceQueueProcess() error {
-	return forceScanAndProcess(s, s.tsMaintenanceQueue.baseQueue)
-}
-
-// ForceRaftSnapshotQueueProcess iterates over all ranges, enqueuing
-// any that need raft snapshots, then processes the raft snapshot
-// queue.
-func (s *Store) ForceRaftSnapshotQueueProcess() error {
-	return forceScanAndProcess(s, s.raftSnapshotQueue.baseQueue)
-}
-
-// ForceConsistencyQueueProcess runs all the ranges through the consistency
-// queue.
-func (s *Store) ForceConsistencyQueueProcess() error {
-	return forceScanAndProcess(s, s.consistencyQueue.baseQueue)
+// GetTxnWaitMetrics is called by txnwait.Queue instances to get a reference to
+// the shared metrics instance.
+func (s *Store) GetTxnWaitMetrics() *txnwait.Metrics {
+	return s.txnWaitMetrics
 }
 
 func init() {

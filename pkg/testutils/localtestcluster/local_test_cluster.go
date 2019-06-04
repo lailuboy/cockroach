@@ -103,7 +103,6 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	ltc.Manual = hlc.NewManualClock(123)
 	ltc.Clock = hlc.NewClock(ltc.Manual.UnixNano, 50*time.Millisecond)
 	cfg := storage.TestStoreConfig(ltc.Clock)
-	ltc.Cfg = cfg
 	ambient := log.AmbientContext{Tracer: cfg.Settings.Tracer}
 	nc := &base.NodeIDContainer{}
 	ambient.AddLogTag("n", nc)
@@ -116,10 +115,11 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 
 	ltc.tester = t
 	ltc.Stopper = stop.NewStopper()
-	rpcContext := rpc.NewContext(ambient, baseCtx, ltc.Clock, ltc.Stopper, &cfg.Settings.Version)
-	c := &rpcContext.ClusterID
-	server := rpc.NewServer(rpcContext) // never started
-	ltc.Gossip = gossip.New(ambient, c, nc, rpcContext, server, ltc.Stopper, metric.NewRegistry(), roachpb.Locality{})
+	cfg.RPCContext = rpc.NewContext(ambient, baseCtx, ltc.Clock, ltc.Stopper, &cfg.Settings.Version)
+	cfg.RPCContext.NodeID.Set(ambient.AnnotateCtx(context.Background()), nodeID)
+	c := &cfg.RPCContext.ClusterID
+	server := rpc.NewServer(cfg.RPCContext) // never started
+	ltc.Gossip = gossip.New(ambient, c, nc, cfg.RPCContext, server, ltc.Stopper, metric.NewRegistry(), roachpb.Locality{}, config.DefaultZoneConfigRef())
 	ltc.Eng = engine.NewInMem(roachpb.Attributes{}, 50<<20)
 	ltc.Stopper.AddCloser(ltc.Eng)
 
@@ -172,15 +172,15 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	cfg.TimestampCachePageSize = tscache.TestSklPageSize
 	ctx := context.TODO()
 
-	if err := storage.Bootstrap(ctx, ltc.Eng, roachpb.StoreIdent{NodeID: nodeID, StoreID: 1}, cfg.Settings.Version.BootstrapVersion()); err != nil {
+	if err := storage.InitEngine(ctx, ltc.Eng, roachpb.StoreIdent{NodeID: nodeID, StoreID: 1}, cfg.Settings.Version.BootstrapVersion()); err != nil {
 		t.Fatalf("unable to start local test cluster: %s", err)
 	}
-	ltc.Store = storage.NewStore(cfg, ltc.Eng, nodeDesc)
+	ltc.Store = storage.NewStore(ctx, cfg, ltc.Eng, nodeDesc)
 
 	var initialValues []roachpb.KeyValue
 	var splits []roachpb.RKey
 	if !ltc.DontCreateSystemRanges {
-		schema := sqlbase.MakeMetadataSchema()
+		schema := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig)
 		var tableSplits []roachpb.RKey
 		initialValues, tableSplits = schema.GetInitialValues()
 		splits = append(config.StaticSplits(), tableSplits...)
@@ -189,12 +189,14 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		})
 	}
 
-	if err := ltc.Store.WriteInitialData(
+	if err := storage.WriteInitialClusterData(
 		ctx,
+		ltc.Eng,
 		initialValues,
 		cfg.Settings.Version.ServerVersion,
 		1, /* numStores */
 		splits,
+		ltc.Clock.PhysicalNow(),
 	); err != nil {
 		t.Fatalf("unable to start local test cluster: %s", err)
 	}
@@ -212,6 +214,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	if err := ltc.Gossip.SetNodeDescriptor(nodeDesc); err != nil {
 		t.Fatalf("unable to set node descriptor: %s", err)
 	}
+	ltc.Cfg = cfg
 }
 
 // Stop stops the cluster.

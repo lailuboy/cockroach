@@ -15,14 +15,13 @@
 package norm
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // ----------------------------------------------------------------------
@@ -53,7 +52,7 @@ func (c *CustomFuncs) ConstructNonLeftJoin(
 	case opt.FullJoinApplyOp:
 		return c.f.ConstructRightJoinApply(left, right, on, private)
 	}
-	panic(fmt.Sprintf("unexpected join operator: %v", joinOp))
+	panic(pgerror.AssertionFailedf("unexpected join operator: %v", log.Safe(joinOp)))
 }
 
 // ConstructNonRightJoin maps a right join to an inner join and a full join to a
@@ -72,7 +71,7 @@ func (c *CustomFuncs) ConstructNonRightJoin(
 	case opt.FullJoinApplyOp:
 		return c.f.ConstructLeftJoinApply(left, right, on, private)
 	}
-	panic(fmt.Sprintf("unexpected join operator: %v", joinOp))
+	panic(pgerror.AssertionFailedf("unexpected join operator: %v", log.Safe(joinOp)))
 }
 
 // SimplifyNotNullEquality simplifies an expression of the following form:
@@ -106,18 +105,18 @@ func (c *CustomFuncs) SimplifyNotNullEquality(
 			return c.f.ConstructTrue()
 		}
 	}
-	panic(fmt.Sprintf("invalid ops: %v, %v", testOp, constOp))
+	panic(pgerror.AssertionFailedf("invalid ops: %v, %v", testOp, constOp))
 }
 
-// CanMap returns true if it is possible to map a boolean expression src, which
-// is a conjunct in the given filters expression, to use the output columns of
-// the relational expression dst.
+// CanMapJoinOpFilter returns true if it is possible to map a boolean expression
+// src, which is a conjunct in the given filters expression, to use the output
+// columns of the relational expression dst.
 //
 // In order for one column to map to another, the two columns must be
 // equivalent. This happens when there is an equality predicate such as a.x=b.x
 // in the ON or WHERE clause. Additionally, the two columns must be of the same
-// type (see GetEquivColsWithEquivType for details). CanMap checks that for each
-// column in src, there is at least one equivalent column in dst.
+// type (see GetEquivColsWithEquivType for details). CanMapJoinOpFilter checks
+// that for each column in src, there is at least one equivalent column in dst.
 //
 // For example, consider this query:
 //
@@ -125,12 +124,12 @@ func (c *CustomFuncs) SimplifyNotNullEquality(
 //
 // Since there is an equality predicate on a.x=b.x, it is possible to map
 // a.x + b.y = 5 to b.x + b.y = 5, and that allows the filter to be pushed down
-// to the right side of the join. In this case, CanMap returns true when src is
-// a.x + b.y = 5 and dst is (Scan b), but false when src is a.x + b.y = 5 and
-// dst is (Scan a).
+// to the right side of the join. In this case, CanMapJoinOpFilter returns true
+// when src is a.x + b.y = 5 and dst is (Scan b), but false when src is
+// a.x + b.y = 5 and dst is (Scan a).
 //
-// If src has a correlated subquery, CanMap returns false.
-func (c *CustomFuncs) CanMap(
+// If src has a correlated subquery, CanMapJoinOpFilter returns false.
+func (c *CustomFuncs) CanMapJoinOpFilter(
 	filters memo.FiltersExpr, src *memo.FiltersItem, dst memo.RelExpr,
 ) bool {
 	// Fast path if src is already bound by dst.
@@ -143,8 +142,8 @@ func (c *CustomFuncs) CanMap(
 		return false
 	}
 
-	// For CanMap to be true, each column in src must map to at least one column
-	// in dst.
+	// For CanMapJoinOpFilter to be true, each column in src must map to at
+	// least one column in dst.
 	for i, ok := scalarProps.OuterCols.Next(0); ok; i, ok = scalarProps.OuterCols.Next(i + 1) {
 		eqCols := c.GetEquivColsWithEquivType(opt.ColumnID(i), filters)
 		if !eqCols.Intersects(c.OutputCols(dst)) {
@@ -155,26 +154,29 @@ func (c *CustomFuncs) CanMap(
 	return true
 }
 
-// Map maps a boolean expression src, which is a conjunct in the given filters
-// expression, to use the output columns of the relational expression dst.
+// MapJoinOpFilter maps a boolean expression src, which is a conjunct in
+// the given filters expression, to use the output columns of the relational
+// expression dst.
 //
-// Map assumes that CanMap has already returned true, and therefore a mapping
-// is possible (see the comment above CanMap for details).
+// MapJoinOpFilter assumes that CanMapJoinOpFilter has already returned true,
+// and therefore a mapping is possible (see comment above CanMapJoinOpFilter
+// for details).
 //
-// For each column in src that is not also in dst, Map replaces it with an
-// equivalent column in dst. If there are multiple equivalent columns in dst,
-// it chooses one arbitrarily. Map does not replace any columns in subqueries,
-// since we know there are no correlated subqueries (otherwise CanMap would
-// have returned false).
+// For each column in src that is not also in dst, MapJoinOpFilter replaces it
+// with an equivalent column in dst. If there are multiple equivalent columns
+// in dst, it chooses one arbitrarily. MapJoinOpFilter does not replace any
+// columns in subqueries, since we know there are no correlated subqueries
+// (otherwise CanMapJoinOpFilter would have returned false).
 //
 // For example, consider this query:
 //
 //   SELECT * FROM a INNER JOIN b ON a.x=b.x AND a.x + b.y = 5
 //
-// If Map is called with src as a.x + b.y = 5 and dst as (Scan b), it returns
-// b.x + b.y = 5. Map should not be called with the equality predicate
-// a.x = b.x, because it would just return the tautology b.x = b.x.
-func (c *CustomFuncs) Map(
+// If MapJoinOpFilter is called with src as a.x + b.y = 5 and dst as (Scan b),
+// it returns b.x + b.y = 5. MapJoinOpFilter should not be called with the
+// equality predicate a.x = b.x, because it would just return the tautology
+// b.x = b.x.
+func (c *CustomFuncs) MapJoinOpFilter(
 	filters memo.FiltersExpr, src *memo.FiltersItem, dst memo.RelExpr,
 ) opt.ScalarExpr {
 	// Fast path if src is already bound by dst.
@@ -182,8 +184,9 @@ func (c *CustomFuncs) Map(
 		return src.Condition
 	}
 
-	// Map each column in src to one column in dst. We choose an arbitrary column
-	// (the one with the smallest ColumnID) if there are multiple choices.
+	// MapJoinOpFilter each column in src to one column in dst. We choose an
+	// arbitrary column (the one with the smallest ColumnID) if there are multiple
+	// choices.
 	var colMap util.FastIntMap
 	outerCols := src.ScalarProps(c.mem).OuterCols
 	for srcCol, ok := outerCols.Next(0); ok; srcCol, ok = outerCols.Next(srcCol + 1) {
@@ -194,7 +197,7 @@ func (c *CustomFuncs) Map(
 		} else {
 			dstCol, ok := eqCols.Next(0)
 			if !ok {
-				panic(fmt.Errorf(
+				panic(pgerror.AssertionFailedf(
 					"Map called on src that cannot be mapped to dst. src:\n%s\ndst:\n%s",
 					src, dst,
 				))
@@ -420,46 +423,31 @@ func (c *CustomFuncs) JoinFiltersMatchAllLeftRows(
 	}
 
 	var leftRightColMap map[opt.ColumnID]opt.ColumnID
-	// Condition #5: All remaining left columns correspond to a foreign key relation.
+	// Condition #5: All remaining left columns correspond to a validated foreign
+	// key relation.
 	leftTabMeta := md.TableMeta(leftTab)
+	if leftTabMeta.IgnoreForeignKeys {
+		// We are not allowed to use any of the left table's outbound foreign keys.
+		return false
+	}
 	rightTabMeta := md.TableMeta(rightTab)
-	for i, cnt := 0, leftTabMeta.Table.IndexCount(); i < cnt; i++ {
-		index := leftTabMeta.Table.Index(i)
-		fkRef, ok := index.ForeignKey()
 
-		if !ok {
-			// No foreign key reference on this index.
+	// Search for validated foreign key references from the left table to the
+	// right table.
+	for i, cnt := 0, leftTabMeta.Table.OutboundForeignKeyCount(); i < cnt; i++ {
+		fkRef := leftTabMeta.Table.OutboundForeignKey(i)
+		if fkRef.ReferencedTableID() != rightTabMeta.Table.ID() || !fkRef.Validated() {
 			continue
 		}
-
-		fkTable := md.TableByStableID(fkRef.TableID)
-		fkPrefix := int(fkRef.PrefixLen)
-		if fkPrefix <= 0 {
-			panic("fkPrefix should always be positive")
-		}
-		if fkTable == nil || fkTable.ID() != rightTabMeta.Table.ID() {
+		fkTable := md.TableByStableID(fkRef.ReferencedTableID())
+		if fkTable == nil {
 			continue
-		}
-
-		// Find the index corresponding to fkRef.IndexID - the index
-		// on the right table that forms the destination end of
-		// the fk relation.
-		var fkIndex cat.Index
-		found := false
-		for j, cnt2 := 0, fkTable.IndexCount(); j < cnt2; j++ {
-			if fkTable.Index(j).ID() == fkRef.IndexID {
-				found = true
-				fkIndex = fkTable.Index(j)
-				break
-			}
-		}
-		if !found {
-			panic("Foreign key referenced index not found in table")
 		}
 
 		var leftIndexCols opt.ColSet
-		for j := 0; j < fkPrefix; j++ {
-			ord := index.Column(j).Ordinal
+		numCols := fkRef.ColumnCount()
+		for j := 0; j < numCols; j++ {
+			ord := fkRef.OriginColumnOrdinal(leftTabMeta.Table, j)
 			leftIndexCols.Add(int(leftTab.ColumnID(ord)))
 		}
 
@@ -481,15 +469,15 @@ func (c *CustomFuncs) JoinFiltersMatchAllLeftRows(
 		// in the foreign key index matches that of the RHS column (in the index being
 		// referenced) that it's being equated to.
 		fkMatch := true
-		for j := 0; j < fkPrefix; j++ {
-			indexLeftCol := leftTab.ColumnID(index.Column(j).Ordinal)
+		for j := 0; j < numCols; j++ {
+			indexLeftCol := leftTab.ColumnID(fkRef.OriginColumnOrdinal(leftTabMeta.Table, j))
 
 			// Not every fk column needs to be in the equality conditions.
 			if !remainingLeftColIDs.Contains(int(indexLeftCol)) {
 				continue
 			}
 
-			indexRightCol := rightTab.ColumnID(fkIndex.Column(j).Ordinal)
+			indexRightCol := rightTab.ColumnID(fkRef.ReferencedColumnOrdinal(fkTable, j))
 
 			if rightCol, ok := leftRightColMap[indexLeftCol]; !ok || rightCol != indexRightCol {
 				fkMatch = false
@@ -634,7 +622,7 @@ func (c *CustomFuncs) ExtractJoinEquality(
 		}
 	}
 	if leftProj.empty() && rightProj.empty() {
-		panic("no equalities to extract")
+		panic(pgerror.AssertionFailedf("no equalities to extract"))
 	}
 
 	join := c.f.ConstructJoin(

@@ -15,21 +15,22 @@
 package norm
 
 import (
-	"fmt"
 	"math"
-	"reflect"
 	"sort"
 
 	"github.com/cockroachdb/apd"
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // CustomFuncs contains all the custom match and replace functions used by
@@ -67,15 +68,16 @@ func (c *CustomFuncs) NeedSortedUniqueList(list memo.ScalarListExpr) bool {
 		return false
 	}
 	ls := listSorter{cf: c, list: list}
+	var needSortedUniqueList bool
 	for i, item := range list {
 		if !opt.IsConstValueOp(item) {
 			return false
 		}
 		if i != 0 && !ls.less(i-1, i) {
-			return true
+			needSortedUniqueList = true
 		}
 	}
-	return false
+	return needSortedUniqueList
 }
 
 // ConstructSortedUniqueList sorts the given list and removes duplicates, and
@@ -83,7 +85,7 @@ func (c *CustomFuncs) NeedSortedUniqueList(list memo.ScalarListExpr) bool {
 // comparison rule details.
 func (c *CustomFuncs) ConstructSortedUniqueList(
 	list memo.ScalarListExpr,
-) (memo.ScalarListExpr, types.T) {
+) (memo.ScalarListExpr, *types.T) {
 	// Make a copy of the list, since it needs to stay immutable.
 	newList := make(memo.ScalarListExpr, len(list))
 	copy(newList, list)
@@ -103,12 +105,11 @@ func (c *CustomFuncs) ConstructSortedUniqueList(
 	newList = newList[:n]
 
 	// Construct the type of the tuple.
-	typ := types.TTuple{Types: make([]types.T, n)}
+	contents := make([]types.T, n)
 	for i := range newList {
-		typ.Types[i] = newList[i].DataType()
+		contents[i] = *newList[i].DataType()
 	}
-
-	return newList, typ
+	return newList, types.MakeTuple(contents)
 }
 
 // ----------------------------------------------------------------------
@@ -120,32 +121,23 @@ func (c *CustomFuncs) ConstructSortedUniqueList(
 // ----------------------------------------------------------------------
 
 // HasColType returns true if the given scalar expression has a static type
-// that's equivalent to the requested coltype.
-func (c *CustomFuncs) HasColType(scalar opt.ScalarExpr, dstTyp coltypes.T) bool {
-	srcTyp, _ := coltypes.DatumTypeToColumnType(scalar.DataType())
-	if reflect.TypeOf(srcTyp) != reflect.TypeOf(dstTyp) {
-		return false
-	}
-	return coltypes.ColTypeAsString(srcTyp) == coltypes.ColTypeAsString(dstTyp)
+// that's identical to the requested coltype.
+func (c *CustomFuncs) HasColType(scalar opt.ScalarExpr, dstTyp *types.T) bool {
+	return scalar.DataType().Identical(dstTyp)
 }
 
 // IsString returns true if the given scalar expression is of type String.
 func (c *CustomFuncs) IsString(scalar opt.ScalarExpr) bool {
-	return scalar.DataType() == types.String
-}
-
-// ColTypeToDatumType maps the given column type to a datum type.
-func (c *CustomFuncs) ColTypeToDatumType(colTyp coltypes.T) types.T {
-	return coltypes.CastTargetToDatumType(colTyp)
+	return scalar.DataType().Family() == types.StringFamily
 }
 
 // BoolType returns the boolean SQL type.
-func (c *CustomFuncs) BoolType() types.T {
+func (c *CustomFuncs) BoolType() *types.T {
 	return types.Bool
 }
 
 // AnyType returns the wildcard Any type.
-func (c *CustomFuncs) AnyType() types.T {
+func (c *CustomFuncs) AnyType() *types.T {
 	return types.Any
 }
 
@@ -158,18 +150,17 @@ func (c *CustomFuncs) CanConstructBinary(op opt.Operator, left, right opt.Scalar
 
 // ArrayType returns the type of the first output column wrapped
 // in an array.
-func (c *CustomFuncs) ArrayType(in memo.RelExpr) types.T {
+func (c *CustomFuncs) ArrayType(in memo.RelExpr) *types.T {
 	inCol, _ := c.OutputCols(in).Next(0)
 	inTyp := c.mem.Metadata().ColumnMeta(opt.ColumnID(inCol)).Type
-	return types.TArray{Typ: inTyp}
+	return types.MakeArray(inTyp)
 }
 
-// BinaryColType returns the column type of the binary overload for the
-// given operator and operands.
-func (c *CustomFuncs) BinaryColType(op opt.Operator, left, right opt.ScalarExpr) coltypes.T {
+// BinaryType returns the type of the binary overload for the given operator and
+// operands.
+func (c *CustomFuncs) BinaryType(op opt.Operator, left, right opt.ScalarExpr) *types.T {
 	o, _ := memo.FindBinaryOverload(op, left.DataType(), right.DataType())
-	colType, _ := coltypes.DatumTypeToColumnType(o.ReturnType)
-	return colType
+	return o.ReturnType
 }
 
 // ----------------------------------------------------------------------
@@ -242,6 +233,13 @@ func (c *CustomFuncs) HasOuterCols(input opt.Expr) bool {
 // produced by the Scan.
 func (c *CustomFuncs) IsBoundBy(src opt.Expr, cols opt.ColSet) bool {
 	return c.OuterCols(src).SubsetOf(cols)
+}
+
+// IsDeterminedBy returns true if all outer references in the source expression
+// are bound by the closure of the given columns according to the functional
+// dependencies of the input expression.
+func (c *CustomFuncs) IsDeterminedBy(src opt.Expr, cols opt.ColSet, input memo.RelExpr) bool {
+	return input.Relational().FuncDeps.InClosureOf(c.OuterCols(src), cols)
 }
 
 // IsCorrelated returns true if any variable in the source expression references
@@ -342,7 +340,7 @@ func (c *CustomFuncs) sharedProps(e opt.Expr) *props.Shared {
 	case memo.ScalarPropsExpr:
 		return &t.ScalarProps(c.mem).Shared
 	}
-	panic(fmt.Sprintf("no logical properties available for node: %v", e))
+	panic(pgerror.AssertionFailedf("no logical properties available for node: %v", e))
 }
 
 // ----------------------------------------------------------------------
@@ -452,7 +450,7 @@ func (c *CustomFuncs) RemoveFiltersItem(
 			return newFilters
 		}
 	}
-	panic(fmt.Sprintf("item to remove is not in the list: %v", search))
+	panic(pgerror.AssertionFailedf("item to remove is not in the list: %v", search))
 }
 
 // ReplaceFiltersItem returns a new list that is a copy of the given list,
@@ -472,7 +470,7 @@ func (c *CustomFuncs) ReplaceFiltersItem(
 			return newFilters
 		}
 	}
-	panic(fmt.Sprintf("item to replace is not in the list: %v", search))
+	panic(pgerror.AssertionFailedf("item to replace is not in the list: %v", search))
 }
 
 // FiltersBoundBy returns true if all outer references in any of the filter
@@ -525,7 +523,7 @@ func (c *CustomFuncs) ExtractBoundConditions(
 }
 
 // ExtractUnboundConditions is the opposite of ExtractBoundConditions. Instead of
-// extracting expressions that are bound by the given expression, it extracts
+// extracting expressions that are bound by the given columns, it extracts
 // list expressions that have at least one outer reference that is *not* bound
 // by the given columns (i.e. it has a "free" variable).
 func (c *CustomFuncs) ExtractUnboundConditions(
@@ -538,6 +536,168 @@ func (c *CustomFuncs) ExtractUnboundConditions(
 		}
 	}
 	return newFilters
+}
+
+// ExtractDeterminedConditions returns a new list of filters containing only
+// those expressions from the given list which are bound by columns which
+// are functionally determined by the given columns.
+func (c *CustomFuncs) ExtractDeterminedConditions(
+	filters memo.FiltersExpr, cols opt.ColSet, input memo.RelExpr,
+) memo.FiltersExpr {
+	newFilters := make(memo.FiltersExpr, 0, len(filters))
+	for i := range filters {
+		if c.IsDeterminedBy(&filters[i], cols, input) {
+			newFilters = append(newFilters, filters[i])
+		}
+	}
+	return newFilters
+}
+
+// ExtractUndeterminedConditions is the opposite of
+// ExtractDeterminedConditions.
+func (c *CustomFuncs) ExtractUndeterminedConditions(
+	filters memo.FiltersExpr, cols opt.ColSet, input memo.RelExpr,
+) memo.FiltersExpr {
+	newFilters := make(memo.FiltersExpr, 0, len(filters))
+	for i := range filters {
+		if !c.IsDeterminedBy(&filters[i], cols, input) {
+			newFilters = append(newFilters, filters[i])
+		}
+	}
+	return newFilters
+}
+
+// CanConsolidateFilters returns true if there are at least two different
+// filter conditions that contain the same variable, where the conditions
+// have tight constraints and contain a single variable. For example,
+// CanConsolidateFilters returns true with filters {x > 5, x < 10}, but false
+// with {x > 5, y < 10} and {x > 5, x = y}.
+func (c *CustomFuncs) CanConsolidateFilters(filters memo.FiltersExpr) bool {
+	var seen opt.ColSet
+	for i := range filters {
+		if col, ok := c.canConsolidateFilter(&filters[i]); ok {
+			if seen.Contains(col) {
+				return true
+			}
+			seen.Add(col)
+		}
+	}
+	return false
+}
+
+// canConsolidateFilter determines whether a filter condition can be
+// consolidated. Filters can be consolidated if they have tight constraints
+// and contain a single variable. Examples of such filters include x < 5 and
+// x IS NULL. If the filter can be consolidated, canConsolidateFilter returns
+// the column ID of the variable and ok=true. Otherwise, canConsolidateFilter
+// returns ok=false.
+func (c *CustomFuncs) canConsolidateFilter(filter *memo.FiltersItem) (col int, ok bool) {
+	if !filter.ScalarProps(c.mem).TightConstraints {
+		return 0, false
+	}
+
+	outerCols := c.OuterCols(filter)
+	if outerCols.Len() != 1 {
+		return 0, false
+	}
+
+	col, _ = outerCols.Next(0)
+	return col, true
+}
+
+// ConsolidateFilters consolidates filter conditions that contain the same
+// variable, where the conditions have tight constraints and contain a single
+// variable. The consolidated filters are combined with a tree of nested
+// And operations, and wrapped with a Range expression.
+//
+// See the ConsolidateSelectFilters rule for more details about why this is
+// necessary.
+func (c *CustomFuncs) ConsolidateFilters(filters memo.FiltersExpr) memo.FiltersExpr {
+	// First find the columns that have filter conditions that can be
+	// consolidated.
+	var seen, seenTwice opt.ColSet
+	for i := range filters {
+		if col, ok := c.canConsolidateFilter(&filters[i]); ok {
+			if seen.Contains(col) {
+				seenTwice.Add(col)
+			} else {
+				seen.Add(col)
+			}
+		}
+	}
+
+	newFilters := make(memo.FiltersExpr, seenTwice.Len(), len(filters)-seenTwice.Len())
+
+	// newFilters contains an empty item for each of the new Range expressions
+	// that will be created below. Fill in rangeMap to track which column
+	// corresponds to each item.
+	var rangeMap util.FastIntMap
+	i := 0
+	for col, ok := seenTwice.Next(0); ok; col, ok = seenTwice.Next(col + 1) {
+		rangeMap.Set(col, i)
+		i++
+	}
+
+	// Iterate through each existing filter condition, and either consolidate it
+	// into one of the new Range expressions or add it unchanged to the new
+	// filters.
+	for i := range filters {
+		if col, ok := c.canConsolidateFilter(&filters[i]); ok && seenTwice.Contains(col) {
+			// This is one of the filter conditions that can be consolidated into a
+			// Range.
+			cond := filters[i].Condition
+			switch t := cond.(type) {
+			case *memo.RangeExpr:
+				// If it is already a range expression, unwrap it.
+				cond = t.And
+			}
+			rangeIdx, _ := rangeMap.Get(col)
+			rangeItem := &newFilters[rangeIdx]
+			if rangeItem.Condition == nil {
+				// This is the first condition.
+				rangeItem.Condition = cond
+			} else {
+				// Build a left-deep tree of ANDs.
+				rangeItem.Condition = c.f.ConstructAnd(rangeItem.Condition, cond)
+			}
+		} else {
+			newFilters = append(newFilters, filters[i])
+		}
+	}
+
+	// Construct each of the new Range operators now that we have built the
+	// conjunctions.
+	for i, n := 0, seenTwice.Len(); i < n; i++ {
+		newFilters[i].Condition = c.f.ConstructRange(newFilters[i].Condition)
+	}
+
+	return newFilters
+}
+
+// AreFiltersSorted determines whether the expressions in a FiltersExpr are
+// ordered by their expression IDs.
+func (c *CustomFuncs) AreFiltersSorted(f memo.FiltersExpr) bool {
+	for i, n := 0, f.ChildCount(); i < n-1; i++ {
+		if f.Child(i).Child(0).(opt.ScalarExpr).ID() > f.Child(i+1).Child(0).(opt.ScalarExpr).ID() {
+			return false
+		}
+	}
+	return true
+}
+
+// SortFilters sorts a filter list by the IDs of the expressions. This has the
+// effect of canonicalizing FiltersExprs which may have the same filters, but
+// in a different order.
+func (c *CustomFuncs) SortFilters(f memo.FiltersExpr) memo.FiltersExpr {
+	result := make(memo.FiltersExpr, len(f))
+	for i, n := 0, f.ChildCount(); i < n; i++ {
+		fi := f.Child(i).(*memo.FiltersItem)
+		result[i] = *fi
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Child(0).(opt.ScalarExpr).ID() < result[j].Child(0).(opt.ScalarExpr).ID()
+	})
+	return result
 }
 
 // ----------------------------------------------------------------------
@@ -606,7 +766,7 @@ func (c *CustomFuncs) MergeProjectWithValues(
 	for i, colID := range values.Cols {
 		if passthrough.Contains(int(colID)) {
 			newExprs = append(newExprs, tuple.Elems[i])
-			newTypes = append(newTypes, tuple.Elems[i].DataType())
+			newTypes = append(newTypes, *tuple.Elems[i].DataType())
 			newCols = append(newCols, colID)
 		}
 	}
@@ -614,11 +774,12 @@ func (c *CustomFuncs) MergeProjectWithValues(
 	for i := range projections {
 		item := &projections[i]
 		newExprs = append(newExprs, item.Element)
-		newTypes = append(newTypes, item.Element.DataType())
+		newTypes = append(newTypes, *item.Element.DataType())
 		newCols = append(newCols, item.Col)
 	}
 
-	rows := memo.ScalarListExpr{c.f.ConstructTuple(newExprs, types.TTuple{Types: newTypes})}
+	tupleTyp := types.MakeTuple(newTypes)
+	rows := memo.ScalarListExpr{c.f.ConstructTuple(newExprs, tupleTyp)}
 	return c.f.ConstructValues(rows, &memo.ValuesPrivate{
 		Cols: newCols,
 		ID:   values.ID,
@@ -656,32 +817,6 @@ func (c *CustomFuncs) AreProjectionsCorrelated(
 		}
 	}
 	return false
-}
-
-// ProjectColMapLeft returns a Projections operator that maps the left side
-// columns in a SetPrivate to the output columns in it. Useful for replacing set
-// operations with simpler constructs.
-func (c *CustomFuncs) ProjectColMapLeft(set *memo.SetPrivate) memo.ProjectionsExpr {
-	return c.projectColMapSide(set.OutCols, set.LeftCols)
-}
-
-// ProjectColMapRight returns a Project operator that maps the right side
-// columns in a SetPrivate to the output columns in it. Useful for replacing set
-// operations with simpler constructs.
-func (c *CustomFuncs) ProjectColMapRight(set *memo.SetPrivate) memo.ProjectionsExpr {
-	return c.projectColMapSide(set.OutCols, set.RightCols)
-}
-
-// projectColMapSide implements the side-agnostic logic from ProjectColMapLeft
-// and ProjectColMapRight.
-func (c *CustomFuncs) projectColMapSide(toList, fromList opt.ColList) memo.ProjectionsExpr {
-	items := make(memo.ProjectionsExpr, len(toList))
-	for idx, fromCol := range fromList {
-		toCol := toList[idx]
-		items[idx].Element = c.f.ConstructVariable(fromCol)
-		items[idx].Col = toCol
-	}
-	return items
 }
 
 // MakeEmptyColSet returns a column set with no columns in it.
@@ -887,6 +1022,150 @@ func (c *CustomFuncs) ZipOuterCols(zip memo.ZipExpr) opt.ColSet {
 
 // ----------------------------------------------------------------------
 //
+// Set Rules
+//   Custom match and replace functions used with set.opt rules.
+//
+// ----------------------------------------------------------------------
+
+// ProjectColMapLeft returns a Projections operator that maps the left side
+// columns in a SetPrivate to the output columns in it. Useful for replacing set
+// operations with simpler constructs.
+func (c *CustomFuncs) ProjectColMapLeft(set *memo.SetPrivate) memo.ProjectionsExpr {
+	return c.projectColMapSide(set.OutCols, set.LeftCols)
+}
+
+// ProjectColMapRight returns a Project operator that maps the right side
+// columns in a SetPrivate to the output columns in it. Useful for replacing set
+// operations with simpler constructs.
+func (c *CustomFuncs) ProjectColMapRight(set *memo.SetPrivate) memo.ProjectionsExpr {
+	return c.projectColMapSide(set.OutCols, set.RightCols)
+}
+
+// projectColMapSide implements the side-agnostic logic from ProjectColMapLeft
+// and ProjectColMapRight.
+func (c *CustomFuncs) projectColMapSide(toList, fromList opt.ColList) memo.ProjectionsExpr {
+	items := make(memo.ProjectionsExpr, len(toList))
+	for idx, fromCol := range fromList {
+		toCol := toList[idx]
+		items[idx].Element = c.f.ConstructVariable(fromCol)
+		items[idx].Col = toCol
+	}
+	return items
+}
+
+// CanMapOnSetOp determines whether the filter can be mapped to either
+// side of a set operator.
+func (c *CustomFuncs) CanMapOnSetOp(src *memo.FiltersItem) bool {
+	filterProps := src.ScalarProps(c.mem)
+	for i, ok := filterProps.OuterCols.Next(0); ok; i, ok = filterProps.OuterCols.Next(i + 1) {
+		colType := c.f.Metadata().ColumnMeta(opt.ColumnID(i)).Type
+		if sqlbase.DatumTypeHasCompositeKeyEncoding(colType) {
+			return false
+		}
+	}
+	return !filterProps.HasCorrelatedSubquery
+}
+
+// MapSetOpFilterLeft maps the filter onto the left expression by replacing
+// the out columns of the filter with the appropriate corresponding columns in
+// the left side of the operator.
+// Useful for pushing filters to relations the set operation is composed of.
+func (c *CustomFuncs) MapSetOpFilterLeft(
+	filter *memo.FiltersItem, set *memo.SetPrivate,
+) opt.ScalarExpr {
+	return c.mapSetOpFilter(filter, set.OutCols, set.LeftCols)
+}
+
+// MapSetOpFilterRight maps the filter onto the right expression by replacing
+// the out columns of the filter with the appropriate corresponding columns in
+// the right side of the operator.
+// Useful for pushing filters to relations the set operation is composed of.
+func (c *CustomFuncs) MapSetOpFilterRight(
+	filter *memo.FiltersItem, set *memo.SetPrivate,
+) opt.ScalarExpr {
+	return c.mapSetOpFilter(filter, set.OutCols, set.RightCols)
+}
+
+// mapSetOpFilter maps filter expressions to dst by replacing occurrences of
+// columns in src with corresponding columns in dst (the two lists must be of
+// equal length).
+//
+// For each column in src that is not an outer column, SetMap replaces it with
+// the corresponding column in dst.
+//
+// For example, consider this query:
+//
+//   SELECT * FROM (SELECT x FROM a UNION SELECT y FROM b) WHERE x < 5
+//
+// If mapSetOpFilter is called on the left subtree of the Union, the filter
+// x < 5 propagates to that side after mapping the column IDs appropriately.
+// WLOG, If setMap is called on the right subtree, the filter x < 5 will be
+// mapped similarly to y < 5 on the right side.
+func (c *CustomFuncs) mapSetOpFilter(
+	filter *memo.FiltersItem, src opt.ColList, dst opt.ColList,
+) opt.ScalarExpr {
+	// Map each column in src to one column in dst to map the
+	// filters appropriately.
+	var colMap util.FastIntMap
+	for colIndex, outColID := range src {
+		colMap.Set(int(outColID), int(dst[colIndex]))
+	}
+
+	// Recursively walk the scalar sub-tree looking for references to columns
+	// that need to be replaced and then replace them appropriately.
+	var replace ReplaceFunc
+	replace = func(nd opt.Expr) opt.Expr {
+		switch t := nd.(type) {
+		case *memo.VariableExpr:
+			dstCol, inCol := colMap.Get(int(t.Col))
+			if !inCol {
+				// Its not part of the out cols so no replacement required.
+				return nd
+			}
+			return c.f.ConstructVariable(opt.ColumnID(dstCol))
+		}
+		return c.f.Replace(nd, replace)
+	}
+
+	return replace(filter.Condition).(opt.ScalarExpr)
+}
+
+// ----------------------------------------------------------------------
+//
+// Window Rules
+//   Custom match and replace functions used with window.opt rules.
+//
+// ----------------------------------------------------------------------
+
+// CanReduceWindowPartitionCols is true if the set of columns being partitioned
+// on can be made smaller via use of functional dependencies (for instance,
+// partitioning on (k, k+1) can be reduced to just (k)).
+func (c *CustomFuncs) CanReduceWindowPartitionCols(
+	input memo.RelExpr, private *memo.WindowPrivate,
+) bool {
+	fdset := input.Relational().FuncDeps
+	return !fdset.ReduceCols(private.Partition).Equals(private.Partition)
+}
+
+// ReduceWindowPartitionCols reduces the set of columns being partitioned on
+// to a smaller set.
+func (c *CustomFuncs) ReduceWindowPartitionCols(
+	input memo.RelExpr, private *memo.WindowPrivate,
+) *memo.WindowPrivate {
+	fdset := input.Relational().FuncDeps
+	p := *private
+	p.Partition = fdset.ReduceCols(private.Partition)
+	return &p
+}
+
+// WindowPartition returns the set of columns that the window function uses to
+// partition.
+func (c *CustomFuncs) WindowPartition(priv *memo.WindowPrivate) opt.ColSet {
+	return priv.Partition
+}
+
+// ----------------------------------------------------------------------
+//
 // Boolean Rules
 //   Custom match and replace functions used with bool.opt rules.
 //
@@ -932,7 +1211,7 @@ func (c *CustomFuncs) CommuteInequality(
 	case opt.LtOp:
 		return c.f.ConstructGt(right, left)
 	}
-	panic(fmt.Sprintf("called commuteInequality with operator %s", op))
+	panic(pgerror.AssertionFailedf("called commuteInequality with operator %s", log.Safe(op)))
 }
 
 // FindRedundantConjunct takes the left and right operands of an Or operator as
@@ -1043,7 +1322,7 @@ func (c *CustomFuncs) extractConjunct(conjunct opt.ScalarExpr, and *memo.AndExpr
 //   (a = x) AND (b = y) AND (c = z)
 func (c *CustomFuncs) NormalizeTupleEquality(left, right memo.ScalarListExpr) opt.ScalarExpr {
 	if len(left) != len(right) {
-		panic("tuple length mismatch")
+		panic(pgerror.AssertionFailedf("tuple length mismatch"))
 	}
 	if len(left) == 0 {
 		// () = (), which is always true.
@@ -1098,18 +1377,6 @@ func (c *CustomFuncs) AllowNullArgs(op opt.Operator, left, right opt.ScalarExpr)
 	return memo.BinaryAllowsNullArgs(op, left.DataType(), right.DataType())
 }
 
-// FoldNullUnary replaces the unary operator with a typed null value having the
-// same type as the unary operator would have.
-func (c *CustomFuncs) FoldNullUnary(op opt.Operator, input opt.ScalarExpr) opt.ScalarExpr {
-	return c.f.ConstructNull(memo.InferUnaryType(op, input.DataType()))
-}
-
-// FoldNullBinary replaces the binary operator with a typed null value having
-// the same type as the binary operator would have.
-func (c *CustomFuncs) FoldNullBinary(op opt.Operator, left, right opt.ScalarExpr) opt.ScalarExpr {
-	return c.f.ConstructNull(memo.InferBinaryType(op, left.DataType(), right.DataType()))
-}
-
 // IsJSONScalar returns if the JSON value is a number, string, true, false, or null.
 func (c *CustomFuncs) IsJSONScalar(value opt.ScalarExpr) bool {
 	v := value.(*memo.ConstExpr).Value.(*tree.DJSON)
@@ -1143,17 +1410,8 @@ func (c *CustomFuncs) IsConstValueEqual(const1, const2 opt.ScalarExpr) bool {
 		datum2 := const2.(*memo.ConstExpr).Value
 		return datum1.Compare(c.f.evalCtx, datum2) == 0
 	default:
-		panic(fmt.Errorf("unexpected Op type: %v", op1))
+		panic(pgerror.AssertionFailedf("unexpected Op type: %v", log.Safe(op1)))
 	}
-}
-
-// ensureTyped makes sure that any NULL passing through gets tagged with an
-// appropriate type.
-func (c *CustomFuncs) ensureTyped(d opt.ScalarExpr, typ types.T) opt.ScalarExpr {
-	if d.DataType() == types.Unknown {
-		return c.f.ConstructNull(typ)
-	}
-	return d
 }
 
 // SimplifyWhens removes known unreachable WHEN cases and constructs a new CASE
@@ -1162,13 +1420,9 @@ func (c *CustomFuncs) ensureTyped(d opt.ScalarExpr, typ types.T) opt.ScalarExpr 
 func (c *CustomFuncs) SimplifyWhens(
 	condition opt.ScalarExpr, whens memo.ScalarListExpr, orElse opt.ScalarExpr,
 ) opt.ScalarExpr {
-	var typ types.T
 	newWhens := make(memo.ScalarListExpr, 0, len(whens))
 	for _, item := range whens {
 		when := item.(*memo.WhenExpr)
-		if typ == nil || typ == types.Unknown {
-			typ = when.Typ
-		}
 		if opt.IsConstValueOp(when.Condition) {
 			if !c.IsConstValueEqual(condition, when.Condition) {
 				// Ignore known unmatching conditions.
@@ -1178,7 +1432,7 @@ func (c *CustomFuncs) SimplifyWhens(
 			// If this is true, we won't ever match anything else, so convert this to
 			// the ELSE (or just return it if there are no earlier items).
 			if len(newWhens) == 0 {
-				return when.Value
+				return c.ensureTyped(when.Value, memo.InferWhensType(whens, orElse))
 			}
 			return c.f.ConstructCase(condition, newWhens, when.Value)
 		}
@@ -1193,10 +1447,19 @@ func (c *CustomFuncs) SimplifyWhens(
 		// a type we observed earlier.
 		// typ will never be nil here because the definition of
 		// SimplifyCaseWhenConstValue ensures that whens is nonempty.
-		return c.ensureTyped(orElse, typ)
+		return c.ensureTyped(orElse, memo.InferWhensType(whens, orElse))
 	}
 
 	return c.f.ConstructCase(condition, newWhens, orElse)
+}
+
+// ensureTyped makes sure that any NULL passing through gets tagged with an
+// appropriate type.
+func (c *CustomFuncs) ensureTyped(d opt.ScalarExpr, typ *types.T) opt.ScalarExpr {
+	if d.DataType().Family() == types.UnknownFamily {
+		return c.f.ConstructNull(typ)
+	}
+	return d
 }
 
 // OpsAreSame returns true if the two operators are the same.
@@ -1222,9 +1485,9 @@ func (c *CustomFuncs) ConvertConstArrayToTuple(scalar opt.ScalarExpr) opt.Scalar
 	ts := make([]types.T, len(darr.Array))
 	for i, delem := range darr.Array {
 		elems[i] = c.f.ConstructConstVal(delem, delem.ResolvedType())
-		ts[i] = darr.ParamTyp
+		ts[i] = *darr.ParamTyp
 	}
-	return c.f.ConstructTuple(elems, types.TTuple{Types: ts})
+	return c.f.ConstructTuple(elems, types.MakeTuple(ts))
 }
 
 // CastToCollatedString returns the given string or collated string as a
@@ -1237,7 +1500,7 @@ func (c *CustomFuncs) CastToCollatedString(str opt.ScalarExpr, locale string) op
 	case *tree.DCollatedString:
 		value = t.Contents
 	default:
-		panic(fmt.Sprintf("unexpected type for COLLATE: %T", str.(*memo.ConstExpr).Value))
+		panic(pgerror.AssertionFailedf("unexpected type for COLLATE: %T", log.Safe(str.(*memo.ConstExpr).Value)))
 	}
 
 	return c.f.ConstructConst(tree.NewDCollatedString(value, locale, &c.f.evalCtx.CollationEnv))
@@ -1262,7 +1525,7 @@ func (c *CustomFuncs) FirstCol(in memo.RelExpr) opt.ColumnID {
 }
 
 // MakeArrayAggCol returns a ColPrivate with the given type and an "array_agg" label.
-func (c *CustomFuncs) MakeArrayAggCol(typ types.T) *memo.ColPrivate {
+func (c *CustomFuncs) MakeArrayAggCol(typ *types.T) *memo.ColPrivate {
 	return &memo.ColPrivate{Col: c.mem.Metadata().AddColumn("array_agg", typ)}
 }
 
@@ -1296,6 +1559,15 @@ func (c *CustomFuncs) MakeLimited(sub *memo.SubqueryPrivate) *memo.SubqueryPriva
 //
 // ----------------------------------------------------------------------
 
+// IsAdditive returns true if the type of the expression supports addition and
+// subtraction in the natural way. This differs from "has a +/- Numeric
+// implementation" because JSON has an implementation for "- INT" which doesn't
+// obey x - 0 = x. Additive types include all numeric types as well as
+// timestamps and dates.
+func (c *CustomFuncs) IsAdditive(e opt.ScalarExpr) bool {
+	return types.IsAdditiveType(e.DataType())
+}
+
 // EqualsNumber returns true if the given numeric value (decimal, float, or
 // integer) is equal to the given integer value.
 func (c *CustomFuncs) EqualsNumber(datum tree.Datum, value int64) bool {
@@ -1317,251 +1589,4 @@ func (c *CustomFuncs) EqualsNumber(datum tree.Datum, value int64) bool {
 		return *t == tree.DInt(value)
 	}
 	return false
-}
-
-// ----------------------------------------------------------------------
-//
-// Constant Folding Rules
-//   Custom match and replace functions used with fold_constants.opt
-//   rules.
-//
-// ----------------------------------------------------------------------
-
-// IsListOfConstants returns true if elems is a list of constant values or
-// tuples.
-func (c *CustomFuncs) IsListOfConstants(elems memo.ScalarListExpr) bool {
-	for _, elem := range elems {
-		if !c.IsConstValueOrTuple(elem) {
-			return false
-		}
-	}
-	return true
-}
-
-// FoldArray evaluates an Array expression with constant inputs. It returns the
-// array as a Const datum with type TArray.
-func (c *CustomFuncs) FoldArray(elems memo.ScalarListExpr, typ types.T) opt.ScalarExpr {
-	elemType := typ.(types.TArray).Typ
-	a := tree.NewDArray(elemType)
-	a.Array = make(tree.Datums, len(elems))
-	for i := range a.Array {
-		a.Array[i] = memo.ExtractConstDatum(elems[i])
-		if a.Array[i] == tree.DNull {
-			a.HasNulls = true
-		}
-	}
-	return c.f.ConstructConst(a)
-}
-
-// IsConstValueOrTuple returns true if the input is a constant or a tuple of
-// constants.
-func (c *CustomFuncs) IsConstValueOrTuple(input opt.ScalarExpr) bool {
-	return memo.CanExtractConstDatum(input)
-}
-
-// FoldBinary evaluates a binary expression with constant inputs. It returns
-// a constant expression as long as it finds an appropriate overload function
-// for the given operator and input types, and the evaluation causes no error.
-func (c *CustomFuncs) FoldBinary(op opt.Operator, left, right opt.ScalarExpr) opt.ScalarExpr {
-	lDatum, rDatum := memo.ExtractConstDatum(left), memo.ExtractConstDatum(right)
-
-	o, ok := memo.FindBinaryOverload(op, left.DataType(), right.DataType())
-	if !ok {
-		return nil
-	}
-
-	result, err := o.Fn(c.f.evalCtx, lDatum, rDatum)
-	if err != nil {
-		return nil
-	}
-	return c.f.ConstructConstVal(result, o.ReturnType)
-}
-
-// FoldUnary evaluates a unary expression with a constant input. It returns
-// a constant expression as long as it finds an appropriate overload function
-// for the given operator and input type, and the evaluation causes no error.
-func (c *CustomFuncs) FoldUnary(op opt.Operator, input opt.ScalarExpr) opt.ScalarExpr {
-	datum := memo.ExtractConstDatum(input)
-
-	o, ok := memo.FindUnaryOverload(op, input.DataType())
-	if !ok {
-		return nil
-	}
-
-	result, err := o.Fn(c.f.evalCtx, datum)
-	if err != nil {
-		return nil
-	}
-	return c.f.ConstructConstVal(result, o.ReturnType)
-}
-
-// FoldCast evaluates a cast expression with a constant input. It returns
-// a constant expression as long as the evaluation causes no error.
-func (c *CustomFuncs) FoldCast(input opt.ScalarExpr, colType coltypes.T) opt.ScalarExpr {
-	switch colType.(type) {
-	case *coltypes.TOid:
-		// Save this cast for the execbuilder.
-		return nil
-	}
-
-	datum := memo.ExtractConstDatum(input)
-	texpr, err := tree.NewTypedCastExpr(datum, colType)
-	if err != nil {
-		return nil
-	}
-
-	result, err := texpr.Eval(c.f.evalCtx)
-	if err != nil {
-		return nil
-	}
-
-	return c.f.ConstructConstVal(result, c.ColTypeToDatumType(colType))
-}
-
-// isMonotonicConversion returns true if conversion of a value from FROM to
-// TO is monotonic.
-// That is, if a and b are values of type FROM, then
-//
-//   1. a = b implies a::TO = b::TO and
-//   2. a < b implies a::TO <= b::TO
-//
-// Property (1) can be violated by cases like:
-//
-//   '-0'::FLOAT = '0'::FLOAT, but '-0'::FLOAT::STRING != '0'::FLOAT::STRING
-//
-// Property (2) can be violated by cases like:
-//
-//   2 < 10, but  2::STRING > 10::STRING.
-//
-// Note that the stronger version of (2),
-//
-//   a < b implies a::TO < b::TO
-//
-// is not required, for instance this is not generally true of conversion from
-// a TIMESTAMP to a DATE, but certain such conversions can still generate spans
-// in some cases where values under FROM and TO are "the same" (such as where a
-// TIMESTAMP precisely falls on a date boundary).  We don't need this property
-// because we will subsequently check that the values can round-trip to ensure
-// that we don't lose any information by doing the conversion.
-// TODO(justin): fill this out with the complete set of such conversions.
-func isMonotonicConversion(from, to coltypes.T) bool {
-	if from == coltypes.Timestamp ||
-		from == coltypes.TimestampWithTZ ||
-		from == coltypes.Date {
-		return to == coltypes.Timestamp ||
-			to == coltypes.TimestampWithTZ ||
-			to == coltypes.Date
-	}
-
-	if from == coltypes.Int8 ||
-		from == coltypes.Float8 ||
-		from == coltypes.Decimal {
-		return to == coltypes.Int8 ||
-			to == coltypes.Float8 ||
-			to == coltypes.Decimal
-	}
-
-	return false
-}
-
-// UnifyComparison attempts to convert a constant expression to the type of the
-// variable expression, if that conversion can round-trip and is monotonic.
-func (c *CustomFuncs) UnifyComparison(left, right opt.ScalarExpr) opt.ScalarExpr {
-	v := left.(*memo.VariableExpr)
-	cnst := right.(*memo.ConstExpr)
-
-	desiredType := v.DataType()
-	originalType := cnst.DataType()
-
-	// Don't bother if they're already the same.
-	if desiredType.Equivalent(originalType) {
-		return nil
-	}
-
-	desiredColType, err := coltypes.DatumTypeToColumnType(desiredType)
-	if err != nil {
-		return nil
-	}
-
-	originalColType, err := coltypes.DatumTypeToColumnType(originalType)
-	if err != nil {
-		return nil
-	}
-
-	if !isMonotonicConversion(originalColType, desiredColType) {
-		return nil
-	}
-
-	// Check that the datum can round-trip between the types. If this is true, it
-	// means we don't lose any information needed to generate spans, and combined
-	// with monotonicity means that it's safe to convert the RHS to the type of
-	// the LHS.
-	convertedDatum, err := tree.PerformCast(c.f.evalCtx, cnst.Value, desiredColType)
-	if err != nil {
-		return nil
-	}
-
-	convertedBack, err := tree.PerformCast(c.f.evalCtx, convertedDatum, originalColType)
-	if err != nil {
-		return nil
-	}
-
-	if convertedBack.Compare(c.f.evalCtx, cnst.Value) != 0 {
-		return nil
-	}
-
-	return c.f.ConstructConst(convertedDatum)
-}
-
-// FoldComparison evaluates a comparison expression with constant inputs. It
-// returns a constant expression as long as it finds an appropriate overload
-// function for the given operator and input types, and the evaluation causes
-// no error.
-func (c *CustomFuncs) FoldComparison(op opt.Operator, left, right opt.ScalarExpr) opt.ScalarExpr {
-	lDatum, rDatum := memo.ExtractConstDatum(left), memo.ExtractConstDatum(right)
-
-	var flipped, not bool
-	o, flipped, not, ok := memo.FindComparisonOverload(op, left.DataType(), right.DataType())
-	if !ok {
-		return nil
-	}
-
-	if flipped {
-		lDatum, rDatum = rDatum, lDatum
-	}
-
-	result, err := o.Fn(c.f.evalCtx, lDatum, rDatum)
-	if err != nil {
-		return nil
-	}
-	if b, ok := result.(*tree.DBool); ok && not {
-		result = tree.MakeDBool(!*b)
-	}
-	return c.f.ConstructConstVal(result, types.Bool)
-}
-
-// AreFiltersSorted determines whether the expressions in a FiltersExpr are
-// ordered by their expression IDs.
-func (c *CustomFuncs) AreFiltersSorted(f memo.FiltersExpr) bool {
-	for i, n := 0, f.ChildCount(); i < n-1; i++ {
-		if f.Child(i).Child(0).(opt.ScalarExpr).ID() > f.Child(i+1).Child(0).(opt.ScalarExpr).ID() {
-			return false
-		}
-	}
-	return true
-}
-
-// SortFilters sorts a filter list by the IDs of the expressions. This has the
-// effect of canonicalizing FiltersExprs which may have the same filters, but
-// in a different order.
-func (c *CustomFuncs) SortFilters(f memo.FiltersExpr) memo.FiltersExpr {
-	result := make(memo.FiltersExpr, len(f))
-	for i, n := 0, f.ChildCount(); i < n; i++ {
-		fi := f.Child(i).(*memo.FiltersItem)
-		result[i] = *fi
-	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Child(0).(opt.ScalarExpr).ID() < result[j].Child(0).(opt.ScalarExpr).ID()
-	})
-	return result
 }

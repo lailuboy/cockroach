@@ -16,11 +16,10 @@ package distsqlrun
 
 import (
 	"context"
-	"net"
+	"math"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -28,12 +27,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // RepeatableRowSource is a RowSource used in benchmarks to avoid having to
@@ -44,16 +41,14 @@ type RepeatableRowSource struct {
 	nextRowIdx int
 	rows       sqlbase.EncDatumRows
 	// Schema of rows.
-	types []sqlbase.ColumnType
+	types []types.T
 }
 
 var _ RowSource = &RepeatableRowSource{}
 
 // NewRepeatableRowSource creates a RepeatableRowSource with the given schema
 // and rows. types is optional if at least one row is provided.
-func NewRepeatableRowSource(
-	types []sqlbase.ColumnType, rows sqlbase.EncDatumRows,
-) *RepeatableRowSource {
+func NewRepeatableRowSource(types []types.T, rows sqlbase.EncDatumRows) *RepeatableRowSource {
 	if types == nil {
 		panic("types required")
 	}
@@ -61,7 +56,7 @@ func NewRepeatableRowSource(
 }
 
 // OutputTypes is part of the RowSource interface.
-func (r *RepeatableRowSource) OutputTypes() []sqlbase.ColumnType {
+func (r *RepeatableRowSource) OutputTypes() []types.T {
 	return r.types
 }
 
@@ -69,7 +64,7 @@ func (r *RepeatableRowSource) OutputTypes() []sqlbase.ColumnType {
 func (r *RepeatableRowSource) Start(ctx context.Context) context.Context { return ctx }
 
 // Next is part of the RowSource interface.
-func (r *RepeatableRowSource) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (r *RepeatableRowSource) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	// If we've emitted all rows, signal that we have reached the end.
 	if r.nextRowIdx >= len(r.rows) {
 		return nil, nil
@@ -97,14 +92,16 @@ type RowDisposer struct{}
 var _ RowReceiver = &RowDisposer{}
 
 // Push is part of the RowReceiver interface.
-func (r *RowDisposer) Push(row sqlbase.EncDatumRow, meta *ProducerMetadata) ConsumerStatus {
+func (r *RowDisposer) Push(
+	row sqlbase.EncDatumRow, meta *distsqlpb.ProducerMetadata,
+) ConsumerStatus {
 	return NeedMoreRows
 }
 
 // ProducerDone is part of the RowReceiver interface.
 func (r *RowDisposer) ProducerDone() {}
 
-func (r *RowDisposer) Types() []sqlbase.ColumnType {
+func (r *RowDisposer) Types() []types.T {
 	return nil
 }
 
@@ -132,81 +129,6 @@ func (rb *RowBuffer) GetRowsNoMeta(t *testing.T) sqlbase.EncDatumRows {
 	return res
 }
 
-// startMockDistSQLServer starts a MockDistSQLServer and returns the address on
-// which it's listening.
-func startMockDistSQLServer(stopper *stop.Stopper) (*MockDistSQLServer, net.Addr, error) {
-	rpcContext := newInsecureRPCContext(stopper)
-	server := rpc.NewServer(rpcContext)
-	mock := newMockDistSQLServer()
-	distsqlpb.RegisterDistSQLServer(server, mock)
-	ln, err := netutil.ListenAndServeGRPC(stopper, server, util.IsolatedTestAddr)
-	if err != nil {
-		return nil, nil, err
-	}
-	return mock, ln.Addr(), nil
-}
-
-func newInsecureRPCContext(stopper *stop.Stopper) *rpc.Context {
-	return rpc.NewContext(
-		log.AmbientContext{Tracer: tracing.NewTracer()},
-		&base.Config{Insecure: true},
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond),
-		stopper,
-		&cluster.MakeTestingClusterSettings().Version,
-	)
-}
-
-// MockDistSQLServer implements the DistSQLServer (gRPC) interface and allows
-// clients to control the inbound streams.
-type MockDistSQLServer struct {
-	inboundStreams   chan InboundStreamNotification
-	runSyncFlowCalls chan RunSyncFlowCall
-}
-
-// InboundStreamNotification is the MockDistSQLServer's way to tell its clients
-// that a new gRPC call has arrived and thus a stream has arrived. The rpc
-// handler is blocked until donec is signaled.
-type InboundStreamNotification struct {
-	stream distsqlpb.DistSQL_FlowStreamServer
-	donec  chan<- error
-}
-
-type RunSyncFlowCall struct {
-	stream distsqlpb.DistSQL_RunSyncFlowServer
-	donec  chan<- error
-}
-
-// MockDistSQLServer implements the DistSQLServer interface.
-var _ distsqlpb.DistSQLServer = &MockDistSQLServer{}
-
-func newMockDistSQLServer() *MockDistSQLServer {
-	return &MockDistSQLServer{
-		inboundStreams:   make(chan InboundStreamNotification),
-		runSyncFlowCalls: make(chan RunSyncFlowCall),
-	}
-}
-
-// RunSyncFlow is part of the DistSQLServer interface.
-func (ds *MockDistSQLServer) RunSyncFlow(stream distsqlpb.DistSQL_RunSyncFlowServer) error {
-	donec := make(chan error)
-	ds.runSyncFlowCalls <- RunSyncFlowCall{stream: stream, donec: donec}
-	return <-donec
-}
-
-// SetupFlow is part of the DistSQLServer interface.
-func (ds *MockDistSQLServer) SetupFlow(
-	_ context.Context, req *distsqlpb.SetupFlowRequest,
-) (*distsqlpb.SimpleResponse, error) {
-	return nil, nil
-}
-
-// FlowStream is part of the DistSQLServer interface.
-func (ds *MockDistSQLServer) FlowStream(stream distsqlpb.DistSQL_FlowStreamServer) error {
-	donec := make(chan error)
-	ds.inboundStreams <- InboundStreamNotification{stream: stream, donec: donec}
-	return <-donec
-}
-
 // createDummyStream creates the server and client side of a FlowStream stream.
 // This can be use by tests to pretend that then have received a FlowStream RPC.
 // The stream can be used to send messages (ConsumerSignal's) on it (within a
@@ -223,12 +145,14 @@ func createDummyStream() (
 	err error,
 ) {
 	stopper := stop.NewStopper()
-	mockServer, addr, err := startMockDistSQLServer(stopper)
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clusterID, mockServer, addr, err := StartMockDistSQLServer(clock, stopper, staticNodeID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	rpcCtx := newInsecureRPCContext(stopper)
-	conn, err := rpcCtx.GRPCDial(addr.String()).Connect(context.Background())
+
+	rpcContext := rpc.NewInsecureTestingContextWithClusterID(clock, stopper, clusterID)
+	conn, err := rpcContext.GRPCDialNode(addr.String(), staticNodeID).Connect(context.Background())
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -237,10 +161,10 @@ func createDummyStream() (
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	streamNotification := <-mockServer.inboundStreams
-	serverStream = streamNotification.stream
+	streamNotification := <-mockServer.InboundStreams
+	serverStream = streamNotification.Stream
 	cleanup = func() {
-		close(streamNotification.donec)
+		close(streamNotification.Donec)
 		stopper.Stop(context.TODO())
 	}
 	return serverStream, clientStream, cleanup, nil
@@ -252,9 +176,9 @@ func runProcessorTest(
 	t *testing.T,
 	core distsqlpb.ProcessorCoreUnion,
 	post distsqlpb.PostProcessSpec,
-	inputTypes []sqlbase.ColumnType,
+	inputTypes []types.T,
 	inputRows sqlbase.EncDatumRows,
-	outputTypes []sqlbase.ColumnType,
+	outputTypes []types.T,
 	expected sqlbase.EncDatumRows,
 	txn *client.Txn,
 ) {
@@ -311,4 +235,18 @@ type rowsAccessor interface {
 
 func (s *sorterBase) getRows() *rowcontainer.DiskBackedRowContainer {
 	return s.rows.(*rowcontainer.DiskBackedRowContainer)
+}
+
+func makeTestDiskMonitor(ctx context.Context, st *cluster.Settings) *mon.BytesMonitor {
+	diskMonitor := mon.MakeMonitor(
+		"test-disk",
+		mon.DiskResource,
+		nil, /* curCount */
+		nil, /* maxHist */
+		-1,  /* increment: use default block size */
+		math.MaxInt64,
+		st,
+	)
+	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	return &diskMonitor
 }

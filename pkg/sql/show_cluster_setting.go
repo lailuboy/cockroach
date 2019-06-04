@@ -26,8 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -108,31 +108,21 @@ func (p *planner) ShowClusterSetting(
 	ctx context.Context, n *tree.ShowClusterSetting,
 ) (planNode, error) {
 
-	if err := p.RequireSuperUser(ctx, "SHOW CLUSTER SETTINGS"); err != nil {
+	if err := p.RequireSuperUser(ctx, "SHOW CLUSTER SETTING"); err != nil {
 		return nil, err
 	}
 
 	name := strings.ToLower(n.Name)
-
-	if name == "all" {
-		return p.delegateQuery(ctx, "SHOW CLUSTER SETTINGS", `
-SELECT variable,
-       value,
-       type AS setting_type,
-       description
-  FROM crdb_internal.cluster_settings`, nil, nil)
-	}
-
 	st := p.ExecCfg().Settings
 	val, ok := settings.Lookup(name)
 	if !ok {
 		return nil, errors.Errorf("unknown setting: %q", name)
 	}
-	var dType types.T
+	var dType *types.T
 	switch val.(type) {
-	case *settings.IntSetting, *settings.EnumSetting:
+	case *settings.IntSetting:
 		dType = types.Int
-	case *settings.StringSetting, *settings.ByteSizeSetting, *settings.StateMachineSetting:
+	case *settings.StringSetting, *settings.ByteSizeSetting, *settings.StateMachineSetting, *settings.EnumSetting:
 		dType = types.String
 	case *settings.BoolSetting:
 		dType = types.Bool
@@ -168,7 +158,7 @@ SELECT variable,
 			case *settings.DurationSetting:
 				d = &tree.DInterval{Duration: duration.MakeDuration(s.Get(&st.SV).Nanoseconds(), 0, 0)}
 			case *settings.EnumSetting:
-				d = tree.NewDInt(tree.DInt(s.Get(&st.SV)))
+				d = tree.NewDString(s.String(&st.SV))
 			case *settings.ByteSizeSetting:
 				d = tree.NewDString(s.String(&st.SV))
 			default:

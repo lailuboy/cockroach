@@ -16,22 +16,36 @@ package sql
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+)
+
+// createStatsPostEvents controls the cluster setting for enabling
+// automatic table statistics collection.
+var createStatsPostEvents = settings.RegisterBoolSetting(
+	"sql.stats.post_events.enabled",
+	"if set, an event is shown for every CREATE STATISTICS job",
+	false,
 )
 
 func (p *planner) CreateStatistics(ctx context.Context, n *tree.CreateStats) (planNode, error) {
@@ -90,76 +104,9 @@ func (*createStatsNode) Values() tree.Datums   { return nil }
 
 // startJob starts a CreateStats job to plan and execute statistics creation.
 func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Datums) error {
-	if !n.p.ExecCfg().Settings.Version.IsActive(cluster.VersionCreateStats) {
-		return errors.Errorf(`CREATE STATISTICS requires all nodes to be upgraded to %s`,
-			cluster.VersionByKey(cluster.VersionCreateStats),
-		)
-	}
-
-	var tableDesc *ImmutableTableDescriptor
-	var err error
-	switch t := n.Table.(type) {
-	case *tree.TableName:
-		// TODO(anyone): if CREATE STATISTICS is meant to be able to operate
-		// within a transaction, then the following should probably run with
-		// caching disabled, like other DDL statements.
-		tableDesc, err = ResolveExistingObject(ctx, n.p, t, true /*required*/, requireTableDesc)
-		if err != nil {
-			return err
-		}
-
-	case *tree.TableRef:
-		flags := ObjectLookupFlags{CommonLookupFlags: CommonLookupFlags{
-			avoidCached: n.p.avoidCachedDescriptors,
-		}}
-		tableDesc, err = n.p.Tables().getTableVersionByID(ctx, n.p.txn, sqlbase.ID(t.TableID), flags)
-		if err != nil {
-			return err
-		}
-	}
-
-	if tableDesc.IsVirtualTable() {
-		return pgerror.NewError(pgerror.CodeWrongObjectTypeError, "cannot create statistics on virtual tables")
-	}
-
-	if tableDesc.IsView() {
-		return pgerror.NewError(pgerror.CodeWrongObjectTypeError, "cannot create statistics on views")
-	}
-
-	if err := n.p.CheckPrivilege(ctx, tableDesc, privilege.SELECT); err != nil {
+	record, err := n.makeJobRecord(ctx)
+	if err != nil {
 		return err
-	}
-
-	// Identify which columns we should create statistics for.
-	var createStatsColLists []jobspb.CreateStatsDetails_ColList
-	if len(n.ColumnNames) == 0 {
-		if createStatsColLists, err = createStatsDefaultColumns(tableDesc); err != nil {
-			return err
-		}
-	} else {
-		columns, err := tableDesc.FindActiveColumnsByNames(n.ColumnNames)
-		if err != nil {
-			return err
-		}
-
-		columnIDs := make([]sqlbase.ColumnID, len(columns))
-		for i := range columns {
-			if columns[i].Type.SemanticType == sqlbase.ColumnType_JSONB {
-				return errors.New("CREATE STATISTICS is not supported for JSON columns")
-			}
-			columnIDs[i] = columns[i].ID
-		}
-		createStatsColLists = []jobspb.CreateStatsDetails_ColList{{IDs: columnIDs}}
-	}
-
-	// Evaluate the AS OF time, if any.
-	var asOf *hlc.Timestamp
-	if n.AsOf.Expr != nil {
-		asOfTs, err := n.p.EvalAsOfTimestamp(n.AsOf)
-		if err != nil {
-			return err
-		}
-		asOf = &asOfTs
 	}
 
 	if n.Name == stats.AutoStatsName {
@@ -170,25 +117,141 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 		if err := checkRunningJobs(ctx, nil /* job */, n.p); err != nil {
 			return err
 		}
+	} else {
+		telemetry.Inc(sqltelemetry.CreateStatisticsUseCounter)
 	}
 
-	// Create a job to run statistics creation.
-	_, errCh, err := n.p.ExecCfg().JobRegistry.StartJob(ctx, resultsCh, jobs.Record{
-		Description: tree.AsStringWithFlags(n, tree.FmtAlwaysQualifyTableNames),
-		Username:    n.p.User(),
-		Details: jobspb.CreateStatsDetails{
-			Name:        n.Name,
-			Table:       tableDesc.TableDescriptor,
-			ColumnLists: createStatsColLists,
-			Statement:   n.String(),
-			AsOf:        asOf,
-		},
-		Progress: jobspb.CreateStatsProgress{},
-	})
+	job, errCh, err := n.p.ExecCfg().JobRegistry.StartJob(ctx, resultsCh, *record)
 	if err != nil {
 		return err
 	}
-	return <-errCh
+
+	if err = <-errCh; err != nil {
+		pgerr, ok := errors.Cause(err).(*pgerror.Error)
+		if ok && pgerr.Code == pgerror.CodeLockNotAvailableError {
+			// Delete the job so users don't see it and get confused by the error.
+			const stmt = `DELETE FROM system.jobs WHERE id = $1`
+			if _ /* cols */, delErr := n.p.ExecCfg().InternalExecutor.Exec(
+				ctx, "delete-job", nil /* txn */, stmt, *job.ID(),
+			); delErr != nil {
+				log.Warningf(ctx, "failed to delete job: %v", delErr)
+			}
+		}
+	}
+	return err
+}
+
+// makeJobRecord creates a CreateStats job record which can be used to plan and
+// execute statistics creation.
+func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, error) {
+	if !n.p.ExecCfg().Settings.Version.IsActive(cluster.VersionCreateStats) {
+		return nil, pgerror.Newf(pgerror.CodeObjectNotInPrerequisiteStateError,
+			`CREATE STATISTICS requires all nodes to be upgraded to %s`,
+			cluster.VersionByKey(cluster.VersionCreateStats),
+		)
+	}
+
+	var tableDesc *ImmutableTableDescriptor
+	var fqTableName string
+	var err error
+	switch t := n.Table.(type) {
+	case *tree.UnresolvedObjectName:
+		tableDesc, err = n.p.ResolveExistingObjectEx(ctx, t, true /*required*/, ResolveRequireTableDesc)
+		if err != nil {
+			return nil, err
+		}
+		fqTableName = n.p.ResolvedName(t).FQString()
+
+	case *tree.TableRef:
+		flags := ObjectLookupFlags{CommonLookupFlags: CommonLookupFlags{
+			avoidCached: n.p.avoidCachedDescriptors,
+		}}
+		tableDesc, err = n.p.Tables().getTableVersionByID(ctx, n.p.txn, sqlbase.ID(t.TableID), flags)
+		if err != nil {
+			return nil, err
+		}
+		fqTableName, err = n.p.getQualifiedTableName(ctx, &tableDesc.TableDescriptor)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if tableDesc.IsVirtualTable() {
+		return nil, pgerror.New(
+			pgerror.CodeWrongObjectTypeError, "cannot create statistics on virtual tables",
+		)
+	}
+
+	if tableDesc.IsView() {
+		return nil, pgerror.New(
+			pgerror.CodeWrongObjectTypeError, "cannot create statistics on views",
+		)
+	}
+
+	if err := n.p.CheckPrivilege(ctx, tableDesc, privilege.SELECT); err != nil {
+		return nil, err
+	}
+
+	// Identify which columns we should create statistics for.
+	var createStatsColLists []jobspb.CreateStatsDetails_ColList
+	if len(n.ColumnNames) == 0 {
+		if createStatsColLists, err = createStatsDefaultColumns(tableDesc); err != nil {
+			return nil, err
+		}
+	} else {
+		columns, err := tableDesc.FindActiveColumnsByNames(n.ColumnNames)
+		if err != nil {
+			return nil, err
+		}
+
+		columnIDs := make([]sqlbase.ColumnID, len(columns))
+		for i := range columns {
+			if columns[i].Type.Family() == types.JsonFamily {
+				return nil, pgerror.UnimplementedWithIssuef(35844,
+					"CREATE STATISTICS is not supported for JSON columns")
+			}
+			columnIDs[i] = columns[i].ID
+		}
+		createStatsColLists = []jobspb.CreateStatsDetails_ColList{{IDs: columnIDs}}
+	}
+
+	// Evaluate the AS OF time, if any.
+	var asOf *hlc.Timestamp
+	if n.Options.AsOf.Expr != nil {
+		asOfTs, err := n.p.EvalAsOfTimestamp(n.Options.AsOf)
+		if err != nil {
+			return nil, err
+		}
+		asOf = &asOfTs
+	}
+
+	// Create a job to run statistics creation.
+	statement := tree.AsStringWithFQNames(n, n.p.EvalContext().Annotations)
+	var description string
+	if n.Name == stats.AutoStatsName {
+		// Use a user-friendly description for automatic statistics.
+		description = fmt.Sprintf("Table statistics refresh for %s", fqTableName)
+	} else {
+		// This must be a user query, so use the statement (for consistency with
+		// other jobs triggered by statements).
+		description = statement
+		statement = ""
+	}
+	return &jobs.Record{
+		Description: description,
+		Statement:   statement,
+		Username:    n.p.User(),
+		Details: jobspb.CreateStatsDetails{
+			Name:            string(n.Name),
+			FQTableName:     fqTableName,
+			Table:           tableDesc.TableDescriptor,
+			ColumnLists:     createStatsColLists,
+			Statement:       n.String(),
+			AsOf:            asOf,
+			MaxFractionIdle: n.Options.Throttling,
+		},
+		Progress: jobspb.CreateStatsProgress{},
+	}, nil
 }
 
 // maxNonIndexCols is the maximum number of non-index columns that we will use
@@ -225,6 +288,10 @@ func createStatsDefaultColumns(
 
 	// Add columns for each secondary index.
 	for i := range desc.Indexes {
+		if desc.Indexes[i].Type == sqlbase.IndexDescriptor_INVERTED {
+			// We don't yet support stats on inverted indexes.
+			continue
+		}
 		idxCol := desc.Indexes[i].ColumnIDs[0]
 		if !requestedCols.Contains(int(idxCol)) {
 			columns = append(
@@ -238,7 +305,7 @@ func createStatsDefaultColumns(
 	nonIdxCols := 0
 	for i := 0; i < len(desc.Columns) && nonIdxCols < maxNonIndexCols; i++ {
 		col := &desc.Columns[i]
-		if col.Type.SemanticType != sqlbase.ColumnType_JSONB && !requestedCols.Contains(int(col.ID)) {
+		if col.Type.Family() != types.JsonFamily && !requestedCols.Contains(int(col.ID)) {
 			columns = append(
 				columns, jobspb.CreateStatsDetails_ColList{IDs: []sqlbase.ColumnID{col.ID}},
 			)
@@ -249,11 +316,27 @@ func createStatsDefaultColumns(
 	return columns, nil
 }
 
+// makePlanForExplainDistSQL is part of the distSQLExplainable interface.
+func (n *createStatsNode) makePlanForExplainDistSQL(
+	planCtx *PlanningCtx, distSQLPlanner *DistSQLPlanner,
+) (PhysicalPlan, error) {
+	// Create a job record but don't actually start the job.
+	record, err := n.makeJobRecord(planCtx.ctx)
+	if err != nil {
+		return PhysicalPlan{}, err
+	}
+	job := n.p.ExecCfg().JobRegistry.NewJob(*record)
+
+	return distSQLPlanner.createPlanForCreateStats(planCtx, job)
+}
+
 // createStatsResumer implements the jobs.Resumer interface for CreateStats
 // jobs. A new instance is created for each job. evalCtx is populated inside
 // createStatsResumer.Resume so it can be used in createStatsResumer.OnSuccess
 // (if the job is successful).
 type createStatsResumer struct {
+	job     *jobs.Job
+	tableID sqlbase.ID
 	evalCtx *extendedEvalContext
 }
 
@@ -261,21 +344,22 @@ var _ jobs.Resumer = &createStatsResumer{}
 
 // Resume is part of the jobs.Resumer interface.
 func (r *createStatsResumer) Resume(
-	ctx context.Context, job *jobs.Job, phs interface{}, resultsCh chan<- tree.Datums,
+	ctx context.Context, phs interface{}, resultsCh chan<- tree.Datums,
 ) error {
 	p := phs.(*planner)
-	details := job.Details().(jobspb.CreateStatsDetails)
+	details := r.job.Details().(jobspb.CreateStatsDetails)
 	if details.Name == stats.AutoStatsName {
 		// We want to make sure there is only one automatic CREATE STATISTICS job
 		// running at a time.
-		if err := checkRunningJobs(ctx, job, p); err != nil {
+		if err := checkRunningJobs(ctx, r.job, p); err != nil {
 			return err
 		}
 	}
 
+	r.tableID = details.Table.ID
 	r.evalCtx = p.ExtendedEvalContext()
 
-	ci := sqlbase.ColTypeInfoFromColTypes([]sqlbase.ColumnType{})
+	ci := sqlbase.ColTypeInfoFromColTypes([]types.T{})
 	rows := rowcontainer.NewRowContainer(r.evalCtx.Mon.MakeBoundAccount(), ci, 0)
 	defer func() {
 		if rows != nil {
@@ -291,8 +375,10 @@ func (r *createStatsResumer) Resume(
 			txn.SetFixedTimestamp(ctx, *details.AsOf)
 		}
 
+		planCtx := dsp.NewPlanningCtx(ctx, r.evalCtx, txn)
+		planCtx.planner = p
 		if err := dsp.planAndRunCreateStats(
-			ctx, r.evalCtx, txn, job, NewRowResultWriter(rows),
+			ctx, r.evalCtx, planCtx, txn, r.job, NewRowResultWriter(rows),
 		); err != nil {
 			// Check if this was a context canceled error and restart if it was.
 			if s, ok := status.FromError(errors.Cause(err)); ok {
@@ -308,7 +394,7 @@ func (r *createStatsResumer) Resume(
 			// job progress to coerce out the correct error type. If the update succeeds
 			// then return the original error, otherwise return this error instead so
 			// it can be cleaned up at a higher level.
-			if jobErr := job.FractionProgressed(
+			if jobErr := r.job.FractionProgressed(
 				ctx,
 				func(ctx context.Context, _ jobspb.ProgressDetails) float32 {
 					// The job failed so the progress value here doesn't really matter.
@@ -354,7 +440,7 @@ func checkRunningJobs(ctx context.Context, job *jobs.Job, p *planner) error {
 			return err
 		}
 
-		if payload.Type() == jobspb.TypeCreateStats {
+		if payload.Type() == jobspb.TypeCreateStats || payload.Type() == jobspb.TypeAutoCreateStats {
 			id := (*int64)(row[0].(*tree.DInt))
 			if *id == jobID {
 				break
@@ -362,7 +448,7 @@ func checkRunningJobs(ctx context.Context, job *jobs.Job, p *planner) error {
 
 			// This is not the first CreateStats job running. This job should fail
 			// so that the earlier job can succeed.
-			return pgerror.NewError(
+			return pgerror.New(
 				pgerror.CodeLockNotAvailableError, "another CREATE STATISTICS job is already running",
 			)
 		}
@@ -371,16 +457,24 @@ func checkRunningJobs(ctx context.Context, job *jobs.Job, p *planner) error {
 }
 
 // OnFailOrCancel is part of the jobs.Resumer interface.
-func (r *createStatsResumer) OnFailOrCancel(
-	ctx context.Context, txn *client.Txn, job *jobs.Job,
-) error {
+func (r *createStatsResumer) OnFailOrCancel(ctx context.Context, txn *client.Txn) error {
 	return nil
 }
 
 // OnSuccess is part of the jobs.Resumer interface.
-func (r *createStatsResumer) OnSuccess(ctx context.Context, _ *client.Txn, job *jobs.Job) error {
-	details := job.Details().(jobspb.CreateStatsDetails)
+func (r *createStatsResumer) OnSuccess(ctx context.Context, _ *client.Txn) error {
+	details := r.job.Details().(jobspb.CreateStatsDetails)
+
+	// Invalidate the local cache synchronously; this guarantees that the next
+	// statement in the same session won't use a stale cache (whereas the gossip
+	// update is handled asynchronously).
+	r.evalCtx.ExecCfg.TableStatsCache.InvalidateTableStats(ctx, r.tableID)
+
 	// Record this statistics creation in the event log.
+	if !createStatsPostEvents.Get(&r.evalCtx.Settings.SV) {
+		return nil
+	}
+
 	// TODO(rytaft): This creates a new transaction for the CREATE STATISTICS
 	// event. It must be different from the CREATE STATISTICS transaction,
 	// because that transaction must be read-only. In the future we may want
@@ -395,24 +489,23 @@ func (r *createStatsResumer) OnSuccess(ctx context.Context, _ *client.Txn, job *
 			int32(details.Table.ID),
 			int32(r.evalCtx.NodeID),
 			struct {
-				StatisticName string
-				Statement     string
-			}{details.Name.String(), details.Statement},
+				TableName string
+				Statement string
+			}{details.FQTableName, details.Statement},
 		)
 	})
 }
 
 // OnTerminal is part of the jobs.Resumer interface.
 func (r *createStatsResumer) OnTerminal(
-	ctx context.Context, job *jobs.Job, status jobs.Status, resultsCh chan<- tree.Datums,
+	ctx context.Context, status jobs.Status, resultsCh chan<- tree.Datums,
 ) {
 }
 
 func init() {
-	jobs.AddResumeHook(func(typ jobspb.Type, settings *cluster.Settings) jobs.Resumer {
-		if typ != jobspb.TypeCreateStats {
-			return nil
-		}
-		return &createStatsResumer{}
-	})
+	createResumerFn := func(job *jobs.Job, settings *cluster.Settings) jobs.Resumer {
+		return &createStatsResumer{job: job}
+	}
+	jobs.RegisterConstructor(jobspb.TypeCreateStats, createResumerFn)
+	jobs.RegisterConstructor(jobspb.TypeAutoCreateStats, createResumerFn)
 }

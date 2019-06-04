@@ -17,12 +17,14 @@ package optbuilder
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/delegate"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/exprgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // Builder holds the context needed for building a memo structure from a SQL
@@ -62,14 +64,6 @@ type Builder struct {
 	// This is used when re-preparing invalidated queries.
 	KeepPlaceholders bool
 
-	// FmtFlags controls the way column names are formatted in test output. For
-	// example, if set to FmtAlwaysQualifyTableNames, the builder fully qualifies
-	// the table name in all column aliases before adding them to the metadata.
-	// This flag allows us to test that name resolution works correctly, and
-	// avoids cluttering test output with schema and catalog names in the general
-	// case.
-	FmtFlags tree.FmtFlags
-
 	// IsCorrelated is set to true during semantic analysis if a scalar variable was
 	// pulled from an outer scope, that is, if the query was found to be correlated.
 	IsCorrelated bool
@@ -77,6 +71,11 @@ type Builder struct {
 	// HadPlaceholders is set to true if we replaced any placeholders with their
 	// values.
 	HadPlaceholders bool
+
+	// DisableMemoReuse is set to true if we encountered a statement that is not
+	// safe to cache the memo for. This is the case for various DDL and SHOW
+	// statements.
+	DisableMemoReuse bool
 
 	factory *norm.Factory
 	stmt    tree.Statement
@@ -127,18 +126,21 @@ func New(
 // Builder.factory from the parsed SQL statement in Builder.stmt. See the
 // comment above the Builder type declaration for details.
 //
-// If any subroutines panic with a builderError as part of the build process,
-// the panic is caught here and returned as an error.
+// If any subroutines panic with a builderError or pgerror.Error as part of the
+// build process, the panic is caught here and returned as an error.
 func (b *Builder) Build() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			// This code allows us to propagate builder errors without adding
-			// lots of checks for `if err != nil` throughout the code. This is
+			// This code allows us to propagate semantic and internal errors without
+			// adding lots of checks for `if err != nil` throughout the code. This is
 			// only possible because the code does not update shared state and does
 			// not manipulate locks.
-			if bldErr, ok := r.(builderError); ok {
-				err = bldErr.error
-			} else {
+			switch e := r.(type) {
+			case builderError:
+				err = e.error
+			case *pgerror.Error:
+				err = e
+			default:
 				panic(r)
 			}
 		}
@@ -153,24 +155,26 @@ func (b *Builder) Build() (err error) {
 
 	// Build the memo, and call SetRoot on the memo to indicate the root group
 	// and physical properties.
-	outScope := b.buildStmt(b.stmt, b.allocScope())
+	outScope := b.buildStmt(b.stmt, nil /* desiredTypes */, b.allocScope())
 	physical := outScope.makePhysicalProps()
 	b.factory.Memo().SetRoot(outScope.expr, physical)
 	return nil
 }
 
-// builderError is used for semantic errors that occur during the build process
-// and is passed as an argument to panic. These panics are caught and converted
-// back to errors inside Builder.Build.
+// builderError is used to wrap errors returned by various external APIs that
+// occur during the build process. It exists for us to be able to panic on these
+// errors and then catch them inside Builder.Build even if they are not
+// pgerror.Error.
 type builderError struct {
 	error
 }
 
-// unimplementedf formats according to a format specifier and returns a Postgres
-// error with the pgerror.CodeFeatureNotSupportedError code, wrapped in a
+// unimplementedWithIssueDetailf formats according to a format
+// specifier and returns a Postgres error with the
+// pg code FeatureNotSupported, wrapped in a
 // builderError.
-func unimplementedf(format string, a ...interface{}) builderError {
-	return builderError{pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, format, a...)}
+func unimplementedWithIssueDetailf(issue int, detail, format string, args ...interface{}) error {
+	return pgerror.UnimplementedWithIssueDetailf(issue, detail, format, args...)
 }
 
 // buildStmt builds a set of memo groups that represent the given SQL
@@ -187,9 +191,11 @@ func unimplementedf(format string, a ...interface{}) builderError {
 //
 // outScope  This return value contains the newly bound variables that will be
 //           visible to enclosing statements, as well as a pointer to any
-//           "parent" scope that is still visible. The top-level memo group ID
-//           for the built statement/expression is returned in outScope.group.
-func (b *Builder) buildStmt(stmt tree.Statement, inScope *scope) (outScope *scope) {
+//           "parent" scope that is still visible. The top-level memo expression
+//           for the built statement/expression is returned in outScope.expr.
+func (b *Builder) buildStmt(
+	stmt tree.Statement, desiredTypes []*types.T, inScope *scope,
+) (outScope *scope) {
 	// NB: The case statements are sorted lexicographically.
 	switch stmt := stmt.(type) {
 	case *tree.CreateTable:
@@ -205,10 +211,10 @@ func (b *Builder) buildStmt(stmt tree.Statement, inScope *scope) (outScope *scop
 		return b.buildInsert(stmt, inScope)
 
 	case *tree.ParenSelect:
-		return b.buildSelect(stmt.Select, nil /* desiredTypes */, inScope)
+		return b.buildSelect(stmt.Select, desiredTypes, inScope)
 
 	case *tree.Select:
-		return b.buildSelect(stmt, nil /* desiredTypes */, inScope)
+		return b.buildSelect(stmt, desiredTypes, inScope)
 
 	case *tree.ShowTraceForSession:
 		return b.buildShowTrace(stmt, inScope)
@@ -217,7 +223,18 @@ func (b *Builder) buildStmt(stmt tree.Statement, inScope *scope) (outScope *scop
 		return b.buildUpdate(stmt, inScope)
 
 	default:
-		panic(unimplementedf("unsupported statement: %T", stmt))
+		newStmt, err := delegate.TryDelegate(b.ctx, b.catalog, b.evalCtx, stmt)
+		if err != nil {
+			panic(builderError{err})
+		}
+		if newStmt != nil {
+			// Many delegate implementations resolve objects. It would be tedious to
+			// register all those dependencies with the metadata (for cache
+			// invalidation). We don't care about caching plans for these statements.
+			b.DisableMemoReuse = true
+			return b.buildStmt(newStmt, desiredTypes, inScope)
+		}
+		panic(unimplementedWithIssueDetailf(34848, stmt.StatementTag(), "unsupported statement: %T", stmt))
 	}
 }
 

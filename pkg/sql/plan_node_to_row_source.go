@@ -21,11 +21,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 type metadataForwarder interface {
-	forwardMetadata(metadata *distsqlrun.ProducerMetadata)
+	forwardMetadata(metadata *distsqlpb.ProducerMetadata)
 }
 
 type planNodeToRowSource struct {
@@ -37,7 +38,7 @@ type planNodeToRowSource struct {
 
 	node        planNode
 	params      runParams
-	outputTypes []sqlbase.ColumnType
+	outputTypes []types.T
 
 	firstNotWrapped planNode
 
@@ -50,13 +51,9 @@ func makePlanNodeToRowSource(
 ) (*planNodeToRowSource, error) {
 	nodeColumns := planColumns(source)
 
-	types := make([]sqlbase.ColumnType, len(nodeColumns))
+	types := make([]types.T, len(nodeColumns))
 	for i := range nodeColumns {
-		colTyp, err := sqlbase.DatumTypeToColumnType(nodeColumns[i].Typ)
-		if err != nil {
-			return nil, err
-		}
-		types[i] = colTyp
+		types[i] = *nodeColumns[i].Typ
 	}
 	row := make(sqlbase.EncDatumRow, len(nodeColumns))
 
@@ -135,7 +132,7 @@ func (p *planNodeToRowSource) InternalClose() {
 	}
 }
 
-func (p *planNodeToRowSource) Next() (sqlbase.EncDatumRow, *distsqlrun.ProducerMetadata) {
+func (p *planNodeToRowSource) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	if p.State == distsqlrun.StateRunning && p.fastPath {
 		var count int
 		// If our node is a "fast path node", it means that we're set up to just
@@ -183,7 +180,7 @@ func (p *planNodeToRowSource) Next() (sqlbase.EncDatumRow, *distsqlrun.ProducerM
 
 		for i, datum := range p.node.Values() {
 			if datum != nil {
-				p.row[i] = sqlbase.DatumToEncDatum(p.outputTypes[i], datum)
+				p.row[i] = sqlbase.DatumToEncDatum(&p.outputTypes[i], datum)
 			}
 		}
 		// ProcessRow here is required to deal with projections, which won't be
@@ -214,6 +211,6 @@ func (p *planNodeToRowSource) IsException() bool {
 // that need to forward metadata to the end of the flow. They can't pass
 // metadata through local processors, so they instead add the metadata to our
 // trailing metadata and expect us to forward it further.
-func (p *planNodeToRowSource) forwardMetadata(metadata *distsqlrun.ProducerMetadata) {
+func (p *planNodeToRowSource) forwardMetadata(metadata *distsqlpb.ProducerMetadata) {
 	p.ProcessorBase.AppendTrailingMeta(*metadata)
 }

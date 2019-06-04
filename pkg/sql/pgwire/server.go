@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -69,9 +70,12 @@ const (
 	// secure server in cleartext.
 	ErrSSLRequired = "node is running secure mode, SSL connection required"
 
-	// ErrDraining is returned when a client attempts to connect to a server
+	// ErrDrainingNewConn is returned when a client attempts to connect to a server
 	// which is not accepting client connections.
-	ErrDraining = "server is not accepting clients"
+	ErrDrainingNewConn = "server is not accepting clients"
+	// ErrDrainingExistingConn is returned when a connection is shut down because
+	// the server is draining.
+	ErrDrainingExistingConn = "server is shutting down"
 )
 
 // Fully-qualified names for metrics.
@@ -79,6 +83,12 @@ var (
 	MetaConns = metric.Metadata{
 		Name:        "sql.conns",
 		Help:        "Number of active sql connections",
+		Measurement: "Connections",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaNewConns = metric.Metadata{
+		Name:        "sql.new_conns",
+		Help:        "Counter of the number of sql connections created",
 		Measurement: "Connections",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -158,6 +168,7 @@ type ServerMetrics struct {
 	BytesInCount   *metric.Counter
 	BytesOutCount  *metric.Counter
 	Conns          *metric.Gauge
+	NewConns       *metric.Counter
 	ConnMemMetrics sql.MemoryMetrics
 	SQLMemMetrics  sql.MemoryMetrics
 }
@@ -169,6 +180,7 @@ func makeServerMetrics(
 		BytesInCount:   metric.NewCounter(MetaBytesIn),
 		BytesOutCount:  metric.NewCounter(MetaBytesOut),
 		Conns:          metric.NewGauge(MetaConns),
+		NewConns:       metric.NewCounter(MetaNewConns),
 		ConnMemMetrics: sql.MakeMemMetrics("conns", histogramWindow),
 		SQLMemMetrics:  sqlMemMetrics,
 	}
@@ -280,9 +292,11 @@ func (s *Server) IsDraining() bool {
 func (s *Server) Metrics() (res []interface{}) {
 	return []interface{}{
 		&s.metrics,
-		&s.SQLServer.Metrics.StatementCounters,
+		&s.SQLServer.Metrics.StartedStatementCounters,
+		&s.SQLServer.Metrics.ExecutedStatementCounters,
 		&s.SQLServer.Metrics.EngineMetrics,
-		&s.SQLServer.InternalMetrics.StatementCounters,
+		&s.SQLServer.InternalMetrics.StartedStatementCounters,
+		&s.SQLServer.InternalMetrics.ExecutedStatementCounters,
 		&s.SQLServer.InternalMetrics.EngineMetrics,
 	}
 }
@@ -398,6 +412,8 @@ func (s *Server) drainImpl(drainWait time.Duration, cancelWait time.Duration) er
 
 // ServeConn serves a single connection, driving the handshake process and
 // delegating to the appropriate connection type.
+//
+// An error is returned if the initial handshake of the connection fails.
 func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 	s.mu.Lock()
 	draining := s.mu.draining
@@ -421,6 +437,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 	// DrainClient() waits for that number to drop to zero,
 	// so we don't want it to oscillate unnecessarily.
 	if !draining {
+		s.metrics.NewConns.Inc(1)
 		s.metrics.Conns.Inc(1)
 		defer s.metrics.Conns.Dec(1)
 	}
@@ -471,24 +488,24 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 
 	sendErr := func(err error) error {
 		msgBuilder := newWriteBuffer(s.metrics.BytesOutCount)
-		_ /* err */ = writeErr(err, msgBuilder, conn)
+		_ /* err */ = writeErr(ctx, &s.execCfg.Settings.SV, err, msgBuilder, conn)
 		_ = conn.Close()
 		return err
 	}
 
 	if version != version30 {
 		if version == versionCancel {
-			telemetry.Count("pgwire.unimplemented.cancel_request")
+			telemetry.Inc(sqltelemetry.CancelRequestCounter)
 			_ = conn.Close()
 			return nil
 		}
 		return sendErr(fmt.Errorf("unknown protocol version %d", version))
 	}
 	if errSSLRequired {
-		return sendErr(pgerror.NewError(pgerror.CodeProtocolViolationError, ErrSSLRequired))
+		return sendErr(pgerror.New(pgerror.CodeProtocolViolationError, ErrSSLRequired))
 	}
 	if draining {
-		return sendErr(newAdminShutdownErr(errors.New(ErrDraining)))
+		return sendErr(newAdminShutdownErr(ErrDrainingNewConn))
 	}
 
 	var sArgs sql.SessionArgs
@@ -514,10 +531,23 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 	auth := s.auth.conf
 	s.auth.RUnlock()
 
-	return serveConn(
+	var authHook func(context.Context) error
+	if k := s.execCfg.PGWireTestingKnobs; k != nil {
+		authHook = k.AuthHook
+	}
+
+	serveConn(
 		ctx, conn, sArgs,
 		&s.metrics, reserved, s.SQLServer,
-		s.IsDraining, s.execCfg.InternalExecutor, s.stopper, s.cfg.Insecure, auth)
+		s.IsDraining,
+		authOptions{
+			insecure: s.cfg.Insecure,
+			ie:       s.execCfg.InternalExecutor,
+			auth:     auth,
+			authHook: authHook,
+		},
+		s.stopper)
+	return nil
 }
 
 // -1 for the sentinel in case someone wants to set it to 0.
@@ -532,7 +562,7 @@ func parseOptions(ctx context.Context, data []byte) (sql.SessionArgs, error) {
 	for {
 		key, err := buf.GetString()
 		if err != nil {
-			return sql.SessionArgs{}, pgerror.NewErrorf(pgerror.CodeProtocolViolationError,
+			return sql.SessionArgs{}, pgerror.Newf(pgerror.CodeProtocolViolationError,
 				"error reading option key: %s", err)
 		}
 		if len(key) == 0 {
@@ -540,7 +570,7 @@ func parseOptions(ctx context.Context, data []byte) (sql.SessionArgs, error) {
 		}
 		value, err := buf.GetString()
 		if err != nil {
-			return sql.SessionArgs{}, pgerror.NewErrorf(pgerror.CodeProtocolViolationError,
+			return sql.SessionArgs{}, pgerror.Newf(pgerror.CodeProtocolViolationError,
 				"error reading option value: %s", err)
 		}
 		key = strings.ToLower(key)
@@ -549,11 +579,11 @@ func parseOptions(ctx context.Context, data []byte) (sql.SessionArgs, error) {
 			args.User = value
 		case "results_buffer_size":
 			if args.ConnResultsBufferSize, err = humanizeutil.ParseBytes(value); err != nil {
-				return sql.SessionArgs{}, pgerror.NewErrorf(pgerror.CodeProtocolViolationError,
+				return sql.SessionArgs{}, pgerror.Newf(pgerror.CodeProtocolViolationError,
 					"error parsing results_buffer_size option value '%s' as bytes", value)
 			}
 			if args.ConnResultsBufferSize < 0 {
-				return sql.SessionArgs{}, pgerror.NewErrorf(pgerror.CodeProtocolViolationError,
+				return sql.SessionArgs{}, pgerror.Newf(pgerror.CodeProtocolViolationError,
 					"results_buffer_size option value '%s' cannot be negative", value)
 			}
 		default:
@@ -563,11 +593,12 @@ func parseOptions(ctx context.Context, data []byte) (sql.SessionArgs, error) {
 			} else {
 				if !exists {
 					if _, ok := sql.UnsupportedVars[key]; ok {
-						telemetry.Count("unimplemented.pgwire.parameter." + key)
+						counter := sqltelemetry.UnimplementedClientStatusParameterCounter(key)
+						telemetry.Inc(counter)
 					}
 					log.Warningf(ctx, "unknown configuration parameter: %q", key)
 				} else {
-					return sql.SessionArgs{}, pgerror.NewErrorf(pgerror.CodeCantChangeRuntimeParamError,
+					return sql.SessionArgs{}, pgerror.Newf(pgerror.CodeCantChangeRuntimeParamError,
 						"parameter %q cannot be changed", key)
 				}
 			}
@@ -583,6 +614,6 @@ func parseOptions(ctx context.Context, data []byte) (sql.SessionArgs, error) {
 	return args, nil
 }
 
-func newAdminShutdownErr(err error) error {
-	return pgerror.NewErrorf(pgerror.CodeAdminShutdownError, err.Error())
+func newAdminShutdownErr(msg string) error {
+	return pgerror.Newf(pgerror.CodeAdminShutdownError, msg)
 }

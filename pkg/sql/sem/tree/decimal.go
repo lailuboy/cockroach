@@ -32,7 +32,8 @@ var (
 		Rounding:    apd.RoundHalfUp,
 		MaxExponent: 2000,
 		MinExponent: -2000,
-		Traps:       apd.DefaultTraps,
+		// Don't error on invalid operation, return NaN instead.
+		Traps: apd.DefaultTraps &^ apd.InvalidOperation,
 	}
 	// ExactCtx is a decimal context with exact precision.
 	ExactCtx = DecimalCtx.WithPrecision(0)
@@ -51,7 +52,7 @@ var (
 		return &ctx
 	}()
 
-	errScaleOutOfRange = pgerror.NewError(pgerror.CodeNumericValueOutOfRangeError, "scale out of range")
+	errScaleOutOfRange = pgerror.New(pgerror.CodeNumericValueOutOfRangeError, "scale out of range")
 )
 
 // LimitDecimalWidth limits d's precision (total number of digits) and scale
@@ -66,7 +67,7 @@ func LimitDecimalWidth(d *apd.Decimal, precision, scale int) error {
 		return errScaleOutOfRange
 	}
 	if scale > precision {
-		return pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError, "scale (%d) must be between 0 and precision (%d)", scale, precision)
+		return pgerror.Newf(pgerror.CodeInvalidParameterValueError, "scale (%d) must be between 0 and precision (%d)", scale, precision)
 	}
 
 	// http://www.postgresql.org/docs/9.5/static/datatype-numeric.html
@@ -88,7 +89,7 @@ func LimitDecimalWidth(d *apd.Decimal, precision, scale int) error {
 		default:
 			lt = fmt.Sprintf("10^%d", v)
 		}
-		return pgerror.NewErrorf(pgerror.CodeNumericValueOutOfRangeError, "value with precision %d, scale %d must round to an absolute value less than %s", precision, scale, lt)
+		return pgerror.Newf(pgerror.CodeNumericValueOutOfRangeError, "value with precision %d, scale %d must round to an absolute value less than %s", precision, scale, lt)
 	}
 	return nil
 }

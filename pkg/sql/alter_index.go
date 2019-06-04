@@ -16,8 +16,8 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -33,7 +33,7 @@ type alterIndexNode struct {
 // AlterIndex applies a schema change on an index.
 // Privileges: CREATE on table.
 func (p *planner) AlterIndex(ctx context.Context, n *tree.AlterIndex) (planNode, error) {
-	tableDesc, indexDesc, err := p.getTableAndIndex(ctx, nil, n.Index, privilege.CREATE)
+	tableDesc, indexDesc, err := p.getTableAndIndex(ctx, &n.Index, privilege.CREATE)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +80,8 @@ func (n *alterIndexNode) startExec(params runParams) error {
 			}
 			n.indexDesc.Partitioning = partitioning
 		default:
-			return fmt.Errorf("unsupported alter command: %T", cmd)
+			return pgerror.AssertionFailedf(
+				"unsupported alter command: %T", cmd)
 		}
 	}
 
@@ -92,8 +93,9 @@ func (n *alterIndexNode) startExec(params runParams) error {
 	mutationID := sqlbase.InvalidMutationID
 	var err error
 	if addedMutations {
-		mutationID, err = params.p.createOrUpdateSchemaChangeJob(params.ctx, n.tableDesc,
-			tree.AsStringWithFlags(n.n, tree.FmtAlwaysQualifyTableNames))
+		mutationID, err = params.p.createOrUpdateSchemaChangeJob(
+			params.ctx, n.tableDesc, tree.AsStringWithFQNames(n.n, params.Ann()),
+		)
 	} else if !descriptorChanged {
 		// Nothing to be done
 		return nil

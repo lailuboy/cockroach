@@ -24,11 +24,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -46,8 +48,9 @@ func TestGossipInfoStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	rpcContext := newInsecureRPCContext(stopper)
-	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry())
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
 	slice := []byte("b")
 	if err := g.AddInfo("s", slice, time.Hour); err != nil {
 		t.Fatal(err)
@@ -61,14 +64,14 @@ func TestGossipInfoStore(t *testing.T) {
 }
 
 // TestGossipMoveNode verifies that if a node is moved to a new address, it
-// gets properly updated in gossip (including that any other node that was
-// previously at that address gets removed from the cluster).
+// gets properly updated in gossip.
 func TestGossipMoveNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	rpcContext := newInsecureRPCContext(stopper)
-	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry())
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
 	var nodes []*roachpb.NodeDescriptor
 	for i := 1; i <= 3; i++ {
 		node := &roachpb.NodeDescriptor{
@@ -127,8 +130,10 @@ func TestGossipGetNextBootstrapAddress(t *testing.T) {
 	if len(resolvers) != 3 {
 		t.Errorf("expected 3 resolvers; got %d", len(resolvers))
 	}
-	server := rpc.NewServer(newInsecureRPCContext(stopper))
-	g := NewTest(0, nil, server, stopper, metric.NewRegistry())
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+	server := rpc.NewServer(rpcContext)
+	g := NewTest(0, nil, server, stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
 	g.setResolvers(resolvers)
 
 	// Using specified resolvers, fetch bootstrap addresses 3 times
@@ -153,7 +158,8 @@ func TestGossipLocalityResolver(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	rpcContext := newInsecureRPCContext(stopper)
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
 
 	gossipLocalityAdvertiseList := roachpb.Locality{}
 	tier := roachpb.Tier{}
@@ -187,7 +193,7 @@ func TestGossipLocalityResolver(t *testing.T) {
 	var node2LocalityList []roachpb.LocalityAddress
 	node2LocalityList = append(node2LocalityList, nodeLocalityAddress2)
 
-	g := NewTestWithLocality(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry(), gossipLocalityAdvertiseList)
+	g := NewTestWithLocality(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry(), gossipLocalityAdvertiseList, config.DefaultZoneConfigRef())
 	node1 := &roachpb.NodeDescriptor{NodeID: 1, Address: node1PublicAddress, LocalityAddress: node1LocalityList}
 	node2 := &roachpb.NodeDescriptor{NodeID: 2, Address: node2PublicAddress, LocalityAddress: node2LocalityList}
 
@@ -221,10 +227,13 @@ func TestGossipRaceLogStatus(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	local := startGossip(1, stopper, t, metric.NewRegistry())
+	// Shared cluster ID by all gossipers (this ensures that the gossipers
+	// don't talk to servers from unrelated tests by accident).
+	clusterID := uuid.MakeV4()
+	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
 
 	local.mu.Lock()
-	peer := startGossip(2, stopper, t, metric.NewRegistry())
+	peer := startGossip(clusterID, 2, stopper, t, metric.NewRegistry())
 	local.startClientLocked(&peer.mu.is.NodeAddr)
 	local.mu.Unlock()
 
@@ -267,7 +276,11 @@ func TestGossipOutgoingLimitEnforced(t *testing.T) {
 		t.Fatalf("maxPeers(5)=%d, which is higher than this test's assumption", maxPeers)
 	}
 
-	local := startGossip(1, stopper, t, metric.NewRegistry())
+	// Shared cluster ID by all gossipers (this ensures that the gossipers
+	// don't talk to servers from unrelated tests by accident).
+	clusterID := uuid.MakeV4()
+
+	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
 	local.mu.Lock()
 	localAddr := local.mu.is.NodeAddr
 	local.mu.Unlock()
@@ -276,7 +289,7 @@ func TestGossipOutgoingLimitEnforced(t *testing.T) {
 		// After creating a new node, join it to the first node to ensure that the
 		// network is connected (and thus all nodes know each other's addresses)
 		// before we start the actual test.
-		newPeer := startGossip(roachpb.NodeID(i+2), stopper, t, metric.NewRegistry())
+		newPeer := startGossip(clusterID, roachpb.NodeID(i+2), stopper, t, metric.NewRegistry())
 		newPeer.mu.Lock()
 		newPeer.startClientLocked(&localAddr)
 		newPeer.mu.Unlock()
@@ -355,13 +368,16 @@ func TestGossipMostDistant(t *testing.T) {
 
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
+			// Shared cluster ID by all gossipers (this ensures that the gossipers
+			// don't talk to servers from unrelated tests by accident).
+			clusterID := uuid.MakeV4()
 
 			// Set up a gossip network of 10 nodes connected in a single line:
 			//
 			//   1 <- 2 <- 3 <- 4 <- 5 <- 6 <- 7 <- 8 <- 9 <- 10
 			nodes := make([]*Gossip, n)
 			for i := range nodes {
-				nodes[i] = startGossip(roachpb.NodeID(i+1), stopper, t, metric.NewRegistry())
+				nodes[i] = startGossip(clusterID, roachpb.NodeID(i+1), stopper, t, metric.NewRegistry())
 				if i == 0 {
 					continue
 				}
@@ -443,7 +459,12 @@ func TestGossipNoForwardSelf(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	local := startGossip(1, stopper, t, metric.NewRegistry())
+
+	// Shared cluster ID by all gossipers (this ensures that the gossipers
+	// don't talk to servers from unrelated tests by accident).
+	clusterID := uuid.MakeV4()
+
+	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -455,14 +476,14 @@ func TestGossipNoForwardSelf(t *testing.T) {
 	maxSize := local.server.mu.incoming.maxSize
 	local.server.mu.Unlock()
 	for i := 0; i < maxSize; i++ {
-		peers = append(peers, startGossip(roachpb.NodeID(i+2), stopper, t, metric.NewRegistry()))
+		peers = append(peers, startGossip(clusterID, roachpb.NodeID(i+2), stopper, t, metric.NewRegistry()))
 	}
 
 	for _, peer := range peers {
 		c := newClient(log.AmbientContext{Tracer: tracing.NewTracer()}, local.GetNodeAddr(), makeMetrics())
 
 		testutils.SucceedsSoon(t, func() error {
-			conn, err := peer.rpcContext.GRPCDial(c.addr.String()).Connect(ctx)
+			conn, err := peer.rpcContext.GRPCUnvalidatedDial(c.addr.String()).Connect(ctx)
 			if err != nil {
 				return err
 			}
@@ -491,7 +512,7 @@ func TestGossipNoForwardSelf(t *testing.T) {
 		local.server.mu.Lock()
 		maxSize := local.server.mu.incoming.maxSize
 		local.server.mu.Unlock()
-		peer := startGossip(roachpb.NodeID(i+maxSize+2), stopper, t, metric.NewRegistry())
+		peer := startGossip(clusterID, roachpb.NodeID(i+maxSize+2), stopper, t, metric.NewRegistry())
 
 		for {
 			localAddr := local.GetNodeAddr()
@@ -523,12 +544,17 @@ func TestGossipCullNetwork(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	local := startGossip(1, stopper, t, metric.NewRegistry())
+
+	// Shared cluster ID by all gossipers (this ensures that the gossipers
+	// don't talk to servers from unrelated tests by accident).
+	clusterID := uuid.MakeV4()
+
+	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
 	local.SetCullInterval(5 * time.Millisecond)
 
 	local.mu.Lock()
 	for i := 0; i < minPeers; i++ {
-		peer := startGossip(roachpb.NodeID(i+2), stopper, t, metric.NewRegistry())
+		peer := startGossip(clusterID, roachpb.NodeID(i+2), stopper, t, metric.NewRegistry())
 		local.startClientLocked(peer.GetNodeAddr())
 	}
 	local.mu.Unlock()
@@ -562,7 +588,12 @@ func TestGossipOrphanedStallDetection(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	local := startGossip(1, stopper, t, metric.NewRegistry())
+
+	// Shared cluster ID by all gossipers (this ensures that the gossipers
+	// don't talk to servers from unrelated tests by accident).
+	clusterID := uuid.MakeV4()
+
+	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
 	local.SetStallInterval(5 * time.Millisecond)
 
 	// Make sure we have the sentinel to ensure that its absence is not the
@@ -572,7 +603,7 @@ func TestGossipOrphanedStallDetection(t *testing.T) {
 	}
 
 	peerStopper := stop.NewStopper()
-	peer := startGossip(2, peerStopper, t, metric.NewRegistry())
+	peer := startGossip(clusterID, 2, peerStopper, t, metric.NewRegistry())
 
 	peerNodeID := peer.NodeID.Get()
 	peerAddr := peer.GetNodeAddr()
@@ -616,7 +647,7 @@ func TestGossipOrphanedStallDetection(t *testing.T) {
 
 	peerStopper = stop.NewStopper()
 	defer peerStopper.Stop(context.TODO())
-	startGossipAtAddr(peerNodeID, peerAddr, peerStopper, t, metric.NewRegistry())
+	startGossipAtAddr(clusterID, peerNodeID, peerAddr, peerStopper, t, metric.NewRegistry())
 
 	testutils.SucceedsSoon(t, func() error {
 		for _, peerID := range local.Outgoing() {
@@ -659,19 +690,23 @@ func TestGossipJoinTwoClusters(t *testing.T) {
 				stopper.Stop(context.TODO())
 			}
 		}()
-		rpcCtx := newInsecureRPCContext(stopper)
-		server := rpc.NewServer(rpcCtx)
 
+		var clusterID uuid.UUID
 		switch i {
 		case 0, 1:
-			clusterIDs = append(clusterIDs, uuid.MakeV4())
+			clusterID = uuid.MakeV4()
 		case 2:
-			clusterIDs = append(clusterIDs, clusterIDs[0])
+			clusterID = clusterIDs[0]
 		}
+		clusterIDs = append(clusterIDs, clusterID)
+		clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+		rpcContext := rpc.NewInsecureTestingContextWithClusterID(clock, stopper, clusterID)
+
+		server := rpc.NewServer(rpcContext)
 
 		// node ID must be non-zero
 		gnode := NewTest(
-			roachpb.NodeID(i+1), rpcCtx, server, stopper, metric.NewRegistry())
+			roachpb.NodeID(i+1), rpcContext, server, stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
 		g = append(g, gnode)
 		gnode.SetStallInterval(interval)
 		gnode.SetBootstrapInterval(interval)
@@ -735,8 +770,13 @@ func TestGossipPropagation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	local := startGossip(1, stopper, t, metric.NewRegistry())
-	remote := startGossip(2, stopper, t, metric.NewRegistry())
+
+	// Shared cluster ID by all gossipers (this ensures that the gossipers
+	// don't talk to servers from unrelated tests by accident).
+	clusterID := uuid.MakeV4()
+
+	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
+	remote := startGossip(clusterID, 2, stopper, t, metric.NewRegistry())
 	remote.mu.Lock()
 	rAddr := remote.mu.is.NodeAddr
 	remote.mu.Unlock()
@@ -825,8 +865,12 @@ func TestGossipLoopbackInfoPropagation(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
 
-	local := startGossip(1, stopper, t, metric.NewRegistry())
-	remote := startGossip(2, stopper, t, metric.NewRegistry())
+	// Shared cluster ID by all gossipers (this ensures that the gossipers
+	// don't talk to servers from unrelated tests by accident).
+	clusterID := uuid.MakeV4()
+
+	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
+	remote := startGossip(clusterID, 2, stopper, t, metric.NewRegistry())
 	remote.mu.Lock()
 	rAddr := remote.mu.is.NodeAddr
 	remote.mu.Unlock()

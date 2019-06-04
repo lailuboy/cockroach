@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -153,10 +154,9 @@ func TestHashJoiner(t *testing.T) {
 func TestHashJoinerError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	columnTypeInt := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
 	v := [10]sqlbase.EncDatum{}
 	for i := range v {
-		v[i] = sqlbase.DatumToEncDatum(columnTypeInt, tree.NewDInt(tree.DInt(i)))
+		v[i] = sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(i)))
 	}
 
 	testCases := joinerErrorTestCases()
@@ -232,7 +232,7 @@ func TestHashJoinerError(t *testing.T) {
 }
 
 func checkExpectedRows(
-	types []sqlbase.ColumnType, expectedRows sqlbase.EncDatumRows, results *RowBuffer,
+	types []types.T, expectedRows sqlbase.EncDatumRows, results *RowBuffer,
 ) error {
 	var expected []string
 	for _, row := range expectedRows {
@@ -270,10 +270,9 @@ func checkExpectedRows(
 // the consumer is draining.
 func TestHashJoinerDrain(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	columnTypeInt := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
 	v := [10]sqlbase.EncDatum{}
 	for i := range v {
-		v[i] = sqlbase.DatumToEncDatum(columnTypeInt, tree.NewDInt(tree.DInt(i)))
+		v[i] = sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(i)))
 	}
 	spec := distsqlpb.HashJoinerSpec{
 		LeftEqColumns:  []uint32{0},
@@ -374,10 +373,9 @@ func TestHashJoinerDrain(t *testing.T) {
 func TestHashJoinerDrainAfterBuildPhaseError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	columnTypeInt := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
 	v := [10]sqlbase.EncDatum{}
 	for i := range v {
-		v[i] = sqlbase.DatumToEncDatum(columnTypeInt, tree.NewDInt(tree.DInt(i)))
+		v[i] = sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(i)))
 	}
 	spec := distsqlpb.HashJoinerSpec{
 		LeftEqColumns:  []uint32{0},
@@ -423,11 +421,11 @@ func TestHashJoinerDrainAfterBuildPhaseError(t *testing.T) {
 		rightInputDrainNotification <- nil
 	}
 	rightErrorReturned := false
-	rightInputNext := func(rb *RowBuffer) (sqlbase.EncDatumRow, *ProducerMetadata) {
+	rightInputNext := func(rb *RowBuffer) (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 		if !rightErrorReturned {
 			rightErrorReturned = true
 			// The right input is going to return an error as the first thing.
-			return nil, &ProducerMetadata{Err: errors.Errorf("Test error. Please drain.")}
+			return nil, &distsqlpb.ProducerMetadata{Err: errors.Errorf("Test error. Please drain.")}
 		}
 		// Let RowBuffer.Next() do its usual thing.
 		return nil, nil
@@ -505,21 +503,12 @@ func BenchmarkHashJoiner(b *testing.B) {
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := tree.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
-	diskMonitor := mon.MakeMonitor(
-		"test-disk",
-		mon.DiskResource,
-		nil, /* curCount */
-		nil, /* maxHist */
-		-1,  /* increment: use default block size */
-		math.MaxInt64,
-		st,
-	)
-	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor := makeTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 	flowCtx := &FlowCtx{
 		Settings:    st,
 		EvalCtx:     &evalCtx,
-		diskMonitor: &diskMonitor,
+		diskMonitor: diskMonitor,
 	}
 	tempEngine, err := engine.NewTempEngine(base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {

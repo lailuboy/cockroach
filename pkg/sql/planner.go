@@ -19,24 +19,19 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/pkg/errors"
@@ -75,6 +70,13 @@ type extendedEvalContext struct {
 	SchemaChangers *schemaChangerCollection
 
 	schemaAccessors *schemaInterface
+}
+
+// copy returns a deep copy of ctx.
+func (ctx *extendedEvalContext) copy() *extendedEvalContext {
+	cpy := *ctx
+	cpy.EvalContext = *ctx.EvalContext.Copy()
+	return &cpy
 }
 
 // schemaInterface provides access to the database and table descriptors.
@@ -166,9 +168,9 @@ type planner struct {
 	// be pool allocated.
 	alloc sqlbase.DatumAlloc
 
-	// optimizer caches an instance of the cost-based optimizer that can be reused
-	// to plan queries (reused in order to reduce allocations).
-	optimizer xform.Optimizer
+	// optPlanningCtx stores the optimizer planning context, which contains
+	// data structures that can be reused between queries (for efficiency).
+	optPlanningCtx optPlanningCtx
 
 	queryCacheSession querycache.Session
 }
@@ -215,9 +217,11 @@ func newInternalPlanner(
 			Location: time.UTC,
 		},
 	}
+	// The table collection used by the internal planner does not rely on the
+	// databaseCache and there are no subscribers to the databaseCache, so we can
+	// leave it uninitialized.
 	tables := &TableCollection{
-		leaseMgr:      execCfg.LeaseManager,
-		databaseCache: newDatabaseCache(config.NewSystemConfig()),
+		leaseMgr: execCfg.LeaseManager,
 	}
 	dataMutator := &sessionDataMutator{
 		data: sd,
@@ -258,9 +262,11 @@ func newInternalPlanner(
 		ctx, sd, dataMutator, tables, txn, ts, ts, execCfg, &plannerMon,
 	)
 	p.extendedEvalCtx.Planner = p
+	p.extendedEvalCtx.SessionAccessor = p
 	p.extendedEvalCtx.Sequence = p
 	p.extendedEvalCtx.ClusterID = execCfg.ClusterID()
 	p.extendedEvalCtx.NodeID = execCfg.NodeID.Get()
+	p.extendedEvalCtx.Locality = execCfg.Locality
 
 	p.sessionDataMutator = dataMutator
 	p.autoCommit = false
@@ -268,6 +274,7 @@ func newInternalPlanner(
 	p.extendedEvalCtx.MemMetrics = memMetrics
 	p.extendedEvalCtx.ExecCfg = execCfg
 	p.extendedEvalCtx.Placeholders = &p.semaCtx.Placeholders
+	p.extendedEvalCtx.Annotations = &p.semaCtx.Annotations
 	p.extendedEvalCtx.Tables = tables
 
 	p.queryCacheSession.Init()
@@ -331,8 +338,13 @@ func (p *planner) LogicalSchemaAccessor() SchemaAccessor {
 	return p.extendedEvalCtx.schemaAccessors.logical
 }
 
+// Note: if the context will be modified, use ExtendedEvalContextCopy instead.
 func (p *planner) ExtendedEvalContext() *extendedEvalContext {
 	return &p.extendedEvalCtx
+}
+
+func (p *planner) ExtendedEvalContextCopy() *extendedEvalContext {
+	return p.extendedEvalCtx.copy()
 }
 
 func (p *planner) CurrentDatabase() string {
@@ -376,7 +388,7 @@ func (p *planner) DistSQLPlanner() *DistSQLPlanner {
 
 // ParseType implements the tree.EvalPlanner interface.
 // We define this here to break the dependency from eval.go to the parser.
-func (p *planner) ParseType(sql string) (coltypes.CastTargetType, error) {
+func (p *planner) ParseType(sql string) (*types.T, error) {
 	return parser.ParseType(sql)
 }
 
@@ -384,12 +396,17 @@ func (p *planner) ParseType(sql string) (coltypes.CastTargetType, error) {
 func (p *planner) ParseQualifiedTableName(
 	ctx context.Context, sql string,
 ) (*tree.TableName, error) {
-	return parser.ParseTableName(sql)
+	name, err := parser.ParseTableName(sql)
+	if err != nil {
+		return nil, err
+	}
+	tn := name.ToTableName()
+	return &tn, nil
 }
 
 // ResolveTableName implements the tree.EvalDatabase interface.
 func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) error {
-	_, err := ResolveExistingObject(ctx, p, tn, true /*required*/, anyDescType)
+	_, err := ResolveExistingObject(ctx, p, tn, true /*required*/, ResolveAnyDescType)
 	return err
 }
 
@@ -535,64 +552,13 @@ func (p *planner) prepareForDistSQLSupportCheck() {
 	p.setUnlimited(p.curPlan.plan)
 }
 
-// runWithDistSQL runs a planNode tree synchronously via DistSQL, returning the
-// results in a RowContainer. There's no streaming on this, so use sparingly.
-// In general, you should always prefer to use the internal executor if you can.
-func (p *planner) runWithDistSQL(
-	ctx context.Context, plan planNode,
-) (*rowcontainer.RowContainer, error) {
-	params := runParams{
-		ctx:             ctx,
-		extendedEvalCtx: &p.extendedEvalCtx,
-		p:               p,
-	}
-	// Create the DistSQL plan for the input.
-	planCtx := params.extendedEvalCtx.DistSQLPlanner.NewPlanningCtx(ctx, params.extendedEvalCtx, params.p.txn)
-	log.VEvent(ctx, 1, "creating DistSQL plan")
-	physPlan, err := planCtx.ExtendedEvalCtx.DistSQLPlanner.createPlanForNode(planCtx, plan)
-	if err != nil {
-		return nil, err
-	}
-	planCtx.ExtendedEvalCtx.DistSQLPlanner.FinalizePlan(planCtx, &physPlan)
-	columns := planColumns(plan)
-
-	// Initialize a row container for the DistSQL execution engine to write into.
-	// The caller of this method will call Close on the returned RowContainer,
-	// which will close this account.
-	acc := planCtx.EvalContext().Mon.MakeBoundAccount()
-	ci := sqlbase.ColTypeInfoFromResCols(columns)
-	rows := rowcontainer.NewRowContainer(acc, ci, 0 /* rowCapacity */)
-	rowResultWriter := NewRowResultWriter(rows)
-	recv := MakeDistSQLReceiver(
-		ctx,
-		rowResultWriter,
-		tree.Rows,
-		p.ExecCfg().RangeDescriptorCache,
-		p.ExecCfg().LeaseHolderCache,
-		p.txn,
-		func(ts hlc.Timestamp) {
-			_ = p.ExecCfg().Clock.Update(ts)
-		},
-		p.extendedEvalCtx.Tracing,
-	)
-	defer recv.Release()
-
-	// Copy the evalCtx, as dsp.Run() might change it.
-	evalCtxCopy := p.extendedEvalCtx
-	// Run the plan, writing to the row container we initialized earlier.
-	p.extendedEvalCtx.DistSQLPlanner.Run(
-		planCtx, p.txn, &physPlan, recv, &evalCtxCopy, nil /* finishedSetupFn */)
-	if rowResultWriter.Err() != nil {
-		rows.Close(ctx)
-		return nil, rowResultWriter.Err()
-	}
-	return rows, nil
-}
-
 // txnModesSetter is an interface used by SQL execution to influence the current
 // transaction.
 type txnModesSetter interface {
-	setTransactionModes(modes tree.TransactionModes) error
+	// setTransactionModes updates some characteristics of the current
+	// transaction.
+	// asOfTs, if not empty, is the evaluation of modes.AsOf.
+	setTransactionModes(modes tree.TransactionModes, asOfTs hlc.Timestamp) error
 }
 
 // sqlStatsCollector is the interface used by SQL execution, through the

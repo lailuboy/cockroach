@@ -18,9 +18,9 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -36,7 +36,7 @@ import (
 // plan execution.
 type planHookFn func(
 	context.Context, tree.Statement, PlanHookState,
-) (fn PlanHookRowFn, header sqlbase.ResultColumns, subplans []planNode, err error)
+) (fn PlanHookRowFn, header sqlbase.ResultColumns, subplans []planNode, avoidBuffering bool, err error)
 
 // PlanHookRowFn describes the row-production for hook-created plans. The
 // channel argument is used to return results to the plan's runner. It's
@@ -90,10 +90,13 @@ type PlanHookState interface {
 	) (*DropUserNode, error)
 	GetAllUsersAndRoles(ctx context.Context) (map[string]bool, error)
 	BumpRoleMembershipTableVersion(ctx context.Context) error
-	Select(ctx context.Context, n *tree.Select, desiredTypes []types.T) (planNode, error)
+	Select(ctx context.Context, n *tree.Select, desiredTypes []*types.T) (planNode, error)
 	EvalAsOfTimestamp(asOf tree.AsOfClause) (hlc.Timestamp, error)
 	ResolveUncachedDatabaseByName(
 		ctx context.Context, dbName string, required bool) (*UncachedDatabaseDescriptor, error)
+	ResolveMutableTableDescriptor(
+		ctx context.Context, tn *ObjectName, required bool, requiredType ResolveRequiredType,
+	) (table *MutableTableDescriptor, err error)
 }
 
 // AddPlanHook adds a hook used to short-circuit creating a planNode from a

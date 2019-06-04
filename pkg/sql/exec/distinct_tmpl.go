@@ -25,23 +25,27 @@ package exec
 
 import (
 	"bytes"
+	"context"
 
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/pkg/errors"
 )
 
-// orderedDistinctColsToOperators is a utility function that given an input and
+// OrderedDistinctColsToOperators is a utility function that given an input and
 // a slice of columns, creates a chain of distinct operators and returns the
 // last distinct operator in that chain as well as its output column.
-func orderedDistinctColsToOperators(
+func OrderedDistinctColsToOperators(
 	input Operator, distinctCols []uint32, typs []types.T,
 ) (Operator, []bool, error) {
-	distinctCol := make([]bool, ColBatchSize)
+	distinctCol := make([]bool, coldata.BatchSize)
+	// zero the boolean column on every iteration.
+	input = fnOp{input: input, fn: func() { copy(distinctCol, zeroBoolColumn) }}
 	var err error
 	for i := range distinctCols {
-		input, err = newSingleOrderedDistinct(input, int(distinctCols[i]), distinctCol, typs[i])
+		input, err = newSingleOrderedDistinct(input, int(distinctCols[i]), distinctCol, typs[distinctCols[i]])
 		if err != nil {
 			return nil, nil, err
 		}
@@ -52,7 +56,7 @@ func orderedDistinctColsToOperators(
 // NewOrderedDistinct creates a new ordered distinct operator on the given
 // input columns with the given types.
 func NewOrderedDistinct(input Operator, distinctCols []uint32, typs []types.T) (Operator, error) {
-	op, outputCol, err := orderedDistinctColsToOperators(input, distinctCols, typs)
+	op, outputCol, err := OrderedDistinctColsToOperators(input, distinctCols, typs)
 	if err != nil {
 		return nil, err
 	}
@@ -110,11 +114,11 @@ func newSingleOrderedDistinct(
 }
 
 // partitioner is a simple implementation of sorted distinct that's useful for
-// other operators that need to partition an arbitrarily-sized ColVec.
+// other operators that need to partition an arbitrarily-sized Vec.
 type partitioner interface {
 	// partition partitions the input colVec of size n, writing true to the
 	// outputCol for every value that differs from the previous one.
-	partition(colVec ColVec, outputCol []bool, n uint64)
+	partition(colVec coldata.Vec, outputCol []bool, n uint64)
 }
 
 // newPartitioner returns a new partitioner on type t.
@@ -160,8 +164,15 @@ func (p *sortedDistinct_TYPEOp) Init() {
 	p.input.Init()
 }
 
-func (p *sortedDistinct_TYPEOp) Next() ColBatch {
-	batch := p.input.Next()
+func (p *sortedDistinct_TYPEOp) reset() {
+	p.foundFirstRow = false
+	if resetter, ok := p.input.(resetter); ok {
+		resetter.reset()
+	}
+}
+
+func (p *sortedDistinct_TYPEOp) Next(ctx context.Context) coldata.Batch {
+	batch := p.input.Next(ctx)
 	if batch.Length() == 0 {
 		return batch
 	}
@@ -171,6 +182,7 @@ func (p *sortedDistinct_TYPEOp) Next() ColBatch {
 	// We always output the first row.
 	lastVal := p.lastVal
 	sel := batch.Selection()
+	startIdx := uint16(0)
 	if !p.foundFirstRow {
 		if sel != nil {
 			lastVal = col[sel[0]]
@@ -179,11 +191,12 @@ func (p *sortedDistinct_TYPEOp) Next() ColBatch {
 			lastVal = col[0]
 			outputCol[0] = true
 		}
-	}
-
-	startIdx := uint16(0)
-	if !p.foundFirstRow {
 		startIdx = 1
+		p.foundFirstRow = true
+		if batch.Length() == 1 {
+			p.lastVal = lastVal
+			return batch
+		}
 	}
 
 	n := batch.Length()
@@ -191,19 +204,19 @@ func (p *sortedDistinct_TYPEOp) Next() ColBatch {
 		// Bounds check elimination.
 		sel = sel[startIdx:n]
 		for _, i := range sel {
-			_INNER_LOOP(int(i), lastVal, col, outputCol)
+			_CHECK_DISTINCT(int(i), lastVal, col, outputCol)
 		}
 	} else {
 		// Bounds check elimination.
 		col = col[startIdx:n]
 		outputCol = outputCol[startIdx:n]
+		_ = outputCol[len(col)-1]
 		for i := range col {
-			_INNER_LOOP(i, lastVal, col, outputCol)
+			_CHECK_DISTINCT(i, lastVal, col, outputCol)
 		}
 	}
 
 	p.lastVal = lastVal
-	p.foundFirstRow = true
 
 	return batch
 }
@@ -214,32 +227,29 @@ func (p *sortedDistinct_TYPEOp) Next() ColBatch {
 // input column.
 type partitioner_TYPE struct{}
 
-func (p partitioner_TYPE) partition(colVec ColVec, outputCol []bool, n uint64) {
+func (p partitioner_TYPE) partition(colVec coldata.Vec, outputCol []bool, n uint64) {
 	col := colVec._TemplateType()
 	lastVal := col[0]
 	outputCol[0] = true
 	outputCol = outputCol[1:n]
 	col = col[1:n]
 	for i := range col {
-		v := col[i]
-		var unique bool
-		_ASSIGN_NE("unique", "v", "lastVal")
-		outputCol[i] = outputCol[i] || unique
-		lastVal = v
+		_CHECK_DISTINCT(i, lastVal, col, outputCol)
 	}
 }
 
 // {{end}}
 
 // {{/*
-func _INNER_LOOP(i int, lastVal _GOTYPE, col []interface{}, outputCol []bool) { // */}}
+// _CHECK_DISTINCT retrieves the value at the ith index of col, compares it
+// to the passed in lastVal, and sets the ith value of outputCol to true if the
+// compared values were distinct.
+func _CHECK_DISTINCT(i int, lastVal _GOTYPE, col []_GOTYPE, outputCol []bool) { // */}}
 
-	// {{define "innerLoop"}}
+	// {{define "checkDistinct"}}
 	v := col[i]
-	// Note that not inlining this unique var actually makes a non-trivial
-	// performance difference.
 	var unique bool
-	_ASSIGN_NE("unique", "v", "lastVal")
+	_ASSIGN_NE(unique, v, lastVal)
 	outputCol[i] = outputCol[i] || unique
 	lastVal = v
 	// {{end}}

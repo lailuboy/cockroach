@@ -1,4 +1,4 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata
+# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata
 
 query T
 SHOW DATABASES
@@ -50,7 +50,7 @@ SET sql_safe_updates = FALSE;
 statement error pgcode 42P01 relation "kv" does not exist
 SELECT * FROM kv
 
-statement error database "test" does not exist
+statement error target database or schema does not exist
 SHOW GRANTS ON DATABASE test
 
 query T

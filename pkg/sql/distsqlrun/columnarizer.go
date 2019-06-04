@@ -19,24 +19,28 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec"
-	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/types/conv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
-// columnarizer turns a RowSource input into an exec.Operator output, by reading
-// the input in chunks of size exec.ColBatchSize and converting each chunk into
-// an exec.ColBatch column by column.
+// columnarizer turns a RowSource input into an exec.Operator output, by
+// reading the input in chunks of size coldata.BatchSize and converting each
+// chunk into a coldata.Batch column by column.
 type columnarizer struct {
 	ProcessorBase
 
 	input RowSource
 	da    sqlbase.DatumAlloc
 
-	buffered sqlbase.EncDatumRows
-	batch    exec.ColBatch
+	buffered        sqlbase.EncDatumRows
+	batch           coldata.Batch
+	accumulatedMeta []distsqlpb.ProducerMetadata
 }
 
-// newColumnarizer returns a new columnarizer
+var _ exec.Operator = &columnarizer{}
+
+// newColumnarizer returns a new columnarizer.
 func newColumnarizer(flowCtx *FlowCtx, processorID int32, input RowSource) (*columnarizer, error) {
 	c := &columnarizer{
 		input: input,
@@ -47,7 +51,7 @@ func newColumnarizer(flowCtx *FlowCtx, processorID int32, input RowSource) (*col
 		input.OutputTypes(),
 		flowCtx,
 		processorID,
-		nil,
+		nil, /* output */
 		nil, /* memMonitor */
 		ProcStateOpts{InputsToDrain: []RowSource{input}},
 	); err != nil {
@@ -58,23 +62,24 @@ func newColumnarizer(flowCtx *FlowCtx, processorID int32, input RowSource) (*col
 }
 
 func (c *columnarizer) Init() {
-	typs := types.FromColumnTypes(c.OutputTypes())
-	c.batch = exec.NewMemBatch(typs)
-	c.buffered = make(sqlbase.EncDatumRows, exec.ColBatchSize)
+	typs := conv.FromColumnTypes(c.OutputTypes())
+	c.batch = coldata.NewMemBatch(typs)
+	c.buffered = make(sqlbase.EncDatumRows, coldata.BatchSize)
 	for i := range c.buffered {
 		c.buffered[i] = make(sqlbase.EncDatumRow, len(typs))
 	}
+	c.accumulatedMeta = make([]distsqlpb.ProducerMetadata, 0, 1)
 	c.input.Start(context.TODO())
 }
 
-func (c *columnarizer) Next() exec.ColBatch {
+func (c *columnarizer) Next(context.Context) coldata.Batch {
 	// Buffer up n rows.
 	nRows := uint16(0)
 	columnTypes := c.OutputTypes()
-	for ; nRows < exec.ColBatchSize; nRows++ {
+	for ; nRows < coldata.BatchSize; nRows++ {
 		row, meta := c.input.Next()
 		if meta != nil {
-			// TODO(asubiotto): Forward metadata.
+			c.accumulatedMeta = append(c.accumulatedMeta, *meta)
 			nRows--
 			continue
 		}
@@ -97,4 +102,21 @@ func (c *columnarizer) Next() exec.ColBatch {
 	return c.batch
 }
 
+// Run is part of the Processor interface.
+//
+// columnarizers are not expected to be Run, so we prohibit calling this method
+// on them.
+func (c *columnarizer) Run(context.Context) {
+	panic("columnarizer should not be Run")
+}
+
 var _ exec.Operator = &columnarizer{}
+var _ distsqlpb.MetadataSource = &columnarizer{}
+
+// DrainMeta is part of the MetadataSource interface.
+func (c *columnarizer) DrainMeta(ctx context.Context) []distsqlpb.ProducerMetadata {
+	if src, ok := c.input.(distsqlpb.MetadataSource); ok {
+		c.accumulatedMeta = append(c.accumulatedMeta, src.DrainMeta(ctx)...)
+	}
+	return c.accumulatedMeta
+}

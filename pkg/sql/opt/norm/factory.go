@@ -15,13 +15,13 @@
 package norm
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // ReplaceFunc is the callback function passed to the Factory.Replace method.
@@ -193,7 +193,7 @@ func (f *Factory) CopyAndReplace(
 	from memo.RelExpr, fromProps *physical.Required, replace ReplaceFunc,
 ) {
 	if !f.mem.IsEmpty() {
-		panic("destination memo must be empty")
+		panic(pgerror.AssertionFailedf("destination memo must be empty"))
 	}
 
 	// Copy all metadata to the target memo so that referenced tables and columns
@@ -321,7 +321,7 @@ func (f *Factory) ConstructJoin(
 	case opt.AntiJoinApplyOp:
 		return f.ConstructAntiJoinApply(left, right, on, private)
 	}
-	panic(fmt.Sprintf("unexpected join operator: %v", joinOp))
+	panic(pgerror.AssertionFailedf("unexpected join operator: %v", log.Safe(joinOp)))
 }
 
 // ConstructConstVal constructs one of the constant value operators from the
@@ -329,7 +329,7 @@ func (f *Factory) ConstructJoin(
 // special-case operators for True, False, and Null, to make matching easier.
 // Null operators require the static type to be specified, so that rewrites do
 // not change it.
-func (f *Factory) ConstructConstVal(d tree.Datum, t types.T) opt.ScalarExpr {
+func (f *Factory) ConstructConstVal(d tree.Datum, t *types.T) opt.ScalarExpr {
 	if d == tree.DNull {
 		return f.ConstructNull(t)
 	}

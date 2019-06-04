@@ -64,6 +64,8 @@ const (
 	EndTransaction
 	// AdminSplit is called to coordinate a split of a range.
 	AdminSplit
+	// AdminUnsplit is called to remove the sticky bit of a manually split range.
+	AdminUnsplit
 	// AdminMerge is called to coordinate a merge of two adjacent ranges.
 	AdminMerge
 	// AdminTransferLease is called to initiate a range lease transfer.
@@ -92,6 +94,12 @@ const (
 	// an error code either indicating the pusher must retry or abort and
 	// restart the transaction.
 	PushTxn
+	// RecoverTxn attempts to recover an abandoned STAGING transaction. It
+	// specifies whether all of the abandoned transaction's in-flight writes
+	// succeeded or whether any failed. This is used to determine whether the
+	// result of the recovery should be committing the abandoned transaction or
+	// aborting it.
+	RecoverTxn
 	// QueryTxn fetches the current state of the designated transaction.
 	QueryTxn
 	// QueryIntent checks whether the specified intent exists.

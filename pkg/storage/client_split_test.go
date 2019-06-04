@@ -1100,13 +1100,6 @@ func TestStoreRangeSplitWithMaxBytesUpdate(t *testing.T) {
 func TestStoreRangeSplitBackpressureWrites(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	// Set maxBytes to something small so we can exceed the maximum split
-	// size without adding 2x64MB of data.
-	const maxBytes = 1 << 16
-	cfg := config.DefaultZoneConfig()
-	cfg.RangeMaxBytes = proto.Int64(maxBytes)
-	defer config.TestingSetDefaultZoneConfig(cfg)()
-
 	// Backpressured writes react differently depending on whether there is an
 	// ongoing split or not. If there is an ongoing split then the writes wait
 	// on the split are only allowed to proceed if the split succeeds. If there
@@ -1121,7 +1114,7 @@ func TestStoreRangeSplitBackpressureWrites(t *testing.T) {
 		{splitOngoing: true, splitErr: false, expErr: ""},
 		{splitOngoing: true, splitErr: true, expErr: "split failed while applying backpressure.* boom"},
 		{splitOngoing: false, expErr: ""},
-		{splitImpossible: true, expErr: "split failed while applying backpressure: could not find valid split key"},
+		{splitImpossible: true, expErr: "split failed while applying backpressure.* could not find valid split key"},
 	}
 	for _, tc := range testCases {
 		var name string
@@ -1135,6 +1128,10 @@ func TestStoreRangeSplitBackpressureWrites(t *testing.T) {
 			splitKey := roachpb.RKey(keys.UserTableDataMin)
 			splitPending, blockSplits := make(chan struct{}), make(chan struct{})
 			storeCfg := storage.TestStoreConfig(nil)
+			// Set maxBytes to something small so we can exceed the maximum split
+			// size without adding 2x64MB of data.
+			const maxBytes = 1 << 16
+			storeCfg.DefaultZoneConfig.RangeMaxBytes = proto.Int64(maxBytes)
 			storeCfg.TestingKnobs.DisableGCQueue = true
 			storeCfg.TestingKnobs.DisableMergeQueue = true
 			storeCfg.TestingKnobs.DisableSplitQueue = true
@@ -1272,7 +1269,7 @@ func TestStoreRangeSystemSplits(t *testing.T) {
 
 	userTableMax := keys.MinUserDescID + 4
 	var exceptions map[int]struct{}
-	schema := sqlbase.MakeMetadataSchema()
+	schema := sqlbase.MakeMetadataSchema(config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef())
 	// Write table descriptors for the tables in the metadata schema as well as
 	// five dummy user tables. This does two things:
 	//   - descriptor IDs are used to determine split keys
@@ -2026,7 +2023,7 @@ func TestStoreRangeSplitRaceUninitializedRHS(t *testing.T) {
 		// nonexistent right-hand-side, giving it a head start. This code looks
 		// fairly complicated since it wants to ensure that the two replicas
 		// don't diverge.
-		if trigger != nil && len(trigger.RightDesc.Replicas) == 2 && args.Hdr.Txn.Epoch == 0 {
+		if trigger != nil && len(trigger.RightDesc.InternalReplicas) == 2 && args.Hdr.Txn.Epoch == 0 {
 			seen.Lock()
 			defer seen.Unlock()
 			sid, sl := int(args.Sid)-1, seen.sids[args.CmdID]
@@ -2081,7 +2078,7 @@ func TestStoreRangeSplitRaceUninitializedRHS(t *testing.T) {
 
 			trigger := <-currentTrigger // our own copy
 			// Make sure the first node is first for convenience.
-			replicas := trigger.RightDesc.Replicas
+			replicas := trigger.RightDesc.InternalReplicas
 			if replicas[0].NodeID > replicas[1].NodeID {
 				tmp := replicas[1]
 				replicas[1] = replicas[0]
@@ -2536,12 +2533,12 @@ func TestDistributedTxnCleanup(t *testing.T) {
 				// normal or min priority txn.
 				if force {
 					ba := roachpb.BatchRequest{}
+					ba.Timestamp = store.Clock().Now()
 					ba.RangeID = lhs.RangeID
 					ba.Add(&roachpb.PushTxnRequest{
 						RequestHeader: roachpb.RequestHeader{
 							Key: proto.Key,
 						},
-						Now:       store.Clock().Now(),
 						PusheeTxn: proto.TxnMeta,
 						PushType:  roachpb.PUSH_ABORT,
 						Force:     true,
@@ -2591,13 +2588,6 @@ func TestUnsplittableRange(t *testing.T) {
 	ctx := context.Background()
 	ttl := 1 * time.Hour
 	const maxBytes = 1 << 16
-	zoneConfig := config.DefaultZoneConfig()
-	zoneConfig.RangeMaxBytes = proto.Int64(maxBytes)
-	zoneConfig.GC = &config.GCPolicy{
-		TTLSeconds: int32(ttl.Seconds()),
-	}
-	defer config.TestingSetDefaultZoneConfig(zoneConfig)()
-	defer config.TestingSetDefaultSystemZoneConfig(zoneConfig)()
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -2605,6 +2595,14 @@ func TestUnsplittableRange(t *testing.T) {
 	manual := hlc.NewManualClock(123)
 	splitQueuePurgatoryChan := make(chan time.Time, 1)
 	cfg := storage.TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
+	cfg.DefaultZoneConfig.RangeMaxBytes = proto.Int64(maxBytes)
+	cfg.DefaultZoneConfig.GC = &config.GCPolicy{
+		TTLSeconds: int32(ttl.Seconds()),
+	}
+	cfg.DefaultSystemZoneConfig.RangeMaxBytes = proto.Int64(maxBytes)
+	cfg.DefaultSystemZoneConfig.GC = &config.GCPolicy{
+		TTLSeconds: int32(ttl.Seconds()),
+	}
 	cfg.TestingKnobs.SplitQueuePurgatoryChan = splitQueuePurgatoryChan
 	cfg.TestingKnobs.DisableMergeQueue = true
 	store := createTestStoreWithConfig(t, stopper, cfg)

@@ -21,14 +21,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
 )
 
 // MutationFilter is the type of a simple predicate on a mutation.
@@ -99,7 +99,8 @@ func (cb *ColumnBackfiller) Init(
 	cb.updateCols = append(cb.added, dropped...)
 	// Populate default or computed values.
 	cb.updateExprs = make([]tree.TypedExpr, len(cb.updateCols))
-	for j, col := range cb.added {
+	for j := range cb.added {
+		col := &cb.added[j]
 		if col.IsComputed() {
 			cb.updateExprs[j] = computedExprs[j]
 		} else if defaultExprs == nil || defaultExprs[j] == nil {
@@ -162,7 +163,7 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 	for id, table := range fkTables {
 		if table.Desc == nil {
 			// We weren't passed all of the tables that we need by the coordinator.
-			return roachpb.Key{}, errors.Errorf("table %v not sent by coordinator", id)
+			return roachpb.Key{}, pgerror.AssertionFailedf("table %v not sent by coordinator", id)
 		}
 	}
 	// TODO(dan): Tighten up the bound on the requestedCols parameter to
@@ -293,7 +294,7 @@ type IndexBackfiller struct {
 	// colIdxMap maps ColumnIDs to indices into desc.Columns and desc.Mutations.
 	colIdxMap map[sqlbase.ColumnID]int
 
-	types   []sqlbase.ColumnType
+	types   []types.T
 	rowVals tree.Datums
 }
 
@@ -332,22 +333,23 @@ func (ib *IndexBackfiller) Init(desc *sqlbase.ImmutableTableDescriptor) error {
 		if IndexMutationFilter(m) {
 			idx := m.GetIndex()
 			ib.added = append(ib.added, *idx)
-			for i, col := range cols {
-				if idx.ContainsColumnID(col.ID) {
+			for i := range cols {
+				id := cols[i].ID
+				if idx.ContainsColumnID(id) {
 					valNeededForCol.Add(i)
 				}
 			}
 		}
 	}
 
-	ib.types = make([]sqlbase.ColumnType, len(cols))
+	ib.types = make([]types.T, len(cols))
 	for i := range cols {
 		ib.types[i] = cols[i].Type
 	}
 
 	ib.colIdxMap = make(map[sqlbase.ColumnID]int, len(cols))
-	for i, c := range cols {
-		ib.colIdxMap[c.ID] = i
+	for i := range cols {
+		ib.colIdxMap[cols[i].ID] = i
 	}
 
 	tableArgs := row.FetcherTableArgs{
@@ -361,11 +363,6 @@ func (ib *IndexBackfiller) Init(desc *sqlbase.ImmutableTableDescriptor) error {
 		false /* reverse */, false /* returnRangeInfo */, false /* isCheck */, &ib.alloc, tableArgs,
 	)
 }
-
-// BulkWriteIndex enables experimental bulk-ingestion of index entries.
-var BulkWriteIndex = settings.RegisterBoolSetting(
-	"schemachanger.bulk_index_backfill.enabled", "backfill indexes in bulk via addsstable", true,
-)
 
 // BuildIndexEntriesChunk reads a chunk of rows from a table using the span sp
 // provided, and builds all the added indexes.

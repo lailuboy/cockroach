@@ -80,16 +80,50 @@ var rocksdbConcurrency = envutil.EnvOrDefaultInt(
 		return max
 	}())
 
+var ingestDelayL0Threshold = settings.RegisterIntSetting(
+	"rocksdb.ingest_backpressure.l0_file_count_threshold",
+	"number of L0 files after which to backpressure SST ingestions",
+	20,
+)
+
+var ingestDelayPendingLimit = settings.RegisterByteSizeSetting(
+	"rocksdb.ingest_backpressure.pending_compaction_threshold",
+	"pending compaction estimate above which to backpressure SST ingestions",
+	64<<30,
+)
+
+var ingestDelayTime = settings.RegisterDurationSetting(
+	"rocksdb.ingest_backpressure.max_delay",
+	"maximum amount of time to backpressure a single SST ingestion",
+	time.Second*5,
+)
+
 // Set to true to perform expensive iterator debug leak checking. In normal
 // operation, we perform inexpensive iterator leak checking but those checks do
 // not indicate where the leak arose. The expensive checking tracks the stack
 // traces of every iterator allocated. DO NOT ENABLE in production code.
 const debugIteratorLeak = false
 
+//export rocksDBV
+func rocksDBV(sevLvl C.int, infoVerbosity C.int) bool {
+	sev := log.Severity(sevLvl)
+	return sev == log.Severity_INFO && log.V(int32(infoVerbosity)) ||
+		sev == log.Severity_WARNING ||
+		sev == log.Severity_ERROR ||
+		sev == log.Severity_FATAL
+}
+
 //export rocksDBLog
-func rocksDBLog(logLevel C.int, s *C.char, n C.int) {
-	if log.V(int32(logLevel)) {
-		ctx := logtags.AddTag(context.Background(), "rocksdb", nil)
+func rocksDBLog(sevLvl C.int, s *C.char, n C.int) {
+	ctx := logtags.AddTag(context.Background(), "rocksdb", nil)
+	switch log.Severity(sevLvl) {
+	case log.Severity_WARNING:
+		log.Warning(ctx, C.GoStringN(s, n))
+	case log.Severity_ERROR:
+		log.Error(ctx, C.GoStringN(s, n))
+	case log.Severity_FATAL:
+		log.Fatal(ctx, C.GoStringN(s, n))
+	default:
 		log.Info(ctx, C.GoStringN(s, n))
 	}
 }
@@ -648,6 +682,7 @@ func (r *RocksDB) syncLoop() {
 	s.Lock()
 
 	var lastSync time.Time
+	var err error
 
 	for {
 		for len(s.pending) == 0 && !s.closed {
@@ -673,8 +708,14 @@ func (r *RocksDB) syncLoop() {
 
 		s.Unlock()
 
-		var err error
-		if r.cfg.Dir != "" {
+		// Linux only guarantees we'll be notified of a writeback error once
+		// during a sync call. After sync fails once, we cannot rely on any
+		// future data written to WAL being crash-recoverable. That's because
+		// any future writes will be appended after a potential corruption in
+		// the WAL, and RocksDB's recovery terminates upon encountering any
+		// corruption. So, we must not call `DBSyncWAL` again after it has
+		// failed once.
+		if r.cfg.Dir != "" && err == nil {
 			err = statusToError(C.DBSyncWAL(r.rdb))
 			lastSync = timeutil.Now()
 		}
@@ -725,6 +766,14 @@ func (r *RocksDB) Close() {
 	r.syncer.Unlock()
 }
 
+// CreateCheckpoint creates a RocksDB checkpoint in the given directory (which
+// must not exist). This directory should be located on the same file system, or
+// copies of all data are used instead of hard links, which is very expensive.
+func (r *RocksDB) CreateCheckpoint(dir string) error {
+	status := C.DBCreateCheckpoint(r.rdb, goToCSlice([]byte(dir)))
+	return errors.Wrap(statusToError(status), "unable to take RocksDB checkpoint")
+}
+
 // Closed returns true if the engine is closed.
 func (r *RocksDB) Closed() bool {
 	return r.rdb == nil
@@ -740,8 +789,7 @@ func (r *RocksDB) Attrs() roachpb.Attributes {
 
 // Put sets the given key to the value provided.
 //
-// The key and value byte slices may be reused safely. put takes a copy of
-// them before returning.
+// It is safe to modify the contents of the arguments after Put returns.
 func (r *RocksDB) Put(key MVCCKey, value []byte) error {
 	return dbPut(r.rdb, key, value)
 }
@@ -752,13 +800,14 @@ func (r *RocksDB) Put(key MVCCKey, value []byte) error {
 // Currently 64-bit counter logic is implemented. See the documentation of
 // goMerge and goMergeInit for details.
 //
-// The key and value byte slices may be reused safely. merge takes a copy
-// of them before returning.
+// It is safe to modify the contents of the arguments after Merge returns.
 func (r *RocksDB) Merge(key MVCCKey, value []byte) error {
 	return dbMerge(r.rdb, key, value)
 }
 
 // LogData is part of the Writer interface.
+//
+// It is safe to modify the contents of the arguments after LogData returns.
 func (r *RocksDB) LogData(data []byte) error {
 	panic("unimplemented")
 }
@@ -771,6 +820,9 @@ func (r *RocksDB) LogLogicalOp(op MVCCLogicalOpType, details MVCCLogicalOpDetail
 // ApplyBatchRepr atomically applies a set of batched updates. Created by
 // calling Repr() on a batch. Using this method is equivalent to constructing
 // and committing a batch whose Repr() equals repr.
+//
+// It is safe to modify the contents of the arguments after ApplyBatchRepr
+// returns.
 func (r *RocksDB) ApplyBatchRepr(repr []byte, sync bool) error {
 	return dbApplyBatchRepr(r.rdb, repr, sync)
 }
@@ -788,23 +840,32 @@ func (r *RocksDB) GetProto(
 }
 
 // Clear removes the item from the db with the given key.
+//
+// It is safe to modify the contents of the arguments after Clear returns.
 func (r *RocksDB) Clear(key MVCCKey) error {
 	return dbClear(r.rdb, key)
 }
 
 // SingleClear removes the most recent item from the db with the given key.
+//
+// It is safe to modify the contents of the arguments after SingleClear returns.
 func (r *RocksDB) SingleClear(key MVCCKey) error {
 	return dbSingleClear(r.rdb, key)
 }
 
 // ClearRange removes a set of entries, from start (inclusive) to end
 // (exclusive).
+//
+// It is safe to modify the contents of the arguments after ClearRange returns.
 func (r *RocksDB) ClearRange(start, end MVCCKey) error {
 	return dbClearRange(r.rdb, start, end)
 }
 
 // ClearIterRange removes a set of entries, from start (inclusive) to end
 // (exclusive).
+//
+// It is safe to modify the contents of the arguments after ClearIterRange
+// returns.
 func (r *RocksDB) ClearIterRange(iter Iterator, start, end MVCCKey) error {
 	return dbClearIterRange(r.rdb, iter, start, end)
 }
@@ -1179,7 +1240,48 @@ func (r *RocksDB) GetStats() (*Stats, error) {
 		Compactions:                    int64(s.compactions),
 		TableReadersMemEstimate:        int64(s.table_readers_mem_estimate),
 		PendingCompactionBytesEstimate: int64(s.pending_compaction_bytes_estimate),
+		L0FileCount:                    int64(s.l0_file_count),
 	}, nil
+}
+
+// GetTickersAndHistograms retrieves maps of all RocksDB tickers and histograms.
+// It differs from `GetStats` by getting _every_ ticker and histogram, and by not
+// getting anything else (DB properties, for example).
+func (r *RocksDB) GetTickersAndHistograms() (*enginepb.TickersAndHistograms, error) {
+	res := new(enginepb.TickersAndHistograms)
+	var s C.DBTickersAndHistogramsResult
+	if err := statusToError(C.DBGetTickersAndHistograms(r.rdb, &s)); err != nil {
+		return nil, err
+	}
+
+	tickers := (*[maxArrayLen / C.sizeof_TickerInfo]C.TickerInfo)(
+		unsafe.Pointer(s.tickers))[:s.tickers_len:s.tickers_len]
+	res.Tickers = make(map[string]uint64)
+	for _, ticker := range tickers {
+		name := cStringToGoString(ticker.name)
+		value := uint64(ticker.value)
+		res.Tickers[name] = value
+	}
+	C.free(unsafe.Pointer(s.tickers))
+
+	res.Histograms = make(map[string]enginepb.HistogramData)
+	histograms := (*[maxArrayLen / C.sizeof_HistogramInfo]C.HistogramInfo)(
+		unsafe.Pointer(s.histograms))[:s.histograms_len:s.histograms_len]
+	for _, histogram := range histograms {
+		name := cStringToGoString(histogram.name)
+		value := enginepb.HistogramData{
+			Mean:  float64(histogram.mean),
+			P50:   float64(histogram.p50),
+			P95:   float64(histogram.p95),
+			P99:   float64(histogram.p99),
+			Max:   float64(histogram.max),
+			Count: uint64(histogram.count),
+			Sum:   uint64(histogram.sum),
+		}
+		res.Histograms[name] = value
+	}
+	C.free(unsafe.Pointer(s.histograms))
+	return res, nil
 }
 
 // GetCompactionStats returns the internal RocksDB compaction stats. See
@@ -1200,6 +1302,7 @@ func (r *RocksDB) GetEnvStats() (*EnvStats, error) {
 		TotalBytes:       uint64(s.total_bytes),
 		ActiveKeyFiles:   uint64(s.active_key_files),
 		ActiveKeyBytes:   uint64(s.active_key_bytes),
+		EncryptionType:   int32(s.encryption_type),
 		EncryptionStatus: cStringToGoBytes(s.encryption_status),
 	}, nil
 }
@@ -1940,8 +2043,8 @@ func (r *rocksDBBatch) commitInternal(sync bool) error {
 
 	warnLargeBatches := r.parent.cfg.WarnLargeBatchThreshold > 0
 	if elapsed := timeutil.Since(start); warnLargeBatches && (elapsed >= r.parent.cfg.WarnLargeBatchThreshold) {
-		log.Warningf(context.TODO(), "batch [%d/%d/%d] commit took %s (>%s):\n%s",
-			count, size, r.flushes, elapsed, r.parent.cfg.WarnLargeBatchThreshold, debug.Stack())
+		log.Warningf(context.TODO(), "batch [%d/%d/%d] commit took %s (>= warning threshold %s)",
+			count, size, r.flushes, elapsed, r.parent.cfg.WarnLargeBatchThreshold)
 	}
 
 	return nil
@@ -2907,6 +3010,57 @@ func (r *RocksDB) setAuxiliaryDir(d string) error {
 	}
 	r.auxDir = d
 	return nil
+}
+
+// PreIngestDelay may choose to block for some duration if L0 has an excessive
+// number of files in it or if PendingCompactionBytesEstimate is elevated. This
+// it is intended to be called before ingesting a new SST, since we'd rather
+// backpressure the bulk operation adding SSTs than slow down the whole RocksDB
+// instance and impact all forground traffic by adding too many files to it.
+// After the number of L0 files exceeds the configured limit, it gradually
+// begins delaying more for each additional file in L0 over the limit until
+// hitting its configured (via settings) maximum delay. If the pending
+// compaction limit is exceeded, it waits for the maximum delay.
+func (r *RocksDB) PreIngestDelay(ctx context.Context) {
+	if r.cfg.Settings == nil {
+		return
+	}
+	stats, err := r.GetStats()
+	if err != nil {
+		log.Warningf(ctx, "failed to read stats: %+v", err)
+		return
+	}
+	targetDelay := calculatePreIngestDelay(r.cfg, stats)
+
+	if targetDelay == 0 {
+		return
+	}
+	log.VEventf(ctx, 2, "delaying SST ingestion %s. %d L0 files, %db pending compaction", targetDelay, stats.L0FileCount, stats.PendingCompactionBytesEstimate)
+
+	select {
+	case <-time.After(targetDelay):
+	case <-ctx.Done():
+	}
+}
+
+func calculatePreIngestDelay(cfg RocksDBConfig, stats *Stats) time.Duration {
+	maxDelay := ingestDelayTime.Get(&cfg.Settings.SV)
+	l0Filelimit := ingestDelayL0Threshold.Get(&cfg.Settings.SV)
+	compactionLimit := ingestDelayPendingLimit.Get(&cfg.Settings.SV)
+
+	if stats.PendingCompactionBytesEstimate >= compactionLimit {
+		return maxDelay
+	}
+	const ramp = 10
+	if stats.L0FileCount > l0Filelimit {
+		delayPerFile := maxDelay / time.Duration(ramp)
+		targetDelay := time.Duration(stats.L0FileCount-l0Filelimit) * delayPerFile
+		if targetDelay > maxDelay {
+			return maxDelay
+		}
+		return targetDelay
+	}
+	return 0
 }
 
 // IngestExternalFiles atomically links a slice of files into the RocksDB

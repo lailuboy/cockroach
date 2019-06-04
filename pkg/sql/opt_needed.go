@@ -234,6 +234,9 @@ func setNeededColumns(plan planNode, needed []bool) {
 	case *splitNode:
 		setNeededColumns(n.rows, allColumns(n.rows))
 
+	case *unsplitNode:
+		setNeededColumns(n.rows, allColumns(n.rows))
+
 	case *relocateNode:
 		setNeededColumns(n.rows, allColumns(n.rows))
 
@@ -253,6 +256,12 @@ func setNeededColumns(plan planNode, needed []bool) {
 
 	case *controlJobsNode:
 		setNeededColumns(n.rows, allColumns(n.rows))
+
+	case *errorIfRowsNode:
+		setNeededColumns(n.plan, allColumns(n.plan))
+
+	case *bufferNode:
+		setNeededColumns(n.plan, needed)
 
 	case *alterIndexNode:
 	case *alterTableNode:
@@ -287,10 +296,10 @@ func setNeededColumns(plan planNode, needed []bool) {
 	case *setVarNode:
 	case *setClusterSettingNode:
 	case *setZoneConfigNode:
-	case *showZoneConfigNode:
 	case *showFingerprintsNode:
 	case *showTraceNode:
 	case *scatterNode:
+	case *scanBufferNode:
 
 	default:
 		panic(fmt.Sprintf("unhandled node type: %T", plan))

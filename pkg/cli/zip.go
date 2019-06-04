@@ -17,12 +17,16 @@ package cli
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -39,15 +43,50 @@ var debugZipCmd = &cobra.Command{
 	Long: `
 
 Gather cluster debug data into a zip file. Data includes cluster events, node
-liveness, node status, range status, node stack traces, log files, and SQL
-schema.
+liveness, node status, range status, node stack traces, node engine stats, log
+files, and SQL schema.
 
-Retrieval of per-node details (status, stack traces, range status) requires the
-node to be live and operating properly. Retrieval of SQL data requires the
-cluster to be live.
+Retrieval of per-node details (status, stack traces, range status, engine stats)
+requires the node to be live and operating properly. Retrieval of SQL data
+requires the cluster to be live.
 `,
 	Args: cobra.ExactArgs(1),
 	RunE: MaybeDecorateGRPCError(runDebugZip),
+}
+
+// Tables containing cluster-wide info that are collected in a debug zip.
+var debugZipTablesPerCluster = []string{
+	"crdb_internal.cluster_queries",
+	"crdb_internal.cluster_sessions",
+	"crdb_internal.cluster_settings",
+
+	"crdb_internal.jobs",
+
+	"crdb_internal.kv_node_status",
+	"crdb_internal.kv_store_status",
+
+	"crdb_internal.schema_changes",
+	"crdb_internal.partitions",
+	"crdb_internal.zones",
+}
+
+// Tables collected from each node in a debug zip.
+var debugZipTablesPerNode = []string{
+	"crdb_internal.feature_usage",
+
+	"crdb_internal.gossip_alerts",
+	"crdb_internal.gossip_liveness",
+	"crdb_internal.gossip_network",
+	"crdb_internal.gossip_nodes",
+
+	"crdb_internal.leases",
+
+	"crdb_internal.node_statement_statistics",
+	"crdb_internal.node_build_info",
+	"crdb_internal.node_metrics",
+	"crdb_internal.node_queries",
+	"crdb_internal.node_runtime_info",
+	"crdb_internal.node_sessions",
 }
 
 type zipper struct {
@@ -89,6 +128,9 @@ func (z *zipper) createRaw(name string, b []byte) error {
 }
 
 func (z *zipper) createJSON(name string, m interface{}) error {
+	if !strings.HasSuffix(name, ".json") {
+		return errors.Errorf("%s does not have .json suffix", name)
+	}
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
@@ -97,11 +139,11 @@ func (z *zipper) createJSON(name string, m interface{}) error {
 }
 
 func (z *zipper) createError(name string, e error) error {
-	fmt.Printf("  %s: %s\n", name, e)
 	w, err := z.create(name, time.Time{})
 	if err != nil {
 		return err
 	}
+	fmt.Printf("  ^- resulted in %s\n", e)
 	fmt.Fprintf(w, "%s\n", e)
 	return nil
 }
@@ -114,6 +156,9 @@ func (z *zipper) createJSONOrError(name string, m interface{}, e error) error {
 }
 
 func (z *zipper) createRawOrError(name string, b []byte, e error) error {
+	if filepath.Ext(name) == "" {
+		return errors.Errorf("%s has no extension", name)
+	}
 	if e != nil {
 		return z.createError(name, e)
 	}
@@ -125,21 +170,25 @@ type zipRequest struct {
 	pathName string
 }
 
+func guessNodeURL(workingURL string, hostport string) *sqlConn {
+	u, err := url.Parse(workingURL)
+	if err != nil {
+		u = &url.URL{Host: "invalid"}
+	}
+	u.Host = hostport
+	return makeSQLConn(u.String())
+}
+
 func runDebugZip(cmd *cobra.Command, args []string) error {
 	const (
-		base               = "debug"
-		eventsName         = base + "/events"
-		gossipLivenessName = base + "/gossip/liveness"
-		gossipNetworkName  = base + "/gossip/network"
-		gossipNodesName    = base + "/gossip/nodes"
-		alertsName         = base + "/alerts"
-		livenessName       = base + "/liveness"
-		metricsName        = base + "/metrics"
-		nodesPrefix        = base + "/nodes"
-		rangelogName       = base + "/rangelog"
-		reportsPrefix      = base + "/reports"
-		schemaPrefix       = base + "/schema"
-		settingsName       = base + "/settings"
+		base          = "debug"
+		eventsName    = base + "/events"
+		livenessName  = base + "/liveness"
+		nodesPrefix   = base + "/nodes"
+		rangelogName  = base + "/rangelog"
+		reportsPrefix = base + "/reports"
+		schemaPrefix  = base + "/schema"
+		settingsName  = base + "/settings"
 	)
 
 	baseCtx, cancel := context.WithCancel(context.Background())
@@ -181,7 +230,7 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 			data, err = r.fn(ctx)
 			return err
 		})
-		return z.createJSONOrError(r.pathName, data, err)
+		return z.createJSONOrError(r.pathName+".json", data, err)
 	}
 
 	for _, r := range []zipRequest{
@@ -221,17 +270,10 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	for _, item := range []struct {
-		query, name string
-	}{
-		{"SELECT * FROM crdb_internal.gossip_liveness;", gossipLivenessName},
-		{"SELECT * FROM crdb_internal.gossip_network;", gossipNetworkName},
-		{"SELECT * FROM crdb_internal.gossip_nodes;", gossipNodesName},
-		{"SELECT * FROM crdb_internal.node_metrics;", metricsName},
-		{"SELECT * FROM crdb_internal.gossip_alerts;", alertsName},
-	} {
-		if err := dumpTableDataForZip(z, sqlConn, item.query, item.name); err != nil {
-			return errors.Wrap(err, item.name)
+	for _, table := range debugZipTablesPerCluster {
+		query := fmt.Sprintf(`SELECT * FROM %s`, table)
+		if err := dumpTableDataForZip(z, sqlConn, query, base+"/"+table+".txt"); err != nil {
+			return errors.Wrap(err, table)
 		}
 	}
 
@@ -248,8 +290,23 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 			for _, node := range nodes.Nodes {
 				id := fmt.Sprintf("%d", node.Desc.NodeID)
 				prefix := fmt.Sprintf("%s/%s", nodesPrefix, id)
-				if err := z.createJSON(prefix+"/status", node); err != nil {
+				// Don't use sqlConn because that's only for is the node `debug
+				// zip` was pointed at, but here we want to connect to nodes
+				// individually to grab node- local SQL tables. Try to guess by
+				// replacing the host in the connection string; this may or may
+				// not work and if it doesn't, we let the invalid curSQLConn get
+				// used anyway so that anything that does *not* need it will
+				// still happen.
+				curSQLConn := guessNodeURL(sqlConn.url, node.Desc.Address.AddressField)
+				if err := z.createJSON(prefix+"/status.json", node); err != nil {
 					return err
+				}
+
+				for _, table := range debugZipTablesPerNode {
+					query := fmt.Sprintf(`SELECT * FROM %s`, table)
+					if err := dumpTableDataForZip(z, curSQLConn, query, prefix+"/"+table+".txt"); err != nil {
+						return errors.Wrap(err, table)
+					}
 				}
 
 				for _, r := range []zipRequest{
@@ -265,6 +322,12 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 						},
 						pathName: prefix + "/gossip",
 					},
+					{
+						fn: func(ctx context.Context) (interface{}, error) {
+							return status.EngineStats(ctx, &serverpb.EngineStatsRequest{NodeId: id})
+						},
+						pathName: prefix + "/enginestats",
+					},
 				} {
 					if err := runZipRequest(r); err != nil {
 						return err
@@ -275,12 +338,12 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 				err = contextutil.RunWithTimeout(baseCtx, "request stacks", timeout,
 					func(ctx context.Context) error {
 						stacks, err := status.Stacks(ctx, &serverpb.StacksRequest{NodeId: id})
-						if err != nil {
+						if err == nil {
 							stacksData = stacks.Data
 						}
 						return err
 					})
-				if err := z.createRawOrError(prefix+"/stacks", stacksData, err); err != nil {
+				if err := z.createRawOrError(prefix+"/stacks.txt", stacksData, err); err != nil {
 					return err
 				}
 
@@ -291,15 +354,17 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 							NodeId: id,
 							Type:   serverpb.ProfileRequest_HEAP,
 						})
-						heapData = heap.Data
+						if err == nil {
+							heapData = heap.Data
+						}
 						return err
 					})
-				if err := z.createRawOrError(prefix+"/heap", heapData, err); err != nil {
+				if err := z.createRawOrError(prefix+"/heap.pprof", heapData, err); err != nil {
 					return err
 				}
 
 				var profiles *serverpb.GetFilesResponse
-				if err := contextutil.RunWithTimeout(baseCtx, "request files", timeout,
+				if err := contextutil.RunWithTimeout(baseCtx, "request heap files", timeout,
 					func(ctx context.Context) error {
 						profiles, err = status.GetFiles(ctx, &serverpb.GetFilesRequest{
 							NodeId:   id,
@@ -308,15 +373,35 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 						})
 						return err
 					}); err != nil {
-					if err := z.createError(prefix+"/heapfiles", err); err != nil {
+					if err := z.createError(prefix+"/heapprof", err); err != nil {
 						return err
 					}
 				} else {
 					for _, file := range profiles.Files {
-						name := prefix + "/heapprof/" + file.Name
+						name := prefix + "/heapprof/" + file.Name + ".pprof"
 						if err := z.createRaw(name, file.Contents); err != nil {
 							return err
 						}
+					}
+				}
+
+				var goroutinesResp *serverpb.GetFilesResponse
+				if err := contextutil.RunWithTimeout(baseCtx, "request goroutine files", timeout,
+					func(ctx context.Context) error {
+						goroutinesResp, err = status.GetFiles(ctx, &serverpb.GetFilesRequest{
+							NodeId:   id,
+							Type:     serverpb.FileType_GOROUTINES,
+							Patterns: []string{"*"},
+						})
+						return err
+					}); err != nil {
+					return z.createError("/goroutines", err)
+				}
+				for _, file := range goroutinesResp.Files {
+					// NB: the files have a .txt.gz suffix already.
+					name := prefix + "/goroutines/" + file.Name
+					if err := z.createRawOrError(name, file.Contents, err); err != nil {
+						return err
 					}
 				}
 
@@ -372,7 +457,7 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 					})
 					for _, r := range ranges.Ranges {
 						name := fmt.Sprintf("%s/ranges/%s", prefix, r.State.Desc.RangeID)
-						if err := z.createJSON(name, r); err != nil {
+						if err := z.createJSON(name+".json", r); err != nil {
 							return err
 						}
 					}
@@ -399,7 +484,7 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 						database, err = admin.DatabaseDetails(ctx, &serverpb.DatabaseDetailsRequest{Database: dbName})
 						return err
 					})
-				if err := z.createJSONOrError(prefix+"@details", database, requestErr); err != nil {
+				if err := z.createJSONOrError(prefix+"@details.json", database, requestErr); err != nil {
 					return err
 				}
 				if requestErr != nil {
@@ -414,7 +499,7 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 							table, err = admin.TableDetails(ctx, &serverpb.TableDetailsRequest{Database: dbName, Table: tableName})
 							return err
 						})
-					if err := z.createJSONOrError(name, table, err); err != nil {
+					if err := z.createJSONOrError(name+".json", table, err); err != nil {
 						return err
 					}
 				}
@@ -426,16 +511,19 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 }
 
 func dumpTableDataForZip(z *zipper, conn *sqlConn, query string, name string) error {
+	if !strings.HasSuffix(name, ".txt") {
+		return errors.Errorf("%s does not have .txt suffix", name)
+	}
+	var buf bytes.Buffer
+
+	err := runQueryAndFormatResults(conn, &buf, makeQuery(query))
+	if err != nil {
+		return z.createError(name, err)
+	}
 	w, err := z.create(name, time.Time{})
 	if err != nil {
 		return err
 	}
-
-	if err = runQueryAndFormatResults(conn, w, makeQuery(query)); err != nil {
-		if err := z.createError(name, err); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	_, err = io.Copy(w, bytes.NewReader(buf.Bytes()))
+	return err
 }

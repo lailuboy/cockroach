@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -122,6 +123,14 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 			cfg.MaxOffset = MaxOffsetType(mo)
 		}
 	}
+	if params.Knobs.Server != nil {
+		if zoneConfig := params.Knobs.Server.(*TestingKnobs).DefaultZoneConfigOverride; zoneConfig != nil {
+			cfg.DefaultZoneConfig = *zoneConfig
+		}
+		if systemZoneConfig := params.Knobs.Server.(*TestingKnobs).DefaultSystemZoneConfigOverride; systemZoneConfig != nil {
+			cfg.DefaultSystemZoneConfig = *systemZoneConfig
+		}
+	}
 	if params.ScanInterval != 0 {
 		cfg.ScanInterval = params.ScanInterval
 	}
@@ -146,6 +155,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.SQLMemoryPoolSize != 0 {
 		cfg.SQLMemoryPoolSize = params.SQLMemoryPoolSize
 	}
+
 	cfg.JoinList = []string{params.JoinAddr}
 	if cfg.Insecure {
 		// Whenever we can (i.e. in insecure mode), use IsolatedTestAddr
@@ -181,12 +191,22 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 			if storeSpec.Size.Percent > 0 {
 				panic(fmt.Sprintf("test server does not yet support in memory stores based on percentage of total memory: %s", storeSpec))
 			}
+		} else {
+			// The default store spec is in-memory, so if this one is on-disk then
+			// one specific test must have requested it. A failure is returned if
+			// the Path field is empty, which means the test is then forced to pick
+			// the dir (and the test is then responsible for cleaning it up, not
+			// TestServer).
+
+			// HeapProfileDirName and GoroutineDumpDirName are normally set by the
+			// cli, once, to the path of the first store.
+			if cfg.HeapProfileDirName == "" {
+				cfg.HeapProfileDirName = filepath.Join(storeSpec.Path, "logs")
+			}
+			if cfg.GoroutineDumpDirName == "" {
+				cfg.GoroutineDumpDirName = filepath.Join(storeSpec.Path, "logs")
+			}
 		}
-		// The default store spec is in-memory, so if this one is on-disk then
-		// one specific test must have requested it. A failure is returned if
-		// the Path field is empty, which means the test is then forced to pick
-		// the dir (and the test is then responsible for cleaning it up, not
-		// TestServer).
 	}
 	cfg.Stores = base.StoreSpecList{Specs: params.StoreSpecs}
 	if params.TempStorageConfig != (base.TempStorageConfig{}) {
@@ -303,16 +323,8 @@ func (ts *TestServer) Start(params base.TestServerArgs) error {
 		params.Stopper = stop.NewStopper()
 	}
 
-	// TODO(andrei): Running two TestServers concurrently with
-	// PartOfCluster==false can result in the default zone config not be reset
-	// properly. It would be nice if this were more robust.
 	if !params.PartOfCluster {
-		// Change the replication requirements so we don't get log spam about ranges
-		// not being replicated enough.
-		cfg := config.DefaultZoneConfig()
-		cfg.NumReplicas = proto.Int32(1)
-		fn := config.TestingSetDefaultZoneConfig(cfg)
-		params.Stopper.AddCloser(stop.CloserFn(fn))
+		ts.Cfg.DefaultZoneConfig.NumReplicas = proto.Int32(1)
 	}
 
 	// Needs to be called before NewServer to ensure resolvers are initialized.
@@ -345,13 +357,15 @@ func (ts *TestServer) Start(params base.TestServerArgs) error {
 // assuming no additional information is added outside of the normal bootstrap
 // process.
 func (ts *TestServer) ExpectedInitialRangeCount() (int, error) {
-	return ExpectedInitialRangeCount(ts.DB())
+	return ExpectedInitialRangeCount(ts.DB(), &ts.cfg.DefaultZoneConfig, &ts.cfg.DefaultSystemZoneConfig)
 }
 
 // ExpectedInitialRangeCount returns the expected number of ranges that should
 // be on the server after bootstrap.
-func ExpectedInitialRangeCount(db *client.DB) (int, error) {
-	descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(context.Background(), db)
+func ExpectedInitialRangeCount(
+	db *client.DB, defaultZoneConfig *config.ZoneConfig, defaultSystemZoneConfig *config.ZoneConfig,
+) (int, error) {
+	descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(context.Background(), db, defaultZoneConfig, defaultSystemZoneConfig)
 	if err != nil {
 		return 0, err
 	}
@@ -587,6 +601,24 @@ func (ts *TestServer) LookupRange(key roachpb.Key) (roachpb.RangeDescriptor, err
 	return rs[0], nil
 }
 
+// MergeRanges merges the range containing leftKey with the range to its right.
+func (ts *TestServer) MergeRanges(leftKey roachpb.Key) (roachpb.RangeDescriptor, error) {
+
+	ctx := context.Background()
+	mergeReq := roachpb.AdminMergeRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key: leftKey,
+		},
+	}
+	_, pErr := client.SendWrapped(ctx, ts.DB().NonTransactionalSender(), &mergeReq)
+	if pErr != nil {
+		return roachpb.RangeDescriptor{},
+			errors.Errorf(
+				"%q: merge unexpected error: %s", leftKey, pErr)
+	}
+	return ts.LookupRange(leftKey)
+}
+
 // SplitRange splits the range containing splitKey.
 // The right range created by the split starts at the split key and extends to the
 // original range's end key.
@@ -607,6 +639,7 @@ func (ts *TestServer) SplitRange(
 			Key: splitKey,
 		},
 		SplitKey: splitKey,
+		Manual:   true,
 	}
 	_, pErr := client.SendWrapped(ctx, ts.DB().NonTransactionalSender(), &splitReq)
 	if pErr != nil {

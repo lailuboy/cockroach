@@ -32,6 +32,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"text/template"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/config"
@@ -76,6 +77,11 @@ type SyncedCluster struct {
 	Impl        ClusterImpl
 	UseTreeDist bool
 	Quiet       bool
+	// AuthorizedKeys is used by SetupSSH to add additional authorized keys.
+	AuthorizedKeys []byte
+
+	// Used to stash debug information.
+	DebugDir string
 }
 
 func (c *SyncedCluster) host(index int) string {
@@ -141,7 +147,7 @@ func (c *SyncedCluster) newSession(i int) (session, error) {
 	if c.IsLocal() {
 		return newLocalSession(), nil
 	}
-	return newRemoteSession(c.user(i), c.host(i))
+	return newRemoteSession(c.user(i), c.host(i), c.DebugDir)
 }
 
 // Stop TODO(peter): document
@@ -261,51 +267,85 @@ fi
 	}
 }
 
-// NodeMonitorInfo TODO(peter): document
+// NodeMonitorInfo is a message describing a cockroach process' status.
 type NodeMonitorInfo struct {
+	// The index of the node (in a SyncedCluster) at which the message originated.
 	Index int
-	Msg   string
+	// A message about the node. This is either a PID, "dead", "nc exited", or
+	// "skipped".
+	// Anything but a PID or "skipped" is an indication that there is some
+	// problem with the node and that the process is not running.
+	Msg string
+	// Err is an error that may occur when trying to probe the status of the node.
+	// If Err is non-nil, Msg is empty. After an error is returned, the node with
+	// the given index will no longer be probed. Errors typically indicate networking
+	// issues or nodes that have (physically) shut down.
+	Err error
 }
 
-// Monitor TODO(peter): document
-func (c *SyncedCluster) Monitor() chan NodeMonitorInfo {
+// Monitor writes NodeMonitorInfo for the cluster nodes to the returned channel.
+// Infos sent to the channel always have the Index and exactly one of Msg or Err
+// set.
+//
+// If oneShot is true, infos are retrieved only once for each node and the
+// channel is subsequently closed; otherwise the process continues indefinitely
+// (emitting new information as the status of the cockroach process changes).
+//
+// If ignoreEmptyNodes is true, nodes on which no CockroachDB data is found
+// (in {store-dir}) will not be probed and single message, "skipped", will
+// be emitted for them.
+func (c *SyncedCluster) Monitor(ignoreEmptyNodes bool, oneShot bool) chan NodeMonitorInfo {
 	ch := make(chan NodeMonitorInfo)
 	nodes := c.ServerNodes()
+	var wg sync.WaitGroup
 
 	for i := range nodes {
+		wg.Add(1)
 		go func(i int) {
+			defer wg.Done()
 			sess, err := c.newSession(nodes[i])
 			if err != nil {
-				ch <- NodeMonitorInfo{nodes[i], err.Error()}
+				ch <- NodeMonitorInfo{Index: nodes[i], Err: err}
+				wg.Done()
 				return
 			}
 			defer sess.Close()
 
 			p, err := sess.StdoutPipe()
 			if err != nil {
-				ch <- NodeMonitorInfo{nodes[i], err.Error()}
+				ch <- NodeMonitorInfo{Index: nodes[i], Err: err}
+				wg.Done()
 				return
 			}
-
-			go func(p io.Reader) {
-				r := bufio.NewReader(p)
-				for {
-					line, _, err := r.ReadLine()
-					if err == io.EOF {
-						return
-					}
-					ch <- NodeMonitorInfo{nodes[i], string(line)}
-				}
-			}(p)
 
 			// On each monitored node, we loop looking for a cockroach process. In
 			// order to avoid polling with lsof, if we find a live process we use nc
 			// (netcat) to connect to the rpc port which will block until the server
 			// either decides to kill the connection or the process is killed.
-			cmd := fmt.Sprintf(`
+			// In one-shot we don't use nc and return after the first assessment
+			// of the process' health.
+			data := struct {
+				OneShot     bool
+				IgnoreEmpty bool
+				Store       string
+				Port        int
+			}{
+				OneShot:     oneShot,
+				IgnoreEmpty: ignoreEmptyNodes,
+				Store:       Cockroach{}.NodeDir(c, nodes[i]),
+				Port:        Cockroach{}.NodePort(c, nodes[i]),
+			}
+
+			snippet := `
 lastpid=0
+{{ if .IgnoreEmpty}}
+if [ ! -f "{{.Store}}/CURRENT" ]; then
+  echo "skipped"
+  exit 0
+fi
+{{- end}}
 while :; do
-  pid=$(lsof -i :%[1]d -sTCP:LISTEN | awk '!/COMMAND/ {print $2}')
+  pid=$(lsof -i :{{.Port}} -sTCP:LISTEN | awk '!/COMMAND/ {print $2}')
   if [ "${pid}" != "${lastpid}" ]; then
     if [ -n "${lastpid}" -a -z "${pid}" ]; then
       echo dead
@@ -315,21 +355,31 @@ while :; do
       echo ${pid}
     fi
   fi
-
+{{if .OneShot }}
+  exit 0
+{{- end}}
   if [ -n "${lastpid}" ]; then
-    nc localhost %[1]d >/dev/null 2>&1
-    echo nc exited
+    while kill -0 "${lastpid}"; do
+      sleep 1
+    done
+    echo "kill exited nonzero"
   else
     sleep 1
   fi
 done
-`,
-				Cockroach{}.NodePort(c, nodes[i]))
+`
+
+			t := template.Must(template.New("script").Parse(snippet))
+			var buf bytes.Buffer
+			if err := t.Execute(&buf, data); err != nil {
+				ch <- NodeMonitorInfo{Index: nodes[i], Err: err}
+				return
+			}
 
 			// Request a PTY so that the script will receive will receive a SIGPIPE
 			// when the session is closed.
 			if err := sess.RequestPty(); err != nil {
-				ch <- NodeMonitorInfo{nodes[i], err.Error()}
+				ch <- NodeMonitorInfo{Index: nodes[i], Err: err}
 				return
 			}
 			// Give the session a valid stdin pipe so that nc won't exit immediately.
@@ -338,16 +388,44 @@ done
 			// when the roachprod process is killed.
 			inPipe, err := sess.StdinPipe()
 			if err != nil {
-				ch <- NodeMonitorInfo{nodes[i], err.Error()}
+				ch <- NodeMonitorInfo{Index: nodes[i], Err: err}
 				return
 			}
 			defer inPipe.Close()
-			if err := sess.Run(cmd); err != nil {
-				ch <- NodeMonitorInfo{nodes[i], err.Error()}
+
+			var readerWg sync.WaitGroup
+			readerWg.Add(1)
+			go func(p io.Reader) {
+				defer readerWg.Done()
+				r := bufio.NewReader(p)
+				for {
+					line, _, err := r.ReadLine()
+					if err == io.EOF {
+						return
+					}
+					ch <- NodeMonitorInfo{Index: nodes[i], Msg: string(line)}
+				}
+			}(p)
+
+			if err := sess.Start(buf.String()); err != nil {
+				ch <- NodeMonitorInfo{Index: nodes[i], Err: err}
+				return
+			}
+
+			readerWg.Wait()
+			// We must call `sess.Wait()` only after finishing reading from the stdout
+			// pipe. Otherwise it can be closed under us, causing the reader to loop
+			// infinitely receiving a non-`io.EOF` error.
+			if err := sess.Wait(); err != nil {
+				ch <- NodeMonitorInfo{Index: nodes[i], Err: err}
 				return
 			}
 		}(i)
 	}
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
 
 	return ch
 }
@@ -376,7 +454,10 @@ func (c *SyncedCluster) Run(stdout, stderr io.Writer, nodes []int, title, cmd st
 		e := expander{
 			node: nodes[i],
 		}
-		expandedCmd := e.expand(c, cmd)
+		expandedCmd, err := e.expand(c, cmd)
+		if err != nil {
+			return nil, err
+		}
 
 		// Be careful about changing these command strings. In particular, we need
 		// to support running commands in the background on both local and remote
@@ -386,7 +467,7 @@ func (c *SyncedCluster) Run(stdout, stderr io.Writer, nodes []int, title, cmd st
 		//
 		// That command should return immediately. And a "roachprod status" should
 		// reveal that the sleep command is running on the cluster.
-		nodeCmd := fmt.Sprintf(`export ROACHPROD=%d%s && bash -c %s`,
+		nodeCmd := fmt.Sprintf(`export ROACHPROD=%d%s GOTRACEBACK=crash && bash -c %s`,
 			nodes[i], c.Tag, ssh.Escape1(expandedCmd))
 		if c.IsLocal() {
 			nodeCmd = fmt.Sprintf("cd ${HOME}/local/%d ; %s", nodes[i], nodeCmd)
@@ -460,7 +541,21 @@ func (c *SyncedCluster) Wait() error {
 	return nil
 }
 
-// SetupSSH TODO(peter): document
+// SetupSSH configures the cluster for use with SSH. This is generally run after
+// the cloud.Cluster has been synced which resets the SSH credentials on the
+// machines and sets them up for the current user. This method enables the
+// hosts to talk to eachother and optionally confiures additional keys to be
+// added to the hosts via the c.AuthorizedKeys field. It does so in the following
+// steps:
+//
+//   1. Creates an ssh key pair on the first host to be used on all hosts if
+//      none exists.
+//   2. Distributes the public key, private key, and authorized_keys file from
+//      the first host to the others.
+//   3. Merges the data in c.AuthorizedKeys with the existing authorized_keys
+//      files on all hosts.
+//
+// This call strives to be idempotent.
 func (c *SyncedCluster) SetupSSH() error {
 	if c.IsLocal() {
 		return nil
@@ -473,7 +568,6 @@ func (c *SyncedCluster) SetupSSH() error {
 
 	// Generate an ssh key that we'll distribute to all of the nodes in the
 	// cluster in order to allow inter-node ssh.
-	var msg string
 	var sshTar []byte
 	c.Parallel("generating ssh key", 1, 0, func(i int) ([]byte, error) {
 		sess, err := c.newSession(1)
@@ -498,17 +592,11 @@ tar cf - .ssh/id_rsa .ssh/id_rsa.pub .ssh/authorized_keys
 		sess.SetStderr(&stderr)
 
 		if err := sess.Run(cmd); err != nil {
-			msg = fmt.Sprintf("~ %s\n%v\n%s", cmd, err, stderr.String())
-		} else {
-			sshTar = stdout.Bytes()
+			return nil, errors.Wrapf(err, "%s: stderr:\n%s", cmd, stderr.String())
 		}
+		sshTar = stdout.Bytes()
 		return nil, nil
 	})
-
-	if msg != "" {
-		fmt.Fprintln(os.Stderr, msg)
-		return nil
-	}
 
 	// Skip the the first node which is where we generated the key.
 	nodes := c.Nodes[1:]
@@ -522,7 +610,7 @@ tar cf - .ssh/id_rsa .ssh/id_rsa.pub .ssh/authorized_keys
 		sess.SetStdin(bytes.NewReader(sshTar))
 		cmd := `tar xf -`
 		if out, err := sess.CombinedOutput(cmd); err != nil {
-			return nil, errors.Wrapf(err, "~ %s\n%s", cmd, out)
+			return nil, errors.Wrapf(err, "%s: output:\n%s", cmd, out)
 		}
 		return nil, nil
 	})
@@ -549,36 +637,105 @@ tar cf - .ssh/id_rsa .ssh/id_rsa.pub .ssh/authorized_keys
 	for _, i := range c.Nodes {
 		ips = append(ips, c.host(i))
 	}
-	c.Parallel("scanning hosts", len(c.Nodes), 0, func(i int) ([]byte, error) {
+	var knownHostsData []byte
+	c.Parallel("scanning hosts", 1, 0, func(i int) ([]byte, error) {
 		sess, err := c.newSession(c.Nodes[i])
 		if err != nil {
 			return nil, err
 		}
 		defer sess.Close()
 
-		// Note that this is not idempotent. If we run the ssh-keyscan multiple
-		// times on the same node the known_hosts file will grow. This isn't a
-		// problem for the usage here which only performs the keyscan once when the
-		// cluster is created. ssh-keyscan may return fewer than the desired number
-		// of entries if the remote nodes are not responding yet, so we loop until
-		// we have a scan that found host keys for all of the IPs.
+		// ssh-keyscan may return fewer than the desired number of entries if the
+		// remote nodes are not responding yet, so we loop until we have a scan that
+		// found host keys for all of the IPs. Merge the newly scanned keys with the
+		// existing list to make this process idempotent.
 		cmd := `
+set -e
+tmp="$(tempfile -d ~/.ssh -p 'roachprod' )"
+on_exit() {
+    rm -f "${tmp}"
+}
+trap on_exit EXIT
 for i in {1..20}; do
-  ssh-keyscan -T 60 -t rsa ` + strings.Join(ips, " ") + ` > .ssh/known_hosts.tmp
-  if [ "$(cat .ssh/known_hosts.tmp | wc -l)" -eq "` + fmt.Sprint(len(ips)) + `" ]; then
-    cat .ssh/known_hosts.tmp >> .ssh/known_hosts
-    rm -f .ssh/known_hosts.tmp
+  ssh-keyscan -T 60 -t rsa ` + strings.Join(ips, " ") + ` > "${tmp}"
+  if [[ "$(wc < ${tmp} -l)" -eq "` + fmt.Sprint(len(ips)) + `" ]]; then
+    [[ -f .ssh/known_hosts ]] && cat .ssh/known_hosts >> "${tmp}"
+    sort -u < "${tmp}"
     exit 0
   fi
   sleep 1
 done
 exit 1
 `
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		sess.SetStdout(&stdout)
+		sess.SetStderr(&stderr)
+		if err := sess.Run(cmd); err != nil {
+			return nil, errors.Wrapf(err, "%s: stderr:\n%s", cmd, stderr.String())
+		}
+		knownHostsData = stdout.Bytes()
+		return nil, nil
+	})
+	const sharedUser = "ubuntu"
+	c.Parallel("distributing known_hosts", len(c.Nodes), 0, func(i int) ([]byte, error) {
+		sess, err := c.newSession(c.Nodes[i])
+		if err != nil {
+			return nil, err
+		}
+		defer sess.Close()
+
+		sess.SetStdin(bytes.NewReader(knownHostsData))
+		const cmd = `
+known_hosts_data="$(cat)"
+set -e
+tmp="$(tempfile -p 'roachprod' -m 0644 )"
+on_exit() {
+    rm -f "${tmp}"
+}
+echo "${known_hosts_data}" > "${tmp}"
+trap on_exit EXIT
+cat "${tmp}" >> ~/.ssh/known_hosts
+if [[ "$(whoami)" != "` + sharedUser + `" ]]; then
+    sudo -u ` + sharedUser + ` bash -c "cat ${tmp} >> ~` + sharedUser + `/.ssh/known_hosts"
+fi
+`
 		if out, err := sess.CombinedOutput(cmd); err != nil {
-			return nil, errors.Wrapf(err, "~ %s\n%s", cmd, out)
+			return nil, errors.Wrapf(err, "%s: output:\n%s", cmd, out)
 		}
 		return nil, nil
 	})
+	if len(c.AuthorizedKeys) > 0 {
+		c.Parallel("adding additional authorized keys", len(c.Nodes), 0, func(i int) ([]byte, error) {
+			sess, err := c.newSession(c.Nodes[i])
+			if err != nil {
+				return nil, err
+			}
+			defer sess.Close()
+
+			sess.SetStdin(bytes.NewReader(c.AuthorizedKeys))
+
+			const cmd = `
+keys_data="$(cat)"
+set -e
+tmp1="$(tempfile -d ~/.ssh -p 'roachprod' )"
+tmp2="$(tempfile -d ~/.ssh -p 'roachprod' )"
+on_exit() {
+    rm -f "${tmp1}" "${tmp2}"
+}
+trap on_exit EXIT
+[[ -f ~/.ssh/authorized_keys ]] && cat ~/.ssh/authorized_keys > "${tmp1}"
+echo "${keys_data}" >> "${tmp1}"
+sort -u < "${tmp1}" > "${tmp2}"
+sudo install --mode 0600 --owner ` + sharedUser +
+				` --group ` + sharedUser +
+				` "${tmp2}" ~` + sharedUser + `/.ssh/authorized_keys`
+			if out, err := sess.CombinedOutput(cmd); err != nil {
+				return nil, errors.Wrapf(err, "~ %s\n%s", cmd, out)
+			}
+			return nil, nil
+		})
+	}
 
 	return nil
 }
@@ -665,6 +822,12 @@ const progressTodo = "----------------------------------------"
 
 func formatProgress(p float64) string {
 	i := int(math.Ceil(float64(len(progressDone)) * (1 - p)))
+	if i > len(progressDone) {
+		i = len(progressDone)
+	}
+	if i < 0 {
+		i = 0
+	}
 	return fmt.Sprintf("[%s%s] %.0f%%", progressDone[i:], progressTodo[:i], 100*p)
 }
 
@@ -1201,8 +1364,11 @@ func (c *SyncedCluster) SSH(sshArgs, args []string) error {
 	}
 	var expandedArgs []string
 	for _, arg := range args {
-		arg = e.expand(c, arg)
-		expandedArgs = append(expandedArgs, strings.Split(arg, " ")...)
+		expandedArg, err := e.expand(c, arg)
+		if err != nil {
+			return err
+		}
+		expandedArgs = append(expandedArgs, strings.Split(expandedArg, " ")...)
 	}
 
 	var allArgs []string
@@ -1243,7 +1409,7 @@ func (c *SyncedCluster) SSH(sshArgs, args []string) error {
 
 func (c *SyncedCluster) scp(src, dest string) error {
 	args := []string{
-		"scp", "-r", "-C",
+		"scp", "-v", "-r", "-C",
 		"-o", "StrictHostKeyChecking=no",
 	}
 	args = append(args, sshAuthArgs()...)

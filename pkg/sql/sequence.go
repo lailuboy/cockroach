@@ -37,7 +37,7 @@ func (p *planner) IncrementSequence(ctx context.Context, seqName *tree.TableName
 		return 0, readOnlyError("nextval()")
 	}
 
-	descriptor, err := ResolveExistingObject(ctx, p, seqName, true /*required*/, requireSequenceDesc)
+	descriptor, err := ResolveExistingObject(ctx, p, seqName, true /*required*/, ResolveRequireSequenceDesc)
 	if err != nil {
 		return 0, err
 	}
@@ -85,7 +85,7 @@ func boundsExceededError(descriptor *sqlbase.ImmutableTableDescriptor) error {
 		word = "minimum"
 		value = seqOpts.MinValue
 	}
-	return pgerror.NewErrorf(
+	return pgerror.Newf(
 		pgerror.CodeSequenceGeneratorLimitExceeded,
 		`reached %s value of sequence %q (%d)`, word,
 		tree.ErrString((*tree.Name)(&descriptor.Name)), value)
@@ -95,14 +95,14 @@ func boundsExceededError(descriptor *sqlbase.ImmutableTableDescriptor) error {
 func (p *planner) GetLatestValueInSessionForSequence(
 	ctx context.Context, seqName *tree.TableName,
 ) (int64, error) {
-	descriptor, err := ResolveExistingObject(ctx, p, seqName, true /*required*/, requireSequenceDesc)
+	descriptor, err := ResolveExistingObject(ctx, p, seqName, true /*required*/, ResolveRequireSequenceDesc)
 	if err != nil {
 		return 0, err
 	}
 
 	val, ok := p.SessionData().SequenceState.GetLastValueByID(uint32(descriptor.ID))
 	if !ok {
-		return 0, pgerror.NewErrorf(
+		return 0, pgerror.Newf(
 			pgerror.CodeObjectNotInPrerequisiteStateError,
 			`currval of sequence %q is not yet defined in this session`, tree.ErrString(seqName))
 	}
@@ -118,7 +118,7 @@ func (p *planner) SetSequenceValue(
 		return readOnlyError("setval()")
 	}
 
-	descriptor, err := ResolveExistingObject(ctx, p, seqName, true /*required*/, requireSequenceDesc)
+	descriptor, err := ResolveExistingObject(ctx, p, seqName, true /*required*/, ResolveRequireSequenceDesc)
 	if err != nil {
 		return err
 	}
@@ -131,7 +131,7 @@ func (p *planner) SetSequenceValue(
 		// CockroachDB grows to automatically make sequences virtual when
 		// clients don't expect it, we may need to make this a no-op
 		// instead.
-		return pgerror.NewErrorf(
+		return pgerror.Newf(
 			pgerror.CodeObjectNotInPrerequisiteStateError,
 			`cannot set the value of virtual sequence %q`, tree.ErrString(seqName))
 	}
@@ -154,7 +154,7 @@ func MakeSequenceKeyVal(
 ) ([]byte, int64, error) {
 	opts := sequence.SequenceOpts
 	if newVal > opts.MaxValue || newVal < opts.MinValue {
-		return nil, 0, pgerror.NewErrorf(
+		return nil, 0, pgerror.Newf(
 			pgerror.CodeNumericValueOutOfRangeError,
 			`value %d is out of bounds for sequence "%s" (%d..%d)`,
 			newVal, sequence.Name, opts.MinValue, opts.MaxValue,
@@ -183,7 +183,7 @@ func (p *planner) GetSequenceValue(
 }
 
 func readOnlyError(s string) error {
-	return pgerror.NewErrorf(pgerror.CodeReadOnlySQLTransactionError,
+	return pgerror.Newf(pgerror.CodeReadOnlySQLTransactionError,
 		"cannot execute %s in a read-only transaction", s)
 }
 
@@ -200,7 +200,7 @@ func assignSequenceOptions(
 		}
 	}
 	if opts.Increment == 0 {
-		return pgerror.NewError(
+		return pgerror.New(
 			pgerror.CodeInvalidParameterValueError, "INCREMENT must not be zero")
 	}
 	isAscending := opts.Increment > 0
@@ -224,13 +224,13 @@ func assignSequenceOptions(
 		// Error on duplicate options.
 		_, seenBefore := optionsSeen[option.Name]
 		if seenBefore {
-			return pgerror.NewError(pgerror.CodeSyntaxError, "conflicting or redundant options")
+			return pgerror.New(pgerror.CodeSyntaxError, "conflicting or redundant options")
 		}
 		optionsSeen[option.Name] = true
 
 		switch option.Name {
 		case tree.SeqOptCycle:
-			return pgerror.UnimplementedWithIssueError(20961,
+			return pgerror.UnimplementedWithIssue(20961,
 				"CYCLE option is not supported")
 		case tree.SeqOptNoCycle:
 			// Do nothing; this is the default.
@@ -238,12 +238,12 @@ func assignSequenceOptions(
 			v := *option.IntVal
 			switch {
 			case v < 1:
-				return pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError,
+				return pgerror.Newf(pgerror.CodeInvalidParameterValueError,
 					"CACHE (%d) must be greater than zero", v)
 			case v == 1:
 				// Do nothing; this is the default.
 			case v > 1:
-				return pgerror.UnimplementedWithIssueErrorf(32567,
+				return pgerror.UnimplementedWithIssuef(32567,
 					"CACHE values larger than 1 are not supported, found %d", v)
 			}
 		case tree.SeqOptIncrement:
@@ -276,12 +276,12 @@ func assignSequenceOptions(
 	}
 
 	if opts.Start > opts.MaxValue {
-		return pgerror.NewErrorf(
+		return pgerror.Newf(
 			pgerror.CodeInvalidParameterValueError,
 			"START value (%d) cannot be greater than MAXVALUE (%d)", opts.Start, opts.MaxValue)
 	}
 	if opts.Start < opts.MinValue {
-		return pgerror.NewErrorf(
+		return pgerror.Newf(
 			pgerror.CodeInvalidParameterValueError,
 			"START value (%d) cannot be less than MINVALUE (%d)", opts.Start, opts.MinValue)
 	}
@@ -310,17 +310,18 @@ func maybeAddSequenceDependencies(
 		if err != nil {
 			return nil, err
 		}
+		tn := parsedSeqName.ToTableName()
 
 		var seqDesc *MutableTableDescriptor
 		p, ok := sc.(*planner)
 		if ok {
-			seqDesc, err = p.ResolveMutableTableDescriptor(ctx, parsedSeqName, true /*required*/, requireSequenceDesc)
+			seqDesc, err = p.ResolveMutableTableDescriptor(ctx, &tn, true /*required*/, ResolveRequireSequenceDesc)
 			if err != nil {
 				return nil, err
 			}
 		} else {
 			// This is only executed via IMPORT which uses its own resolver.
-			seqDesc, err = ResolveMutableExistingObject(ctx, sc, parsedSeqName, true /*required*/, requireSequenceDesc)
+			seqDesc, err = ResolveMutableExistingObject(ctx, sc, &tn, true /*required*/, ResolveRequireSequenceDesc)
 			if err != nil {
 				return nil, err
 			}
@@ -358,7 +359,7 @@ func removeSequenceDependencies(
 			}
 		}
 		if refIdx == -1 {
-			return pgerror.NewAssertionErrorf("couldn't find reference from sequence to this column")
+			return pgerror.AssertionFailedf("couldn't find reference from sequence to this column")
 		}
 		seqDesc.DependedOnBy = append(seqDesc.DependedOnBy[:refIdx], seqDesc.DependedOnBy[refIdx+1:]...)
 		if err := params.p.writeSchemaChange(params.ctx, seqDesc, sqlbase.InvalidMutationID); err != nil {
@@ -379,12 +380,12 @@ func getUsedSequenceNames(defaultExpr tree.TypedExpr) ([]string, error) {
 	var names []string
 	_, err := tree.SimpleVisit(
 		defaultExpr,
-		func(expr tree.Expr) (err error, recurse bool, newExpr tree.Expr) {
+		func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
 			switch t := expr.(type) {
 			case *tree.FuncExpr:
 				def, err := t.Func.Resolve(searchPath)
 				if err != nil {
-					return err, false, expr
+					return false, expr, err
 				}
 				if def.Name == "nextval" {
 					arg := t.Exprs[0]
@@ -394,7 +395,7 @@ func getUsedSequenceNames(defaultExpr tree.TypedExpr) ([]string, error) {
 					}
 				}
 			}
-			return nil, true, expr
+			return true, expr, nil
 		},
 	)
 	if err != nil {

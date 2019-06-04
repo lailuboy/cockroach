@@ -29,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datadriven"
 )
@@ -51,9 +51,8 @@ func TestEval(t *testing.T) {
 				// expr.TypeCheck to avoid constant folding.
 				typedExpr, err := expr.TypeCheck(nil, types.Any)
 				if err != nil {
-					t.Fatalf("%s: %v", d.Input, err)
+					t.Fatalf("%s %s: %v", path, d.Input, err)
 				}
-				t.Logf("Type checked expression: %s", typedExpr)
 
 				e, err := getExpr(typedExpr)
 				if err != nil {
@@ -253,6 +252,7 @@ func TestEvalError(t *testing.T) {
 	}{
 		{`1 % 0`, `zero modulus`},
 		{`1 / 0`, `division by zero`},
+		{`1::float / 0::float`, `division by zero`},
 		{`1 // 0`, `division by zero`},
 		{`1.5 / 0`, `division by zero`},
 		{`'11h2m'::interval / 0`, `division by zero`},

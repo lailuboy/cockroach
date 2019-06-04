@@ -55,6 +55,15 @@ func (node *ShowClusterSetting) Format(ctx *FmtCtx) {
 	})
 }
 
+// ShowAllClusterSettings represents a SHOW CLUSTER SETTING statement.
+type ShowAllClusterSettings struct {
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowAllClusterSettings) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW ALL CLUSTER SETTINGS")
+}
+
 // BackupDetails represents the type of details to display for a SHOW BACKUP
 // statement.
 type BackupDetails int
@@ -87,13 +96,18 @@ func (node *ShowBackup) Format(ctx *FmtCtx) {
 
 // ShowColumns represents a SHOW COLUMNS statement.
 type ShowColumns struct {
-	Table TableName
+	Table       *UnresolvedObjectName
+	WithComment bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowColumns) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW COLUMNS FROM ")
-	ctx.FormatNode(&node.Table)
+	ctx.FormatNode(node.Table)
+
+	if node.WithComment {
+		ctx.WriteString(" WITH COMMENT")
+	}
 }
 
 // ShowDatabases represents a SHOW DATABASES statement.
@@ -130,25 +144,40 @@ func (node *ShowTraceForSession) Format(ctx *FmtCtx) {
 	ctx.WriteString(" FOR SESSION")
 }
 
-// ShowIndex represents a SHOW INDEX statement.
-type ShowIndex struct {
-	Table TableName
+// ShowIndexes represents a SHOW INDEX statement.
+type ShowIndexes struct {
+	Table *UnresolvedObjectName
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowIndex) Format(ctx *FmtCtx) {
+func (node *ShowIndexes) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW INDEXES FROM ")
-	ctx.FormatNode(&node.Table)
+	ctx.FormatNode(node.Table)
+}
+
+// ShowDatabaseIndexes represents a SHOW INDEXES FROM DATABASE statement.
+type ShowDatabaseIndexes struct {
+	Database Name
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowDatabaseIndexes) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW INDEXES FROM DATABASE ")
+	ctx.FormatNode(&node.Database)
 }
 
 // ShowQueries represents a SHOW QUERIES statement
 type ShowQueries struct {
+	All     bool
 	Cluster bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowQueries) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW ")
+	if node.All {
+		ctx.WriteString("ALL ")
+	}
 	if node.Cluster {
 		ctx.WriteString("CLUSTER QUERIES")
 	} else {
@@ -158,21 +187,33 @@ func (node *ShowQueries) Format(ctx *FmtCtx) {
 
 // ShowJobs represents a SHOW JOBS statement
 type ShowJobs struct {
+	// If Automatic is true, show only automatically-generated jobs such
+	// as automatic CREATE STATISTICS jobs. If Automatic is false, show
+	// only non-automatically-generated jobs.
+	Automatic bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowJobs) Format(ctx *FmtCtx) {
-	ctx.WriteString("SHOW JOBS")
+	ctx.WriteString("SHOW ")
+	if node.Automatic {
+		ctx.WriteString("AUTOMATIC ")
+	}
+	ctx.WriteString("JOBS")
 }
 
 // ShowSessions represents a SHOW SESSIONS statement
 type ShowSessions struct {
+	All     bool
 	Cluster bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowSessions) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW ")
+	if node.All {
+		ctx.WriteString("ALL ")
+	}
 	if node.Cluster {
 		ctx.WriteString("CLUSTER SESSIONS")
 	} else {
@@ -229,13 +270,13 @@ func (node *ShowTables) Format(ctx *FmtCtx) {
 
 // ShowConstraints represents a SHOW CONSTRAINTS statement.
 type ShowConstraints struct {
-	Table TableName
+	Table *UnresolvedObjectName
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowConstraints) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW CONSTRAINTS FROM ")
-	ctx.FormatNode(&node.Table)
+	ctx.FormatNode(node.Table)
 }
 
 // ShowGrants represents a SHOW GRANTS statement.
@@ -279,13 +320,13 @@ func (node *ShowRoleGrants) Format(ctx *FmtCtx) {
 
 // ShowCreate represents a SHOW CREATE statement.
 type ShowCreate struct {
-	Name TableName
+	Name *UnresolvedObjectName
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowCreate) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW CREATE ")
-	ctx.FormatNode(&node.Name)
+	ctx.FormatNode(node.Name)
 }
 
 // ShowSyntax represents a SHOW SYNTAX statement.
@@ -331,38 +372,35 @@ func (node *ShowRoles) Format(ctx *FmtCtx) {
 }
 
 // ShowRanges represents a SHOW EXPERIMENTAL_RANGES statement.
-// Only one of Table and Index can be set.
 type ShowRanges struct {
-	Table *TableName
-	Index *TableIndexName
+	TableOrIndex TableIndexName
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowRanges) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW EXPERIMENTAL_RANGES FROM ")
-	if node.Index != nil {
+	if node.TableOrIndex.Index != "" {
 		ctx.WriteString("INDEX ")
-		ctx.FormatNode(node.Index)
 	} else {
 		ctx.WriteString("TABLE ")
-		ctx.FormatNode(node.Table)
 	}
+	ctx.FormatNode(&node.TableOrIndex)
 }
 
 // ShowFingerprints represents a SHOW EXPERIMENTAL_FINGERPRINTS statement.
 type ShowFingerprints struct {
-	Table TableName
+	Table *UnresolvedObjectName
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowFingerprints) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE ")
-	ctx.FormatNode(&node.Table)
+	ctx.FormatNode(node.Table)
 }
 
 // ShowTableStats represents a SHOW STATISTICS FOR TABLE statement.
 type ShowTableStats struct {
-	Table     TableName
+	Table     *UnresolvedObjectName
 	UsingJSON bool
 }
 
@@ -373,7 +411,7 @@ func (node *ShowTableStats) Format(ctx *FmtCtx) {
 		ctx.WriteString("USING JSON ")
 	}
 	ctx.WriteString("FOR TABLE ")
-	ctx.FormatNode(&node.Table)
+	ctx.FormatNode(node.Table)
 }
 
 // ShowHistogram represents a SHOW HISTOGRAM statement.

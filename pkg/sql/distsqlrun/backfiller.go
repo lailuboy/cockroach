@@ -24,7 +24,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
@@ -34,6 +36,12 @@ import (
 )
 
 type chunkBackfiller interface {
+	// prepare must be called before runChunk.
+	prepare(ctx context.Context) error
+
+	// close should always be called to close a backfiller if prepare() was called.
+	close(ctx context.Context)
+
 	// runChunk returns the next-key and an error. next-key is nil
 	// once the backfill is complete.
 	runChunk(
@@ -43,12 +51,18 @@ type chunkBackfiller interface {
 		chunkSize int64,
 		readAsOf hlc.Timestamp,
 	) (roachpb.Key, error)
+
+	// CurrentBufferFill returns how fractionally full the configured buffer is.
+	CurrentBufferFill() float32
+
+	// flush must be called after the last chunk to finish buffered work.
+	flush(ctx context.Context) error
 }
 
 // backfiller is a processor that implements a distributed backfill of
 // an entity, like indexes or columns, during a schema change.
 type backfiller struct {
-	chunkBackfiller
+	chunks chunkBackfiller
 	// name is the name of the kind of entity this backfiller processes.
 	name string
 	// mutationFilter returns true if the mutation should be processed by the
@@ -62,7 +76,7 @@ type backfiller struct {
 }
 
 // OutputTypes is part of the processor interface.
-func (*backfiller) OutputTypes() []sqlbase.ColumnType {
+func (*backfiller) OutputTypes() []types.T {
 	// No output types.
 	return nil
 }
@@ -75,7 +89,7 @@ func (b *backfiller) Run(ctx context.Context) {
 	defer tracing.FinishSpan(span)
 
 	if err := b.mainLoop(ctx); err != nil {
-		b.output.Push(nil /* row */, &ProducerMetadata{Err: err})
+		b.output.Push(nil /* row */, &distsqlpb.ProducerMetadata{Err: err})
 	}
 	sendTraceData(ctx, b.output)
 	b.output.ProducerDone()
@@ -110,37 +124,86 @@ func (b *backfiller) mainLoop(ctx context.Context) error {
 		len(b.spec.Spans) == 0 {
 		return errors.Errorf("completed processing all spans for %s backfill (%d, %d)", b.name, desc.ID, mutationID)
 	}
-	work := b.spec.Spans[0].Span
 
 	// Backfill the mutations for all the rows.
 	chunkSize := b.spec.ChunkSize
+
+	if err := b.chunks.prepare(ctx); err != nil {
+		return err
+	}
+	defer b.chunks.close(ctx)
+
+	requiredCheckpointAfter := b.spec.Duration
+	// As we approach the end of the configured duration, we may want to actually
+	// opportunistically wrap up a bit early. Specifically, if doing so can avoid
+	// starting a new fresh buffer that would need to then be flushed shortly
+	// thereafter with very little in it, resulting in many small SSTs that are
+	// almost as expensive to for their recipients but don't actually add much
+	// data. Instead, if our buffer is full enough that it is likely to flush soon
+	// and we're near the end of the alloted time, go ahead and stop there, flush
+	// and return.
+	opportunisticCheckpointAfter := (b.spec.Duration * 4) / 5
+	// opportunisticFillThreshold is the buffer fill fraction above which we'll
+	// conclude that running another chunk risks starting *but not really filling*
+	// a new buffer. This can be set pretty high -- if a single chunk is likely to
+	// fill more than this amount and cause a flush, then it likely also fills
+	// a non-trivial part of the next buffer.
+	const opportunisticCheckpointThreshold = 0.8
 	start := timeutil.Now()
-	var resume roachpb.Span
-	sp := work
-	var nChunks, row = 0, int64(0)
-	for ; sp.Key != nil; nChunks, row = nChunks+1, row+chunkSize {
-		if log.V(2) {
-			log.Infof(ctx, "%s backfill (%d, %d) at row: %d, span: %s",
-				b.name, desc.ID, mutationID, row, sp)
+	totalChunks := 0
+	totalSpans := 0
+	var finishedSpans roachpb.Spans
+
+	for i := range b.spec.Spans {
+		log.VEventf(ctx, 2, "%s backfiller starting span %d of %d: %s",
+			b.name, i+1, len(b.spec.Spans), b.spec.Spans[i].Span)
+		chunks := 0
+		todo := b.spec.Spans[i].Span
+		for todo.Key != nil {
+			log.VEventf(ctx, 3, "%s backfiller starting chunk %d: %s", b.name, chunks, todo)
+			var err error
+			todo.Key, err = b.chunks.runChunk(ctx, mutations, todo, chunkSize, b.spec.ReadAsOf)
+			if err != nil {
+				return err
+			}
+			chunks++
+			running := timeutil.Since(start)
+			if running > opportunisticCheckpointAfter && b.chunks.CurrentBufferFill() > opportunisticCheckpointThreshold {
+				break
+			}
+			if running > requiredCheckpointAfter {
+				break
+			}
 		}
-		var err error
-		sp.Key, err = b.runChunk(ctx, mutations, sp, chunkSize, b.spec.ReadAsOf)
-		if err != nil {
-			return err
-		}
-		if timeutil.Since(start) > b.spec.Duration && sp.Key != nil {
-			resume = sp
+		totalChunks += chunks
+
+		// If we exited the loop with a non-nil resume key, we ran out of time.
+		if todo.Key != nil {
+			log.VEventf(ctx, 2,
+				"%s backfiller ran out of time on span %d of %d, will resume it at %s next time",
+				b.name, i+1, len(b.spec.Spans), todo)
+			finishedSpans = append(finishedSpans, roachpb.Span{Key: b.spec.Spans[i].Span.Key, EndKey: todo.Key})
 			break
 		}
+		log.VEventf(ctx, 2, "%s backfiller finished span %d of %d: %s",
+			b.name, i+1, len(b.spec.Spans), b.spec.Spans[i].Span)
+		totalSpans++
+		finishedSpans = append(finishedSpans, b.spec.Spans[i].Span)
 	}
-	log.VEventf(ctx, 2, "processed %d rows in %d chunks", row, nChunks)
+
+	log.VEventf(ctx, 3, "%s backfiller flushing...", b.name)
+	if err := b.chunks.flush(ctx); err != nil {
+		return err
+	}
+	log.VEventf(ctx, 2, "%s backfiller finished %d spans in %d chunks in %s",
+		b.name, totalSpans, totalChunks, timeutil.Since(start))
+
 	return WriteResumeSpan(ctx,
 		b.flowCtx.ClientDB,
 		b.spec.Table.ID,
 		mutationID,
 		b.filter,
-		work,
-		resume,
+		finishedSpans,
 		b.flowCtx.JobRegistry,
 	)
 }
@@ -174,7 +237,8 @@ func GetResumeSpans(
 	}
 
 	if mutationIdx == noIndex {
-		return nil, nil, 0, errors.Errorf("mutation %d has completed", mutationID)
+		return nil, nil, 0, pgerror.AssertionFailedf(
+			"mutation %d has completed", log.Safe(mutationID))
 	}
 
 	// Find the job.
@@ -189,16 +253,19 @@ func GetResumeSpans(
 	}
 
 	if jobID == 0 {
-		return nil, nil, 0, errors.Errorf("no job found for mutation %d", mutationID)
+		return nil, nil, 0, pgerror.AssertionFailedf(
+			"no job found for mutation %d", log.Safe(mutationID))
 	}
 
 	job, err := jobsRegistry.LoadJobWithTxn(ctx, jobID, txn)
 	if err != nil {
-		return nil, nil, 0, errors.Wrapf(err, "can't find job %d", jobID)
+		return nil, nil, 0, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+			"can't find job %d", log.Safe(jobID))
 	}
 	details, ok := job.Details().(jobspb.SchemaChangeDetails)
 	if !ok {
-		return nil, nil, 0, errors.Errorf("expected SchemaChangeDetails job type, got %T", job.Details())
+		return nil, nil, 0, pgerror.AssertionFailedf(
+			"expected SchemaChangeDetails job type, got %T", job.Details())
 	}
 	// Return the resume spans from the job using the mutation idx.
 	return details.ResumeSpanList[mutationIdx].ResumeSpans, job, mutationIdx, nil
@@ -225,15 +292,11 @@ func WriteResumeSpan(
 	id sqlbase.ID,
 	mutationID sqlbase.MutationID,
 	filter backfill.MutationFilter,
-	origSpan roachpb.Span,
-	resume roachpb.Span,
+	finished roachpb.Spans,
 	jobsRegistry *jobs.Registry,
 ) error {
 	ctx, traceSpan := tracing.ChildSpan(ctx, "checkpoint")
 	defer tracing.FinishSpan(traceSpan)
-	if resume.Key != nil && !resume.EndKey.Equal(origSpan.EndKey) {
-		panic("resume must end on the same key as origSpan")
-	}
 
 	return db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		resumeSpans, job, mutationIdx, error := GetResumeSpans(ctx, jobsRegistry, txn, id, mutationID, filter)
@@ -241,50 +304,7 @@ func WriteResumeSpan(
 			return error
 		}
 
-		// This loop is finding a span in the checkpoint that fits
-		// origSpan. It then carves a spot for origSpan in the
-		// checkpoint, and replaces origSpan in the checkpoint with
-		// resume.
-		for i, sp := range resumeSpans {
-			if sp.Key.Compare(origSpan.Key) <= 0 &&
-				sp.EndKey.Compare(origSpan.EndKey) >= 0 {
-				// origSpan is in sp; split sp if needed to accommodate
-				// origSpan and replace origSpan with resume.
-				before := resumeSpans[:i]
-				after := append([]roachpb.Span{}, resumeSpans[i+1:]...)
-
-				// add span to before, but merge it with the last span
-				// if possible.
-				addSpan := func(begin, end roachpb.Key) {
-					if begin.Equal(end) {
-						return
-					}
-					if len(before) > 0 && before[len(before)-1].EndKey.Equal(begin) {
-						before[len(before)-1].EndKey = end
-					} else {
-						before = append(before, roachpb.Span{Key: begin, EndKey: end})
-					}
-				}
-
-				// The work done = [origSpan.Key...resume.Key]
-				addSpan(sp.Key, origSpan.Key)
-				if resume.Key != nil {
-					addSpan(resume.Key, resume.EndKey)
-				} else {
-					log.VEventf(ctx, 2, "completed processing of span: %+v", origSpan)
-				}
-				addSpan(origSpan.EndKey, sp.EndKey)
-				resumeSpans = append(before, after...)
-
-				log.VEventf(ctx, 2, "ckpt %+v", resumeSpans)
-
-				return SetResumeSpansInJob(ctx, resumeSpans, mutationIdx, txn, job)
-			}
-		}
-		// Unable to find a span containing origSpan. This can happen if the
-		// coordinator node looses its schema change lease and another node takes
-		// over and updates the checkpoint.
-		log.Warningf(ctx, "span %+v not found among %+v", origSpan, resumeSpans)
-		return nil
+		resumeSpans = roachpb.SubtractSpans(resumeSpans, finished)
+		return SetResumeSpansInJob(ctx, resumeSpans, mutationIdx, txn, job)
 	})
 }

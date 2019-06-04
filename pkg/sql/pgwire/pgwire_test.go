@@ -260,7 +260,7 @@ func TestPGWireDrainClient(t *testing.T) {
 
 	// Ensure server is in draining mode and rejects new connections.
 	testutils.SucceedsSoon(t, func() error {
-		if err := trivialQuery(pgBaseURL); !testutils.IsError(err, pgwire.ErrDraining) {
+		if err := trivialQuery(pgBaseURL); !testutils.IsError(err, pgwire.ErrDrainingNewConn) {
 			return errors.Errorf("unexpected error: %v", err)
 		}
 		return nil
@@ -471,8 +471,8 @@ func TestPGPrepareFail(t *testing.T) {
 		"SELECT CASE WHEN TRUE THEN $1 ELSE $2 END": "pq: could not determine data type of placeholder $1",
 		"SELECT $1 > 0 AND NOT $1":                  "pq: placeholder $1 already has type int, cannot assign bool",
 		"CREATE TABLE $1 (id INT)":                  "pq: syntax error at or near \"1\"",
-		"UPDATE d.t SET s = i + $1":                 "pq: unsupported binary operator: <int> + <placeholder{1}> (desired <string>)",
-		"SELECT $0 > 0":                             "pq: placeholder index must be between 1 and 65536",
+		"UPDATE d.t SET s = i + $1":                 "pq: unsupported binary operator: <int> + <anyelement> (desired <string>)",
+		"SELECT $0 > 0":                             "pq: lexical error: placeholder index must be between 1 and 65536",
 		"SELECT $2 > 0":                             "pq: could not determine data type of placeholder $1",
 		"SELECT 3 + CASE (4) WHEN 4 THEN $1 END":    "pq: could not determine data type of placeholder $1",
 		"SELECT ($1 + $1) + current_date()":         "pq: could not determine data type of placeholder $1",
@@ -953,6 +953,9 @@ func TestPGPreparedQuery(t *testing.T) {
 		{"SELECT $1::INT[]", []preparedQueryTest{
 			baseTest.SetArgs(pq.Array([]int64{10})).Results(pq.Array([]int64{10})),
 		}},
+		{"INSERT INTO d.arr VALUES($1, $2)", []preparedQueryTest{
+			baseTest.SetArgs(pq.Array([]int64{}), pq.Array([]string{})),
+		}},
 		{"EXPERIMENTAL SCRUB TABLE system.locations", []preparedQueryTest{
 			baseTest.SetArgs(),
 		}},
@@ -1081,6 +1084,7 @@ CREATE TABLE d.ts (a TIMESTAMP, b DATE);
 CREATE TABLE d.two (a INT, b INT);
 CREATE TABLE d.intStr (a INT, s STRING);
 CREATE TABLE d.str (s STRING, b BYTES);
+CREATE TABLE d.arr (a INT[], b TEXT[]);
 CREATE TABLE d.emptynorows (); -- zero columns, zero rows
 CREATE TABLE d.emptyrows (x INT);
 INSERT INTO d.emptyrows VALUES (1),(2),(3);
@@ -1893,8 +1897,8 @@ func TestPGWireAuth(t *testing.T) {
 				Host:     net.JoinHostPort(host, port),
 				RawQuery: "sslmode=require",
 			}
-			if err := trivialQuery(unicodeUserPgURL); !testutils.IsError(err, "pq: password authentication failed for user") {
-				t.Fatalf("unexpected error: %v", err)
+			if err := trivialQuery(unicodeUserPgURL); !testutils.IsError(err, "password authentication failed for user") {
+				t.Fatalf("expected \"password authentication failed for user\", got: %v", err)
 			}
 
 			// Supply correct password.
@@ -1927,8 +1931,8 @@ func TestPGWireAuth(t *testing.T) {
 		// Even though the correct password is supplied (empty string), this
 		// should fail because we do not support password authentication for
 		// users with empty passwords.
-		if err := trivialQuery(testUserPgURL); !testutils.IsError(err, "pq: password authentication failed for user") {
-			t.Fatalf("unexpected error: %v", err)
+		if err := trivialQuery(testUserPgURL); !testutils.IsError(err, "password authentication failed for user") {
+			t.Fatalf("expected \"password authentication failed for user\", got: %v", err)
 		}
 	})
 }
@@ -2303,7 +2307,39 @@ func TestCancelRequest(t *testing.T) {
 	if _, err := fe.Receive(); err != io.EOF {
 		t.Fatalf("unexpected: %v", err)
 	}
-	if count := telemetry.GetFeatureCounts()["pgwire.unimplemented.cancel_request"]; count != 1 {
+	if count := telemetry.GetRawFeatureCounts()["pgwire.unimplemented.cancel_request"]; count != 1 {
 		t.Fatalf("expected 1 cancel request, got %d", count)
+	}
+}
+
+func TestFailPrepareFailsTxn(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
+	defer cleanupFn()
+
+	db, err := gosql.Open("postgres", pgURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Prepare("select fail"); err == nil {
+		t.Fatal("Got no error, expected one")
+	}
+
+	// This should also fail, since the txn should be destroyed.
+	if _, err := tx.Query("select 1"); err == nil {
+		t.Fatal("got no error, expected one")
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -70,6 +70,7 @@ const rangeTableDisplayList: RangeTableRow[] = [
   { variable: "commit", display: "Commit", compareToLeader: true },
   { variable: "lastIndex", display: "Last Index", compareToLeader: true },
   { variable: "logSize", display: "Log Size", compareToLeader: false },
+  { variable: "logSizeTrusted", display: "Log Size Trusted?", compareToLeader: false },
   { variable: "leaseHolderQPS", display: "Lease Holder QPS", compareToLeader: false },
   { variable: "keysWrittenPS", display: "Average Keys Written Per Second", compareToLeader: false },
   { variable: "approxProposalQuota", display: "Approx Proposal Quota", compareToLeader: false },
@@ -215,6 +216,9 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
     }
     if (problems.underreplicated) {
       results = _.concat(results, "Underreplicated (or slow)");
+    }
+    if (problems.overreplicated) {
+      results = _.concat(results, "Overreplicated");
     }
     if (problems.no_raft_leader) {
       results = _.concat(results, "No Raft Leader");
@@ -471,6 +475,7 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
         commit: this.contentIf(!dormant, () => this.createContent(FixLong(info.raft_state.hard_state.commit))),
         lastIndex: this.createContent(FixLong(info.state.last_index)),
         logSize: this.contentBytes(FixLong(info.state.raft_log_size)),
+        logSizeTrusted: this.createContent(info.state.raft_log_size_trusted.toString()),
         leaseHolderQPS: leaseHolder ? this.createContent(info.stats.queries_per_second.toFixed(4)) : rangeTableEmptyContent,
         keysWrittenPS: this.createContent(info.stats.writes_per_second.toFixed(4)),
         approxProposalQuota: raftLeader ? this.createContent(FixLong(info.state.approximate_proposal_quota)) : rangeTableEmptyContent,
@@ -503,13 +508,13 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
       });
     });
 
-    const leaderReplicaIDs = new Set(_.map(leader.state.state.desc.replicas, rep => rep.replica_id));
+    const leaderReplicaIDs = new Set(_.map(leader.state.state.desc.internal_replicas, rep => rep.replica_id));
 
     // Go through all the replicas and add them to map for easy printing.
     const replicasByReplicaIDByStoreID: Map<number, Map<number, protos.cockroach.roachpb.IReplicaDescriptor>> = new Map();
     _.forEach(infos, info => {
       const replicasByReplicaID: Map<number, protos.cockroach.roachpb.IReplicaDescriptor> = new Map();
-      _.forEach(info.state.state.desc.replicas, rep => {
+      _.forEach(info.state.state.desc.internal_replicas, rep => {
         replicasByReplicaID.set(rep.replica_id, rep);
       });
       replicasByReplicaIDByStoreID.set(info.source_store_id, replicasByReplicaID);

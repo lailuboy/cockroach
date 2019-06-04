@@ -19,21 +19,26 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
+	"golang.org/x/text/language"
 )
 
 // SanitizeVarFreeExpr verifies that an expression is valid, has the correct
 // type and contains no variable expressions. It returns the type-checked and
 // constant-folded expression.
 func SanitizeVarFreeExpr(
-	expr tree.Expr, expectedType types.T, context string, semaCtx *tree.SemaContext, allowImpure bool,
+	expr tree.Expr,
+	expectedType *types.T,
+	context string,
+	semaCtx *tree.SemaContext,
+	allowImpure bool,
 ) (tree.TypedExpr, error) {
 	if tree.ContainsVars(expr) {
-		return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+		return nil, pgerror.Newf(pgerror.CodeSyntaxError,
 			"variable sub-expressions are not allowed in %s", context)
 	}
 
@@ -64,6 +69,50 @@ func SanitizeVarFreeExpr(
 	return typedExpr, nil
 }
 
+// ValidateColumnDefType returns an error if the type of a column definition is
+// not valid. It is checked when a column is created or altered.
+func ValidateColumnDefType(t *types.T) error {
+	switch t.Family() {
+	case types.StringFamily, types.CollatedStringFamily:
+		if t.Family() == types.CollatedStringFamily {
+			if _, err := language.Parse(t.Locale()); err != nil {
+				return pgerror.Newf(pgerror.CodeSyntaxError, `invalid locale %s`, t.Locale())
+			}
+		}
+
+	case types.DecimalFamily:
+		switch {
+		case t.Precision() == 0 && t.Scale() > 0:
+			// TODO (seif): Find right range for error message.
+			return errors.New("invalid NUMERIC precision 0")
+		case t.Precision() < t.Scale():
+			return fmt.Errorf("NUMERIC scale %d must be between 0 and precision %d",
+				t.Scale(), t.Precision())
+		}
+
+	case types.ArrayFamily:
+		if t.ArrayContents().Family() == types.ArrayFamily {
+			// Nested arrays are not supported as a column type.
+			return errors.Errorf("nested array unsupported as column type: %s", t.String())
+		}
+		if err := types.CheckArrayElementType(t.ArrayContents()); err != nil {
+			return err
+		}
+		return ValidateColumnDefType(t.ArrayContents())
+
+	case types.BitFamily, types.IntFamily, types.FloatFamily, types.BoolFamily, types.BytesFamily, types.DateFamily,
+		types.INetFamily, types.IntervalFamily, types.JsonFamily, types.OidFamily, types.TimeFamily,
+		types.TimestampFamily, types.TimestampTZFamily, types.UuidFamily:
+		// These types are OK.
+
+	default:
+		return pgerror.Newf(pgerror.CodeInvalidTableDefinitionError,
+			"value type %s cannot be used for table columns", t.String())
+	}
+
+	return nil
+}
+
 // MakeColumnDefDescs creates the column descriptor for a column, as well as the
 // index descriptor if the column is a primary key or unique.
 //
@@ -81,13 +130,13 @@ func SanitizeVarFreeExpr(
 func MakeColumnDefDescs(
 	d *tree.ColumnTableDef, semaCtx *tree.SemaContext,
 ) (*ColumnDescriptor, *IndexDescriptor, tree.TypedExpr, error) {
-	if _, ok := d.Type.(*coltypes.TSerial); ok {
+	if d.IsSerial {
 		// To the reader of this code: if control arrives here, this means
 		// the caller has not suitably called processSerialInColumnDef()
 		// prior to calling MakeColumnDefDescs. The dependent sequences
 		// must be created, and the SERIAL type eliminated, prior to this
 		// point.
-		return nil, nil, nil, pgerror.NewError(pgerror.CodeFeatureNotSupportedError,
+		return nil, nil, nil, pgerror.New(pgerror.CodeFeatureNotSupportedError,
 			"SERIAL cannot be used in this context")
 	}
 
@@ -105,24 +154,20 @@ func MakeColumnDefDescs(
 		Nullable: d.Nullable.Nullability != tree.NotNull && !d.PrimaryKey,
 	}
 
-	// Set Type.SemanticType and Type.Locale.
-	colDatumType := coltypes.CastTargetToDatumType(d.Type)
-	colTyp, err := DatumTypeToColumnType(colDatumType)
+	// Validate and assign column type.
+	err := ValidateColumnDefType(d.Type)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-
-	col.Type, err = PopulateTypeAttrs(colTyp, d.Type)
-	if err != nil {
-		return nil, nil, nil, err
-	}
+	col.Type = *d.Type
 
 	var typedExpr tree.TypedExpr
 	if d.HasDefaultExpr() {
 		// Verify the default expression type is compatible with the column type
 		// and does not contain invalid functions.
+		var err error
 		if typedExpr, err = SanitizeVarFreeExpr(
-			d.DefaultExpr.Expr, colDatumType, "DEFAULT", semaCtx, true, /* allowImpure */
+			d.DefaultExpr.Expr, d.Type, "DEFAULT", semaCtx, true, /* allowImpure */
 		); err != nil {
 			return nil, nil, nil, err
 		}
@@ -184,8 +229,8 @@ func EncodeColumns(
 }
 
 // GetColumnTypes returns the types of the columns with the given IDs.
-func GetColumnTypes(desc *TableDescriptor, columnIDs []ColumnID) ([]ColumnType, error) {
-	types := make([]ColumnType, len(columnIDs))
+func GetColumnTypes(desc *TableDescriptor, columnIDs []ColumnID) ([]types.T, error) {
+	types := make([]types.T, len(columnIDs))
 	for i, id := range columnIDs {
 		col, err := desc.FindActiveColumnByID(id)
 		if err != nil {
@@ -271,11 +316,13 @@ func (desc *TableDescriptor) collectConstraintInfo(
 	for _, index := range indexes {
 		if index.ID == desc.PrimaryIndex.ID {
 			if _, ok := info[index.Name]; ok {
-				return nil, errors.Errorf("duplicate constraint name: %q", index.Name)
+				return nil, pgerror.Newf(pgerror.CodeDuplicateObjectError,
+					"duplicate constraint name: %q", index.Name)
 			}
 			colHiddenMap := make(map[ColumnID]bool, len(desc.Columns))
-			for i, column := range desc.Columns {
-				colHiddenMap[column.ID] = desc.Columns[i].Hidden
+			for i := range desc.Columns {
+				col := &desc.Columns[i]
+				colHiddenMap[col.ID] = col.Hidden
 			}
 			// Don't include constraints against only hidden columns.
 			// This prevents the auto-created rowid primary key index from showing up
@@ -291,75 +338,85 @@ func (desc *TableDescriptor) collectConstraintInfo(
 				continue
 			}
 			detail := ConstraintDetail{Kind: ConstraintTypePK}
-			if tableLookup != nil {
-				detail.Columns = index.ColumnNames
-				detail.Index = index
-			}
+			detail.Columns = index.ColumnNames
+			detail.Index = index
 			info[index.Name] = detail
 		} else if index.Unique {
 			if _, ok := info[index.Name]; ok {
-				return nil, errors.Errorf("duplicate constraint name: %q", index.Name)
+				return nil, pgerror.Newf(pgerror.CodeDuplicateObjectError,
+					"duplicate constraint name: %q", index.Name)
 			}
 			detail := ConstraintDetail{Kind: ConstraintTypeUnique}
-			if tableLookup != nil {
-				detail.Columns = index.ColumnNames
-				detail.Index = index
-			}
-			info[index.Name] = detail
-		}
-
-		if index.ForeignKey.IsSet() {
-			if _, ok := info[index.ForeignKey.Name]; ok {
-				return nil, errors.Errorf("duplicate constraint name: %q", index.ForeignKey.Name)
-			}
-			detail := ConstraintDetail{Kind: ConstraintTypeFK}
-			detail.Unvalidated = index.ForeignKey.Validity == ConstraintValidity_Unvalidated
-			numCols := len(index.ColumnIDs)
-			if index.ForeignKey.SharedPrefixLen > 0 {
-				numCols = int(index.ForeignKey.SharedPrefixLen)
-			}
-			detail.Columns = index.ColumnNames[:numCols]
+			detail.Columns = index.ColumnNames
 			detail.Index = index
-
-			if tableLookup != nil {
-				other, err := tableLookup(index.ForeignKey.Table)
-				if err != nil {
-					return nil, errors.Wrapf(err, "error resolving table %d referenced in foreign key",
-						index.ForeignKey.Table)
-				}
-				otherIdx, err := other.FindIndexByID(index.ForeignKey.Index)
-				if err != nil {
-					return nil, errors.Wrapf(err, "error resolving index %d in table %s referenced "+
-						"in foreign key", index.ForeignKey.Index, other.Name)
-				}
-				detail.Details = fmt.Sprintf("%s.%v", other.Name, otherIdx.ColumnNames)
-				detail.FK = &index.ForeignKey
-				detail.ReferencedTable = other
-				detail.ReferencedIndex = otherIdx
-			}
-			info[index.ForeignKey.Name] = detail
+			info[index.Name] = detail
 		}
 	}
 
-	for _, c := range desc.Checks {
+	fks, err := desc.AllActiveAndInactiveForeignKeys()
+	if err != nil {
+		return nil, err
+	}
+	for id, fk := range fks {
+		idx, err := desc.FindIndexByID(id)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := info[fk.Name]; ok {
+			return nil, pgerror.Newf(pgerror.CodeDuplicateObjectError,
+				"duplicate constraint name: %q", fk.Name)
+		}
+		detail := ConstraintDetail{Kind: ConstraintTypeFK}
+		// Constraints in the Validating state are considered Unvalidated for this purpose
+		detail.Unvalidated = fk.Validity != ConstraintValidity_Validated
+		numCols := len(idx.ColumnIDs)
+		if fk.SharedPrefixLen > 0 {
+			numCols = int(fk.SharedPrefixLen)
+		}
+		detail.Columns = idx.ColumnNames[:numCols]
+		detail.Index = idx
+		detail.FK = fk
+
+		if tableLookup != nil {
+			other, err := tableLookup(fk.Table)
+			if err != nil {
+				return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+					"error resolving table %d referenced in foreign key",
+					log.Safe(fk.Table))
+			}
+			otherIdx, err := other.FindIndexByID(fk.Index)
+			if err != nil {
+				return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+					"error resolving index %d in table %s referenced in foreign key",
+					log.Safe(fk.Index), other.Name)
+			}
+			detail.Details = fmt.Sprintf("%s.%v", other.Name, otherIdx.ColumnNames)
+			detail.ReferencedTable = other
+			detail.ReferencedIndex = otherIdx
+		}
+		info[fk.Name] = detail
+	}
+
+	for _, c := range desc.AllActiveAndInactiveChecks() {
 		if _, ok := info[c.Name]; ok {
 			return nil, errors.Errorf("duplicate constraint name: %q", c.Name)
 		}
 		detail := ConstraintDetail{Kind: ConstraintTypeCheck}
 		// Constraints in the Validating state are considered Unvalidated for this purpose
 		detail.Unvalidated = c.Validity != ConstraintValidity_Validated
+		detail.CheckConstraint = c
+		detail.Details = c.Expr
 		if tableLookup != nil {
-			detail.Details = c.Expr
-			detail.CheckConstraint = c
-
 			colsUsed, err := c.ColumnsUsed(desc)
 			if err != nil {
-				return nil, errors.Wrapf(err, "error computing columns used in check constraint %q", c.Name)
+				return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+					"error computing columns used in check constraint %q", c.Name)
 			}
 			for _, colID := range colsUsed {
 				col, err := desc.FindColumnByID(colID)
 				if err != nil {
-					return nil, errors.Wrapf(err, "error finding column %d in table %s", colID, desc.Name)
+					return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+						"error finding column %d in table %s", log.Safe(colID), desc.Name)
 				}
 				detail.Columns = append(detail.Columns, col.Name)
 			}

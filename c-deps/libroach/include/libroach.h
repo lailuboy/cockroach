@@ -100,6 +100,12 @@ void DBReleaseCache(DBCache* cache);
 // exist.
 DBStatus DBOpen(DBEngine** db, DBSlice dir, DBOptions options);
 
+// Creates a RocksDB checkpoint in the specified directory (which must not exist).
+// A checkpoint is a logical copy of the database, though it will hardlink the
+// SSTs references by it (when possible), thus avoiding duplication of any of
+// the actual data.
+DBStatus DBCreateCheckpoint(DBEngine* db, DBSlice dir);
+
 // Set a callback to be invoked during DBOpen that can make changes to RocksDB
 // initialization. Used by CCL code to install additional features.
 //
@@ -348,7 +354,31 @@ typedef struct {
   int64_t compactions;
   int64_t table_readers_mem_estimate;
   int64_t pending_compaction_bytes_estimate;
+  int64_t l0_file_count;
 } DBStatsResult;
+
+typedef struct {
+  DBString name;
+  uint64_t value;
+} TickerInfo;
+
+typedef struct {
+  DBString name;
+  double mean;
+  double p50;
+  double p95;
+  double p99;
+  double max;
+  uint64_t count;
+  uint64_t sum;
+} HistogramInfo;
+
+typedef struct {
+  TickerInfo* tickers;
+  size_t tickers_len;
+  HistogramInfo* histograms;
+  size_t histograms_len;
+} DBTickersAndHistogramsResult;
 
 // DBEnvStatsResult contains Env stats (filesystem layer).
 typedef struct {
@@ -359,6 +389,8 @@ typedef struct {
   // Files/bytes using the active data key.
   uint64_t active_key_files;
   uint64_t active_key_bytes;
+  // Enum of the encryption algorithm in use.
+  int32_t encryption_type;
   // encryption status (CCL only).
   // This is a serialized enginepbccl/stats.proto:EncryptionStatus
   DBString encryption_status;
@@ -373,6 +405,7 @@ typedef struct {
 } DBEncryptionRegistries;
 
 DBStatus DBGetStats(DBEngine* db, DBStatsResult* stats);
+DBStatus DBGetTickersAndHistograms(DBEngine* db, DBTickersAndHistogramsResult* stats);
 DBString DBGetCompactionStats(DBEngine* db);
 DBStatus DBGetEnvStats(DBEngine* db, DBEnvStatsResult* stats);
 DBStatus DBGetEncryptionRegistries(DBEngine* db, DBEncryptionRegistries* result);

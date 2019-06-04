@@ -23,10 +23,12 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -37,11 +39,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -53,6 +57,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
+	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/raftpb"
 )
 
 func adminMergeArgs(key roachpb.Key) *roachpb.AdminMergeRequest {
@@ -236,7 +243,8 @@ func mergeWithData(t *testing.T, retries int64) {
 		for _, req := range ba.Requests {
 			if et := req.GetEndTransaction(); et != nil && et.InternalCommitTrigger.GetMergeTrigger() != nil {
 				if atomic.AddInt64(&retries, -1) >= 0 {
-					return roachpb.NewError(roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE))
+					return roachpb.NewError(
+						roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE, "filter err"))
 				}
 			}
 			if req.GetSubsume() != nil {
@@ -464,6 +472,21 @@ func mergeCheckingTimestampCaches(t *testing.T, disjointLeaseholders bool) {
 		t.Fatalf("expected read to execute at %v, but executed at %v", readTS, br.Timestamp)
 	}
 
+	// Simulate a txn abort on the RHS from a node with a newer clock. Because
+	// the transaction record for the pushee was not yet written, this will bump
+	// the write timestamp cache to record the abort.
+	pushee := roachpb.MakeTransaction("pushee", rhsKey, roachpb.MinUserPriority, readTS, 0)
+	pusher := roachpb.MakeTransaction("pusher", rhsKey, roachpb.MaxUserPriority, readTS, 0)
+	ba = roachpb.BatchRequest{}
+	ba.Timestamp = readTS
+	ba.RangeID = rhsDesc.RangeID
+	ba.Add(pushTxnArgs(&pusher, &pushee, roachpb.PUSH_ABORT))
+	if br, pErr := rhsStore.Send(ctx, ba); pErr != nil {
+		t.Fatal(pErr)
+	} else if txn := br.Responses[0].GetPushTxn().PusheeTxn; txn.Status != roachpb.ABORTED {
+		t.Fatalf("expected aborted pushee, but got %v", txn)
+	}
+
 	// Merge the RHS back into the LHS.
 	args := adminMergeArgs(lhsDesc.StartKey.AsRawKey())
 	if _, pErr := client.SendWrapped(ctx, lhsStore.TestSender(), args); pErr != nil {
@@ -480,6 +503,31 @@ func mergeCheckingTimestampCaches(t *testing.T, disjointLeaseholders bool) {
 		t.Fatal(pErr)
 	} else if !readTS.Less(br.Timestamp) {
 		t.Fatalf("expected write to execute after %v, but executed at %v", readTS, br.Timestamp)
+	}
+
+	// Attempt to create a transaction record for the pushee transaction, which
+	// was aborted before the merge. This should be rejected with a transaction
+	// aborted error. The reason will depend on whether the leaseholders were
+	// disjoint or not because disjoint leaseholders will lead to a loss of
+	// resolution in the timestamp cache. Either way though, the transaction
+	// should not be allowed to create its record.
+	hb, hbH := heartbeatArgs(&pushee, mtc.clock.Now())
+	ba = roachpb.BatchRequest{}
+	ba.Header = hbH
+	ba.RangeID = lhsDesc.RangeID
+	ba.Add(hb)
+	var expReason roachpb.TransactionAbortedReason
+	if disjointLeaseholders {
+		expReason = roachpb.ABORT_REASON_TIMESTAMP_CACHE_REJECTED_POSSIBLE_REPLAY
+	} else {
+		expReason = roachpb.ABORT_REASON_ABORTED_RECORD_FOUND
+	}
+	if _, pErr := lhsStore.Send(ctx, ba); pErr == nil {
+		t.Fatalf("expected TransactionAbortedError(%s) but got %v", expReason, pErr)
+	} else if abortErr, ok := pErr.GetDetail().(*roachpb.TransactionAbortedError); !ok {
+		t.Fatalf("expected TransactionAbortedError(%s) but got %v", expReason, pErr)
+	} else if abortErr.Reason != expReason {
+		t.Fatalf("expected TransactionAbortedError(%s) but got %v", expReason, pErr)
 	}
 }
 
@@ -658,7 +706,8 @@ func TestStoreRangeMergeTxnFailure(t *testing.T) {
 		for _, req := range ba.Requests {
 			if et := req.GetEndTransaction(); et != nil && et.InternalCommitTrigger.GetMergeTrigger() != nil {
 				if atomic.AddInt64(&retriesBeforeFailure, -1) >= 0 {
-					return roachpb.NewError(roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE))
+					return roachpb.NewError(
+						roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE, "filter err"))
 				}
 				return roachpb.NewError(errors.New("injected permafail"))
 			}
@@ -730,6 +779,92 @@ func TestStoreRangeMergeTxnFailure(t *testing.T) {
 	}
 }
 
+// TestStoreRangeSplitMergeGeneration verifies that splits and merges both
+// update the range descriptor generations of the involved ranges according to
+// the comment on the RangeDescriptor.Generation field.
+func TestStoreRangeSplitMergeGeneration(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testutils.RunTrueAndFalse(t, "rhsHasHigherGen", func(t *testing.T, rhsHasHigherGen bool) {
+		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				Store: &storage.StoreTestingKnobs{
+					// Disable both splits and merges so that we're in full
+					// control over them.
+					DisableMergeQueue: true,
+					DisableSplitQueue: true,
+				},
+			},
+		})
+		defer s.Stopper().Stop(context.TODO())
+
+		leftKey := roachpb.Key("z")
+		rightKey := leftKey.Next().Next()
+
+		// First, split at the left key for convenience, so that we can check
+		// leftDesc.StartKey == leftKey later.
+		_, _, err := s.SplitRange(leftKey)
+		assert.NoError(t, err)
+
+		store, err := s.GetStores().(*storage.Stores).GetStore(s.GetFirstStoreID())
+		assert.NoError(t, err)
+		leftRepl := store.LookupReplica(keys.MustAddr(leftKey))
+		assert.NotNil(t, leftRepl)
+		preSplitGen := leftRepl.Desc().GetGeneration()
+		leftDesc, rightDesc, err := s.SplitRange(rightKey)
+		assert.NoError(t, err)
+
+		// Split should increment the LHS' generation and also propagate the result
+		// to the RHS.
+		assert.Equal(t, preSplitGen+1, leftDesc.GetGeneration())
+		assert.Equal(t, preSplitGen+1, rightDesc.GetGeneration())
+
+		if rhsHasHigherGen {
+			// Split the RHS again to increment its generation once more, so that
+			// we get (assuming preSplitGen=1):
+			//
+			// |--left@2---||---right@3---||--don't care--|
+			//
+			rightDesc, _, err = s.SplitRange(rightKey.Next())
+			assert.NoError(t, err)
+			assert.Equal(t, preSplitGen+2, rightDesc.GetGeneration())
+		} else {
+			// Split and merge the LHS to increment the generation (it ends up
+			// being incremented by two). Note that leftKey.Next() is still in
+			// the left range. Assuming preSplitGen=1, we'll end up in the
+			// situation:
+			//
+			// |--left@4---||---right@2---|
+			var tmpRightDesc roachpb.RangeDescriptor
+			leftDesc, tmpRightDesc, err = s.SplitRange(leftKey.Next())
+			assert.Equal(t, preSplitGen+2, leftDesc.GetGeneration())
+			assert.Equal(t, preSplitGen+2, tmpRightDesc.GetGeneration())
+			assert.NoError(t, err)
+			leftDesc, err = s.MergeRanges(leftKey)
+			assert.NoError(t, err)
+			assert.Equal(t, preSplitGen+3, leftDesc.GetGeneration())
+		}
+
+		// Make sure the split/merge shenanigans above didn't get the range
+		// descriptors confused.
+		assert.Equal(t, leftKey, leftDesc.StartKey.AsRawKey())
+		assert.Equal(t, rightKey, rightDesc.StartKey.AsRawKey())
+
+		// Merge the two ranges back to verify that the resulting descriptor
+		// has the correct generation.
+		mergedDesc, err := s.MergeRanges(leftKey)
+		assert.NoError(t, err)
+
+		maxPreMergeGen := leftDesc.GetGeneration()
+		if rhsGen := rightDesc.GetGeneration(); rhsGen > maxPreMergeGen {
+			maxPreMergeGen = rhsGen
+		}
+
+		assert.Equal(t, maxPreMergeGen+1, mergedDesc.GetGeneration())
+		assert.Equal(t, leftDesc.RangeID, mergedDesc.RangeID)
+	})
+}
+
 // TestStoreRangeMergeStats starts by splitting a range, then writing random
 // data to both sides of the split. It then merges the ranges and verifies the
 // merged range has stats consistent with recomputations.
@@ -773,7 +908,7 @@ func TestStoreRangeMergeStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	hiPriTxn := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
-	hiPriTxn.InternalSetPriority(roachpb.MaxTxnPriority)
+	hiPriTxn.InternalSetPriority(enginepb.MaxTxnPriority)
 	for _, key := range []string{"a-txn1", "c-txn2", "a-txn3", "c-txn3"} {
 		if err := hiPriTxn.Put(ctx, key, "val"); err != nil {
 			t.Fatal(err)
@@ -906,7 +1041,7 @@ func TestStoreRangeMergeInFlightTxns(t *testing.T) {
 
 		// Create and commit a txn that aborts txn1.
 		txn2 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
-		txn2.InternalSetPriority(roachpb.MaxTxnPriority)
+		txn2.InternalSetPriority(enginepb.MaxTxnPriority)
 		if err := txn2.Put(ctx, rhsKey, "muhahahah"); err != nil {
 			t.Fatal(err)
 		}
@@ -956,7 +1091,14 @@ func TestStoreRangeMergeInFlightTxns(t *testing.T) {
 		txn2 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
 		txn2ErrCh := make(chan error)
 		go func() {
-			txn2ErrCh <- txn2.Put(ctx, rhsKey, "muhahahah")
+			// Get should block on txn1's intent until txn1 commits.
+			kv, err := txn2.Get(ctx, rhsKey)
+			if err != nil {
+				txn2ErrCh <- err
+			} else if string(kv.ValueBytes()) != t.Name() {
+				txn2ErrCh <- errors.Errorf("actual value %q did not match expected value %q", kv.ValueBytes(), t.Name())
+			}
+			txn2ErrCh <- nil
 		}()
 
 		// Wait for txn2 to realize it conflicts with txn1 and enter its wait queue.
@@ -987,21 +1129,14 @@ func TestStoreRangeMergeInFlightTxns(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		kv, pErr := store.DB().Get(ctx, rhsKey)
-		if pErr != nil {
-			t.Fatal(pErr)
-		} else if string(kv.ValueBytes()) != t.Name() {
-			t.Fatalf("actual value %q did not match expected value %q", kv.ValueBytes(), t.Name())
-		}
-
-		// Now that txn1 has committed, txn2's put operation should complete.
+		// Now that txn1 has committed, txn2's get operation should complete.
 		select {
 		case err := <-txn2ErrCh:
 			if err != nil {
 				t.Fatal(err)
 			}
 		case <-ctx.Done():
-			t.Fatal("timed out waiting for txn2 to complete put")
+			t.Fatal("timed out waiting for txn2 to complete get")
 		}
 
 		if err := txn2.Commit(ctx); err != nil {
@@ -2249,7 +2384,7 @@ func TestStoreRangeMergeReadoptedBothFollowers(t *testing.T) {
 
 	addLHSRepl2 := func() error {
 		for r := retry.StartWithCtx(ctx, retry.Options{}); r.Next(); {
-			err := lhsRepl0.ChangeReplicas(ctx, roachpb.ADD_REPLICA, roachpb.ReplicationTarget{
+			_, err := lhsRepl0.ChangeReplicas(ctx, roachpb.ADD_REPLICA, roachpb.ReplicationTarget{
 				NodeID:  store2.Ident.NodeID,
 				StoreID: store2.Ident.StoreID,
 			}, lhsRepl0.Desc(), storagepb.ReasonUnknown, t.Name())
@@ -2355,12 +2490,13 @@ func TestStoreRangeReadoptedLHSFollower(t *testing.T) {
 		// Attempt to re-add the merged range to store2. This should succeed
 		// immediately because there are no overlapping replicas that would interfere
 		// with the widening of the existing LHS replica.
-		if err := mtc.dbs[0].AdminChangeReplicas(
+		if _, err := mtc.dbs[0].AdminChangeReplicas(
 			ctx, lhsDesc.StartKey.AsRawKey(), roachpb.ADD_REPLICA,
 			[]roachpb.ReplicationTarget{{
 				NodeID:  mtc.idents[2].NodeID,
 				StoreID: mtc.idents[2].StoreID,
 			}},
+			*lhsDesc,
 		); !testutils.IsError(err, "cannot apply snapshot: snapshot intersects existing range") {
 			t.Fatal(err)
 		}
@@ -2428,7 +2564,7 @@ func (h *slowSnapRaftHandler) HandleSnapshot(
 // merge, and correctly refuse to GC its replica of B. In this case, however,
 // S3's replica of A is uninitialized and thus doesn't know its start and end
 // key, so S3 will instead discover some more-distant left neighbor of B. This
-// distant neighbor might very well be up-to-date, and S3 will incorreclty
+// distant neighbor might very well be up-to-date, and S3 will incorrectly
 // conclude that it can GC its replica of B!
 //
 // So say S3 GCs its replica of B. There are now two paths that A might take.
@@ -2601,7 +2737,8 @@ func testMergeWatcher(t *testing.T, injectFailures bool) {
 		for _, req := range ba.Requests {
 			if et := req.GetEndTransaction(); et != nil && et.InternalCommitTrigger.GetMergeTrigger() != nil {
 				if atomic.AddInt64(&mergeTxnRetries, -1) >= 0 {
-					return roachpb.NewError(roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE))
+					return roachpb.NewError(
+						roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE, "filter err"))
 				}
 			}
 			if pt := req.GetPushTxn(); pt != nil {
@@ -2724,23 +2861,26 @@ func TestStoreRangeMergeSlowWatcher(t *testing.T) {
 	// Force PushTxn requests generated by the watcher goroutine to wait on a
 	// channel. This is how we control when store1's merge watcher goroutine hears
 	// about the status of the A <- B merge.
-	allowPushTxn := make(chan struct{}, 10) // buffered for headroom if the merge txn restarts
+	var syn syncutil.Mutex
+	cond := sync.NewCond(&syn)
 	storeCfg.TestingKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
+		syn.Lock()
+		defer syn.Unlock()
 		for _, req := range ba.Requests {
 			// We can detect PushTxn requests generated by the watcher goroutine
 			// because they use the minimum transaction priority. Note that we
 			// only block the watcher goroutine on store1 so that we only interfere
 			// with the first merge (A <- B) and not the later merge (AB <- C).
-			if pt := req.GetPushTxn(); pt != nil && pt.PusherTxn.Priority == roachpb.MinTxnPriority &&
+			if pt := req.GetPushTxn(); pt != nil && pt.PusherTxn.Priority == enginepb.MinTxnPriority &&
 				ba.GatewayNodeID == store1.Ident.NodeID {
-				<-allowPushTxn
+				cond.Wait()
 			}
 			if et := req.GetEndTransaction(); et != nil && !et.Commit && ba.Txn.Name == "merge" {
 				// The merge transaction needed to restart for some reason. To avoid
 				// deadlocking, we need to allow the watcher goroutine's PushTxn request
 				// through so that it allows traffic on the range again. We'll try again
 				// with the restarted merge transaction.
-				allowPushTxn <- struct{}{}
+				cond.Signal()
 			}
 		}
 		return nil
@@ -2824,7 +2964,7 @@ func TestStoreRangeMergeSlowWatcher(t *testing.T) {
 
 	// With the meta2CKey intent cleaned up, allow store1's merge watcher
 	// goroutine to proceed.
-	close(allowPushTxn)
+	cond.Signal()
 
 	// We *must* see a RangeNotFound error from the get request we sent earlier
 	// because we sent it after the merge completed. Anything else is a
@@ -2845,7 +2985,9 @@ type unreliableRaftHandler struct {
 	rangeID roachpb.RangeID
 	storage.RaftMessageHandler
 	// If non-nil, can return false to avoid dropping a msg to rangeID
-	drop func(request *storage.RaftMessageRequest, response *storage.RaftMessageResponse) bool
+	dropReq  func(*storage.RaftMessageRequest) bool
+	dropHB   func(*storage.RaftHeartbeat) bool
+	dropResp func(*storage.RaftMessageResponse) bool
 }
 
 func (h *unreliableRaftHandler) HandleRaftRequest(
@@ -2853,19 +2995,52 @@ func (h *unreliableRaftHandler) HandleRaftRequest(
 	req *storage.RaftMessageRequest,
 	respStream storage.RaftMessageResponseStream,
 ) *roachpb.Error {
-	if req.RangeID == h.rangeID {
-		if h.drop == nil || h.drop(req, nil) {
+	if len(req.Heartbeats)+len(req.HeartbeatResps) > 0 {
+		reqCpy := *req
+		req = &reqCpy
+		req.Heartbeats = h.filterHeartbeats(req.Heartbeats)
+		req.HeartbeatResps = h.filterHeartbeats(req.HeartbeatResps)
+		if len(req.Heartbeats)+len(req.HeartbeatResps) == 0 {
+			// Entirely filtered.
+			return nil
+		}
+	} else if req.RangeID == h.rangeID {
+		if h.dropReq == nil || h.dropReq(req) {
+			log.Infof(
+				ctx,
+				"dropping Raft message %s",
+				raft.DescribeMessage(req.Message, func([]byte) string {
+					return "<omitted>"
+				}),
+			)
+
 			return nil
 		}
 	}
 	return h.RaftMessageHandler.HandleRaftRequest(ctx, req, respStream)
 }
 
+func (h *unreliableRaftHandler) filterHeartbeats(
+	hbs []storage.RaftHeartbeat,
+) []storage.RaftHeartbeat {
+	if len(hbs) == 0 {
+		return hbs
+	}
+	var cpy []storage.RaftHeartbeat
+	for i := range hbs {
+		hb := &hbs[i]
+		if hb.RangeID != h.rangeID || (h.dropHB != nil && !h.dropHB(hb)) {
+			cpy = append(cpy, *hb)
+		}
+	}
+	return cpy
+}
+
 func (h *unreliableRaftHandler) HandleRaftResponse(
 	ctx context.Context, resp *storage.RaftMessageResponse,
 ) error {
 	if resp.RangeID == h.rangeID {
-		if h.drop == nil || h.drop(nil, resp) {
+		if h.dropResp == nil || h.dropResp(resp) {
 			return nil
 		}
 	}
@@ -2925,7 +3100,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 	}
 
 	// Truncate the logs of the LHS.
-	{
+	index := func() uint64 {
 		repl := store0.LookupReplica(roachpb.RKey("a"))
 		index, err := repl.GetLastIndex()
 		if err != nil {
@@ -2941,12 +3116,31 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 		if _, err := client.SendWrapped(ctx, mtc.distSenders[0], truncArgs); err != nil {
 			t.Fatal(err)
 		}
-	}
+		return index
+	}()
 
 	beforeRaftSnaps := store2.Metrics().RangeSnapshotsNormalApplied.Count()
 
 	// Restore Raft traffic to the LHS on store2.
-	mtc.transport.Listen(store2.Ident.StoreID, store2)
+	log.Infof(ctx, "restored traffic to store 2")
+	mtc.transport.Listen(store2.Ident.StoreID, &unreliableRaftHandler{
+		rangeID:            aRepl0.RangeID,
+		RaftMessageHandler: store2,
+		dropReq: func(req *storage.RaftMessageRequest) bool {
+			// Make sure that even going forward no MsgApp for what we just
+			// truncated can make it through. The Raft transport is asynchronous
+			// so this is necessary to make the test pass reliably - otherwise
+			// the follower on store2 may catch up without needing a snapshot,
+			// tripping up the test.
+			//
+			// NB: the Index on the message is the log index that _precedes_ any of the
+			// entries in the MsgApp, so filter where msg.Index < index, not <= index.
+			return req.Message.Type == raftpb.MsgApp && req.Message.Index < index
+		},
+		// Don't drop heartbeats or responses.
+		dropHB:   func(*storage.RaftHeartbeat) bool { return false },
+		dropResp: func(*storage.RaftMessageResponse) bool { return false },
+	})
 
 	// Wait for all replicas to catch up to the same point. Because we truncated
 	// the log while store2 was unavailable, this will require a Raft snapshot.
@@ -3083,27 +3277,35 @@ func TestMergeQueue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
+	manualClock := hlc.NewManualClock(123)
+	clock := hlc.NewClock(manualClock.UnixNano, time.Nanosecond)
 	storeCfg := storage.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	storeCfg.TestingKnobs.DisableScanner = true
 	sv := &storeCfg.Settings.SV
 	storagebase.MergeQueueEnabled.Override(sv, true)
 	storage.MergeQueueInterval.Override(sv, 0) // process greedily
+	manualSplitTTL := time.Millisecond * 200
+	storage.ManualSplitTTL.Override(sv, manualSplitTTL)
 	var mtc multiTestContext
 	// This test was written before the multiTestContext started creating many
 	// system ranges at startup, and hasn't been update to take that into account.
 	mtc.startWithSingleRange = true
 
 	mtc.storeConfig = &storeCfg
+	// Inject clock for manipulation in tests
+	mtc.clock = clock
 	mtc.Start(t, 2)
 	defer mtc.Stop()
 	mtc.initGossipNetwork() // needed for the non-collocated case's rebalancing to work
 	store := mtc.Store(0)
 	store.SetMergeQueueActive(true)
 
-	split := func(t *testing.T, key roachpb.Key) {
+	split := func(t *testing.T, key roachpb.Key, manual bool) {
 		t.Helper()
-		if _, pErr := client.SendWrapped(ctx, store.DB().NonTransactionalSender(), adminSplitArgs(key)); pErr != nil {
+		args := adminSplitArgs(key)
+		args.Manual = manual
+		if _, pErr := client.SendWrapped(ctx, store.DB().NonTransactionalSender(), args); pErr != nil {
 			t.Fatal(pErr)
 		}
 	}
@@ -3121,7 +3323,7 @@ func TestMergeQueue(t *testing.T) {
 	rhsStartKey := roachpb.RKey("b")
 	rhsEndKey := roachpb.RKey("c")
 	for _, k := range []roachpb.RKey{lhsStartKey, rhsStartKey, rhsEndKey} {
-		split(t, k.AsRawKey())
+		split(t, k.AsRawKey(), false /* manual */)
 	}
 	lhs := func() *storage.Replica { return store.LookupReplica(lhsStartKey) }
 	rhs := func() *storage.Replica { return store.LookupReplica(rhsStartKey) }
@@ -3134,7 +3336,7 @@ func TestMergeQueue(t *testing.T) {
 	}
 
 	rng, _ := randutil.NewPseudoRand()
-	randBytes := randutil.RandBytes(rng, int(*config.DefaultZoneConfig().RangeMinBytes))
+	randBytes := randutil.RandBytes(rng, int(*storeCfg.DefaultZoneConfig.RangeMinBytes))
 
 	reset := func(t *testing.T) {
 		t.Helper()
@@ -3144,9 +3346,9 @@ func TestMergeQueue(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		setZones(config.DefaultZoneConfig())
+		setZones(*storeCfg.DefaultZoneConfig)
 		store.MustForceMergeScanAndProcess() // drain any merges that might already be queued
-		split(t, roachpb.Key("b"))
+		split(t, roachpb.Key("b"), false /* manual */)
 	}
 
 	verifyMerged := func(t *testing.T) {
@@ -3184,9 +3386,9 @@ func TestMergeQueue(t *testing.T) {
 
 	t.Run("lhs-undersize", func(t *testing.T) {
 		reset(t)
-		zone := config.DefaultZoneConfig()
+		zone := protoutil.Clone(storeCfg.DefaultZoneConfig).(*config.ZoneConfig)
 		*zone.RangeMinBytes *= 2
-		lhs().SetZoneConfig(&zone)
+		lhs().SetZoneConfig(zone)
 		store.MustForceMergeScanAndProcess()
 		verifyMerged(t)
 	})
@@ -3196,17 +3398,16 @@ func TestMergeQueue(t *testing.T) {
 
 		// The ranges are individually beneath the minimum size threshold, but
 		// together they'll exceed the maximum size threshold.
-		zone := config.DefaultZoneConfig()
+		zone := protoutil.Clone(storeCfg.DefaultZoneConfig).(*config.ZoneConfig)
 		zone.RangeMinBytes = proto.Int64(lhs().GetMVCCStats().Total() + 1)
 		zone.RangeMaxBytes = proto.Int64(lhs().GetMVCCStats().Total()*2 - 1)
-		setZones(zone)
+		setZones(*zone)
 		store.MustForceMergeScanAndProcess()
 		verifyUnmerged(t)
 
 		// Once the maximum size threshold is increased, the merge can occur.
-		zone = *protoutil.Clone(&zone).(*config.ZoneConfig)
-		*zone.RangeMaxBytes += 1
-		setZones(zone)
+		zone.RangeMaxBytes = proto.Int64(*zone.RangeMaxBytes + 1)
+		setZones(*zone)
 		store.MustForceMergeScanAndProcess()
 		verifyMerged(t)
 	})
@@ -3218,6 +3419,55 @@ func TestMergeQueue(t *testing.T) {
 		mtc.transferLease(ctx, rhs().RangeID, 0, 1)
 		mtc.unreplicateRange(rhs().RangeID, 0)
 		clearRange(t, lhsStartKey, rhsEndKey)
+		store.MustForceMergeScanAndProcess()
+		verifyMerged(t)
+	})
+
+	// TODO(jeffreyxiao): Add subtest to consider load when making merging
+	// decisions.
+
+	t.Run("sticky bit", func(t *testing.T) {
+		reset(t)
+		store.MustForceMergeScanAndProcess()
+		verifyUnmerged(t)
+
+		// Perform manual merge and verify that no merge occurred.
+		split(t, rhsStartKey.AsRawKey(), true /* manual */)
+		clearRange(t, lhsStartKey, rhsEndKey)
+		store.MustForceMergeScanAndProcess()
+		verifyUnmerged(t)
+
+		// Delete sticky bit and verify that merge occurs.
+		unsplitArgs := &roachpb.AdminUnsplitRequest{
+			RequestHeader: roachpb.RequestHeader{
+				Key: rhsStartKey.AsRawKey(),
+			},
+		}
+		if _, err := client.SendWrapped(ctx, store.DB().NonTransactionalSender(), unsplitArgs); err != nil {
+			t.Fatal(err)
+		}
+		store.MustForceMergeScanAndProcess()
+		verifyMerged(t)
+	})
+
+	t.Run("sticky bit ttl", func(t *testing.T) {
+		reset(t)
+		store.MustForceMergeScanAndProcess()
+		verifyUnmerged(t)
+
+		// Perform manual merge and verify that no merge occurred.
+		split(t, rhsStartKey.AsRawKey(), true /* manual */)
+		clearRange(t, lhsStartKey, rhsEndKey)
+		store.MustForceMergeScanAndProcess()
+		verifyUnmerged(t)
+
+		// Sticky bit is not expired yet.
+		manualClock.Set(manualSplitTTL.Nanoseconds())
+		store.MustForceMergeScanAndProcess()
+		verifyUnmerged(t)
+
+		// Sticky bit is expired.
+		manualClock.Set(manualSplitTTL.Nanoseconds() * 2)
 		store.MustForceMergeScanAndProcess()
 		verifyMerged(t)
 	})
@@ -3245,13 +3495,28 @@ func TestInvalidSubsumeRequest(t *testing.T) {
 
 	getSnapArgs := roachpb.SubsumeRequest{
 		RequestHeader: roachpb.RequestHeader{Key: rhsDesc.StartKey.AsRawKey()},
-		LeftRange:     *lhsDesc,
+		LeftDesc:      *lhsDesc,
+		RightDesc:     rhsDesc,
+	}
+
+	// Subsume with an incorrect RightDesc should fail.
+	{
+		badRHSDesc := *rhsDesc
+		badRHSDesc.EndKey = badRHSDesc.EndKey.Next()
+		badArgs := getSnapArgs
+		badArgs.RightDesc = &badRHSDesc
+		_, pErr := client.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
+			RangeID: rhsDesc.RangeID,
+		}, &badArgs)
+		if exp := "RHS range bounds do not match"; !testutils.IsPError(pErr, exp) {
+			t.Fatalf("expected %q error, but got %v", exp, pErr)
+		}
 	}
 
 	// Subsume from a non-neighboring LHS should fail.
 	{
 		badArgs := getSnapArgs
-		badArgs.LeftRange.EndKey = append(roachpb.RKey{}, badArgs.LeftRange.EndKey...).Next()
+		badArgs.LeftDesc.EndKey = badArgs.LeftDesc.EndKey.Next()
 		_, pErr := client.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
 			RangeID: rhsDesc.RangeID,
 		}, &badArgs)

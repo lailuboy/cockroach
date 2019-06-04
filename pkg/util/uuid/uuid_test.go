@@ -1,3 +1,17 @@
+// Copyright 2019 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
 // Copyright (C) 2013-2018 by Maxim Bublis <b@codemonkey.ru>
 // Use of this source code is governed by a MIT-style
 // license that can be found in licenses/MIT-gofrs.txt.
@@ -9,6 +23,7 @@ package uuid
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 )
@@ -164,5 +179,27 @@ func TestTimestampFromV1(t *testing.T) {
 		} else if tt.want != got {
 			t.Errorf("TimestampFromV1(%v) got %v, want %v", tt.u, got, tt.want)
 		}
+	}
+}
+
+func TestDeterministicV4(t *testing.T) {
+	// Test sortedness by enumerating everything in a small `n`.
+	var previous, current UUID
+	for i := 0; i < 10; i++ {
+		current.DeterministicV4(uint64(i), uint64(10))
+		if bytes.Compare(previous[:], current[:]) >= 0 {
+			t.Errorf(`%s should be less than %s`, previous, current)
+		}
+		copy(previous[:], current[:])
+	}
+
+	// Test uniqueness by enumerating adjacent `i`s in a big `n`.
+	previous, current = UUID{}, UUID{}
+	for i := 0; i < 10; i++ {
+		current.DeterministicV4(uint64(i), math.MaxUint64)
+		if bytes.Compare(previous[:], current[:]) >= 0 {
+			t.Errorf(`%s should be less than %s`, previous, current)
+		}
+		copy(previous[:], current[:])
 	}
 }

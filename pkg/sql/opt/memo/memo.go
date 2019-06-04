@@ -16,13 +16,14 @@ package memo
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // Memo is a data structure for efficiently storing a forest of query plans.
@@ -138,9 +139,12 @@ type Memo struct {
 	reorderJoinsLimit int
 	zigzagJoinEnabled bool
 	safeUpdates       bool
+	saveTablesPrefix  string
 
 	// curID is the highest currently in-use scalar expression ID.
 	curID opt.ScalarID
+
+	// WARNING: if you add more members, add initialization code in Init.
 }
 
 // Init initializes a new empty memo instance, or resets existing state so it
@@ -160,6 +164,10 @@ func (m *Memo) Init(evalCtx *tree.EvalContext) {
 	m.dataConversion = evalCtx.SessionData.DataConversion
 	m.reorderJoinsLimit = evalCtx.SessionData.ReorderJoinsLimit
 	m.zigzagJoinEnabled = evalCtx.SessionData.ZigzagJoinEnabled
+	m.safeUpdates = evalCtx.SessionData.SafeUpdates
+	m.saveTablesPrefix = evalCtx.SessionData.SaveTablesPrefix
+
+	m.curID = 0
 }
 
 // IsEmpty returns true if there are no expressions in the memo.
@@ -214,7 +222,7 @@ func (m *Memo) SetRoot(e RelExpr, phys *physical.Required) {
 // SetScalarRoot stores the root memo expression when it is a scalar expression.
 func (m *Memo) SetScalarRoot(scalar opt.ScalarExpr) {
 	if m.rootExpr != nil {
-		panic("cannot set scalar root multiple times")
+		panic(pgerror.AssertionFailedf("cannot set scalar root multiple times"))
 	}
 	m.rootExpr = scalar
 }
@@ -224,7 +232,7 @@ func (m *Memo) SetScalarRoot(scalar opt.ScalarExpr) {
 func (m *Memo) HasPlaceholders() bool {
 	rel, ok := m.rootExpr.(RelExpr)
 	if !ok {
-		panic(fmt.Sprintf("placeholders only supported when memo root is relational"))
+		panic(pgerror.AssertionFailedf("placeholders only supported when memo root is relational"))
 	}
 
 	return rel.Relational().HasPlaceholder
@@ -256,7 +264,8 @@ func (m *Memo) IsStale(
 	if !m.dataConversion.Equals(&evalCtx.SessionData.DataConversion) ||
 		m.reorderJoinsLimit != evalCtx.SessionData.ReorderJoinsLimit ||
 		m.zigzagJoinEnabled != evalCtx.SessionData.ZigzagJoinEnabled ||
-		m.safeUpdates != evalCtx.SessionData.SafeUpdates {
+		m.safeUpdates != evalCtx.SessionData.SafeUpdates ||
+		m.saveTablesPrefix != evalCtx.SessionData.SaveTablesPrefix {
 		return true, nil
 	}
 
@@ -294,11 +303,11 @@ func (m *Memo) SetBestProps(
 		if e.RequiredPhysical() != required ||
 			!e.ProvidedPhysical().Equals(provided) ||
 			e.Cost() != cost {
-			panic(fmt.Sprintf(
+			panic(pgerror.AssertionFailedf(
 				"cannot overwrite %s / %s (%.9g) with %s / %s (%.9g)",
 				e.RequiredPhysical(),
 				e.ProvidedPhysical(),
-				e.Cost(),
+				log.Safe(e.Cost()),
 				required.String(),
 				provided.String(), // Call String() so provided doesn't escape.
 				cost,

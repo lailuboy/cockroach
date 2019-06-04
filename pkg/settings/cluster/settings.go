@@ -102,7 +102,7 @@ var NoSettings *Settings // = nil
 const KeyVersionSetting = "version"
 
 var version = settings.RegisterStateMachineSetting(KeyVersionSetting,
-	"set the active cluster version in the format '<major>.<minor>'.", // hide optional `-<unstable>`
+	"set the active cluster version in the format '<major>.<minor>'", // hide optional `-<unstable>`
 	settings.TransformerFn(versionTransformer),
 )
 
@@ -214,7 +214,7 @@ func (ecv *ExposedClusterVersion) IsActive(versionKey VersionKey) bool {
 // case of a cluster version which is too low.
 func (ecv *ExposedClusterVersion) CheckVersion(versionKey VersionKey, feature string) error {
 	if !ecv.Version().IsActive(versionKey) {
-		return pgerror.NewErrorf(
+		return pgerror.Newf(
 			pgerror.CodeFeatureNotSupportedError,
 			"cluster version does not support %s (>= %s required)",
 			feature,

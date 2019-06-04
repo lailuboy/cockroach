@@ -15,9 +15,12 @@
 package bench
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
@@ -76,6 +79,19 @@ func (f *stubFactory) ConstructHashJoin(
 	return struct{}{}, nil
 }
 
+func (f *stubFactory) ConstructApplyJoin(
+	joinType sqlbase.JoinType,
+	left exec.Node,
+	leftBoundColMap opt.ColMap,
+	memo *memo.Memo,
+	rightProps *physical.Required,
+	fakeRight exec.Node,
+	right memo.RelExpr,
+	onCond tree.TypedExpr,
+) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
 func (f *stubFactory) ConstructMergeJoin(
 	joinType sqlbase.JoinType,
 	left, right exec.Node,
@@ -89,7 +105,7 @@ func (f *stubFactory) ConstructMergeJoin(
 func (f *stubFactory) ConstructGroupBy(
 	input exec.Node,
 	groupCols []exec.ColumnOrdinal,
-	orderedGroupCols exec.ColumnOrdinalSet,
+	groupColOrdering sqlbase.ColumnOrdering,
 	aggregations []exec.AggInfo,
 	reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
@@ -175,11 +191,21 @@ func (f *stubFactory) ConstructProjectSet(
 	return struct{}{}, nil
 }
 
+func (f *stubFactory) ConstructWindow(n exec.Node, wi exec.WindowInfo) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
 func (f *stubFactory) RenameColumns(input exec.Node, colNames []string) (exec.Node, error) {
 	return struct{}{}, nil
 }
 
 func (f *stubFactory) ConstructPlan(root exec.Node, subqueries []exec.Subquery) (exec.Plan, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructExplainOpt(
+	plan string, envOpts exec.ExplainEnvData,
+) (exec.Node, error) {
 	return struct{}{}, nil
 }
 
@@ -246,5 +272,11 @@ func (f *stubFactory) ConstructCreateTable(
 }
 
 func (f *stubFactory) ConstructSequenceSelect(seq cat.Sequence) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructSaveTable(
+	input exec.Node, table *cat.DataSourceName, colNames []string,
+) (exec.Node, error) {
 	return struct{}{}, nil
 }

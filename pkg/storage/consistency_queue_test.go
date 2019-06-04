@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -37,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/stretchr/testify/assert"
 )
 
 // TestConsistencyQueueRequiresLive verifies the queue will not
@@ -55,7 +57,7 @@ func TestConsistencyQueueRequiresLive(t *testing.T) {
 
 	// Verify that queueing is immediately possible.
 	if shouldQ, priority := mtc.stores[0].ConsistencyQueueShouldQueue(
-		context.TODO(), mtc.clock.Now(), repl, config.NewSystemConfig()); !shouldQ {
+		context.TODO(), mtc.clock.Now(), repl, config.NewSystemConfig(sc.DefaultZoneConfig)); !shouldQ {
 		t.Fatalf("expected shouldQ true; got %t, %f", shouldQ, priority)
 	}
 
@@ -64,7 +66,7 @@ func TestConsistencyQueueRequiresLive(t *testing.T) {
 	mtc.advanceClock(context.TODO())
 
 	if shouldQ, priority := mtc.stores[0].ConsistencyQueueShouldQueue(
-		context.TODO(), mtc.clock.Now(), repl, config.NewSystemConfig()); shouldQ {
+		context.TODO(), mtc.clock.Now(), repl, config.NewSystemConfig(sc.DefaultZoneConfig)); shouldQ {
 		t.Fatalf("expected shouldQ false; got %t, %f", shouldQ, priority)
 	}
 }
@@ -183,11 +185,32 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 		// account.
 		startWithSingleRange: true,
 	}
+
+	const numStores = 3
+
+	dir, cleanup := testutils.TempDir(t)
+	defer cleanup()
+	cache := engine.NewRocksDBCache(1 << 20)
+	defer cache.Release()
+
+	// Use on-disk stores because we want to take a RocksDB checkpoint and be
+	// able to find it.
+	for i := 0; i < numStores; i++ {
+		eng, err := engine.NewRocksDB(engine.RocksDBConfig{
+			Dir: filepath.Join(dir, fmt.Sprintf("%d", i)),
+		}, cache)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer eng.Close()
+		mtc.engines = append(mtc.engines, eng)
+	}
+
 	// Store 0 will report a diff with inconsistent key "e".
 	diffKey := []byte("e")
 	var diffTimestamp hlc.Timestamp
 	notifyReportDiff := make(chan struct{}, 1)
-	sc.ConsistencyTestingKnobs.BadChecksumReportDiff =
+	sc.TestingKnobs.ConsistencyTestingKnobs.BadChecksumReportDiff =
 		func(s roachpb.StoreIdent, diff storage.ReplicaSnapshotDiffSlice) {
 			if s != *mtc.Store(0).Ident {
 				t.Errorf("BadChecksumReportDiff called from follower (StoreIdent = %v)", s)
@@ -221,7 +244,7 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 		}
 	// Store 0 will panic.
 	notifyPanic := make(chan struct{}, 1)
-	sc.ConsistencyTestingKnobs.BadChecksumPanic = func(s roachpb.StoreIdent) {
+	sc.TestingKnobs.ConsistencyTestingKnobs.BadChecksumPanic = func(s roachpb.StoreIdent) {
 		if s != *mtc.Store(0).Ident {
 			t.Errorf("BadChecksumPanic called from follower (StoreIdent = %v)", s)
 			return
@@ -229,7 +252,6 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 		notifyPanic <- struct{}{}
 	}
 
-	const numStores = 3
 	defer mtc.Stop()
 	mtc.Start(t, numStores)
 	// Setup replication of range 1 on store 0 to stores 1 and 2.
@@ -245,6 +267,46 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	runCheck := func() *roachpb.CheckConsistencyResponse {
+		checkArgs := roachpb.CheckConsistencyRequest{
+			RequestHeader: roachpb.RequestHeader{
+				// span of keys that include "a" & "c".
+				Key:    []byte("a"),
+				EndKey: []byte("z"),
+			},
+			Mode: roachpb.ChecksumMode_CHECK_VIA_QUEUE,
+		}
+		resp, err := client.SendWrapped(context.Background(), mtc.stores[0].TestSender(), &checkArgs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.(*roachpb.CheckConsistencyResponse)
+	}
+
+	checkpoints := func(nodeIdx int) []string {
+		pat := filepath.Join(mtc.engines[nodeIdx].GetAuxiliaryDir(), "checkpoints") + "/*"
+		m, err := filepath.Glob(pat)
+		assert.NoError(t, err)
+		return m
+	}
+
+	// Run the check the first time, it shouldn't find anything.
+	respOK := runCheck()
+	assert.Len(t, respOK.Result, 1)
+	assert.Equal(t, roachpb.CheckConsistencyResponse_RANGE_CONSISTENT, respOK.Result[0].Status)
+	select {
+	case <-notifyReportDiff:
+		t.Fatal("unexpected diff")
+	case <-notifyPanic:
+		t.Fatal("unexpected panic")
+	default:
+	}
+
+	// No checkpoints should have been created.
+	for i := 0; i < numStores; i++ {
+		assert.Empty(t, checkpoints(i))
+	}
+
 	// Write some arbitrary data only to store 1. Inconsistent key "e"!
 	var val roachpb.Value
 	val.SetInt(42)
@@ -255,17 +317,9 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Run consistency check.
-	checkArgs := roachpb.CheckConsistencyRequest{
-		RequestHeader: roachpb.RequestHeader{
-			// span of keys that include "a" & "c".
-			Key:    []byte("a"),
-			EndKey: []byte("z"),
-		},
-	}
-	if _, err := client.SendWrapped(context.Background(), mtc.stores[0].TestSender(), &checkArgs); err != nil {
-		t.Fatal(err)
-	}
+	// Run consistency check again, this time it should find something.
+	resp := runCheck()
+
 	select {
 	case <-notifyReportDiff:
 	case <-time.After(5 * time.Second):
@@ -276,6 +330,30 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("CheckConsistency() failed to panic as expected")
 	}
+
+	// Checkpoints should have been created on all stores and they're not empty.
+	for i := 0; i < numStores; i++ {
+		cps := checkpoints(i)
+		assert.Len(t, cps, 1)
+		cpEng, err := engine.NewRocksDB(engine.RocksDBConfig{
+			Dir: cps[0],
+		}, cache)
+		assert.NoError(t, err)
+		defer cpEng.Close()
+
+		iter := cpEng.NewIterator(engine.IterOptions{UpperBound: []byte("\xff")})
+		defer iter.Close()
+
+		ms, err := engine.ComputeStatsGo(iter, engine.NilKey, engine.MVCCKeyMax, 0 /* nowNanos */)
+		assert.NoError(t, err)
+
+		assert.NotZero(t, ms.KeyBytes)
+	}
+
+	assert.Len(t, resp.Result, 1)
+	assert.Equal(t, roachpb.CheckConsistencyResponse_RANGE_INCONSISTENT, resp.Result[0].Status)
+	assert.Contains(t, resp.Result[0].Detail, `is inconsistent`)
+	assert.Contains(t, resp.Result[0].Detail, `persisted stats`)
 }
 
 // TestConsistencyQueueRecomputeStats is an end-to-end test of the mechanism CockroachDB
@@ -304,6 +382,20 @@ func TestConsistencyQueueRecomputeStats(t *testing.T) {
 		ScanMinIdleTime: 0,
 		ScanMaxIdleTime: 100 * time.Millisecond,
 	}
+
+	ccCh := make(chan roachpb.CheckConsistencyResponse, 1)
+	knobs := &storage.StoreTestingKnobs{}
+	knobs.ConsistencyTestingKnobs.ConsistencyQueueResultHook = func(resp roachpb.CheckConsistencyResponse) {
+		if len(resp.Result) == 0 || resp.Result[0].Status != roachpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_INCORRECT {
+			// Ignore recomputations triggered by the time series ranges.
+			return
+		}
+		select {
+		case ccCh <- resp:
+		default:
+		}
+	}
+	tsArgs.Knobs.Store = knobs
 	nodeZeroArgs := tsArgs
 	nodeZeroArgs.StoreSpecs = []base.StoreSpec{{
 		Path: path,
@@ -343,7 +435,7 @@ func TestConsistencyQueueRecomputeStats(t *testing.T) {
 		// Split off a range so that we get away from the timeseries writes, which
 		// pollute the stats with ContainsEstimates=true. Note that the split clears
 		// the right hand side (which is what we operate on) from that flag.
-		if err := db0.AdminSplit(ctx, key, key); err != nil {
+		if err := db0.AdminSplit(ctx, key, key, true /* manual */); err != nil {
 			t.Fatal(err)
 		}
 
@@ -386,6 +478,7 @@ func TestConsistencyQueueRecomputeStats(t *testing.T) {
 		// not affected by the workload we run below and also does not influence the
 		// GC queue score.
 		ms.SysCount += sysCountGarbage
+		ms.ContainsEstimates = false
 
 		// Overwrite with the new stats; remember that this range hasn't upreplicated,
 		// so the consistency checker won't see any replica divergence when it runs,
@@ -460,5 +553,13 @@ func TestConsistencyQueueRecomputeStats(t *testing.T) {
 
 	if delta := computeDelta(db0); delta != (enginepb.MVCCStats{}) {
 		t.Fatalf("stats still in need of adjustment: %+v", delta)
+	}
+
+	select {
+	case resp := <-ccCh:
+		assert.Contains(t, resp.Result[0].Detail, `stats delta`)
+		assert.Equal(t, roachpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_INCORRECT, resp.Result[0].Status)
+	default:
+		t.Errorf("no response indicating the incorrect stats")
 	}
 }

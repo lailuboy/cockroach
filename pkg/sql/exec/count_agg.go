@@ -14,6 +14,8 @@
 
 package exec
 
+import "github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
+
 func newCountAgg() *countAgg {
 	return &countAgg{}
 }
@@ -26,7 +28,7 @@ type countAgg struct {
 	done   bool
 }
 
-func (a *countAgg) Init(groups []bool, vec ColVec) {
+func (a *countAgg) Init(groups []bool, vec coldata.Vec) {
 	a.groups = groups
 	a.vec = vec.Int64()
 	a.Reset()
@@ -34,7 +36,8 @@ func (a *countAgg) Init(groups []bool, vec ColVec) {
 
 func (a *countAgg) Reset() {
 	a.curIdx = -1
-	copy(a.vec, zeroInt64Batch)
+	a.done = false
+	copy(a.vec, zeroInt64Column)
 }
 
 func (a *countAgg) CurrentOutputIndex() int {
@@ -44,11 +47,11 @@ func (a *countAgg) CurrentOutputIndex() int {
 func (a *countAgg) SetOutputIndex(idx int) {
 	if a.curIdx != -1 {
 		a.curIdx = idx
-		copy(a.vec[idx+1:], zeroInt64Batch)
+		copy(a.vec[idx+1:], zeroInt64Column)
 	}
 }
 
-func (a *countAgg) Compute(b ColBatch, _ []uint32) {
+func (a *countAgg) Compute(b coldata.Batch, _ []uint32) {
 	if a.done {
 		return
 	}
@@ -70,7 +73,7 @@ func (a *countAgg) Compute(b ColBatch, _ []uint32) {
 			a.vec[a.curIdx]++
 		}
 	} else {
-		for i := uint16(0); i < inputLen; i++ {
+		for i := range a.groups[:inputLen] {
 			x := 0
 			if a.groups[i] {
 				x = 1

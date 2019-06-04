@@ -25,11 +25,18 @@ import (
 func registerElectionAfterRestart(r *registry) {
 	r.Add(testSpec{
 		Name:    "election-after-restart",
+		Skip:    "https://github.com/cockroachdb/cockroach/issues/35047",
 		Cluster: makeClusterSpec(3),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			t.Status("starting up")
 			c.Put(ctx, cockroach, "./cockroach")
 			c.Start(ctx, t)
+
+			// If the initial ranges aren't fully replicated by the time we
+			// run our splits, replicating them after the splits will take
+			// longer, so wait for the initial replication before
+			// proceeding.
+			time.Sleep(3 * time.Second)
 
 			t.Status("creating table and splits")
 			c.Run(ctx, c.Node(1), `./cockroach sql --insecure -e "
@@ -44,6 +51,13 @@ func registerElectionAfterRestart(r *registry) {
         SELECT * FROM test.kv"`)
 			duration := timeutil.Since(start)
 			t.l.Printf("pre-restart, query took %s\n", duration)
+
+			// If we restart before all the nodes have applied the splits,
+			// there will be a lot of snapshot attempts (which may fail)
+			// after the restart. This appears to slow down startup enough
+			// to fail the condition below, so wait a bit for the dust to
+			// settle before restarting.
+			time.Sleep(3 * time.Second)
 
 			t.Status("restarting")
 			c.Stop(ctx)

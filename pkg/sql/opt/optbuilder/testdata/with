@@ -176,7 +176,7 @@ WITH
     t AS (SELECT false)
 SELECT * FROM t
 ----
-error: WITH query name t specified more than once
+error (42712): WITH query name t specified more than once
 
 # Using a CTE once in another CTE and once otherwise.
 build
@@ -185,7 +185,7 @@ WITH
     t2 AS (SELECT * FROM t1)
 SELECT * FROM t1 NATURAL JOIN t2
 ----
-error: unsupported multiple use of CTE clause "t1"
+error (0A000): unimplemented: unsupported multiple use of CTE clause "t1"
 
 build
 WITH
@@ -222,7 +222,7 @@ build
 WITH t AS (SELECT a FROM y WHERE a < 3)
   SELECT * FROM t NATURAL JOIN t
 ----
-error: unsupported multiple use of CTE clause "t"
+error (0A000): unimplemented: unsupported multiple use of CTE clause "t"
 
 build
 WITH t(x) AS (SELECT a FROM x)
@@ -356,7 +356,7 @@ project
 build
 WITH t(b, c) AS (SELECT a FROM x) SELECT b, t.b FROM t
 ----
-error: source "t" has 1 columns available but 2 columns specified
+error (42P10): source "t" has 1 columns available but 2 columns specified
 
 # Ensure you can't reference the original table name
 build

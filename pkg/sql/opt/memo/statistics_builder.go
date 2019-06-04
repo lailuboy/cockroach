@@ -15,17 +15,18 @@
 package memo
 
 import (
-	"fmt"
 	"math"
 	"reflect"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 var statsAnnID = opt.NewTableAnnID()
@@ -244,7 +245,9 @@ func (sb *statisticsBuilder) colStatFromInput(colSet opt.ColSet, e RelExpr) *pro
 		if intersectsLeft {
 			if intersectsRight {
 				// TODO(radu): what if both sides have columns in colSet?
-				panic(fmt.Sprintf("colSet %v contains both left and right columns", colSet))
+				panic(pgerror.AssertionFailedf(
+					"colSet %v contains both left and right columns", log.Safe(colSet),
+				))
 			}
 			if zigzagJoin != nil {
 				return sb.colStatTable(zigzagJoin.LeftTable, colSet)
@@ -265,7 +268,7 @@ func (sb *statisticsBuilder) colStatFromInput(colSet opt.ColSet, e RelExpr) *pro
 		return &props.ColumnStatistic{Cols: colSet, DistinctCount: 1}
 	}
 
-	panic(fmt.Sprintf("unsupported operator type %s", e.Op()))
+	panic(pgerror.AssertionFailedf("unsupported operator type %s", log.Safe(e.Op())))
 }
 
 // colStat gets a column statistic for the given set of columns if it exists.
@@ -278,7 +281,7 @@ func (sb *statisticsBuilder) colStat(colSet opt.ColSet, e RelExpr) *props.Column
 		e = e.Child(0).(RelExpr)
 	}
 	if colSet.Empty() {
-		panic("column statistics cannot be determined for empty column set")
+		panic(pgerror.AssertionFailedf("column statistics cannot be determined for empty column set"))
 	}
 
 	// Check if the requested column statistic is already cached.
@@ -329,8 +332,11 @@ func (sb *statisticsBuilder) colStat(colSet opt.ColSet, e RelExpr) *props.Column
 	case opt.Max1RowOp:
 		return sb.colStatMax1Row(colSet, e.(*Max1RowExpr))
 
-	case opt.RowNumberOp:
-		return sb.colStatRowNumber(colSet, e.(*RowNumberExpr))
+	case opt.OrdinalityOp:
+		return sb.colStatOrdinality(colSet, e.(*OrdinalityExpr))
+
+	case opt.WindowOp:
+		return sb.colStatWindow(colSet, e.(*WindowExpr))
 
 	case opt.ProjectSetOp:
 		return sb.colStatProjectSet(colSet, e.(*ProjectSetExpr))
@@ -341,12 +347,17 @@ func (sb *statisticsBuilder) colStat(colSet opt.ColSet, e RelExpr) *props.Column
 	case opt.SequenceSelectOp:
 		return sb.colStatSequenceSelect(colSet, e.(*SequenceSelectExpr))
 
-	case opt.ExplainOp, opt.ShowTraceForSessionOp:
-		relProps := e.Relational()
-		return sb.colStatLeaf(colSet, &relProps.Stats, &relProps.FuncDeps, relProps.NotNullCols)
+	case opt.ExplainOp:
+		return sb.colStatExplain(colSet, e.(*ExplainExpr))
+
+	case opt.ShowTraceForSessionOp:
+		return sb.colStatShowTrace(colSet, e.(*ShowTraceForSessionExpr))
+
+	case opt.FakeRelOp:
+		panic(pgerror.AssertionFailedf("FakeRelOp does not contain col stat for %v", colSet))
 	}
 
-	panic(fmt.Sprintf("unrecognized relational expression type: %v", e.Op()))
+	panic(pgerror.AssertionFailedf("unrecognized relational expression type: %v", log.Safe(e.Op())))
 }
 
 // colStatLeaf creates a column statistic for a given column set (if it doesn't
@@ -388,7 +399,7 @@ func (sb *statisticsBuilder) colStatLeaf(
 		col, _ := colSet.Next(0)
 		colStat.DistinctCount = unknownDistinctCountRatio * s.RowCount
 		colStat.NullCount = unknownNullCountRatio * s.RowCount
-		if sb.md.ColumnMeta(opt.ColumnID(col)).Type == types.Bool {
+		if sb.md.ColumnMeta(opt.ColumnID(col)).Type.Family() == types.BoolFamily {
 			colStat.DistinctCount = min(colStat.DistinctCount, 2)
 		}
 		if notNullCols.Contains(col) {
@@ -438,6 +449,10 @@ func (sb *statisticsBuilder) makeTableStatistics(tabID opt.TableID) *props.Stati
 		// with most recent first.
 		stats.RowCount = float64(tab.Statistic(0).RowCount())
 
+		// Make sure the row count is at least 1. The stats may be stale, and we
+		// can end up with weird and inefficient plans if we estimate 0 rows.
+		stats.RowCount = max(stats.RowCount, 1)
+
 		// Add all the column statistics, using the most recent statistic for each
 		// column set. Stats are ordered with most recent first.
 		for i := 0; i < tab.StatisticCount(); i++ {
@@ -449,6 +464,10 @@ func (sb *statisticsBuilder) makeTableStatistics(tabID opt.TableID) *props.Stati
 			if colStat, ok := stats.ColStats.Add(cols); ok {
 				colStat.DistinctCount = float64(stat.DistinctCount())
 				colStat.NullCount = float64(stat.NullCount())
+
+				// Make sure the distinct count is at least 1, for the same reason as
+				// the row count above.
+				colStat.DistinctCount = max(colStat.DistinctCount, 1)
 			}
 		}
 	}
@@ -541,6 +560,7 @@ func (sb *statisticsBuilder) colStatScan(colSet opt.ColSet, scan *ScanExpr) *pro
 		colStat.NullCount = 0
 	}
 
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -565,7 +585,9 @@ func (sb *statisticsBuilder) colStatVirtualScan(
 	colSet opt.ColSet, scan *VirtualScanExpr,
 ) *props.ColumnStatistic {
 	s := &scan.Relational().Stats
-	return sb.copyColStat(colSet, s, sb.colStatTable(scan.Table, colSet))
+	colStat := sb.copyColStat(colSet, s, sb.colStatTable(scan.Table, colSet))
+	sb.finalizeFromRowCount(colStat, s.RowCount)
+	return colStat
 }
 
 // +--------+
@@ -646,6 +668,7 @@ func (sb *statisticsBuilder) colStatSelect(
 	if colSet.SubsetOf(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -730,6 +753,7 @@ func (sb *statisticsBuilder) colStatProject(
 	if colSet.SubsetOf(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -771,6 +795,21 @@ func (sb *statisticsBuilder) buildJoin(
 	// are implicit equality conditions on KeyCols.
 	if h.filterIsTrue {
 		s.RowCount = leftStats.RowCount * rightStats.RowCount
+		switch h.joinType {
+		case opt.InnerJoinOp, opt.InnerJoinApplyOp:
+		case opt.LeftJoinOp, opt.LeftJoinApplyOp:
+			// All rows from left side should be in the result.
+			s.RowCount = max(s.RowCount, leftStats.RowCount)
+
+		case opt.RightJoinOp, opt.RightJoinApplyOp:
+			// All rows from right side should be in the result.
+			s.RowCount = max(s.RowCount, rightStats.RowCount)
+
+		case opt.FullJoinOp, opt.FullJoinApplyOp:
+			// All rows from both sides should be in the result.
+			s.RowCount = max(s.RowCount, leftStats.RowCount)
+			s.RowCount = max(s.RowCount, rightStats.RowCount)
+		}
 		s.Selectivity = 1
 		return
 	}
@@ -953,6 +992,7 @@ func (sb *statisticsBuilder) colStatJoin(colSet opt.ColSet, join RelExpr) *props
 		// Column stats come from left side of join.
 		colStat := sb.copyColStat(colSet, s, sb.colStatFromJoinLeft(colSet, join))
 		colStat.ApplySelectivity(s.Selectivity, leftProps.Stats.RowCount)
+		sb.finalizeFromRowCount(colStat, s.RowCount)
 		return colStat
 
 	default:
@@ -1039,15 +1079,10 @@ func (sb *statisticsBuilder) colStatJoin(colSet opt.ColSet, join RelExpr) *props
 			)
 		}
 
-		// The distinct count should be no larger than the row count.
-		if colStat.DistinctCount > s.RowCount {
-			colStat.DistinctCount = s.RowCount
-		}
-		// Similarly, the null count should be no larger than RowCount.
-		colStat.NullCount = min(s.RowCount, colStat.NullCount)
 		if colSet.SubsetOf(relProps.NotNullCols) {
 			colStat.NullCount = 0
 		}
+		sb.finalizeFromRowCount(colStat, s.RowCount)
 		return colStat
 	}
 }
@@ -1235,15 +1270,10 @@ func (sb *statisticsBuilder) colStatIndexJoin(
 		colStat.NullCount = inputStats.RowCount * (f1 + f2 - f1*f2)
 	}
 
-	// The distinct count should be no larger than the row count.
-	if colStat.DistinctCount > s.RowCount {
-		colStat.DistinctCount = s.RowCount
-	}
-	// Similarly, the null count should be no larger than RowCount.
-	colStat.NullCount = min(s.RowCount, colStat.NullCount)
 	if colSet.SubsetOf(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -1365,6 +1395,14 @@ func (sb *statisticsBuilder) buildGroupBy(groupNode RelExpr, relProps *props.Rel
 		// ones in colStatGroupBy.
 		colStat := sb.copyColStatFromChild(groupingColSet, groupNode, s)
 		s.RowCount = colStat.DistinctCount
+
+		// TODO(rytaft): take this out once null count is included in distinct
+		// count.
+		s.RowCount += min(1, colStat.NullCount)
+
+		// Non-scalar GroupBy should never increase the number of rows.
+		inputStats := &groupNode.Child(0).(RelExpr).Relational().Stats
+		s.RowCount = min(s.RowCount, inputStats.RowCount)
 	}
 
 	sb.finalizeFromCardinality(relProps)
@@ -1410,12 +1448,12 @@ func (sb *statisticsBuilder) colStatGroupBy(
 	} else {
 		inputRowCount := sb.statsFromChild(groupNode, 0 /* childIdx */).RowCount
 		colStat.NullCount = ((colStat.DistinctCount + 1) / inputRowCount) * inputColStat.NullCount
-		colStat.NullCount = min(s.RowCount, colStat.NullCount)
 	}
 
 	if colSet.SubsetOf(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -1449,11 +1487,12 @@ func (sb *statisticsBuilder) buildSetNode(setNode RelExpr, relProps *props.Relat
 	switch setNode.Op() {
 	case opt.UnionOp, opt.IntersectOp, opt.ExceptOp:
 		// Since UNION, INTERSECT and EXCEPT eliminate duplicate rows, the row
-		// count will equal the distinct count of the set of output columns.
+		// count will equal the distinct count of the set of output columns, plus
+		// any null values.
 		setPrivate := setNode.Private().(*SetPrivate)
 		outputCols := setPrivate.OutCols.ToSet()
 		colStat := sb.colStatSetNodeImpl(outputCols, setNode, relProps)
-		s.RowCount = colStat.DistinctCount
+		s.RowCount = min(colStat.DistinctCount+colStat.NullCount, s.RowCount)
 	}
 
 	sb.finalizeFromCardinality(relProps)
@@ -1479,20 +1518,16 @@ func (sb *statisticsBuilder) colStatSetNodeImpl(
 	colStat, _ := s.ColStats.Add(outputCols)
 
 	// Use the actual null counts for bag operations, and normalize them for set
-	// operations. See comment in colStatGroupBy for the reasoning behind the null
-	// count formula.
+	// operations.
 	leftNullCount := leftColStat.NullCount
 	rightNullCount := rightColStat.NullCount
 	switch setNode.Op() {
 	case opt.UnionOp, opt.IntersectOp, opt.ExceptOp:
+		// It's very difficult to make any determination about the null count when
+		// the number of output columns is greater than 1.
 		if len(setPrivate.OutCols) == 1 {
 			leftNullCount = min(1, leftNullCount)
 			rightNullCount = min(1, rightNullCount)
-		} else {
-			leftRowCount := sb.statsFromChild(setNode, 0 /* childIdx */).RowCount
-			leftNullCount *= (leftColStat.DistinctCount + 1) / leftRowCount
-			rightRowCount := sb.statsFromChild(setNode, 1 /* childIdx */).RowCount
-			rightNullCount *= (rightColStat.DistinctCount + 1) / rightRowCount
 		}
 	}
 
@@ -1507,6 +1542,12 @@ func (sb *statisticsBuilder) colStatSetNodeImpl(
 		colStat.DistinctCount = min(leftColStat.DistinctCount, rightColStat.DistinctCount)
 		colStat.NullCount = min(leftNullCount, rightNullCount)
 
+		// Ensure that at least one of the distinct count or null count is non-zero
+		// to avoid calculating zero rows.
+		if colStat.DistinctCount == 0 && colStat.NullCount == 0 {
+			colStat.DistinctCount = max(leftColStat.DistinctCount, rightColStat.DistinctCount)
+		}
+
 	case opt.ExceptOp, opt.ExceptAllOp:
 		colStat.DistinctCount = leftColStat.DistinctCount
 		colStat.NullCount = leftNullCount
@@ -1515,6 +1556,7 @@ func (sb *statisticsBuilder) colStatSetNodeImpl(
 	if outputCols.SubsetOf(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -1555,9 +1597,11 @@ func (sb *statisticsBuilder) colStatValues(
 		hash := uint64(offset64)
 		hasNull := false
 		for i, elem := range row.(*TupleExpr).Elems {
-			if elem.Op() == opt.NullOp {
-				hasNull = true
-			} else if colSet.Contains(int(values.Cols[i])) {
+			if colSet.Contains(int(values.Cols[i])) {
+				if elem.Op() == opt.NullOp {
+					hasNull = true
+					break
+				}
 				// Use the pointer value of the scalar expression, since it's already
 				// been interned. Therefore, two expressions with the same pointer
 				// have the same value.
@@ -1566,11 +1610,10 @@ func (sb *statisticsBuilder) colStatValues(
 				hash *= prime64
 			}
 		}
-		if hash != offset64 {
-			distinct[hash] = struct{}{}
-		}
 		if hasNull {
 			nullCount++
+		} else {
+			distinct[hash] = struct{}{}
 		}
 	}
 
@@ -1578,6 +1621,7 @@ func (sb *statisticsBuilder) colStatValues(
 	colStat, _ := s.ColStats.Add(colSet)
 	colStat.DistinctCount = float64(len(distinct))
 	colStat.NullCount = float64(nullCount)
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -1622,6 +1666,7 @@ func (sb *statisticsBuilder) colStatLimit(
 	if colSet.SubsetOf(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -1645,7 +1690,11 @@ func (sb *statisticsBuilder) buildOffset(offset *OffsetExpr, relProps *props.Rel
 	if cnst, ok := offset.Offset.(*ConstExpr); ok && inputStats.RowCount > 0 {
 		hardOffset := *cnst.Value.(*tree.DInt)
 		if float64(hardOffset) >= inputStats.RowCount {
-			s.RowCount = 0
+			// The correct estimate for row count here is 0, but we don't ever want
+			// row count to be zero unless the cardinality is zero. This is because
+			// the stats may be stale, and we can end up with weird and inefficient
+			// plans if we estimate 0 rows. Use a small number instead.
+			s.RowCount = min(1, inputStats.RowCount)
 		} else if hardOffset > 0 {
 			s.RowCount = inputStats.RowCount - float64(hardOffset)
 		}
@@ -1668,6 +1717,7 @@ func (sb *statisticsBuilder) colStatOffset(
 	if colSet.SubsetOf(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -1696,6 +1746,7 @@ func (sb *statisticsBuilder) colStatMax1Row(
 	if colSet.SubsetOf(max1Row.Relational().NotNullCols) {
 		colStat.NullCount = 0
 	}
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -1703,28 +1754,28 @@ func (sb *statisticsBuilder) colStatMax1Row(
 // | Row Number |
 // +------------+
 
-func (sb *statisticsBuilder) buildRowNumber(rowNum *RowNumberExpr, relProps *props.Relational) {
+func (sb *statisticsBuilder) buildOrdinality(ord *OrdinalityExpr, relProps *props.Relational) {
 	s := &relProps.Stats
 	if zeroCardinality := s.Init(relProps); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
 
-	inputStats := &rowNum.Input.Relational().Stats
+	inputStats := &ord.Input.Relational().Stats
 
 	s.RowCount = inputStats.RowCount
 	sb.finalizeFromCardinality(relProps)
 }
 
-func (sb *statisticsBuilder) colStatRowNumber(
-	colSet opt.ColSet, rowNum *RowNumberExpr,
+func (sb *statisticsBuilder) colStatOrdinality(
+	colSet opt.ColSet, ord *OrdinalityExpr,
 ) *props.ColumnStatistic {
-	relProps := rowNum.Relational()
+	relProps := ord.Relational()
 	s := &relProps.Stats
 
 	colStat, _ := s.ColStats.Add(colSet)
 
-	if colSet.Contains(int(rowNum.ColID)) {
+	if colSet.Contains(int(ord.ColID)) {
 		// The ordinality column is a key, so every row is distinct.
 		colStat.DistinctCount = s.RowCount
 		if colSet.Len() == 1 {
@@ -1733,12 +1784,12 @@ func (sb *statisticsBuilder) colStatRowNumber(
 		} else {
 			// Copy NullCount from child.
 			colSetChild := colSet.Copy()
-			colSetChild.Remove(int(rowNum.ColID))
-			inputColStat := sb.colStatFromChild(colSetChild, rowNum, 0 /* childIdx */)
+			colSetChild.Remove(int(ord.ColID))
+			inputColStat := sb.colStatFromChild(colSetChild, ord, 0 /* childIdx */)
 			colStat.NullCount = inputColStat.NullCount
 		}
 	} else {
-		inputColStat := sb.colStatFromChild(colSet, rowNum, 0 /* childIdx */)
+		inputColStat := sb.colStatFromChild(colSet, ord, 0 /* childIdx */)
 		colStat.DistinctCount = inputColStat.DistinctCount
 		colStat.NullCount = inputColStat.NullCount
 	}
@@ -1746,6 +1797,72 @@ func (sb *statisticsBuilder) colStatRowNumber(
 	if colSet.SubsetOf(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
+	sb.finalizeFromRowCount(colStat, s.RowCount)
+	return colStat
+}
+
+// +------------+
+// |   Window   |
+// +------------+
+
+func (sb *statisticsBuilder) buildWindow(window *WindowExpr, relProps *props.Relational) {
+	s := &relProps.Stats
+	if zeroCardinality := s.Init(relProps); zeroCardinality {
+		// Short cut if cardinality is 0.
+		return
+	}
+
+	inputStats := &window.Input.Relational().Stats
+
+	// The row count of a window is equal to the row count of its input.
+	s.RowCount = inputStats.RowCount
+
+	sb.finalizeFromCardinality(relProps)
+}
+
+func (sb *statisticsBuilder) colStatWindow(
+	colSet opt.ColSet, window *WindowExpr,
+) *props.ColumnStatistic {
+	relProps := window.Relational()
+	s := &relProps.Stats
+
+	colStat, _ := s.ColStats.Add(colSet)
+
+	var windowCols opt.ColSet
+	for _, w := range window.Windows {
+		windowCols.Add(int(w.Col))
+	}
+
+	if colSet.Intersects(windowCols) {
+		// These can be quite complicated and differ dramatically based on which
+		// window function is being computed. For now, just assume row_number and
+		// that every row is distinct.
+		// TODO(justin): make these accurate and take into consideration the window
+		// function being computed.
+		colStat.DistinctCount = s.RowCount
+
+		// Just assume that no NULLs are output.
+		// TODO(justin): there are window fns for which this is not true, make
+		// sure those are handled.
+		if colSet.SubsetOf(windowCols) {
+			// The generated columns are the only columns being requested.
+			colStat.NullCount = 0
+		} else {
+			// Copy NullCount from child.
+			colSetChild := colSet.Difference(windowCols)
+			inputColStat := sb.colStatFromChild(colSetChild, window, 0 /* childIdx */)
+			colStat.NullCount = inputColStat.NullCount
+		}
+	} else {
+		inputColStat := sb.colStatFromChild(colSet, window, 0 /* childIdx */)
+		colStat.DistinctCount = inputColStat.DistinctCount
+		colStat.NullCount = inputColStat.NullCount
+	}
+
+	if colSet.SubsetOf(relProps.NotNullCols) {
+		colStat.NullCount = 0
+	}
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -1873,13 +1990,10 @@ func (sb *statisticsBuilder) colStatProjectSet(
 		colStat.NullCount = s.RowCount * (f1 + f2 - f1*f2)
 	}
 
-	// The distinct count and null count should be no larger than the row count.
-	colStat.DistinctCount = min(s.RowCount, colStat.DistinctCount)
-	colStat.NullCount = min(s.RowCount, colStat.NullCount)
-
 	if colSet.SubsetOf(projectSet.Relational().NotNullCols) {
 		colStat.NullCount = 0
 	}
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -1915,6 +2029,7 @@ func (sb *statisticsBuilder) colStatMutation(
 	colStat, _ := s.ColStats.Add(colSet)
 	colStat.DistinctCount = inColStat.DistinctCount
 	colStat.NullCount = inColStat.NullCount
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -1936,6 +2051,51 @@ func (sb *statisticsBuilder) colStatSequenceSelect(
 	colStat, _ := s.ColStats.Add(colSet)
 	colStat.DistinctCount = 1
 	colStat.NullCount = 0
+	sb.finalizeFromRowCount(colStat, s.RowCount)
+	return colStat
+}
+
+// +---------+
+// | Explain |
+// +---------+
+
+func (sb *statisticsBuilder) buildExplain(relProps *props.Relational) {
+	s := &relProps.Stats
+	s.RowCount = unknownGeneratorRowCount
+	sb.finalizeFromCardinality(relProps)
+}
+
+func (sb *statisticsBuilder) colStatExplain(
+	colSet opt.ColSet, explain *ExplainExpr,
+) *props.ColumnStatistic {
+	s := &explain.Relational().Stats
+
+	colStat, _ := s.ColStats.Add(colSet)
+	colStat.DistinctCount = s.RowCount
+	colStat.NullCount = 0
+	sb.finalizeFromRowCount(colStat, s.RowCount)
+	return colStat
+}
+
+// +------------+
+// | Show Trace |
+// +------------+
+
+func (sb *statisticsBuilder) buildShowTrace(relProps *props.Relational) {
+	s := &relProps.Stats
+	s.RowCount = unknownGeneratorRowCount
+	sb.finalizeFromCardinality(relProps)
+}
+
+func (sb *statisticsBuilder) colStatShowTrace(
+	colSet opt.ColSet, showTrace *ShowTraceForSessionExpr,
+) *props.ColumnStatistic {
+	s := &showTrace.Relational().Stats
+
+	colStat, _ := s.ColStats.Add(colSet)
+	colStat.DistinctCount = s.RowCount
+	colStat.NullCount = 0
+	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
 
@@ -1977,7 +2137,9 @@ func (sb *statisticsBuilder) copyColStat(
 	colSet opt.ColSet, s *props.Statistics, inputColStat *props.ColumnStatistic,
 ) *props.ColumnStatistic {
 	if !inputColStat.Cols.SubsetOf(colSet) {
-		panic(fmt.Sprintf("copyColStat colSet: %v inputColSet: %v\n", colSet, inputColStat.Cols))
+		panic(pgerror.AssertionFailedf(
+			"copyColStat colSet: %v inputColSet: %v\n", log.Safe(colSet), log.Safe(inputColStat.Cols),
+		))
 	}
 	colStat, _ := s.ColStats.Add(colSet)
 	colStat.DistinctCount = inputColStat.DistinctCount
@@ -2027,6 +2189,14 @@ func translateColSet(colSetIn opt.ColSet, from opt.ColList, to opt.ColList) opt.
 
 func (sb *statisticsBuilder) finalizeFromCardinality(relProps *props.Relational) {
 	s := &relProps.Stats
+
+	// We don't ever want row count to be zero unless the cardinality is zero.
+	// This is because the stats may be stale, and we can end up with weird and
+	// inefficient plans if we estimate 0 rows.
+	if s.RowCount <= 0 && relProps.Cardinality.Max > 0 {
+		panic(pgerror.AssertionFailedf("estimated row count must be non-zero"))
+	}
+
 	// The row count should be between the min and max cardinality.
 	if s.RowCount > float64(relProps.Cardinality.Max) && relProps.Cardinality.Max != math.MaxUint32 {
 		s.RowCount = float64(relProps.Cardinality.Max)
@@ -2034,12 +2204,24 @@ func (sb *statisticsBuilder) finalizeFromCardinality(relProps *props.Relational)
 		s.RowCount = float64(relProps.Cardinality.Min)
 	}
 
-	// The distinct and null counts should be no larger than the row count.
 	for i, n := 0, s.ColStats.Count(); i < n; i++ {
 		colStat := s.ColStats.Get(i)
-		colStat.DistinctCount = min(colStat.DistinctCount, s.RowCount)
-		colStat.NullCount = min(colStat.NullCount, s.RowCount)
+		sb.finalizeFromRowCount(colStat, s.RowCount)
 	}
+}
+
+func (sb *statisticsBuilder) finalizeFromRowCount(
+	colStat *props.ColumnStatistic, rowCount float64,
+) {
+	// We should always have at least one distinct or null value if
+	// row count > 0.
+	if rowCount > 0 && colStat.DistinctCount == 0 && colStat.NullCount == 0 {
+		panic(pgerror.AssertionFailedf("estimated distinct and/or null count must be non-zero"))
+	}
+
+	// The distinct and null counts should be no larger than the row count.
+	colStat.DistinctCount = min(colStat.DistinctCount, rowCount)
+	colStat.NullCount = min(colStat.NullCount, rowCount)
 }
 
 func min(a float64, b float64) float64 {
@@ -2268,6 +2450,13 @@ func (sb *statisticsBuilder) updateNullCountsFromProps(
 				colStat.ApplySelectivity(s.Selectivity, inputRowCount)
 			}
 		}
+		if colStat.DistinctCount == 0 {
+			// Transfer the null count to the distinct count since we now know that
+			// the column is not null. We want to make sure that either the null
+			// count or the distinct count is non-zero, since we always ensure that
+			// the row count is non-zero to avoid creating inefficient plans.
+			colStat.DistinctCount = min(colStat.NullCount, 1)
+		}
 		colStat.NullCount = 0
 	})
 }
@@ -2332,7 +2521,8 @@ func (sb *statisticsBuilder) updateDistinctCountsFromConstraint(
 			if startVal.Compare(sb.evalCtx, endVal) != 0 {
 				// TODO(rytaft): are there other types we should handle here
 				// besides int?
-				if startVal.ResolvedType() == types.Int && endVal.ResolvedType() == types.Int {
+				if startVal.ResolvedType().Family() == types.IntFamily &&
+					endVal.ResolvedType().Family() == types.IntFamily {
 					start := int(*startVal.(*tree.DInt))
 					end := int(*endVal.(*tree.DInt))
 					// We assume that both start and end boundaries are inclusive. This
@@ -2491,10 +2681,19 @@ func (sb *statisticsBuilder) selectivityFromNullCounts(
 
 		inputStat := sb.colStatFromInput(colStat.Cols, e)
 		if inputStat.NullCount > rowCount {
-			panic("rowCount passed in was too small")
+			panic(pgerror.AssertionFailedf("rowCount passed in was too small"))
 		}
 		if colStat.NullCount < inputStat.NullCount {
-			selectivity *= (1 - (inputStat.NullCount-colStat.NullCount)/rowCount)
+			nullsRemoved := inputStat.NullCount - colStat.NullCount
+
+			// We want to avoid setting selectivity to zero because the stats may be
+			// stale, and we can end up with weird and inefficient plans if we
+			// estimate zero rows. Adjust the estimate for nullsRemoved to avoid
+			// this.
+			if nullsRemoved == rowCount {
+				nullsRemoved = max(nullsRemoved-1, 0)
+			}
+			selectivity *= 1 - nullsRemoved/rowCount
 		}
 	}
 
@@ -2542,13 +2741,20 @@ func (sb *statisticsBuilder) joinSelectivityFromNullCounts(
 		crossJoinNullCount := leftNullCount*rightRowCount + rightNullCount*leftRowCount
 
 		if crossJoinNullCount > inputRowCount {
-			panic("row count passed in was too small")
+			panic(pgerror.AssertionFailedf("row count passed in was too small"))
 		}
 		// We make the assumption that colStat.NullCount is either 0 or equal
 		// to / greater than crossJoinNullCount. In the zero case, account
 		// for this null elimination in the returned selectivity.
 		if colStat.NullCount == 0 {
-			selectivity *= (1 - crossJoinNullCount/inputRowCount)
+			// We want to avoid setting selectivity to zero because the stats may be
+			// stale, and we can end up with weird and inefficient plans if we
+			// estimate zero rows. Adjust the estimate for crossJoinNullCount to
+			// avoid this.
+			if crossJoinNullCount == inputRowCount {
+				crossJoinNullCount = max(crossJoinNullCount-1, 0)
+			}
+			selectivity *= 1 - crossJoinNullCount/inputRowCount
 		}
 	}
 

@@ -16,12 +16,29 @@ package storage
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/rditer"
+	"github.com/cockroachdb/cockroach/pkg/storage/tscache"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
+
+// setTimestampCacheLowWaterMark updates the low water mark of the timestamp
+// cache to the provided timestamp for all key ranges owned by the provided
+// Range descriptor. This ensures that no future writes in either the local or
+// global keyspace are allowed at times equal to or earlier than this timestamp,
+// which could invalidate prior reads.
+func setTimestampCacheLowWaterMark(
+	tc tscache.Cache, desc *roachpb.RangeDescriptor, ts hlc.Timestamp,
+) {
+	for _, keyRange := range rditer.MakeReplicatedKeyRanges(desc) {
+		tc.SetLowWater(keyRange.Start.Key, keyRange.End.Key, ts)
+	}
+}
 
 // updateTimestampCache updates the timestamp cache in order to set a low water
 // mark for the timestamp at which mutations to keys overlapping the provided
@@ -29,7 +46,10 @@ import (
 func (r *Replica) updateTimestampCache(
 	ba *roachpb.BatchRequest, br *roachpb.BatchResponse, pErr *roachpb.Error,
 ) {
-	tc := r.store.tsCache
+	addToTSCache := r.store.tsCache.Add
+	if util.RaceEnabled {
+		addToTSCache = checkedTSCacheUpdate(r.store.Clock().Now(), r.store.tsCache, ba, br, pErr)
+	}
 	// Update the timestamp cache using the timestamp at which the batch
 	// was executed. Note this may have moved forward from ba.Timestamp,
 	// as when the request is retried locally on WriteTooOldErrors.
@@ -43,120 +63,167 @@ func (r *Replica) updateTimestampCache(
 	}
 	for i, union := range ba.Requests {
 		args := union.GetInner()
-		if roachpb.UpdatesTimestampCache(args) {
-			// Skip update if there's an error and it's not for this index
-			// or the request doesn't update the timestamp cache on errors.
-			if pErr != nil {
-				if index := pErr.Index; !roachpb.UpdatesTimestampCacheOnError(args) ||
-					index == nil || int32(i) != index.Index {
-					continue
-				}
-			}
-			header := args.Header()
-			start, end := header.Key, header.EndKey
-			switch t := args.(type) {
-			case *roachpb.EndTransactionRequest:
-				// EndTransaction adds the transaction key to the write
-				// timestamp cache as a tombstone to ensure replays and
-				// concurrent requests aren't able to create a new
-				// transaction record.
-				//
-				// It inserts the timestamp of the final batch in the
-				// transaction. This timestamp must necessarily be equal
-				// to or greater than the transaction's OrigTimestamp,
-				// which is consulted in CanCreateTxnRecord.
-				key := keys.TransactionKey(start, txnID)
-				tc.Add(key, nil, ts, txnID, false /* readCache */)
-			case *roachpb.PushTxnRequest:
-				// A successful PushTxn request bumps the timestamp cache for
-				// the pushee's transaction key. The pushee will consult the
-				// timestamp cache when creating its record. If the push left
-				// the transaction in a PENDING state (PUSH_TIMESTAMP) then we
-				// update the read timestamp cache. This will cause the creator
-				// of the transaction record to forward its provisional commit
-				// timestamp to honor the result of this push. If the push left
-				// the transaction in an ABORTED state (PUSH_ABORT) then we
-				// update the write timestamp cache. This will prevent the
-				// creation of the transaction record entirely.
-				pushee := br.Responses[i].GetInner().(*roachpb.PushTxnResponse).PusheeTxn
-
-				// Update the local clock to the pushee's new timestamp. This
-				// ensures that we can safely update the timestamp cache based
-				// on this value. The pushee's timestamp is not reflected in
-				// the batch request's or response's timestamp.
-				// TODO(nvanbenschoten): there are some concerns that this is
-				// incorrect because this pushee.Timestamp was not accounted
-				// for in the local clock before this request's lease check.
-				// Do something about it.
-				r.store.Clock().Update(pushee.Timestamp)
-
-				var readCache bool
-				switch pushee.Status {
-				case roachpb.PENDING:
-					readCache = true
-				case roachpb.ABORTED:
-					readCache = false
-				case roachpb.COMMITTED:
-					// No need to update the timestamp cache. It was already
-					// updated by the corresponding EndTransaction request.
-					continue
-				}
-				key := keys.TransactionKey(start, pushee.ID)
-				tc.Add(key, nil, pushee.Timestamp, t.PusherTxn.ID, readCache)
-			case *roachpb.ConditionalPutRequest:
-				if pErr != nil {
-					// ConditionalPut still updates on ConditionFailedErrors.
-					if _, ok := pErr.GetDetail().(*roachpb.ConditionFailedError); !ok {
-						continue
-					}
-				}
-				tc.Add(start, end, ts, txnID, true /* readCache */)
-			case *roachpb.InitPutRequest:
-				if pErr != nil {
-					// InitPut still updates on ConditionFailedErrors.
-					if _, ok := pErr.GetDetail().(*roachpb.ConditionFailedError); !ok {
-						continue
-					}
-				}
-				tc.Add(start, end, ts, txnID, true /* readCache */)
-			case *roachpb.ScanRequest:
-				resp := br.Responses[i].GetInner().(*roachpb.ScanResponse)
-				if resp.ResumeSpan != nil {
-					// Note that for forward scan, the resume span will start at
-					// the (last key read).Next(), which is actually the correct
-					// end key for the span to update the timestamp cache.
-					end = resp.ResumeSpan.Key
-				}
-				tc.Add(start, end, ts, txnID, true /* readCache */)
-			case *roachpb.ReverseScanRequest:
-				resp := br.Responses[i].GetInner().(*roachpb.ReverseScanResponse)
-				if resp.ResumeSpan != nil {
-					// Note that for reverse scans, the resume span's end key is
-					// an open interval. That means it was read as part of this op
-					// and won't be read on resume. It is the correct start key for
-					// the span to update the timestamp cache.
-					start = resp.ResumeSpan.EndKey
-				}
-				tc.Add(start, end, ts, txnID, true /* readCache */)
-			case *roachpb.QueryIntentRequest:
-				if t.IfMissing == roachpb.QueryIntentRequest_PREVENT {
-					resp := br.Responses[i].GetInner().(*roachpb.QueryIntentResponse)
-					if !resp.FoundIntent {
-						// If the QueryIntent request has an "if missing" behavior
-						// of PREVENT and the intent is missing then we update the
-						// timestamp cache at the intent's key to the intent's
-						// transactional timestamp. This will prevent the intent
-						// from ever being written in the future. We use an empty
-						// transaction ID so that we block the intent regardless
-						// of whether it is part of the current batch's transaction
-						// or not.
-						tc.Add(start, end, t.Txn.Timestamp, uuid.UUID{}, true /* readCache */)
-					}
-				}
-			default:
-				tc.Add(start, end, ts, txnID, !roachpb.UpdatesWriteTimestampCache(args))
+		if !roachpb.UpdatesTimestampCache(args) {
+			continue
+		}
+		// Skip update if there's an error and it's not for this index
+		// or the request doesn't update the timestamp cache on errors.
+		if pErr != nil {
+			if index := pErr.Index; !roachpb.UpdatesTimestampCacheOnError(args) ||
+				index == nil || int32(i) != index.Index {
+				continue
 			}
 		}
+		header := args.Header()
+		start, end := header.Key, header.EndKey
+		switch t := args.(type) {
+		case *roachpb.EndTransactionRequest:
+			// EndTransaction requests that finalize their transaction add the
+			// transaction key to the write timestamp cache as a tombstone to
+			// ensure replays and concurrent requests aren't able to recreate
+			// the transaction record.
+			//
+			// It inserts the timestamp of the final batch in the transaction.
+			// This timestamp must necessarily be equal to or greater than the
+			// transaction's OrigTimestamp, which is consulted in
+			// CanCreateTxnRecord.
+			if br.Txn.Status.IsFinalized() {
+				key := keys.TransactionKey(start, txnID)
+				addToTSCache(key, nil, ts, txnID, false /* readCache */)
+			}
+		case *roachpb.RecoverTxnRequest:
+			// A successful RecoverTxn request may or may not have finalized the
+			// transaction that it was trying to recover. If so, then we add the
+			// transaction's key to the write timestamp cache as a tombstone to
+			// ensure that replays and concurrent requests aren't able to
+			// recreate the transaction record. This parallels what we do in the
+			// EndTransaction request case.
+			//
+			// Insert the timestamp of the batch, which we asserted during
+			// command evaluation was equal to or greater than the transaction's
+			// OrigTimestamp.
+			recovered := br.Responses[i].GetInner().(*roachpb.RecoverTxnResponse).RecoveredTxn
+			if recovered.Status.IsFinalized() {
+				key := keys.TransactionKey(start, recovered.ID)
+				addToTSCache(key, nil, ts, recovered.ID, false /* readCache */)
+			}
+		case *roachpb.PushTxnRequest:
+			// A successful PushTxn request bumps the timestamp cache for
+			// the pushee's transaction key. The pushee will consult the
+			// timestamp cache when creating its record. If the push left
+			// the transaction in a PENDING state (PUSH_TIMESTAMP) then we
+			// update the read timestamp cache. This will cause the creator
+			// of the transaction record to forward its provisional commit
+			// timestamp to honor the result of this push. If the push left
+			// the transaction in an ABORTED state (PUSH_ABORT) then we
+			// update the write timestamp cache. This will prevent the
+			// creation of the transaction record entirely.
+			pushee := br.Responses[i].GetInner().(*roachpb.PushTxnResponse).PusheeTxn
+
+			var readCache bool
+			switch pushee.Status {
+			case roachpb.PENDING:
+				readCache = true
+			case roachpb.ABORTED:
+				readCache = false
+			case roachpb.STAGING:
+				// No need to update the timestamp cache. If a transaction
+				// is in this state then it must have a transaction record.
+			case roachpb.COMMITTED:
+				// No need to update the timestamp cache. It was already
+				// updated by the corresponding EndTransaction request.
+				continue
+			}
+			key := keys.TransactionKey(start, pushee.ID)
+			addToTSCache(key, nil, pushee.Timestamp, t.PusherTxn.ID, readCache)
+		case *roachpb.ConditionalPutRequest:
+			if pErr != nil {
+				// ConditionalPut still updates on ConditionFailedErrors.
+				if _, ok := pErr.GetDetail().(*roachpb.ConditionFailedError); !ok {
+					continue
+				}
+			}
+			addToTSCache(start, end, ts, txnID, true /* readCache */)
+		case *roachpb.InitPutRequest:
+			if pErr != nil {
+				// InitPut still updates on ConditionFailedErrors.
+				if _, ok := pErr.GetDetail().(*roachpb.ConditionFailedError); !ok {
+					continue
+				}
+			}
+			addToTSCache(start, end, ts, txnID, true /* readCache */)
+		case *roachpb.ScanRequest:
+			resp := br.Responses[i].GetInner().(*roachpb.ScanResponse)
+			if resp.ResumeSpan != nil {
+				// Note that for forward scan, the resume span will start at
+				// the (last key read).Next(), which is actually the correct
+				// end key for the span to update the timestamp cache.
+				end = resp.ResumeSpan.Key
+			}
+			addToTSCache(start, end, ts, txnID, true /* readCache */)
+		case *roachpb.ReverseScanRequest:
+			resp := br.Responses[i].GetInner().(*roachpb.ReverseScanResponse)
+			if resp.ResumeSpan != nil {
+				// Note that for reverse scans, the resume span's end key is
+				// an open interval. That means it was read as part of this op
+				// and won't be read on resume. It is the correct start key for
+				// the span to update the timestamp cache.
+				start = resp.ResumeSpan.EndKey
+			}
+			addToTSCache(start, end, ts, txnID, true /* readCache */)
+		case *roachpb.QueryIntentRequest:
+			missing := false
+			if pErr != nil {
+				switch t := pErr.GetDetail().(type) {
+				case *roachpb.IntentMissingError:
+					missing = true
+				case *roachpb.TransactionRetryError:
+					// QueryIntent will return a TxnRetry(SERIALIZABLE) error
+					// if a transaction is querying its own intent and finds
+					// it pushed.
+					//
+					// NB: we check the index of the error above, so this
+					// TransactionRetryError should indicate a missing intent
+					// from the QueryIntent request. However, bumping the
+					// timestamp cache wouldn't cause a correctness issue
+					// if we found the intent.
+					missing = t.Reason == roachpb.RETRY_SERIALIZABLE
+				}
+			} else {
+				missing = !br.Responses[i].GetInner().(*roachpb.QueryIntentResponse).FoundIntent
+			}
+			if missing {
+				// If the QueryIntent determined that the intent is missing
+				// then we update the timestamp cache at the intent's key to
+				// the intent's transactional timestamp. This will prevent
+				// the intent from ever being written in the future. We use
+				// an empty transaction ID so that we block the intent
+				// regardless of whether it is part of the current batch's
+				// transaction or not.
+				addToTSCache(start, end, t.Txn.Timestamp, uuid.UUID{}, true /* readCache */)
+			}
+		default:
+			addToTSCache(start, end, ts, txnID, !roachpb.UpdatesWriteTimestampCache(args))
+		}
+	}
+}
+
+// checkedTSCacheUpdate wraps tscache.Cache and asserts that any update to the
+// cache is at or below the specified time.
+func checkedTSCacheUpdate(
+	now hlc.Timestamp,
+	tc tscache.Cache,
+	ba *roachpb.BatchRequest,
+	br *roachpb.BatchResponse,
+	pErr *roachpb.Error,
+) func(roachpb.Key, roachpb.Key, hlc.Timestamp, uuid.UUID, bool) {
+	return func(start, end roachpb.Key, ts hlc.Timestamp, txnID uuid.UUID, readCache bool) {
+		if now.Less(ts) {
+			panic(fmt.Sprintf("Unsafe timestamp cache update! Cannot add timestamp %s to timestamp "+
+				"cache after evaluating %v (resp=%v; err=%v) with local hlc clock at timestamp %s. "+
+				"The timestamp cache update could be lost on a lease transfer.", ts, ba, br, pErr, now))
+		}
+		tc.Add(start, end, ts, txnID, readCache)
 	}
 }
 
@@ -203,7 +270,7 @@ func (r *Replica) applyTimestampCache(
 					if ba.Txn.Timestamp.Less(nextTS) {
 						txn := ba.Txn.Clone()
 						bumped = txn.Timestamp.Forward(nextTS) || bumped
-						ba.Txn = &txn
+						ba.Txn = txn
 					}
 				}
 			} else {
@@ -221,7 +288,7 @@ func (r *Replica) applyTimestampCache(
 						txn := ba.Txn.Clone()
 						bumped = txn.Timestamp.Forward(wTS.Next()) || bumped
 						txn.WriteTooOld = true
-						ba.Txn = &txn
+						ba.Txn = txn
 					}
 				}
 			} else {
@@ -281,40 +348,93 @@ func (r *Replica) applyTimestampCache(
 // | v -> t = forward v by timestamp t |
 // +-----------------------------------+
 //
-//                PushTxn(TIMESTAMP)                               HeartbeatTxn
-//                then: v1 -> push.ts                            then: update record
-//                    +------+                                       +------+
-//  PushTxn(ABORT)    |      |       BeginTxn or HeartbeatTxn        |      |   PushTxn(TIMESTAMP)
-// then: v2 -> txn.ts |      v       if: v2 < txn.orig               |      v  then: update record
-//                +---------------+  then: txn.ts -> v1      +--------------------+
-//           +----|               |  else: fail              |                    |----+
-//           |    |               |                          |                    |    |
-//           |    | no txn record |------------------------->| txn record written |    |
-//           +--->|               |                          |     [pending]      |<---+
-//                |               |-+                        |                    |
-//                +---------------+  \                       +--------------------+
-//                  ^                 \                            /           /
-//                  |                  \ EndTxn                   / EndTxn    /
-//                  |                   \ if: v2 < txn.orig      / then: v2 -> txn.ts
-//                  |                    \ then: v2 -> txn.ts   /           /
-//                  |  Eager GC           \ else: fail         /           /
-//                  |     or               \                  /           / PushTxn(ABORT)
-//                  |  GC queue             v                v           / then: v2 -> txn.ts
-//                  |                      +--------------------+       /
-//                  |                      |                    |      /
-//                   \                     |                    |     /
-//                    \                    | txn record written |<---+
-//                     +-------------------|     [finalized]    |
-//                                         |                    |
-//                                         +--------------------+
-//                                                ^      |
-//                                                |      | PushTxn(*)
-//                                                +------+ then: no-op
+//                  PushTxn(TIMESTAMP)                                HeartbeatTxn
+//                  then: v1 -> push.ts                             then: update record
+//                      +------+                                        +------+
+//    PushTxn(ABORT)    |      |        BeginTxn or HeartbeatTxn        |      |   PushTxn(TIMESTAMP)
+//   then: v2 -> txn.ts |      v        if: v2 < txn.orig               |      v  then: update record
+//                 +-----------------+  then: txn.ts -> v1      +--------------------+
+//            +----|                 |  else: fail              |                    |----+
+//            |    |                 |------------------------->|                    |    |
+//            |    |  no txn record  |                          | txn record written |    |
+//            +--->|                 |  EndTxn(STAGING)         |     [pending]      |<---+
+//                 |                 |__  if: v2 < txn.orig     |                    |
+//                 +-----------------+  \__ then: v2 -> txn.ts  +--------------------+
+//                    |            ^       \__ else: fail       _/   |            ^
+//                    |            |          \__             _/     |            |
+// EndTxn(!STAGING)   |            |             \__        _/       | EndTxn(STAGING)
+// if: v2 < txn.orig  |   Eager GC |                \____ _/______   |            |
+// then: v2 -> txn.ts |      or    |                    _/        \  |            | HeartbeatTxn
+// else: fail         |   GC queue |  /----------------/          |  |            | if: epoch update
+//                    v            | v    EndTxn(!STAGING)        v  v            |
+//                +--------------------+  or PushTxn(ABORT)     +--------------------+
+//                |                    |  then: v2 -> txn.ts    |                    |
+//           +--->|                    |<-----------------------|                    |----+
+//           |    | txn record written |                        | txn record written |    |
+//           |    |     [finalized]    |                        |      [staging]     |    |
+//           +----|                    |                        |                    |<---+
+//   PushTxn(*)   +--------------------+                        +--------------------+
+//   then: no-op                    ^   PushTxn(*) + RecoverTxn    |              EndTxn(STAGING)
+//                                  |     then: v2 -> txn.ts       |              or HeartbeatTxn
+//                                  +------------------------------+            then: update record
 //
 //
-// In the diagram, CanCreateTxnRecord is consulted in both of the state
-// transitions that move away from the "no txn record" state. Updating
-// v1 and v2 is performed in updateTimestampCache.
+// In the diagram, CanCreateTxnRecord is consulted in all three of the
+// state transitions that move away from the "no txn record" state.
+// Updating v1 and v2 is performed in updateTimestampCache.
+//
+// The are three separate simplifications to the transaction model that would
+// allow us to simplify this state machine:
+//
+// 1. as discussed on the comment on txnHeartbeater, it is reasonable to expect
+//    that we will eventually move away from tracking transaction liveness on a
+//    per-transaction basis. This means that we would no longer need transaction
+//    heartbeats and would never need to write a transaction record until a
+//    transaction is ready to complete.
+//
+// 2. one of the two possibilities for the "txn record written [finalized]" state
+//    is that the transaction record is aborted. There used to be two reasons to
+//    persist transaction records with the ABORTED status. The first was because
+//    doing so was the only way for concurrent actors to prevent the record from
+//    being re-written by the transaction going forward. The concurrent actor would
+//    write an aborted transaction record and then wait for the GC to clean it up
+//    later. The other reasons for writing the transaction records with the ABORTED
+//    status was because these records could point at intents, which assisted the
+//    cleanup process for these intents. However, this only held for ABORTED
+//    records written on behalf of the transaction coordinator itself. If a
+//    transaction was aborted by a concurrent actor, its record would not
+//    immediately contain any of the transaction's intents.
+//
+//    The first reason here no longer holds. Concurrent actors now bump the write
+//    timestamp cache when aborting a transaction, which has the same effect as
+//    writing an ABORTED transaction record. The second reason still holds but is
+//    fairly weak. A transaction coordinator can kick off intent resolution for an
+//    aborted transaction without needing to write these intents into the record
+//    itself. In the worst case, this intent resolution fails and each intent is
+//    cleaned up individually as it is discovered. All in all, neither
+//    justification for this state holds much weight anymore.
+//
+// 3. the other possibility for the "txn record written [finalized]" state is that
+//    the transaction record is committed. This state is currently critical for the
+//    transaction model because intent resolution cannot begin before a transaction
+//    record enters this state. However, this doesn't need to be the case forever.
+//    There are proposals to modify the state of committed key-value writes
+//    slightly such that intent resolution could be run for implicitly committed
+//    transactions while their transaction record remains in the  "txn record
+//    written [staging]" state. For this to work, the recovery mechanism for
+//    indeterminate commit errors would need to be able to determine whether an
+//    intent or a **committed value** indicated the success of a write that was
+//    in-flight at the time the transaction record was staged. This poses
+//    challenges migration and garbage collection, but it would have a number of
+//    performance benefits.
+//
+// If we were to perform change #1, we could remove the "txn record written
+// [pending]" state. If we were to perform change #2 and #3, we could remove the
+// "txn record written [finalized]" state. All together, this would leave us
+// with only two states that the transaction record could be in, written or not
+// written. At that point, it begins to closely resemble any other write in the
+// system.
+//
 func (r *Replica) CanCreateTxnRecord(
 	txnID uuid.UUID, txnKey []byte, txnMinTSUpperBound hlc.Timestamp,
 ) (ok bool, minCommitTS hlc.Timestamp, reason roachpb.TransactionAbortedReason) {

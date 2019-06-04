@@ -17,7 +17,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/util/version"
 )
 
 func registerAcceptance(r *registry) {
@@ -29,17 +32,22 @@ func registerAcceptance(r *registry) {
 		name string
 		fn   func(ctx context.Context, t *test, c *cluster)
 		skip string
+		// roachtest needs to be taught about MinVersion for subtests.
+		// See https://github.com/cockroachdb/cockroach/issues/36752.
+		//
+		// minVersion string
 	}{
 		// Sorted. Please keep it that way.
 		{name: "bank/cluster-recovery", fn: runBankClusterRecovery},
 		{name: "bank/node-restart", fn: runBankNodeRestart},
 		{
 			name: "bank/zerosum-splits", fn: runBankNodeZeroSum,
-			skip: "https://github.com/cockroachdb/cockroach/issues/33683 (runs " +
-				"into various errors during its rebalances, see isExpectedRelocateError)",
+			skip: "https://github.com/cockroachdb/cockroach/issues/33683 (runs into " +
+				" various errors during its rebalances, see isExpectedRelocateError)",
 		},
 		// {"bank/zerosum-restart", runBankZeroSumRestart},
 		{name: "build-info", fn: runBuildInfo},
+		{name: "build-analyze", fn: runBuildAnalyze},
 		{name: "cli/node-status", fn: runCLINodeStatus},
 		{name: "decommission", fn: runDecommissionAcceptance},
 		{name: "cluster-init", fn: runClusterInit},
@@ -50,7 +58,12 @@ func registerAcceptance(r *registry) {
 		{name: "gossip/locality-address", fn: runCheckLocalityIPAddress},
 		{name: "rapid-restart", fn: runRapidRestart},
 		{name: "status-server", fn: runStatusServer},
-		{name: "version-upgrade", fn: runVersionUpgrade},
+		{
+			name: "version-upgrade",
+			fn:   runVersionUpgrade,
+			// NB: this is hacked back in below.
+			// minVersion: "v19.2.0",
+		},
 	}
 	tags := []string{"default", "quick"}
 	const numNodes = 4
@@ -68,6 +81,10 @@ func registerAcceptance(r *registry) {
 
 	for _, tc := range testCases {
 		tc := tc
+		minV := "v19.2.0-0"
+		if tc.name == "version-upgrade" && !r.buildVersion.AtLeast(version.MustParse(minV)) {
+			tc.skip = fmt.Sprintf("skipped on %s (want at least %s)", r.buildVersion, minV)
+		}
 		spec.SubTests = append(spec.SubTests, testSpec{
 			Skip:    tc.skip,
 			Name:    tc.name,

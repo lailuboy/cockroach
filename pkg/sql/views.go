@@ -21,8 +21,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // planDependencyInfo collects the dependencies related to a single
@@ -51,7 +51,7 @@ type planDependencies map[sqlbase.ID]planDependencyInfo
 func (d planDependencies) String() string {
 	var buf bytes.Buffer
 	for id, deps := range d {
-		fmt.Fprintf(&buf, "%d (%q):", id, tree.ErrNameString(&deps.desc.Name))
+		fmt.Fprintf(&buf, "%d (%q):", id, tree.ErrNameStringP(&deps.desc.Name))
 		for _, dep := range deps.deps {
 			buf.WriteString(" [")
 			if dep.IndexID != 0 {
@@ -81,7 +81,7 @@ func (p *planner) analyzeViewQuery(
 	p.curPlan.hasStar = false
 
 	// Now generate the source plan.
-	sourcePlan, err := p.Select(ctx, viewSelect, []types.T{})
+	sourcePlan, err := p.Select(ctx, viewSelect, []*types.T{})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -90,7 +90,7 @@ func (p *planner) analyzeViewQuery(
 
 	// TODO(a-robinson): Support star expressions as soon as we can (#10028).
 	if p.curPlan.hasStar {
-		return nil, nil, pgerror.UnimplementedWithIssueError(10028, "views do not currently support * expressions")
+		return nil, nil, pgerror.UnimplementedWithIssue(10028, "views do not currently support * expressions")
 	}
 
 	return p.curPlan.deps, planColumns(sourcePlan), nil

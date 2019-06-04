@@ -17,7 +17,10 @@
 // All the concepts here are "physical plan" concepts.
 
 syntax = "proto2";
-package cockroach.sql.distsqlpb;
+// Beware! This package name must not be changed, even though it doesn't match
+// the Go package name, because it defines the Protobuf message names which
+// can't be changed without breaking backward compatibility.
+package cockroach.sql.distsqlrun;
 option go_package = "distsqlpb";
 
 import "jobs/jobspb/jobs.proto";
@@ -127,7 +130,7 @@ message InputSyncSpec {
   repeated StreamEndpointSpec streams = 3 [(gogoproto.nullable) = false];
 
   // Schema for the streams entering this synchronizer.
-  repeated sqlbase.ColumnType column_types = 4 [(gogoproto.nullable) = false];
+  repeated bytes column_types = 4 [(gogoproto.nullable) = false, (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/sql/types.T"];
 }
 
 // OutputRouterSpec is the specification for the output router of a processor;
@@ -191,7 +194,7 @@ message OutputRouterSpec {
 
 message DatumInfo {
   optional sqlbase.DatumEncoding encoding = 1 [(gogoproto.nullable) = false];
-  optional sqlbase.ColumnType type = 2 [(gogoproto.nullable) = false];
+  optional bytes type = 2 [(gogoproto.nullable) = false, (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/sql/types.T"];
 }
 
 // ProducerHeader is a message that is sent once at the beginning of a stream.
@@ -259,14 +262,20 @@ message RemoteProducerMetadata {
     // RowNum messages with this ID.
     optional bool last_msg = 3 [(gogoproto.nullable) = false];
   }
+  message SamplerProgress {
+    // The number of rows processed by the sampler processor since the last
+    // update.
+    optional uint64 rows_processed = 1 [(gogoproto.nullable) = false];
+  }
   oneof value {
     RangeInfos range_info = 1;
     Error error = 2;
     TraceData trace_data = 3;
     roachpb.TxnCoordMeta txn_coord_meta = 4;
     RowNum row_num = 5;
-    cockroach.sql.jobs.jobspb.Progress progress = 6;
+    SamplerProgress sampler_progress = 7;
   }
+  reserved 6;
 }
 
 // DistSQLVersionGossipInfo represents the DistSQL server version information

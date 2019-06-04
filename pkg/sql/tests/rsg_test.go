@@ -28,6 +28,9 @@ import (
 	"testing"
 	"time"
 
+	// Enable CCL statements.
+	_ "github.com/cockroachdb/cockroach/pkg/ccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/internal/rsg"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -35,9 +38,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -147,6 +150,14 @@ func (db *verifyFormatDB) exec(ctx context.Context, sql string) error {
 					}
 				}
 			}
+			if es := err.Error(); strings.Contains(es, "internal error") ||
+				strings.Contains(es, "driver: bad connection") ||
+				strings.Contains(es, "unexpected error inside CockroachDB") {
+				return crasher{
+					sql: sql,
+					err: err,
+				}
+			}
 			return nonCrasher{sql: sql, err: err}
 		}
 		return nil
@@ -188,7 +199,7 @@ func TestRandomSyntaxGeneration(t *testing.T) {
 
 	const rootStmt = "stmt"
 
-	testRandomSyntax(t, false, nil, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
+	testRandomSyntax(t, false, "ident", nil, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		s := r.Generate(rootStmt, 20)
 		// Don't start transactions since closing them is tricky. Just issuing a
 		// ROLLBACK after all queries doesn't work due to the parellel uses of db,
@@ -221,7 +232,7 @@ func TestRandomSyntaxSelect(t *testing.T) {
 
 	const rootStmt = "target_list"
 
-	testRandomSyntax(t, false, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
+	testRandomSyntax(t, false, "ident", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		return db.exec(ctx, `CREATE DATABASE IF NOT EXISTS ident; CREATE TABLE IF NOT EXISTS ident.ident (ident decimal);`)
 	}, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		targets := r.Generate(rootStmt, 300)
@@ -252,11 +263,12 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 	go func() {
 		for {
 			for _, name := range builtins.AllBuiltinNames {
-				switch strings.ToLower(name) {
+				lower := strings.ToLower(name)
+				if strings.HasPrefix(lower, "crdb_internal.force_") {
+					continue
+				}
+				switch lower {
 				case
-					"crdb_internal.force_log_fatal",
-					"crdb_internal.force_panic",
-					"crdb_internal.force_retry",
 					"pg_sleep":
 					continue
 				}
@@ -272,7 +284,7 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 		}
 	}()
 
-	testRandomSyntax(t, false, nil, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
+	testRandomSyntax(t, false, "defaultdb", nil, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		nb := <-namedBuiltinChan
 		var args []string
 		switch ft := nb.builtin.Types.(type) {
@@ -282,7 +294,7 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 			}
 		case tree.HomogeneousType:
 			for i := r.Intn(5); i > 0; i-- {
-				var typ types.T
+				var typ *types.T
 				switch r.Intn(4) {
 				case 0:
 					typ = types.String
@@ -320,7 +332,7 @@ func TestRandomSyntaxFuncCommon(t *testing.T) {
 
 	const rootStmt = "func_expr_common_subexpr"
 
-	testRandomSyntax(t, false, nil, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
+	testRandomSyntax(t, false, "defaultdb", nil, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		expr := r.Generate(rootStmt, 30)
 		s := fmt.Sprintf("SELECT %s", expr)
 		return db.exec(ctx, s)
@@ -339,7 +351,7 @@ func TestRandomSyntaxSchemaChangeDatabase(t *testing.T) {
 		"alter_user_stmt",
 	}
 
-	testRandomSyntax(t, true, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
+	testRandomSyntax(t, true, "ident", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		return db.exec(ctx, `
 			CREATE DATABASE ident;
 		`)
@@ -357,7 +369,7 @@ func TestRandomSyntaxSchemaChangeColumn(t *testing.T) {
 		"alter_table_cmd",
 	}
 
-	testRandomSyntax(t, true, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
+	testRandomSyntax(t, true, "ident", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		return db.exec(ctx, `
 			CREATE DATABASE ident;
 			CREATE TABLE ident.ident (ident decimal);
@@ -376,6 +388,20 @@ var ignoredErrorPatterns = []string{
 	"memory budget exceeded",
 	"generator functions are not allowed in",
 	"txn already encountered an error; cannot be used anymore",
+	"no data source matches prefix",
+	"index .* already contains column",
+	"cannot convert .* to .*",
+	"index .* is in used as unique constraint",
+	"could not decorrelate subquery",
+	"column reference .* is ambiguous",
+	"INSERT has more expressions than target columns",
+	"index .* is in use as unique constraint",
+	"frame .* offset must not be .*",
+	"bit string length .* does not match type",
+	"column reference .* not allowed in this context",
+	"cannot write directly to computed column",
+	"index .* in the middle of being added",
+
 	// Numeric conditions
 	"exponent out of range",
 	"result out of range",
@@ -388,6 +414,10 @@ var ignoredErrorPatterns = []string{
 	"underflow, subnormal",
 	"overflow",
 	"requested length too large",
+	"division by zero",
+	"zero modulus",
+	"is out of range",
+
 	// Type checking
 	"value type .* doesn't match type .* of column",
 	"incompatible value type",
@@ -399,9 +429,13 @@ var ignoredErrorPatterns = []string{
 	"unknown signature",
 	"cannot determine type of empty array",
 	"conflicting ColumnTypes",
+
 	// Data dependencies
 	"violates not-null constraint",
 	"violates unique constraint",
+	"column .* is referenced by the primary key",
+	"column .* is referenced by existing index",
+
 	// Context-specific string formats
 	"invalid regexp flag",
 	"unrecognized privilege",
@@ -414,12 +448,22 @@ var ignoredErrorPatterns = []string{
 	"unterminated string",
 	"incorrect UUID length",
 	"the input string must not be empty",
+
 	// JSON builtins
 	"mismatched array dimensions",
 	"cannot get array length of a non-array",
+	"cannot get array length of a scalar",
 	"cannot be called on a non-array",
 	"cannot call json_object_keys on an array",
 	"cannot set path in scalar",
+	"cannot delete path in scalar",
+	"unable to encode table key: \\*tree\\.DJSON",
+	"path element at position .* is null",
+	"path element is not an integer",
+	"cannot delete from object using integer index",
+	"invalid concatenation of jsonb objects",
+	"null value not allowed for object key",
+
 	// Builtins that have funky preconditions
 	"cannot delete from scalar",
 	"lastval is not yet defined",
@@ -437,6 +481,19 @@ var ignoredErrorPatterns = []string{
 	"expect comma-separated list of filename",
 	"unknown constraint",
 	"invalid destination encoding name",
+	"invalid IP format",
+	"invalid format code",
+	`.*val\(\): syntax error at or near`,
+	"invalid source encoding name",
+	"strconv.Atoi: parsing .*: invalid syntax",
+	"field position .* must be greater than zero",
+	"cannot take logarithm of zero",
+	"only 'hex', 'escape', and 'base64' formats are supported for encode",
+	"LIKE pattern must not end with escape character",
+
+	// TODO(mjibson): fix these
+	"column .* must appear in the GROUP BY clause or be used in an aggregate function",
+	"aggregate functions are not allowed in ON",
 }
 
 var ignoredRegex = regexp.MustCompile(strings.Join(ignoredErrorPatterns, "|"))
@@ -447,11 +504,7 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 	var smither *sqlsmith.Smither
 
 	tableStmts := make([]string, 10)
-	testRandomSyntax(t, true, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
-		if err := db.exec(ctx, "USE defaultdb"); err != nil {
-			return err
-		}
-
+	testRandomSyntax(t, true, "defaultdb", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		// Create some random tables for the smither's column references and INSERT.
 		for i := 0; i < len(tableStmts); i++ {
 			create := sqlbase.RandCreateTable(r.Rnd, i)
@@ -471,7 +524,7 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 			if err := db.exec(ctx, "USE defaultdb"); err != nil {
 				t.Fatalf("couldn't reconnect to db after crasher: %v", c)
 			}
-			fmt.Printf("CRASHER:\n%s\ncaused by: %s\nserver stacktrace:\n%s\n\n", s, c.Error(), c.detail)
+			fmt.Printf("CRASHER:\ncaused by: %s\n\nSTATEMENT:\n%s;\n\nserver stacktrace:\n%s\n\n", c.Error(), s, c.detail)
 			return c
 		}
 		if err == nil {
@@ -483,7 +536,7 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 			shouldLogErr = false
 		}
 		if shouldLogErr {
-			fmt.Printf("%s\ncaused by: %s\n\n", err, s)
+			fmt.Printf("ERROR: %s\ncaused by:\n%s;\n\n", err, s)
 		}
 		return err
 	})
@@ -503,6 +556,7 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 func testRandomSyntax(
 	t *testing.T,
 	allowDuplicates bool,
+	databaseName string,
 	setup func(context.Context, *verifyFormatDB, *rsg.RSG) error,
 	fn func(context.Context, *verifyFormatDB, *rsg.RSG) error,
 ) {
@@ -510,13 +564,14 @@ func testRandomSyntax(
 		t.Skip("enable with '-rsg <duration>'")
 	}
 	ctx := context.Background()
+	defer utilccl.TestingEnableEnterprise()()
 
 	params, _ := tests.CreateTestServerParams()
-	params.UseDatabase = "ident"
+	params.UseDatabase = databaseName
 	// Use a low memory limit to quickly halt runaway functions.
 	params.SQLMemoryPoolSize = 3 * 1024 * 1024 // 3MB
 	// Catch panics and return them as errors.
-	params.Knobs.SQLExecutor = &sql.ExecutorTestingKnobs{
+	params.Knobs.PGWireTestingKnobs = &sql.PGWireTestingKnobs{
 		CatchPanics: true,
 	}
 	s, rawDB, _ := serverutils.StartServer(t, params)

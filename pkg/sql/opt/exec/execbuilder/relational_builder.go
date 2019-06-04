@@ -16,17 +16,21 @@ package execbuilder
 
 import (
 	"fmt"
-	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
 
@@ -86,7 +90,7 @@ func (ep *execPlan) makeBuildScalarCtx() buildScalarCtx {
 func (ep *execPlan) getColumnOrdinal(col opt.ColumnID) exec.ColumnOrdinal {
 	ord, ok := ep.outputCols.Get(int(col))
 	if !ok {
-		panic(fmt.Sprintf("column %d not in input", col))
+		panic(pgerror.AssertionFailedf("column %d not in input", log.Safe(col)))
 	}
 	return exec.ColumnOrdinal(ord)
 }
@@ -136,17 +140,30 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 	isDDL := opt.IsDDLOp(e)
 	if isDDL {
 		if err := b.evalCtx.Txn.SetSystemConfigTrigger(); err != nil {
-			return execPlan{}, errors.Wrap(err,
-				"schema change statement cannot follow a statement that has written in the same transaction")
+			return execPlan{}, pgerror.UnimplementedWithIssuef(26508,
+				"schema change statement cannot follow a statement that has written in the same transaction: %v", err)
 		}
 	}
 
 	// Raise error if mutation op is part of a read-only transaction.
 	if opt.IsMutationOp(e) {
 		if b.evalCtx.TxnReadOnly {
-			return execPlan{}, pgerror.NewErrorf(pgerror.CodeReadOnlySQLTransactionError,
+			return execPlan{}, pgerror.Newf(pgerror.CodeReadOnlySQLTransactionError,
 				"cannot execute %s in a read-only transaction", e.Op().SyntaxTag())
 		}
+	}
+
+	// Collect usage telemetry for relational node, if appropriate.
+	if !b.disableTelemetry {
+		if c := opt.OpTelemetryCounters[e.Op()]; c != nil {
+			telemetry.Inc(c)
+		}
+	}
+
+	var saveTableName string
+	if b.nameGen != nil {
+		// This function must be called in a pre-order traversal of the tree.
+		saveTableName = b.nameGen.GenerateName(e.Op())
 	}
 
 	// Handle read-only operators which never write data or modify schema.
@@ -193,8 +210,8 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 	case *memo.ShowTraceForSessionExpr:
 		ep, err = b.buildShowTrace(t)
 
-	case *memo.RowNumberExpr:
-		ep, err = b.buildRowNumber(t)
+	case *memo.OrdinalityExpr:
+		ep, err = b.buildOrdinality(t)
 
 	case *memo.MergeJoinExpr:
 		ep, err = b.buildMergeJoin(t)
@@ -204,6 +221,9 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 
 	case *memo.ProjectSetExpr:
 		ep, err = b.buildProjectSet(t)
+
+	case *memo.WindowExpr:
+		ep, err = b.buildWindow(t)
 
 	case *memo.InsertExpr:
 		ep, err = b.buildInsert(t)
@@ -233,11 +253,33 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 			break
 		}
 		if opt.IsJoinApplyOp(e) {
-			return execPlan{}, b.decorrelationError()
+			ep, err = b.buildApplyJoin(e)
+			break
 		}
 	}
 	if err != nil {
 		return execPlan{}, err
+	}
+
+	// In race builds, assert that the exec plan output columns match the opt
+	// plan output columns.
+	if util.RaceEnabled {
+		optCols := e.Relational().OutputCols
+		var execCols opt.ColSet
+		ep.outputCols.ForEach(func(key, val int) {
+			execCols.Add(key)
+		})
+		if !execCols.Equals(optCols) {
+			return execPlan{}, pgerror.AssertionFailedf(
+				"exec columns do not match opt columns: expected %v, got %v", optCols, execCols)
+		}
+	}
+
+	if saveTableName != "" {
+		ep, err = b.applySaveTable(ep, e, saveTableName)
+		if err != nil {
+			return execPlan{}, err
+		}
 	}
 
 	// Wrap the expression in a render expression if presentation requires it.
@@ -472,6 +514,132 @@ func (b *Builder) buildProject(prj *memo.ProjectExpr) (execPlan, error) {
 	return res, nil
 }
 
+// ReplaceVars replaces the VariableExprs within a RelExpr with constant Datums
+// provided by the vars map, which maps opt column id for each VariableExpr to
+// replace to the Datum that should replace it. The memo within the input
+// norm.Factory will be replaced with the result.
+// requiredPhysical is the set of physical properties that are required of the
+// root of the new expression.
+func ReplaceVars(
+	f *norm.Factory,
+	applyInput memo.RelExpr,
+	requiredPhysical *physical.Required,
+	vars map[opt.ColumnID]tree.Datum,
+) {
+	var replaceFn norm.ReplaceFunc
+	replaceFn = func(e opt.Expr) opt.Expr {
+		switch t := e.(type) {
+		case *memo.VariableExpr:
+			if d, ok := vars[t.Col]; ok {
+				return f.ConstructConstVal(d, t.Typ)
+			}
+		}
+		return f.CopyAndReplaceDefault(e, replaceFn)
+	}
+	f.CopyAndReplace(applyInput, requiredPhysical, replaceFn)
+}
+
+func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
+	switch join.Op() {
+	case opt.InnerJoinApplyOp, opt.LeftJoinApplyOp, opt.SemiJoinApplyOp, opt.AntiJoinApplyOp:
+	default:
+		return execPlan{}, fmt.Errorf("couldn't execute correlated subquery with op %s", join.Op())
+	}
+	joinType := joinOpToJoinType(join.Op())
+	leftExpr := join.Child(0).(memo.RelExpr)
+	rightExpr := join.Child(1).(memo.RelExpr)
+	filters := join.Child(2).(*memo.FiltersExpr)
+
+	// Create a fake version of the right-side plan that contains NULL for all
+	// outer columns, so that we can figure out the output columns and various
+	// other attributes.
+	var f norm.Factory
+	f.Init(b.evalCtx)
+	fakeBindings := make(map[opt.ColumnID]tree.Datum)
+	rightExpr.Relational().OuterCols.ForEach(func(k int) {
+		fakeBindings[opt.ColumnID(k)] = tree.DNull
+	})
+	ReplaceVars(&f, rightExpr, rightExpr.RequiredPhysical(), fakeBindings)
+
+	// We increment nullifyMissingVarExprs here to instruct the scalar builder to
+	// replace the outer column VariableExprs with null for the current scope.
+	b.nullifyMissingVarExprs++
+	fakeRight, err := b.buildRelational(rightExpr)
+	b.nullifyMissingVarExprs--
+	if err != nil {
+		return execPlan{}, err
+	}
+
+	// Make a copy of the required props.
+	requiredProps := *rightExpr.RequiredPhysical()
+	requiredProps.Presentation = make(physical.Presentation, fakeRight.outputCols.Len())
+	fakeRight.outputCols.ForEach(func(k, v int) {
+		requiredProps.Presentation[opt.ColumnID(v)] = opt.AliasedColumn{
+			ID:    opt.ColumnID(k),
+			Alias: join.Memo().Metadata().ColumnMeta(opt.ColumnID(k)).Alias,
+		}
+	})
+
+	left, err := b.buildRelational(leftExpr)
+	if err != nil {
+		return execPlan{}, err
+	}
+
+	// leftBoundCols is the set of columns that this apply join binds.
+	leftBoundCols := leftExpr.Relational().OutputCols.Intersection(rightExpr.Relational().OuterCols)
+	// leftBoundColMap is a map from opt.ColumnID to opt.ColumnOrdinal that maps
+	// a column bound by the left side of this apply join to the column ordinal
+	// in the left side that contains the binding.
+	var leftBoundColMap opt.ColMap
+	for k, ok := leftBoundCols.Next(0); ok; k, ok = leftBoundCols.Next(k + 1) {
+		v, ok := left.outputCols.Get(k)
+		if !ok {
+			return execPlan{}, fmt.Errorf("couldn't find binding column %d in output columns", k)
+		}
+		leftBoundColMap.Set(k, v)
+	}
+
+	allCols := joinOutputMap(left.outputCols, fakeRight.outputCols)
+
+	ctx := buildScalarCtx{
+		ivh:     tree.MakeIndexedVarHelper(nil /* container */, allCols.Len()),
+		ivarMap: allCols,
+	}
+
+	var onExpr tree.TypedExpr
+	if len(*filters) != 0 {
+		onExpr, err = b.buildScalar(&ctx, filters)
+		if err != nil {
+			return execPlan{}, nil
+		}
+	}
+
+	var outputCols opt.ColMap
+	if joinType == sqlbase.LeftSemiJoin || joinType == sqlbase.LeftAntiJoin {
+		// For semi and anti join, only the left columns are output.
+		outputCols = left.outputCols
+	} else {
+		outputCols = allCols
+	}
+
+	ep := execPlan{outputCols: outputCols}
+
+	ep.root, err = b.factory.ConstructApplyJoin(
+		joinType,
+		left.root,
+		leftBoundColMap,
+		b.mem,
+		&requiredProps,
+		fakeRight.root,
+		rightExpr,
+		onExpr,
+	)
+	if err != nil {
+		return execPlan{}, err
+	}
+	return ep, nil
+}
+
 func (b *Builder) buildHashJoin(join memo.RelExpr) (execPlan, error) {
 	if f := join.Private().(*memo.JoinPrivate).Flags; f.DisallowHashJoin {
 		hint := tree.AstLookup
@@ -603,26 +771,26 @@ func joinOutputMap(left, right opt.ColMap) opt.ColMap {
 
 func joinOpToJoinType(op opt.Operator) sqlbase.JoinType {
 	switch op {
-	case opt.InnerJoinOp:
+	case opt.InnerJoinOp, opt.InnerJoinApplyOp:
 		return sqlbase.InnerJoin
 
-	case opt.LeftJoinOp:
+	case opt.LeftJoinOp, opt.LeftJoinApplyOp:
 		return sqlbase.LeftOuterJoin
 
-	case opt.RightJoinOp:
+	case opt.RightJoinOp, opt.RightJoinApplyOp:
 		return sqlbase.RightOuterJoin
 
-	case opt.FullJoinOp:
+	case opt.FullJoinOp, opt.FullJoinApplyOp:
 		return sqlbase.FullOuterJoin
 
-	case opt.SemiJoinOp:
+	case opt.SemiJoinOp, opt.SemiJoinApplyOp:
 		return sqlbase.LeftSemiJoin
 
-	case opt.AntiJoinOp:
+	case opt.AntiJoinOp, opt.AntiJoinApplyOp:
 		return sqlbase.LeftAntiJoin
 
 	default:
-		panic(fmt.Sprintf("not a join op %s", op))
+		panic(pgerror.AssertionFailedf("not a join op %s", log.Safe(op)))
 	}
 }
 
@@ -691,12 +859,12 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 		ep.root, err = b.factory.ConstructScalarGroupBy(input.root, aggInfos)
 	} else {
 		groupBy := groupBy.(*memo.GroupByExpr)
-		orderedInputCols := input.getColumnOrdinalSet(
-			ordering.StreamingGroupingCols(&groupBy.GroupingPrivate, &groupBy.RequiredPhysical().Ordering),
-		)
+		groupingColOrder := input.sqlOrdering(ordering.StreamingGroupingColOrdering(
+			&groupBy.GroupingPrivate, &groupBy.RequiredPhysical().Ordering,
+		))
 		reqOrdering := ep.reqOrdering(groupBy)
 		ep.root, err = b.factory.ConstructGroupBy(
-			input.root, groupingColIdx, orderedInputCols, aggInfos, reqOrdering,
+			input.root, groupingColIdx, groupingColOrder, aggInfos, reqOrdering,
 		)
 	}
 	if err != nil {
@@ -728,14 +896,28 @@ func (b *Builder) buildDistinct(distinct *memo.DistinctOnExpr) (execPlan, error)
 	}
 
 	distinctCols := input.getColumnOrdinalSet(distinct.GroupingCols)
-	orderedCols := input.getColumnOrdinalSet(
-		ordering.StreamingGroupingCols(&distinct.GroupingPrivate, &distinct.RequiredPhysical().Ordering),
+	var orderedCols exec.ColumnOrdinalSet
+	ordering := ordering.StreamingGroupingColOrdering(
+		&distinct.GroupingPrivate, &distinct.RequiredPhysical().Ordering,
 	)
+	for i := range ordering {
+		orderedCols.Add(int(input.getColumnOrdinal(ordering[i].ID())))
+	}
 	node, err := b.factory.ConstructDistinct(input.root, distinctCols, orderedCols)
 	if err != nil {
 		return execPlan{}, err
 	}
-	return execPlan{root: node, outputCols: input.outputCols}, nil
+	ep := execPlan{root: node, outputCols: input.outputCols}
+
+	// buildGroupByInput can add extra sort column(s), so discard those if they
+	// are present by using an additional projection.
+	outCols := distinct.Relational().OutputCols
+	if input.outputCols.Len() == outCols.Len() {
+		return ep, nil
+	}
+	return b.ensureColumns(
+		ep, opt.ColSetToList(outCols), nil /* colNames */, distinct.ProvidedPhysical().Ordering,
+	)
 }
 
 func (b *Builder) buildGroupByInput(groupBy memo.RelExpr) (execPlan, error) {
@@ -774,14 +956,16 @@ func (b *Builder) buildGroupByInput(groupBy memo.RelExpr) (execPlan, error) {
 	}
 
 	// The input is producing columns that are not useful; set up a projection.
-	cols := make([]exec.ColumnOrdinal, 0, input.outputCols.Len())
+	cols := make([]exec.ColumnOrdinal, 0, neededCols.Len())
 	var newOutputCols opt.ColMap
-	input.outputCols.ForEach(func(colID, ordinal int) {
-		if neededCols.Contains(colID) {
-			newOutputCols.Set(colID, len(cols))
-			cols = append(cols, exec.ColumnOrdinal(ordinal))
+	for colID, ok := neededCols.Next(0); ok; colID, ok = neededCols.Next(colID + 1) {
+		ordinal, ordOk := input.outputCols.Get(colID)
+		if !ordOk {
+			panic(pgerror.AssertionFailedf("needed column not produced by group-by input"))
 		}
-	})
+		newOutputCols.Set(colID, len(cols))
+		cols = append(cols, exec.ColumnOrdinal(ordinal))
+	}
 
 	input.outputCols = newOutputCols
 	reqOrdering := input.reqOrdering(groupByInput)
@@ -856,7 +1040,7 @@ func (b *Builder) buildSetOp(set memo.RelExpr) (execPlan, error) {
 	case opt.ExceptAllOp:
 		typ, all = tree.ExceptOp, true
 	default:
-		panic(fmt.Sprintf("invalid operator %s", set.Op()))
+		panic(pgerror.AssertionFailedf("invalid operator %s", log.Safe(set.Op())))
 	}
 
 	node, err := b.factory.ConstructSetOp(typ, all, left.root, right.root)
@@ -902,13 +1086,13 @@ func (b *Builder) buildSort(sort *memo.SortExpr) (execPlan, error) {
 	return b.buildSortedInput(input, sort.ProvidedPhysical().Ordering)
 }
 
-func (b *Builder) buildRowNumber(rowNum *memo.RowNumberExpr) (execPlan, error) {
-	input, err := b.buildRelational(rowNum.Input)
+func (b *Builder) buildOrdinality(ord *memo.OrdinalityExpr) (execPlan, error) {
+	input, err := b.buildRelational(ord.Input)
 	if err != nil {
 		return execPlan{}, err
 	}
 
-	colName := b.mem.Metadata().ColumnMeta(rowNum.ColID).Alias
+	colName := b.mem.Metadata().ColumnMeta(ord.ColID).Alias
 
 	node, err := b.factory.ConstructOrdinality(input.root, colName)
 	if err != nil {
@@ -918,7 +1102,7 @@ func (b *Builder) buildRowNumber(rowNum *memo.RowNumberExpr) (execPlan, error) {
 	// We have one additional ordinality column, which is ordered at the end of
 	// the list.
 	outputCols := input.outputCols.Copy()
-	outputCols.Set(int(rowNum.ColID), outputCols.Len())
+	outputCols.Set(int(ord.ColID), outputCols.Len())
 
 	return execPlan{root: node, outputCols: outputCols}, nil
 }
@@ -1156,6 +1340,146 @@ func (b *Builder) buildProjectSet(projectSet *memo.ProjectSetExpr) (execPlan, er
 	return ep, nil
 }
 
+func (b *Builder) resultColumn(id opt.ColumnID) sqlbase.ResultColumn {
+	colMeta := b.mem.Metadata().ColumnMeta(id)
+	return sqlbase.ResultColumn{
+		Name: colMeta.Alias,
+		Typ:  colMeta.Type,
+	}
+}
+
+func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
+	input, err := b.buildRelational(w.Input)
+	if err != nil {
+		return execPlan{}, err
+	}
+
+	// Rearrange the input so that the input has all the passthrough columns
+	// followed by all the argument columns.
+
+	passthrough := w.Input.Relational().OutputCols
+
+	desiredCols := opt.ColList{}
+	passthrough.ForEach(func(i int) {
+		desiredCols = append(desiredCols, opt.ColumnID(i))
+	})
+
+	// TODO(justin): this call to ensureColumns is kind of unfortunate because it
+	// can result in an extra render beneath each window function. Figure out a
+	// way to alleviate this.
+	input, err = b.ensureColumns(input, desiredCols, nil, opt.Ordering{})
+	if err != nil {
+		return execPlan{}, err
+	}
+
+	ctx := input.makeBuildScalarCtx()
+
+	ord := w.Ordering.ToOrdering()
+
+	orderingExprs := make(tree.OrderBy, len(ord))
+	for i, c := range ord {
+		direction := tree.Ascending
+		if c.Descending() {
+			direction = tree.Descending
+		}
+		orderingExprs[i] = &tree.Order{
+			Expr:      b.indexedVar(&ctx, b.mem.Metadata(), c.ID()),
+			Direction: direction,
+		}
+	}
+
+	partitionIdxs := make([]exec.ColumnOrdinal, w.Partition.Len())
+	partitionExprs := make(tree.Exprs, w.Partition.Len())
+
+	i := 0
+	w.Partition.ForEach(func(col int) {
+		ordinal, _ := input.outputCols.Get(col)
+		partitionIdxs[i] = exec.ColumnOrdinal(ordinal)
+		partitionExprs[i] = b.indexedVar(&ctx, b.mem.Metadata(), opt.ColumnID(col))
+		i++
+	})
+
+	argIdxs := make([][]exec.ColumnOrdinal, len(w.Windows))
+	exprs := make([]*tree.FuncExpr, len(w.Windows))
+
+	for i := range w.Windows {
+		item := &w.Windows[i]
+		fn := item.Function
+		name, overload := memo.FindWindowOverload(fn)
+		props, _ := builtins.GetBuiltinProperties(name)
+
+		args := make([]tree.TypedExpr, fn.ChildCount())
+		argIdxs[i] = make([]exec.ColumnOrdinal, fn.ChildCount())
+		for j, n := 0, fn.ChildCount(); j < n; j++ {
+			col := fn.Child(j).(*memo.VariableExpr).Col
+			args[j] = b.indexedVar(&ctx, b.mem.Metadata(), col)
+			idx, _ := input.outputCols.Get(int(col))
+			argIdxs[i][j] = exec.ColumnOrdinal(idx)
+		}
+
+		exprs[i] = tree.NewTypedFuncExpr(
+			tree.WrapFunction(name),
+			0,
+			args,
+			// TODO(justin): support filters (only apply to aggregates, not window
+			// functions in general).
+			nil,
+			&tree.WindowDef{
+				Partitions: partitionExprs,
+				OrderBy:    orderingExprs,
+				Frame:      item.Frame,
+			},
+			overload.FixedReturnType(),
+			props,
+			overload,
+		)
+	}
+
+	resultCols := make(sqlbase.ResultColumns, w.Relational().OutputCols.Len())
+
+	// All the passthrough cols will keep their ordinal index.
+	passthrough.ForEach(func(col int) {
+		ordinal, _ := input.outputCols.Get(col)
+		resultCols[ordinal] = b.resultColumn(opt.ColumnID(col))
+	})
+
+	var outputCols opt.ColMap
+	input.outputCols.ForEach(func(key, val int) {
+		if passthrough.Contains(key) {
+			outputCols.Set(key, val)
+		}
+	})
+
+	outputIdxs := make([]int, len(w.Windows))
+
+	// Because of the way we arranged the input columns, we will be outputting
+	// the window columns at the end (which is exactly what the execution engine
+	// will do as well).
+	windowStart := passthrough.Len()
+	for i := range w.Windows {
+		resultCols[windowStart+i] = b.resultColumn(w.Windows[i].Col)
+		outputCols.Set(int(w.Windows[i].Col), windowStart+i)
+		outputIdxs[i] = windowStart + i
+	}
+
+	node, err := b.factory.ConstructWindow(input.root, exec.WindowInfo{
+		Cols:       resultCols,
+		Exprs:      exprs,
+		OutputIdxs: outputIdxs,
+		ArgIdxs:    argIdxs,
+		Partition:  partitionIdxs,
+		Ordering:   input.sqlOrdering(ord),
+	})
+	if err != nil {
+		return execPlan{}, err
+	}
+
+	return execPlan{
+		root:       node,
+		outputCols: outputCols,
+	}, nil
+}
+
 func (b *Builder) buildInsert(ins *memo.InsertExpr) (execPlan, error) {
 	// Build the input query and ensure that the input columns that correspond to
 	// the table columns are projected.
@@ -1169,7 +1493,7 @@ func (b *Builder) buildInsert(ins *memo.InsertExpr) (execPlan, error) {
 	colList := make(opt.ColList, 0, len(ins.InsertCols)+len(ins.CheckCols))
 	colList = appendColsWhenPresent(colList, ins.InsertCols)
 	colList = appendColsWhenPresent(colList, ins.CheckCols)
-	input, err = b.ensureColumns(input, colList, nil, ins.ProvidedPhysical().Ordering)
+	input, err = b.ensureColumns(input, colList, nil, ins.Input.ProvidedPhysical().Ordering)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -1220,7 +1544,7 @@ func (b *Builder) buildUpdate(upd *memo.UpdateExpr) (execPlan, error) {
 	colList = appendColsWhenPresent(colList, upd.FetchCols)
 	colList = appendColsWhenPresent(colList, upd.UpdateCols)
 	colList = appendColsWhenPresent(colList, upd.CheckCols)
-	input, err = b.ensureColumns(input, colList, nil, upd.ProvidedPhysical().Ordering)
+	input, err = b.ensureColumns(input, colList, nil, upd.Input.ProvidedPhysical().Ordering)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -1286,7 +1610,7 @@ func (b *Builder) buildUpsert(ups *memo.UpsertExpr) (execPlan, error) {
 		colList = append(colList, ups.CanaryCol)
 	}
 	colList = appendColsWhenPresent(colList, ups.CheckCols)
-	input, err = b.ensureColumns(input, colList, nil, ups.ProvidedPhysical().Ordering)
+	input, err = b.ensureColumns(input, colList, nil, ups.Input.ProvidedPhysical().Ordering)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -1345,7 +1669,7 @@ func (b *Builder) buildDelete(del *memo.DeleteExpr) (execPlan, error) {
 	// Upgrade execution engine to not require this.
 	colList := make(opt.ColList, 0, len(del.FetchCols))
 	colList = appendColsWhenPresent(colList, del.FetchCols)
-	input, err = b.ensureColumns(input, colList, nil, del.ProvidedPhysical().Ordering)
+	input, err = b.ensureColumns(input, colList, nil, del.Input.ProvidedPhysical().Ordering)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -1387,7 +1711,7 @@ func (b *Builder) canUseDeleteRange(del *memo.DeleteExpr) bool {
 		// There is a separate fast path for interleaved tables in sql/delete.go.
 		return false
 	}
-	if tab.IsReferenced() {
+	if tab.InboundForeignKeyCount() > 0 {
 		// If the table is referenced by other tables' foreign keys, no fast path
 		// is possible, because the integrity of those references must be checked.
 		return false
@@ -1408,15 +1732,13 @@ func (b *Builder) buildDeleteRange(del *memo.DeleteExpr) (execPlan, error) {
 	// canUseDeleteRange has already validated that input is a Scan operator.
 	scan := del.Input.(*memo.ScanExpr)
 	tab := b.mem.Metadata().Table(scan.Table)
-	needed, output := b.getColumns(scan.Cols, scan.Table)
-	res := execPlan{outputCols: output}
+	needed, _ := b.getColumns(scan.Cols, scan.Table)
 
 	root, err := b.factory.ConstructDeleteRange(tab, needed, scan.Constraint)
 	if err != nil {
 		return execPlan{}, err
 	}
-	res.root = root
-	return res, nil
+	return execPlan{root: root}, nil
 }
 
 func (b *Builder) buildCreateTable(ct *memo.CreateTableExpr) (execPlan, error) {
@@ -1427,9 +1749,16 @@ func (b *Builder) buildCreateTable(ct *memo.CreateTableExpr) (execPlan, error) {
 		if err != nil {
 			return execPlan{}, err
 		}
-		// Impose ordering on input columns, so that they match the order of the
-		// table columns into which values will be inserted.
-		input, err = b.ensureColumns(input, ct.InputCols, nil /* colNames */, nil /* provided */)
+		// Impose ordering and naming on input columns, so that they match the
+		// order and names of the table columns into which values will be
+		// inserted.
+		colList := make(opt.ColList, len(ct.InputCols))
+		colNames := make([]string, len(ct.InputCols))
+		for i := range ct.InputCols {
+			colList[i] = ct.InputCols[i].ID
+			colNames[i] = ct.InputCols[i].Alias
+		}
+		input, err = b.ensureColumns(input, colList, colNames, nil /* provided */)
 		if err != nil {
 			return execPlan{}, err
 		}
@@ -1454,6 +1783,29 @@ func (b *Builder) buildSequenceSelect(seqSel *memo.SequenceSelectExpr) (execPlan
 	}
 
 	return ep, nil
+}
+
+func (b *Builder) applySaveTable(
+	input execPlan, e memo.RelExpr, saveTableName string,
+) (execPlan, error) {
+	name := tree.NewTableName(tree.Name(opt.SaveTablesDatabase), tree.Name(saveTableName))
+
+	// Ensure that the column names are unique and match the names used by the
+	// opttester.
+	outputCols := e.Relational().OutputCols
+	colNames := make([]string, outputCols.Len())
+	colNameGen := memo.NewColumnNameGenerator(e)
+	for col, ok := outputCols.Next(0); ok; col, ok = outputCols.Next(col + 1) {
+		ord, _ := input.outputCols.Get(col)
+		colNames[ord] = colNameGen.GenerateName(opt.ColumnID(col))
+	}
+
+	var err error
+	input.root, err = b.factory.ConstructSaveTable(input.root, name, colNames)
+	if err != nil {
+		return execPlan{}, err
+	}
+	return input, err
 }
 
 // needProjection figures out what projection is needed on top of the input plan
@@ -1526,10 +1878,42 @@ func (b *Builder) applyPresentation(input execPlan, p *physical.Required) (execP
 	return b.ensureColumns(input, colList, colNames, nil /* provided */)
 }
 
+// getEnvData consolidates the information that must be presented in
+// EXPLAIN (opt, env).
+func (b *Builder) getEnvData() exec.ExplainEnvData {
+	envOpts := exec.ExplainEnvData{ShowEnv: true}
+	// Catalog objects can show up multiple times in these lists, so
+	// deduplicate them.
+	seen := make(map[tree.TableName]bool)
+	for _, t := range b.mem.Metadata().AllTables() {
+		tn := *t.Table.Name()
+		if !seen[tn] {
+			seen[tn] = true
+			envOpts.Tables = append(envOpts.Tables, tn)
+		}
+	}
+	for _, s := range b.mem.Metadata().AllSequences() {
+		tn := *s.Name()
+		if !seen[tn] {
+			seen[tn] = true
+			envOpts.Sequences = append(envOpts.Sequences, tn)
+		}
+	}
+	for _, v := range b.mem.Metadata().AllViews() {
+		tn := *v.Name()
+		if !seen[tn] {
+			seen[tn] = true
+			envOpts.Views = append(envOpts.Views, tn)
+		}
+	}
+
+	return envOpts
+}
+
 func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
+	var node exec.Node
+
 	if explain.Options.Mode == tree.ExplainOpt {
-		// Special case: EXPLAIN (OPT). Put the formatted expression in
-		// a valuesNode.
 		fmtFlags := memo.ExprFmtHideAll
 		switch {
 		case explain.Options.Flags.Contains(tree.ExplainFlagVerbose):
@@ -1538,29 +1922,42 @@ func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
 		case explain.Options.Flags.Contains(tree.ExplainFlagTypes):
 			fmtFlags = memo.ExprFmtHideQualifications
 		}
+
+		// Format the plan here and pass it through to the exec factory.
 		f := memo.MakeExprFmtCtx(fmtFlags, b.mem)
 		f.FormatExpr(explain.Input)
-		textRows := strings.Split(strings.Trim(f.Buffer.String(), "\n"), "\n")
-		rows := make([][]tree.TypedExpr, len(textRows))
-		for i := range textRows {
-			rows[i] = []tree.TypedExpr{tree.NewDString(textRows[i])}
+		planText := f.Buffer.String()
+
+		// If we're going to display the environment, there's a bunch of queries we
+		// need to run to get that information, and we can't run them from here, so
+		// tell the exec factory what information it needs to fetch.
+		var envOpts exec.ExplainEnvData
+		if explain.Options.Flags.Contains(tree.ExplainFlagEnv) {
+			envOpts = b.getEnvData()
 		}
-		return b.constructValues(rows, explain.ColList)
+
+		var err error
+		node, err = b.factory.ConstructExplainOpt(planText, envOpts)
+		if err != nil {
+			return execPlan{}, err
+		}
+	} else {
+		input, err := b.buildRelational(explain.Input)
+		if err != nil {
+			return execPlan{}, err
+		}
+
+		plan, err := b.factory.ConstructPlan(input.root, b.subqueries)
+		if err != nil {
+			return execPlan{}, err
+		}
+
+		node, err = b.factory.ConstructExplain(&explain.Options, explain.StmtType, plan)
+		if err != nil {
+			return execPlan{}, err
+		}
 	}
 
-	input, err := b.buildRelational(explain.Input)
-	if err != nil {
-		return execPlan{}, err
-	}
-
-	plan, err := b.factory.ConstructPlan(input.root, b.subqueries)
-	if err != nil {
-		return execPlan{}, err
-	}
-	node, err := b.factory.ConstructExplain(&explain.Options, explain.StmtType, plan)
-	if err != nil {
-		return execPlan{}, err
-	}
 	ep := execPlan{root: node}
 	for i := range explain.ColList {
 		ep.outputCols.Set(int(explain.ColList[i]), i)

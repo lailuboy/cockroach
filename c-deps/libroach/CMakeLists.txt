@@ -51,6 +51,7 @@ add_library(roach
   protos/storage/engine/enginepb/rocksdb.pb.cc
   protos/util/hlc/legacy_timestamp.pb.cc
   protos/util/hlc/timestamp.pb.cc
+  protos/util/log/log.pb.cc
   protos/util/unresolved_addr.pb.cc
   rocksdbutils/env_encryption.cc
 )
@@ -71,6 +72,7 @@ add_library(roachccl
   protosccl/ccl/storageccl/engineccl/enginepbccl/stats.pb.cc
 )
 target_include_directories(roachccl
+  PUBLIC ./ccl/include
   PRIVATE .. # CryptoPP headers are directly in the directory. Include .. to be able to include <cryptopp/....h>
   PRIVATE ../protobuf/src
   PRIVATE ../rocksdb/include

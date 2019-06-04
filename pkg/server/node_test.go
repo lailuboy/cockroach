@@ -69,6 +69,7 @@ func createTestNode(
 	nodeRPCContext := rpc.NewContext(
 		log.AmbientContext{Tracer: cfg.Settings.Tracer}, nodeTestBaseContext, cfg.Clock, stopper,
 		&cfg.Settings.Version)
+	cfg.RPCContext = nodeRPCContext
 	cfg.ScanInterval = 10 * time.Hour
 	grpcServer := rpc.NewServer(nodeRPCContext)
 	cfg.Gossip = gossip.NewTest(
@@ -77,6 +78,7 @@ func createTestNode(
 		grpcServer,
 		stopper,
 		metric.NewRegistry(),
+		cfg.DefaultZoneConfig,
 	)
 	retryOpts := base.DefaultRetryOptions()
 	retryOpts.Closer = stopper.ShouldQuiesce()
@@ -180,6 +182,7 @@ func createAndStartTestNode(
 	); err != nil {
 		t.Fatal(err)
 	}
+
 	return grpcServer, addr, node, stopper
 }
 
@@ -202,19 +205,17 @@ func (s keySlice) Less(i, j int) bool { return bytes.Compare(s[i], s[j]) < 0 }
 // cluster. Uses an in memory engine.
 func TestBootstrapCluster(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 	e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
 	defer e.Close()
-	st := cluster.MakeTestingClusterSettings()
 	if _, err := bootstrapCluster(
-		context.TODO(), storage.StoreConfig{
-			Settings: st,
-		}, []engine.Engine{e}, st.Version.BootstrapVersion(), kv.MakeTxnMetrics(metric.TestSampleInterval),
+		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef(),
 	); err != nil {
 		t.Fatal(err)
 	}
 
 	// Scan the complete contents of the local database directly from the engine.
-	rows, _, _, err := engine.MVCCScan(context.Background(), e, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, engine.MVCCScanOptions{})
+	rows, _, _, err := engine.MVCCScan(ctx, e, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, engine.MVCCScanOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +237,7 @@ func TestBootstrapCluster(t *testing.T) {
 	}
 
 	// Add the initial keys for sql.
-	kvs, tableSplits := GetBootstrapSchema().GetInitialValues()
+	kvs, tableSplits := GetBootstrapSchema(config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef()).GetInitialValues()
 	for _, kv := range kvs {
 		expectedKeys = append(expectedKeys, kv.Key)
 	}
@@ -262,10 +263,8 @@ func TestBootstrapNewStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
-	cfg := bootstrapNodeConfig()
 	if _, err := bootstrapCluster(
-		ctx, cfg, []engine.Engine{e}, cfg.Settings.Version.BootstrapVersion(),
-		kv.MakeTxnMetrics(metric.TestSampleInterval),
+		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef(),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -309,20 +308,6 @@ func TestBootstrapNewStore(t *testing.T) {
 	}
 }
 
-// TODO(tschottdorf): tests calling this previously used an empty store config
-// for bootstrapCluster. When changing it to use TestStoreConfig(nil), the
-// following adjustments were necessary to prevent the test from failing to
-// observe its initial splits in time under stressrace, or timing out (never
-// receiving a response from Replica). Investigate why.
-func bootstrapNodeConfig() storage.StoreConfig {
-	cfg := storage.TestStoreConfig(nil)
-	cfg.CoalescedHeartbeatsInterval = 0
-	cfg.RaftHeartbeatIntervalTicks = 0
-	cfg.RaftTickInterval = 0
-	cfg.RaftElectionTimeoutTicks = 0
-	return cfg
-}
-
 // TestNodeJoin verifies a new node is able to join a bootstrapped
 // cluster consisting of one node.
 func TestNodeJoin(t *testing.T) {
@@ -333,11 +318,8 @@ func TestNodeJoin(t *testing.T) {
 	e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
 	engineStopper.AddCloser(e)
 
-	cfg := bootstrapNodeConfig()
 	if _, err := bootstrapCluster(
-		ctx, cfg, []engine.Engine{e},
-		cfg.Settings.Version.BootstrapVersion(),
-		kv.MakeTxnMetrics(metric.TestSampleInterval),
+		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef(),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -403,12 +385,12 @@ func TestNodeJoin(t *testing.T) {
 func TestCorruptedClusterID(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	ctx := context.Background()
 	e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
 	defer e.Close()
 
-	cfg := bootstrapNodeConfig()
 	if _, err := bootstrapCluster(
-		context.TODO(), cfg, []engine.Engine{e}, cfg.Settings.Version.BootstrapVersion(), kv.MakeTxnMetrics(metric.TestSampleInterval),
+		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef(),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -419,21 +401,23 @@ func TestCorruptedClusterID(t *testing.T) {
 		NodeID:    1,
 		StoreID:   1,
 	}
-	if err := engine.MVCCPutProto(context.Background(), e, nil, keys.StoreIdentKey(), hlc.Timestamp{}, nil, &sIdent); err != nil {
+	if err := engine.MVCCPutProto(
+		ctx, e, nil /* ms */, keys.StoreIdentKey(), hlc.Timestamp{}, nil /* txn */, &sIdent,
+	); err != nil {
 		t.Fatal(err)
 	}
 
 	engines := []engine.Engine{e}
 	_, serverAddr, cfg, node, stopper := createTestNode(util.TestAddr, engines, nil, t)
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(ctx)
 	bootstrappedEngines, newEngines, cv, err := inspectEngines(
-		context.TODO(), engines, cfg.Settings.Version.MinSupportedVersion,
+		ctx, engines, cfg.Settings.Version.MinSupportedVersion,
 		cfg.Settings.Version.ServerVersion, node.clusterID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := node.start(
-		context.Background(), serverAddr, bootstrappedEngines, newEngines,
+		ctx, serverAddr, bootstrappedEngines, newEngines,
 		roachpb.Attributes{}, roachpb.Locality{}, cv,
 		[]roachpb.LocalityAddress{},
 		nil, /* nodeDescriptorCallback */
@@ -569,12 +553,6 @@ func TestNodeStatusWritten(t *testing.T) {
 	// ========================================
 	srv, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{
 		DisableEventLog: true,
-		Knobs: base.TestingKnobs{
-			Store: &storage.StoreTestingKnobs{
-				// Prevent the merge queue from immediately discarding our splits.
-				DisableMergeQueue: true,
-			},
-		},
 	})
 	defer srv.Stopper().Stop(context.TODO())
 	ts := srv.(*TestServer)
@@ -597,7 +575,7 @@ func TestNodeStatusWritten(t *testing.T) {
 	}
 
 	// Wait for full replication of initial ranges.
-	initialRanges, err := ExpectedInitialRangeCount(kvDB)
+	initialRanges, err := ExpectedInitialRangeCount(kvDB, &ts.cfg.DefaultZoneConfig, &ts.cfg.DefaultSystemZoneConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -714,7 +692,7 @@ func TestNodeStatusWritten(t *testing.T) {
 	// ========================================
 
 	// Split the range.
-	if err := ts.db.AdminSplit(context.TODO(), splitKey, splitKey); err != nil {
+	if err := ts.db.AdminSplit(context.TODO(), splitKey, splitKey, true /* manual */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -753,11 +731,8 @@ func TestStartNodeWithLocality(t *testing.T) {
 	testLocalityWithNewNode := func(locality roachpb.Locality) {
 		e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
 		defer e.Close()
-		cfg := bootstrapNodeConfig()
 		if _, err := bootstrapCluster(
-			ctx, cfg, []engine.Engine{e},
-			cfg.Settings.Version.BootstrapVersion(),
-			kv.MakeTxnMetrics(metric.TestSampleInterval),
+			ctx, []engine.Engine{e}, cluster.TestingClusterVersion, config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef(),
 		); err != nil {
 			t.Fatal(err)
 		}

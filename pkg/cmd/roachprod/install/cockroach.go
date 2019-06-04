@@ -346,7 +346,7 @@ tar cvf certs.tar certs
 			args = append(args, fmt.Sprintf("--join=%s:%d", host1, r.NodePort(c, 1)))
 		}
 		if advertisePublicIP {
-			args = append(args, fmt.Sprintf("--advertise-host=%s", c.host(i)))
+			args = append(args, fmt.Sprintf("--advertise-host=%s", c.host(i+1)))
 		}
 
 		var keyCmd string
@@ -372,15 +372,18 @@ tar cvf certs.tar certs
 			node: nodes[i],
 		}
 		for _, arg := range extraArgs {
-			arg = e.expand(c, arg)
-			args = append(args, strings.Split(arg, " ")...)
+			expandedArg, err := e.expand(c, arg)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, strings.Split(expandedArg, " ")...)
 		}
 
 		binary := cockroachNodeBinary(c, nodes[i])
 		// NB: this is awkward as when the process fails, the test runner will show an
 		// unhelpful empty error (since everything has been redirected away). This is
 		// unfortunately equally awkward to address.
-		cmd := "mkdir -p " + logDir + "; "
+		cmd := "ulimit -c unlimited; mkdir -p " + logDir + "; "
 		// TODO(peter): The ps and lslocks stuff is intended to debug why killing
 		// of a cockroach process sometimes doesn't release file locks immediately.
 		cmd += `echo ">>> roachprod start: $(date)" >> ` + logDir + "/roachprod.log; " +
@@ -388,10 +391,11 @@ tar cvf certs.tar certs
 			`[ -x /usr/bin/lslocks ] && /usr/bin/lslocks >> ` + logDir + "/roachprod.log; "
 		cmd += keyCmd +
 			fmt.Sprintf(" export ROACHPROD=%d%s && ", nodes[i], c.Tag) +
+			"GOTRACEBACK=crash " +
 			"COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING=1 " +
 			c.Env + " " + binary + " start " + strings.Join(args, " ") +
-			" >> " + logDir + "/cockroach.stdout 2>> " + logDir + "/cockroach.stderr" +
-			" || (x=$?; cat " + logDir + "/cockroach.stderr; exit $x)"
+			" >> " + logDir + "/cockroach.stdout.log 2>> " + logDir + "/cockroach.stderr.log" +
+			" || (x=$?; cat " + logDir + "/cockroach.stderr.log; exit $x)"
 		if out, err := sess.CombinedOutput(cmd); err != nil {
 			return nil, errors.Wrapf(err, "~ %s\n%s", cmd, out)
 		}

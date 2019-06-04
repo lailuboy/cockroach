@@ -24,12 +24,12 @@
 package tree
 
 import (
+	"errors"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"golang.org/x/text/language"
 )
 
@@ -191,7 +191,8 @@ const (
 // statement.
 type ColumnTableDef struct {
 	Name     Name
-	Type     coltypes.T
+	Type     *types.T
+	IsSerial bool
 	Nullable struct {
 		Nullability    Nullability
 		ConstraintName Name
@@ -229,37 +230,33 @@ type ColumnTableDefCheckExpr struct {
 	ConstraintName Name
 }
 
-func processCollationOnType(name Name, typ coltypes.T, c ColumnCollation) (coltypes.T, error) {
-	locale := string(c)
-	switch s := typ.(type) {
-	case *coltypes.TString:
-		return &coltypes.TCollatedString{
-			TString: coltypes.TString{Variant: s.Variant, N: s.N},
-			Locale:  locale,
-		}, nil
-	case *coltypes.TCollatedString:
-		return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+func processCollationOnType(name Name, typ *types.T, c ColumnCollation) (*types.T, error) {
+	switch typ.Family() {
+	case types.StringFamily:
+		return types.MakeCollatedString(typ, string(c)), nil
+	case types.CollatedStringFamily:
+		return nil, pgerror.Newf(pgerror.CodeSyntaxError,
 			"multiple COLLATE declarations for column %q", name)
-	case *coltypes.TArray:
-		var err error
-		s.ParamType, err = processCollationOnType(name, s.ParamType, c)
+	case types.ArrayFamily:
+		elemTyp, err := processCollationOnType(name, typ.ArrayContents(), c)
 		if err != nil {
 			return nil, err
 		}
-		return s, nil
+		return types.MakeArray(elemTyp), nil
 	default:
-		return nil, pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
+		return nil, pgerror.Newf(pgerror.CodeDatatypeMismatchError,
 			"COLLATE declaration for non-string-typed column %q", name)
 	}
 }
 
 // NewColumnTableDef constructs a column definition for a CreateTable statement.
 func NewColumnTableDef(
-	name Name, typ coltypes.T, qualifications []NamedColumnQualification,
+	name Name, typ *types.T, isSerial bool, qualifications []NamedColumnQualification,
 ) (*ColumnTableDef, error) {
 	d := &ColumnTableDef{
-		Name: name,
-		Type: typ,
+		Name:     name,
+		Type:     typ,
+		IsSerial: isSerial,
 	}
 	d.Nullable.Nullability = SilentNull
 	for _, c := range qualifications {
@@ -268,7 +265,7 @@ func NewColumnTableDef(
 			locale := string(t)
 			_, err := language.Parse(locale)
 			if err != nil {
-				return nil, errors.Wrapf(err, "invalid locale %s", locale)
+				return nil, pgerror.Wrapf(err, pgerror.CodeSyntaxError, "invalid locale %s", locale)
 			}
 			d.Type, err = processCollationOnType(name, d.Type, t)
 			if err != nil {
@@ -276,21 +273,21 @@ func NewColumnTableDef(
 			}
 		case *ColumnDefault:
 			if d.HasDefaultExpr() {
-				return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				return nil, pgerror.Newf(pgerror.CodeSyntaxError,
 					"multiple default values specified for column %q", name)
 			}
 			d.DefaultExpr.Expr = t.Expr
 			d.DefaultExpr.ConstraintName = c.Name
 		case NotNullConstraint:
 			if d.Nullable.Nullability == Null {
-				return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				return nil, pgerror.Newf(pgerror.CodeSyntaxError,
 					"conflicting NULL/NOT NULL declarations for column %q", name)
 			}
 			d.Nullable.Nullability = NotNull
 			d.Nullable.ConstraintName = c.Name
 		case NullConstraint:
 			if d.Nullable.Nullability == NotNull {
-				return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				return nil, pgerror.Newf(pgerror.CodeSyntaxError,
 					"conflicting NULL/NOT NULL declarations for column %q", name)
 			}
 			d.Nullable.Nullability = Null
@@ -308,7 +305,7 @@ func NewColumnTableDef(
 			})
 		case *ColumnFKConstraint:
 			if d.HasFKConstraint() {
-				return nil, pgerror.NewErrorf(pgerror.CodeInvalidTableDefinitionError,
+				return nil, pgerror.Newf(pgerror.CodeInvalidTableDefinitionError,
 					"multiple foreign key constraints specified for column %q", name)
 			}
 			d.References.Table = &t.Table
@@ -321,14 +318,14 @@ func NewColumnTableDef(
 			d.Computed.Expr = t.Expr
 		case *ColumnFamilyConstraint:
 			if d.HasColumnFamily() {
-				return nil, pgerror.NewErrorf(pgerror.CodeInvalidTableDefinitionError,
+				return nil, pgerror.Newf(pgerror.CodeInvalidTableDefinitionError,
 					"multiple column families specified for column %q", name)
 			}
 			d.Family.Name = t.Family
 			d.Family.Create = t.Create
 			d.Family.IfNotExists = t.IfNotExists
 		default:
-			panic(fmt.Sprintf("unexpected column qualification: %T", c))
+			return nil, pgerror.AssertionFailedf("unexpected column qualification: %T", c)
 		}
 	}
 	return d, nil
@@ -363,7 +360,7 @@ func (node *ColumnTableDef) HasColumnFamily() bool {
 func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 	ctx.FormatNode(&node.Name)
 	ctx.WriteByte(' ')
-	node.Type.Format(&ctx.Buffer, ctx.flags.EncodeFlags())
+	ctx.WriteString(node.columnTypeString())
 	if node.Nullable.Nullability != SilentNull && node.Nullable.ConstraintName != "" {
 		ctx.WriteString(" CONSTRAINT ")
 		ctx.FormatNode(&node.Nullable.ConstraintName)
@@ -428,9 +425,9 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 	if node.HasColumnFamily() {
 		if node.Family.Create {
 			ctx.WriteString(" CREATE")
-		}
-		if node.Family.IfNotExists {
-			ctx.WriteString(" IF NOT EXISTS")
+			if node.Family.IfNotExists {
+				ctx.WriteString(" IF NOT EXISTS")
+			}
 		}
 		ctx.WriteString(" FAMILY")
 		if len(node.Family.Name) > 0 {
@@ -438,6 +435,20 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 			ctx.FormatNode(&node.Family.Name)
 		}
 	}
+}
+
+func (node *ColumnTableDef) columnTypeString() string {
+	if node.IsSerial {
+		// Map INT types to SERIAL keyword.
+		switch node.Type.Width() {
+		case 16:
+			return "SERIAL2"
+		case 32:
+			return "SERIAL4"
+		}
+		return "SERIAL8"
+	}
+	return node.Type.SQLString()
 }
 
 // String implements the fmt.Stringer interface.
@@ -1041,7 +1052,7 @@ func (node *SequenceOptions) Format(ctx *FmtCtx) {
 		case SeqOptVirtual:
 			ctx.WriteString(option.Name)
 		default:
-			panic(fmt.Sprintf("unexpected SequenceOption: %v", option))
+			panic(pgerror.AssertionFailedf("unexpected SequenceOption: %v", option))
 		}
 	}
 }
@@ -1167,7 +1178,7 @@ type CreateStats struct {
 	Name        Name
 	ColumnNames NameList
 	Table       TableExpr
-	AsOf        AsOfClause
+	Options     CreateStatsOptions
 }
 
 // Format implements the NodeFormatter interface.
@@ -1183,8 +1194,57 @@ func (node *CreateStats) Format(ctx *FmtCtx) {
 	ctx.WriteString(" FROM ")
 	ctx.FormatNode(node.Table)
 
-	if node.AsOf.Expr != nil {
-		ctx.WriteByte(' ')
-		ctx.FormatNode(&node.AsOf)
+	if !node.Options.Empty() {
+		ctx.WriteString(" WITH OPTIONS ")
+		ctx.FormatNode(&node.Options)
 	}
+}
+
+// CreateStatsOptions contains options for CREATE STATISTICS.
+type CreateStatsOptions struct {
+	// Throttling enables throttling and indicates the fraction of time we are
+	// idling (between 0 and 1).
+	Throttling float64
+
+	// AsOf performs a historical read at the given timestamp.
+	// Note that the timestamp will be moved up during the operation if it gets
+	// too old (in order to avoid problems with TTL expiration).
+	AsOf AsOfClause
+}
+
+// Empty returns true if no options were provided.
+func (o *CreateStatsOptions) Empty() bool {
+	return o.Throttling == 0 && o.AsOf.Expr == nil
+}
+
+// Format implements the NodeFormatter interface.
+func (o *CreateStatsOptions) Format(ctx *FmtCtx) {
+	sep := ""
+	if o.Throttling != 0 {
+		fmt.Fprintf(ctx, "THROTTLING %g", o.Throttling)
+		sep = " "
+	}
+	if o.AsOf.Expr != nil {
+		ctx.WriteString(sep)
+		ctx.FormatNode(&o.AsOf)
+		sep = " "
+	}
+}
+
+// CombineWith combines two options, erroring out if the two options contain
+// incompatible settings.
+func (o *CreateStatsOptions) CombineWith(other *CreateStatsOptions) error {
+	if other.Throttling != 0 {
+		if o.Throttling != 0 {
+			return errors.New("THROTTLING specified multiple times")
+		}
+		o.Throttling = other.Throttling
+	}
+	if other.AsOf.Expr != nil {
+		if o.AsOf.Expr != nil {
+			return errors.New("AS OF specified multiple times")
+		}
+		o.AsOf = other.AsOf
+	}
+	return nil
 }

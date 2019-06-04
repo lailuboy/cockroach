@@ -16,16 +16,20 @@ package distsqlrun
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/opentracing/opentracing-go"
+	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 )
 
@@ -49,6 +53,9 @@ type tableReader struct {
 	// that the tableReader will read.
 	maxResults uint64
 
+	// See TableReaderSpec.MaxTimestampAgeNanos.
+	maxTimestampAge time.Duration
+
 	ignoreMisplannedRanges bool
 
 	// input is really the fetcher below, possibly wrapped in a stats generator.
@@ -61,6 +68,7 @@ type tableReader struct {
 
 var _ Processor = &tableReader{}
 var _ RowSource = &tableReader{}
+var _ distsqlpb.MetadataSource = &tableReader{}
 
 const tableReaderProcName = "table reader"
 
@@ -86,6 +94,7 @@ func newTableReader(
 
 	tr.limitHint = limitHint(spec.LimitHint, post)
 	tr.maxResults = spec.MaxResults
+	tr.maxTimestampAge = time.Duration(spec.MaxTimestampAgeNanos)
 
 	returnMutations := spec.Visibility == distsqlpb.ScanVisibility_PUBLIC_AND_NOT_PUBLIC
 	types := spec.Table.ColumnTypesWithMutations(returnMutations)
@@ -156,16 +165,16 @@ func (w *rowFetcherWrapper) Start(ctx context.Context) context.Context {
 
 // Next() calls NextRow() on the underlying Fetcher. If the returned
 // ProducerMetadata is not nil, only its Err field will be set.
-func (w *rowFetcherWrapper) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (w *rowFetcherWrapper) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	row, _, _, err := w.NextRow(w.ctx)
 	if err != nil {
-		return row, &ProducerMetadata{Err: err}
+		return row, &distsqlpb.ProducerMetadata{Err: err}
 	}
 	return row, nil
 }
-func (w rowFetcherWrapper) OutputTypes() []sqlbase.ColumnType { return nil }
-func (w rowFetcherWrapper) ConsumerDone()                     {}
-func (w rowFetcherWrapper) ConsumerClosed()                   {}
+func (w rowFetcherWrapper) OutputTypes() []types.T { return nil }
+func (w rowFetcherWrapper) ConsumerDone()          {}
+func (w rowFetcherWrapper) ConsumerClosed()        {}
 
 func initRowFetcher(
 	fetcher *row.Fetcher,
@@ -205,17 +214,8 @@ func initRowFetcher(
 	return index, isSecondaryIndex, nil
 }
 
-func (tr *tableReader) generateTrailingMeta(ctx context.Context) []ProducerMetadata {
-	var trailingMeta []ProducerMetadata
-	if !tr.ignoreMisplannedRanges {
-		ranges := misplannedRanges(tr.Ctx, tr.fetcher.GetRangeInfo(), tr.flowCtx.nodeID)
-		if ranges != nil {
-			trailingMeta = append(trailingMeta, ProducerMetadata{Ranges: ranges})
-		}
-	}
-	if meta := getTxnCoordMeta(ctx, tr.flowCtx.txn); meta != nil {
-		trailingMeta = append(trailingMeta, ProducerMetadata{TxnCoordMeta: meta})
-	}
+func (tr *tableReader) generateTrailingMeta(ctx context.Context) []distsqlpb.ProducerMetadata {
+	trailingMeta := tr.generateMeta(ctx)
 	tr.InternalClose()
 	return trailingMeta
 }
@@ -250,10 +250,22 @@ func (tr *tableReader) Start(ctx context.Context) context.Context {
 		limitBatches = false
 	}
 	log.VEventf(ctx, 1, "starting scan with limitBatches %t", limitBatches)
-	if err := tr.fetcher.StartScan(
-		fetcherCtx, tr.flowCtx.txn, tr.spans,
-		limitBatches, tr.limitHint, tr.flowCtx.traceKV,
-	); err != nil {
+	var err error
+	if tr.maxTimestampAge == 0 {
+		err = tr.fetcher.StartScan(
+			fetcherCtx, tr.flowCtx.txn, tr.spans,
+			limitBatches, tr.limitHint, tr.flowCtx.traceKV,
+		)
+	} else {
+		initialTS := tr.flowCtx.txn.GetTxnCoordMeta(ctx).Txn.OrigTimestamp
+		err = tr.fetcher.StartInconsistentScan(
+			fetcherCtx, tr.flowCtx.ClientDB, initialTS,
+			tr.maxTimestampAge, tr.spans,
+			limitBatches, tr.limitHint, tr.flowCtx.traceKV,
+		)
+	}
+
+	if err != nil {
 		tr.MoveToDraining(err)
 	}
 	return ctx
@@ -272,7 +284,7 @@ func (tr *tableReader) Release() {
 }
 
 // Next is part of the RowSource interface.
-func (tr *tableReader) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (tr *tableReader) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	for tr.State == StateRunning {
 		row, meta := tr.input.Next()
 
@@ -306,12 +318,17 @@ const tableReaderTagPrefix = "tablereader."
 
 // Stats implements the SpanStats interface.
 func (trs *TableReaderStats) Stats() map[string]string {
-	return trs.InputStats.Stats(tableReaderTagPrefix)
+	inputStatsMap := trs.InputStats.Stats(tableReaderTagPrefix)
+	inputStatsMap[tableReaderTagPrefix+bytesReadTagSuffix] = humanizeutil.IBytes(trs.BytesRead)
+	return inputStatsMap
 }
 
 // StatsForQueryPlan implements the DistSQLSpanStats interface.
 func (trs *TableReaderStats) StatsForQueryPlan() []string {
-	return trs.InputStats.StatsForQueryPlan("" /* prefix */)
+	return append(
+		trs.InputStats.StatsForQueryPlan("" /* prefix */),
+		fmt.Sprintf("%s: %s", bytesReadQueryPlanSuffix, humanizeutil.IBytes(trs.BytesRead)),
+	)
 }
 
 // outputStatsToTrace outputs the collected tableReader stats to the trace. Will
@@ -322,6 +339,28 @@ func (tr *tableReader) outputStatsToTrace() {
 		return
 	}
 	if sp := opentracing.SpanFromContext(tr.Ctx); sp != nil {
-		tracing.SetSpanStats(sp, &TableReaderStats{InputStats: is})
+		tracing.SetSpanStats(sp, &TableReaderStats{
+			InputStats: is,
+			BytesRead:  tr.fetcher.GetBytesRead(),
+		})
 	}
+}
+
+func (tr *tableReader) generateMeta(ctx context.Context) []distsqlpb.ProducerMetadata {
+	var trailingMeta []distsqlpb.ProducerMetadata
+	if !tr.ignoreMisplannedRanges {
+		ranges := misplannedRanges(ctx, tr.fetcher.GetRangesInfo(), tr.flowCtx.nodeID)
+		if ranges != nil {
+			trailingMeta = append(trailingMeta, distsqlpb.ProducerMetadata{Ranges: ranges})
+		}
+	}
+	if meta := getTxnCoordMeta(ctx, tr.flowCtx.txn); meta != nil {
+		trailingMeta = append(trailingMeta, distsqlpb.ProducerMetadata{TxnCoordMeta: meta})
+	}
+	return trailingMeta
+}
+
+// DrainMeta is part of the MetadataSource interface.
+func (tr *tableReader) DrainMeta(ctx context.Context) []distsqlpb.ProducerMetadata {
+	return tr.generateMeta(ctx)
 }

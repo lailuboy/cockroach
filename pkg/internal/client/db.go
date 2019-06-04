@@ -15,9 +15,9 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -135,9 +135,9 @@ type Result struct {
 	// sequence of operations. It is returned whenever an operation over a
 	// span of keys is bounded and the operation returns before completely
 	// running over the span. It allows the operation to be called again with
-	// a new shorter span of keys. An empty span is returned when the
-	// operation has successfully completed running through the span.
-	ResumeSpan roachpb.Span
+	// a new shorter span of keys. A nil span is set when the operation has
+	// successfully completed running through the span.
+	ResumeSpan *roachpb.Span
 	// When ResumeSpan is populated, this specifies the reason why the operation
 	// wasn't completed and needs to be resumed.
 	ResumeReason roachpb.ResponseHeader_ResumeReason
@@ -149,16 +149,25 @@ type Result struct {
 	RangeInfos []roachpb.RangeInfo
 }
 
+// ResumeSpanAsValue returns the resume span as a value if one is set,
+// or an empty span if one is not set.
+func (r *Result) ResumeSpanAsValue() roachpb.Span {
+	if r.ResumeSpan == nil {
+		return roachpb.Span{}
+	}
+	return *r.ResumeSpan
+}
+
 func (r Result) String() string {
 	if r.Err != nil {
 		return r.Err.Error()
 	}
-	var buf bytes.Buffer
-	for i, row := range r.Rows {
+	var buf strings.Builder
+	for i := range r.Rows {
 		if i > 0 {
 			buf.WriteString("\n")
 		}
-		fmt.Fprintf(&buf, "%d: %s", i, &row)
+		fmt.Fprintf(&buf, "%d: %s", i, &r.Rows[i])
 	}
 	return buf.String()
 }
@@ -468,10 +477,27 @@ func (db *DB) AdminMerge(ctx context.Context, key interface{}) error {
 // #16008 for details, and #16344 for the tracking issue to clean this mess up
 // properly.
 //
+// When manual is true, the sticky bit associated with the split range is set.
+// Any ranges with the sticky bit set will be skipped by the merge queue when
+// scanning for potential ranges to merge.
+//
 // The keys can be either byte slices or a strings.
-func (db *DB) AdminSplit(ctx context.Context, spanKey, splitKey interface{}) error {
+func (db *DB) AdminSplit(ctx context.Context, spanKey, splitKey interface{}, manual bool) error {
 	b := &Batch{}
-	b.adminSplit(spanKey, splitKey)
+	b.adminSplit(spanKey, splitKey, manual)
+	return getOneErr(db.Run(ctx, b), b)
+}
+
+// AdminUnsplit removes the sticky bit of the range specified by splitKey.
+//
+// splitKey is the start key of the range whose sticky bit should be removed.
+//
+// If splitKey is not the start key of a range, then this method will throw an
+// error. If the range specified by splitKey does not have a sticky bit set,
+// then this method will not throw an error and is a no-op.
+func (db *DB) AdminUnsplit(ctx context.Context, splitKey interface{}) error {
+	b := &Batch{}
+	b.adminUnsplit(splitKey)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
@@ -499,10 +525,23 @@ func (db *DB) AdminChangeReplicas(
 	key interface{},
 	changeType roachpb.ReplicaChangeType,
 	targets []roachpb.ReplicationTarget,
-) error {
+	expDesc roachpb.RangeDescriptor,
+) (*roachpb.RangeDescriptor, error) {
 	b := &Batch{}
-	b.adminChangeReplicas(key, changeType, targets)
-	return getOneErr(db.Run(ctx, b), b)
+	b.adminChangeReplicas(key, changeType, targets, expDesc)
+	if err := getOneErr(db.Run(ctx, b), b); err != nil {
+		return nil, err
+	}
+	responses := b.response.Responses
+	if len(responses) == 0 {
+		return nil, errors.Errorf("unexpected empty responses for AdminChangeReplicas")
+	}
+	resp, ok := responses[0].GetInner().(*roachpb.AdminChangeReplicasResponse)
+	if !ok {
+		return nil, errors.Errorf("unexpected response of type %T for AdminChangeReplicas",
+			responses[0].GetInner())
+	}
+	return resp.Desc, nil
 }
 
 // AdminRelocateRange relocates the replicas for a range onto the specified

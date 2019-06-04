@@ -20,15 +20,17 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
+
+// scopeOrdinal identifies an ordinal position with a list of scope columns.
+type scopeOrdinal int
 
 // scope is used for the build process and maintains the variables that have
 // been bound within the current scope as columnProps. Variables bound in the
@@ -40,6 +42,10 @@ type scope struct {
 	parent  *scope
 	cols    []scopeColumn
 	groupby groupby
+
+	// windows contains the set of window functions encountered while building
+	// the current SELECT statement.
+	windows []scopeColumn
 
 	// ordering records the ORDER BY columns associated with this scope. Each
 	// column is either in cols or in extraCols.
@@ -64,6 +70,10 @@ type scope struct {
 	// If replaceSRFs is true, replace raw SRFs with an srf struct. See
 	// the replaceSRF() function for more details.
 	replaceSRFs bool
+
+	// singleSRFColumn is true if this scope has a single column that comes from
+	// an SRF. The flag is used to allow renaming the column to the table alias.
+	singleSRFColumn bool
 
 	// srfs contains all the SRFs that were replaced in this scope. It will be
 	// used by the Builder to convert the input from the FROM clause to a lateral
@@ -135,27 +145,36 @@ func (s *scope) replace() *scope {
 }
 
 // appendColumnsFromScope adds newly bound variables to this scope.
-// The groups in the new columns are reset to 0.
+// The expressions in the new columns are reset to nil.
 func (s *scope) appendColumnsFromScope(src *scope) {
 	l := len(s.cols)
 	s.cols = append(s.cols, src.cols...)
-	// We want to reset the groups, as these become pass-through columns in the
-	// new scope.
+	// We want to reset the expressions, as these become pass-through columns in
+	// the new scope.
 	for i := l; i < len(s.cols); i++ {
 		s.cols[i].scalar = nil
 	}
 }
 
 // appendColumns adds newly bound variables to this scope.
-// The groups in the new columns are reset to 0.
+// The expressions in the new columns are reset to nil.
 func (s *scope) appendColumns(cols []scopeColumn) {
 	l := len(s.cols)
 	s.cols = append(s.cols, cols...)
-	// We want to reset the groups, as these become pass-through columns in the
-	// new scope.
+	// We want to reset the expressions, as these become pass-through columns in
+	// the new scope.
 	for i := l; i < len(s.cols); i++ {
 		s.cols[i].scalar = nil
 	}
+}
+
+// appendColumn adds a newly bound variable to this scope.
+// The expression in the new column is reset to nil.
+func (s *scope) appendColumn(col *scopeColumn) {
+	s.cols = append(s.cols, *col)
+	// We want to reset the expression, as this becomes a pass-through column in
+	// the new scope.
+	s.cols[len(s.cols)-1].scalar = nil
 }
 
 // addExtraColumns adds the given columns as extra columns, ignoring any
@@ -286,7 +305,7 @@ func (s *scope) resolveCTE(name *tree.TableName) *cteSource {
 // resolveAndRequireType, which panics with a builderError). If the result
 // type is types.Unknown, then resolveType will wrap the expression in a type
 // cast in order to produce the desired type.
-func (s *scope) resolveType(expr tree.Expr, desired types.T) tree.TypedExpr {
+func (s *scope) resolveType(expr tree.Expr, desired *types.T) tree.TypedExpr {
 	expr = s.walkExprTree(expr)
 	texpr, err := tree.TypeCheck(expr, s.builder.semaCtx, desired)
 	if err != nil {
@@ -305,7 +324,7 @@ func (s *scope) resolveType(expr tree.Expr, desired types.T) tree.TypedExpr {
 // typed expression with no error). If the result type is types.Unknown, then
 // resolveType will wrap the expression in a type cast in order to produce the
 // desired type.
-func (s *scope) resolveAndRequireType(expr tree.Expr, desired types.T) tree.TypedExpr {
+func (s *scope) resolveAndRequireType(expr tree.Expr, desired *types.T) tree.TypedExpr {
 	expr = s.walkExprTree(expr)
 	texpr, err := tree.TypeCheckAndRequire(expr, s.builder.semaCtx, desired, s.context)
 	if err != nil {
@@ -318,14 +337,10 @@ func (s *scope) resolveAndRequireType(expr tree.Expr, desired types.T) tree.Type
 // ensureNullType wraps the expression in a CAST to the desired type (assuming
 // it is not types.Any). types.Unknown is a special type used for null values,
 // and can be cast to any other type.
-func (s *scope) ensureNullType(texpr tree.TypedExpr, desired types.T) tree.TypedExpr {
-	if desired != types.Any && texpr.ResolvedType() == types.Unknown {
-		// Should always be able to convert null value to any other type.
-		colType, err := coltypes.DatumTypeToColumnType(desired)
-		if err != nil {
-			panic(err)
-		}
-		texpr, err = tree.NewTypedCastExpr(texpr, colType)
+func (s *scope) ensureNullType(texpr tree.TypedExpr, desired *types.T) tree.TypedExpr {
+	if desired.Family() != types.AnyFamily && texpr.ResolvedType().Family() == types.UnknownFamily {
+		var err error
+		texpr, err = tree.NewTypedCastExpr(texpr, desired)
 		if err != nil {
 			panic(err)
 		}
@@ -339,6 +354,13 @@ func (s *scope) isOuterColumn(id opt.ColumnID) bool {
 	for i := range s.cols {
 		col := &s.cols[i]
 		if col.id == id {
+			return false
+		}
+	}
+
+	for i := range s.windows {
+		w := &s.windows[i]
+		if w.id == id {
 			return false
 		}
 	}
@@ -409,17 +431,21 @@ func (s *scope) setTableAlias(alias tree.Name) {
 	}
 }
 
-// findExistingCol finds the given expression among the bound variables
-// in this scope. Returns nil if the expression is not found.
-func (s *scope) findExistingCol(expr tree.TypedExpr) *scopeColumn {
+func (s *scope) findExistingColInList(expr tree.TypedExpr, cols []scopeColumn) *scopeColumn {
 	exprStr := symbolicExprStr(expr)
-	for i := range s.cols {
-		col := &s.cols[i]
+	for i := range cols {
+		col := &cols[i]
 		if expr == col || exprStr == col.getExprStr() {
 			return col
 		}
 	}
 	return nil
+}
+
+// findExistingCol finds the given expression among the bound variables
+// in this scope. Returns nil if the expression is not found.
+func (s *scope) findExistingCol(expr tree.TypedExpr) *scopeColumn {
+	return s.findExistingColInList(expr, s.cols)
 }
 
 // getAggregateCols returns the columns in this scope corresponding
@@ -487,7 +513,7 @@ func (s *scope) findAggregate(agg aggregateInfo) *scopeColumn {
 // function. It is used to disallow nested aggregates and ensure that a
 // grouping error is not called on the aggregate arguments. For example:
 //   SELECT max(v) FROM kv GROUP BY k
-// should mot throw an error, even though v is not a grouping column.
+// should not throw an error, even though v is not a grouping column.
 // Non-grouping columns are allowed inside aggregate functions.
 //
 // startAggFunc returns a temporary scope for building the aggregate arguments.
@@ -519,7 +545,7 @@ func (s *scope) startAggFunc() *scope {
 // are only used in a groupings scope.
 func (s *scope) endAggFunc(cols opt.ColSet) (aggInScope, aggOutScope *scope) {
 	if !s.groupby.inAgg {
-		panic(fmt.Errorf("mismatched calls to start/end aggFunc"))
+		panic(pgerror.AssertionFailedf("mismatched calls to start/end aggFunc"))
 	}
 	s.groupby.inAgg = false
 
@@ -535,7 +561,7 @@ func (s *scope) endAggFunc(cols opt.ColSet) (aggInScope, aggOutScope *scope) {
 		}
 	}
 
-	panic(fmt.Errorf("aggregate function is not allowed in this context"))
+	panic(pgerror.AssertionFailedf("aggregate function is not allowed in this context"))
 }
 
 // startBuildingGroupingCols is called when the builder starts building the
@@ -556,7 +582,7 @@ func (s *scope) startBuildingGroupingCols() {
 // to ensure that a grouping error is not called prematurely.
 func (s *scope) endBuildingGroupingCols() {
 	if !s.groupby.buildingGroupingCols {
-		panic(fmt.Errorf("mismatched calls to start/end groupings"))
+		panic(pgerror.AssertionFailedf("mismatched calls to start/end groupings"))
 	}
 	s.groupby.buildingGroupingCols = false
 }
@@ -806,10 +832,6 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 		return false, colI.(*scopeColumn)
 
 	case *tree.FuncExpr:
-		if t.WindowDef != nil {
-			panic(unimplementedf("window functions are not supported"))
-		}
-
 		def, err := t.Func.Resolve(s.builder.semaCtx.SearchPath)
 		if err != nil {
 			panic(builderError{err})
@@ -820,8 +842,13 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 			break
 		}
 
-		if isAggregate(def) {
+		if isAggregate(def) && t.WindowDef == nil {
 			expr = s.replaceAggregate(t, def)
+			break
+		}
+
+		if t.WindowDef != nil {
+			expr = s.replaceWindowFn(t, def)
 			break
 		}
 
@@ -834,7 +861,9 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 		if sub, ok := t.Subquery.(*tree.Subquery); ok {
 			// Copy the ArrayFlatten expression so that the tree isn't mutated.
 			copy := *t
-			copy.Subquery = s.replaceSubquery(sub, false /* wrapInTuple */, 1 /* desiredColumns */, extraColsAllowed)
+			copy.Subquery = s.replaceSubquery(
+				sub, false /* wrapInTuple */, 1 /* desiredNumColumns */, extraColsAllowed,
+			)
 			expr = &copy
 		}
 
@@ -849,7 +878,9 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 			if sub, ok := t.Right.(*tree.Subquery); ok {
 				// Copy the Comparison expression so that the tree isn't mutated.
 				copy := *t
-				copy.Right = s.replaceSubquery(sub, true /* wrapInTuple */, -1 /* desiredColumns */, noExtraColsAllowed)
+				copy.Right = s.replaceSubquery(
+					sub, true /* wrapInTuple */, -1 /* desiredNumColumns */, noExtraColsAllowed,
+				)
 				expr = &copy
 			}
 		}
@@ -861,9 +892,13 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 		}
 
 		if t.Exists {
-			expr = s.replaceSubquery(t, true /* wrapInTuple */, -1 /* desiredColumns */, noExtraColsAllowed)
+			expr = s.replaceSubquery(
+				t, true /* wrapInTuple */, -1 /* desiredNumColumns */, noExtraColsAllowed,
+			)
 		} else {
-			expr = s.replaceSubquery(t, false /* wrapInTuple */, s.columns /* desiredColumns */, noExtraColsAllowed)
+			expr = s.replaceSubquery(
+				t, false /* wrapInTuple */, s.columns /* desiredNumColumns */, noExtraColsAllowed,
+			)
 		}
 	}
 
@@ -882,7 +917,7 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 // replaceSRF also stores a pointer to the new srf struct in this scope's srfs
 // slice. The slice is used later by the Builder to convert the input from
 // the FROM clause to a lateral cross join between the input and a Zip of all
-// the srfs in the s.srfs slice. See Builder.constructProjectSet in srfs.go for
+// the srfs in the s.srfs slice. See Builder.buildProjectSet in srfs.go for
 // more details.
 func (s *scope) replaceSRF(f *tree.FuncExpr, def *tree.FunctionDefinition) *srf {
 	// We need to save and restore the previous value of the field in
@@ -937,7 +972,7 @@ func (s *scope) replaceAggregate(f *tree.FuncExpr, def *tree.FunctionDefinition)
 	// context.
 	defer s.builder.semaCtx.Properties.Restore(s.builder.semaCtx.Properties)
 
-	s.builder.semaCtx.Properties.Require(s.context,
+	s.builder.semaCtx.Properties.Require("aggregate",
 		tree.RejectNestedAggregates|tree.RejectWindowApplications)
 
 	expr := f.Walk(s)
@@ -954,7 +989,6 @@ func (s *scope) replaceAggregate(f *tree.FuncExpr, def *tree.FunctionDefinition)
 			if err != nil {
 				panic(builderError{err})
 			}
-
 		}()
 	}
 
@@ -975,6 +1009,98 @@ func (s *scope) replaceAggregate(f *tree.FuncExpr, def *tree.FunctionDefinition)
 	}
 
 	return s.builder.buildAggregateFunction(f, &private, s)
+}
+
+func isSupportedFrame(f *tree.WindowDef) bool {
+	if f == nil {
+		return true
+	}
+
+	if f.Frame == nil {
+		return true
+	}
+
+	if f.Frame.Mode != tree.RANGE {
+		return false
+	}
+	if f.Frame.Bounds.StartBound != nil &&
+		(f.Frame.Bounds.StartBound.BoundType == tree.OffsetPreceding ||
+			f.Frame.Bounds.StartBound.BoundType == tree.OffsetFollowing) {
+		return false
+	}
+	if f.Frame.Bounds.EndBound != nil &&
+		(f.Frame.Bounds.EndBound.BoundType == tree.OffsetFollowing ||
+			f.Frame.Bounds.EndBound.BoundType == tree.OffsetPreceding) {
+		return false
+	}
+	return true
+}
+
+func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) tree.Expr {
+	if f.Filter != nil ||
+		f.Type == tree.DistinctFuncType ||
+		f.WindowDef.RefName != "" ||
+		!isSupportedFrame(f.WindowDef) {
+		panic(unimplementedWithIssueDetailf(34251, "", "unsupported window function"))
+	}
+
+	f, def = s.replaceCount(f, def)
+
+	if err := tree.CheckIsWindowOrAgg(def); err != nil {
+		panic(builderError{err})
+	}
+
+	// We need to save and restore the previous value of the field in
+	// semaCtx in case we are recursively called within a subquery
+	// context.
+	defer s.builder.semaCtx.Properties.Restore(s.builder.semaCtx.Properties)
+
+	s.builder.semaCtx.Properties.Require("window",
+		tree.RejectNestedWindowFunctions)
+
+	expr := f.Walk(s)
+
+	typedFunc, err := tree.TypeCheck(expr, s.builder.semaCtx, types.Any)
+	if err != nil {
+		panic(builderError{err})
+	}
+	if typedFunc == tree.DNull {
+		return tree.DNull
+	}
+
+	f = typedFunc.(*tree.FuncExpr)
+
+	partition := make([]tree.TypedExpr, len(f.WindowDef.Partitions))
+	for i, e := range f.WindowDef.Partitions {
+		partition[i] = e.(tree.TypedExpr)
+	}
+
+	info := windowInfo{
+		FuncExpr: f,
+		def: memo.FunctionPrivate{
+			Name:       def.Name,
+			Properties: &def.FunctionProperties,
+			Overload:   f.ResolvedOverload(),
+		},
+		partition: partition,
+		orderBy:   f.WindowDef.OrderBy,
+		frame:     f.WindowDef.Frame,
+	}
+
+	if col := s.findExistingColInList(&info, s.windows); col != nil {
+		return col.expr
+	}
+
+	info.col = &scopeColumn{
+		name: tree.Name(def.Name),
+		typ:  f.ResolvedType(),
+		id:   s.builder.factory.Metadata().AddColumn(def.Name, f.ResolvedType()),
+		expr: &info,
+	}
+
+	s.windows = append(s.windows, *info.col)
+
+	return &info
 }
 
 // replaceCount replaces count(*) with count_rows().
@@ -1054,12 +1180,12 @@ const (
 	noExtraColsAllowed = false
 )
 
-// Replace a raw subquery node with a typed subquery. wrapInTuple specifies
-// whether the return type of the subquery should be wrapped in a tuple.
-// wrapInTuple is true for subqueries that may return multiple rows in
+// Replace a raw tree.Subquery node with a lazily typed subquery. wrapInTuple
+// specifies whether the return type of the subquery should be wrapped in a
+// tuple. wrapInTuple is true for subqueries that may return multiple rows in
 // comparison expressions (e.g., IN, ANY, ALL) and EXISTS expressions.
-// desiredColumns specifies the desired number of columns for the
-// subquery. Specifying -1 for desiredColumns allows the subquery to return any
+// desiredNumColumns specifies the desired number of columns for the subquery.
+// Specifying -1 for desiredNumColumns allows the subquery to return any
 // number of columns and is used when the normal type checking machinery will
 // verify that the correct number of columns is returned.
 // If extraColsAllowed is true, extra columns built from the subquery (such as
@@ -1067,59 +1193,15 @@ const (
 // It is the duty of the caller to ensure that those columns are eventually
 // dealt with.
 func (s *scope) replaceSubquery(
-	sub *tree.Subquery, wrapInTuple bool, desiredColumns int, extraColsAllowed bool,
+	sub *tree.Subquery, wrapInTuple bool, desiredNumColumns int, extraColsAllowed bool,
 ) *subquery {
-	if s.replaceSRFs {
-		// We need to save and restore the previous value of the replaceSRFs field in
-		// case we are recursively called within a subquery context.
-		defer func() { s.replaceSRFs = true }()
-		s.replaceSRFs = false
+	return &subquery{
+		Subquery:          sub,
+		wrapInTuple:       wrapInTuple,
+		desiredNumColumns: desiredNumColumns,
+		extraColsAllowed:  extraColsAllowed,
+		scope:             s,
 	}
-
-	subq := subquery{
-		Subquery:    sub,
-		wrapInTuple: wrapInTuple,
-	}
-
-	// Save and restore the previous value of s.builder.subquery in case we are
-	// recursively called within a subquery context.
-	outer := s.builder.subquery
-	defer func() { s.builder.subquery = outer }()
-	s.builder.subquery = &subq
-
-	outScope := s.builder.buildStmt(sub.Select, s)
-	ord := outScope.ordering
-
-	// Treat the subquery result as an anonymous data source (i.e. column names
-	// are not qualified). Remove hidden columns, as they are not accessible
-	// outside the subquery.
-	outScope.setTableAlias("")
-	outScope.removeHiddenCols()
-
-	if desiredColumns > 0 && len(outScope.cols) != desiredColumns {
-		n := len(outScope.cols)
-		switch desiredColumns {
-		case 1:
-			panic(builderError{pgerror.NewErrorf(pgerror.CodeSyntaxError,
-				"subquery must return only one column, found %d", n)})
-		default:
-			panic(builderError{pgerror.NewErrorf(pgerror.CodeSyntaxError,
-				"subquery must return %d columns, found %d", desiredColumns, n)})
-		}
-	}
-
-	if len(outScope.extraCols) > 0 && !extraColsAllowed {
-		// We need to add a projection to remove the extra columns.
-		projScope := outScope.push()
-		projScope.appendColumnsFromScope(outScope)
-		projScope.expr = s.builder.constructProject(outScope.expr.(memo.RelExpr), projScope.cols)
-		outScope = projScope
-	}
-
-	subq.cols = outScope.cols
-	subq.node = outScope.expr.(memo.RelExpr)
-	subq.ordering = ord
-	return &subq
 }
 
 // VisitPost is part of the Visitor interface.
@@ -1134,25 +1216,25 @@ var _ tree.IndexedVarContainer = &scope{}
 
 // IndexedVarEval is part of the IndexedVarContainer interface.
 func (s *scope) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
-	panic("unimplemented: scope.IndexedVarEval")
+	panic(pgerror.AssertionFailedf("unimplemented: scope.IndexedVarEval"))
 }
 
 // IndexedVarResolvedType is part of the IndexedVarContainer interface.
-func (s *scope) IndexedVarResolvedType(idx int) types.T {
+func (s *scope) IndexedVarResolvedType(idx int) *types.T {
 	if idx >= len(s.cols) {
 		if len(s.cols) == 0 {
-			panic(builderError{pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-				"column reference @%d not allowed in this context", idx+1)})
+			panic(pgerror.Newf(pgerror.CodeUndefinedColumnError,
+				"column reference @%d not allowed in this context", idx+1))
 		}
-		panic(builderError{pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-			"invalid column ordinal: @%d", idx+1)})
+		panic(pgerror.Newf(pgerror.CodeUndefinedColumnError,
+			"invalid column ordinal: @%d", idx+1))
 	}
 	return s.cols[idx].typ
 }
 
 // IndexedVarNodeFormatter is part of the IndexedVarContainer interface.
 func (s *scope) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
-	panic("unimplemented: scope.IndexedVarNodeFormatter")
+	panic(pgerror.AssertionFailedf("unimplemented: scope.IndexedVarNodeFormatter"))
 }
 
 // newAmbiguousColumnError returns an error with a helpful error message to be
@@ -1193,7 +1275,7 @@ func (s *scope) newAmbiguousColumnError(
 		}
 	}
 
-	return pgerror.NewErrorf(pgerror.CodeAmbiguousColumnError,
+	return pgerror.Newf(pgerror.CodeAmbiguousColumnError,
 		"column reference %q is ambiguous (candidates: %s)", colString, msgBuf.String(),
 	)
 }
@@ -1202,11 +1284,31 @@ func (s *scope) newAmbiguousColumnError(
 // used in case of an ambiguous table name.
 func newAmbiguousSourceError(tn *tree.TableName) error {
 	if tn.Catalog() == "" {
-		return pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
+		return pgerror.Newf(pgerror.CodeAmbiguousAliasError,
 			"ambiguous source name: %q", tree.ErrString(tn))
 
 	}
-	return pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
+	return pgerror.Newf(pgerror.CodeAmbiguousAliasError,
 		"ambiguous source name: %q (within database %q)",
 		tree.ErrString(&tn.TableName), tree.ErrString(&tn.CatalogName))
+}
+
+func (s *scope) String() string {
+	var buf bytes.Buffer
+
+	if s.parent != nil {
+		buf.WriteString(s.parent.String())
+		buf.WriteString("->")
+	}
+
+	buf.WriteByte('(')
+	for i, c := range s.cols {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		fmt.Fprintf(&buf, "%s:%d", c.name.String(), c.id)
+	}
+	buf.WriteByte(')')
+
+	return buf.String()
 }

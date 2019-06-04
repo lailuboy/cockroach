@@ -20,7 +20,6 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/gossiputil"
@@ -85,9 +84,9 @@ func loadRanges(rr *replicaRankings, s *Store, ranges []testRange) {
 	for _, r := range ranges {
 		repl := &Replica{store: s}
 		repl.mu.state.Desc = &roachpb.RangeDescriptor{}
-		repl.mu.zone = config.DefaultZoneConfigRef()
+		repl.mu.zone = s.cfg.DefaultZoneConfig
 		for _, storeID := range r.storeIDs {
-			repl.mu.state.Desc.Replicas = append(repl.mu.state.Desc.Replicas, roachpb.ReplicaDescriptor{
+			repl.mu.state.Desc.InternalReplicas = append(repl.mu.state.Desc.InternalReplicas, roachpb.ReplicaDescriptor{
 				NodeID:    roachpb.NodeID(storeID),
 				StoreID:   storeID,
 				ReplicaID: roachpb.ReplicaID(storeID),
@@ -95,7 +94,7 @@ func loadRanges(rr *replicaRankings, s *Store, ranges []testRange) {
 		}
 		repl.mu.state.Lease = &roachpb.Lease{
 			Expiration: &hlc.MaxTimestamp,
-			Replica:    repl.mu.state.Desc.Replicas[0],
+			Replica:    repl.mu.state.Desc.InternalReplicas[0],
 		}
 		// TODO(a-robinson): The below three lines won't be needed once the old
 		// rangeInfo code is ripped out of the allocator.
@@ -144,7 +143,7 @@ func TestChooseLeaseToTransfer(t *testing.T) {
 		}
 		status.Lead = uint64(r.ReplicaID())
 		status.Commit = 1
-		for _, replica := range r.Desc().Replicas {
+		for _, replica := range r.Desc().InternalReplicas {
 			status.Progress[uint64(replica.ReplicaID)] = raft.Progress{
 				Match: 1,
 				State: raft.ProgressStateReplicate,
@@ -227,7 +226,7 @@ func TestChooseReplicaToRebalance(t *testing.T) {
 		}
 		status.Lead = uint64(r.ReplicaID())
 		status.Commit = 1
-		for _, replica := range r.Desc().Replicas {
+		for _, replica := range r.Desc().InternalReplicas {
 			status.Progress[uint64(replica.ReplicaID)] = raft.Progress{
 				Match: 1,
 				State: raft.ProgressStateReplicate,
@@ -266,9 +265,7 @@ func TestChooseReplicaToRebalance(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run("", func(t *testing.T) {
-			zone := config.DefaultZoneConfig()
-			zone.NumReplicas = proto.Int32(int32(len(tc.storeIDs)))
-			defer config.TestingSetDefaultZoneConfig(zone)()
+			s.cfg.DefaultZoneConfig.NumReplicas = proto.Int32(int32(len(tc.storeIDs)))
 			loadRanges(rr, s, []testRange{{storeIDs: tc.storeIDs, qps: tc.qps}})
 			hottestRanges := rr.topQPS()
 			_, targets := sr.chooseReplicaToRebalance(
@@ -342,7 +339,7 @@ func TestNoLeaseTransferToBehindReplicas(t *testing.T) {
 		}
 		status.Lead = uint64(r.ReplicaID())
 		status.Commit = 1
-		for _, replica := range r.Desc().Replicas {
+		for _, replica := range r.Desc().InternalReplicas {
 			match := uint64(1)
 			if replica.StoreID == roachpb.StoreID(5) {
 				match = 0

@@ -93,12 +93,12 @@ SELECT * FROM tview
 statement ok
 SET OPTIMIZER = ALWAYS
 
-query error pq: unsupported statement: \*tree\.AlterTable
+query error pq: unimplemented: unsupported statement: \*tree\.AlterTable
 ALTER TABLE test DROP COLUMN v;
 
 # Don't fall back to heuristic planner in ALWAYS mode.
-query error pq: window functions are not supported
-SELECT avg(k) OVER () FROM t ORDER BY 1
+query error unsupported window function
+SELECT avg(k) FILTER (WHERE k > 3) OVER (ORDER BY k) FROM t ORDER BY 1
 
 statement ok
 SET OPTIMIZER = LOCAL

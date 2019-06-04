@@ -17,10 +17,12 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
@@ -40,15 +42,15 @@ type subquery struct {
 // retrieve the Datum result of a subquery.
 func (p *planner) EvalSubquery(expr *tree.Subquery) (result tree.Datum, err error) {
 	if expr.Idx == 0 {
-		return nil, pgerror.NewAssertionErrorf("subquery %q was not processed, analyzeSubqueries not called?", expr)
+		return nil, pgerror.AssertionFailedf("subquery %q was not processed, analyzeSubqueries not called?", expr)
 	}
 	if expr.Idx < 0 || expr.Idx-1 >= len(p.curPlan.subqueryPlans) {
-		return nil, pgerror.NewAssertionErrorf("invalid index %d for %q", expr.Idx, expr)
+		return nil, pgerror.AssertionFailedf("invalid index %d for %q", expr.Idx, expr)
 	}
 
 	s := &p.curPlan.subqueryPlans[expr.Idx-1]
 	if !s.started {
-		return nil, pgerror.NewAssertionErrorf("subquery %d (%q) not started prior to evaluation", expr.Idx, expr)
+		return nil, pgerror.AssertionFailedf("subquery %d (%q) not started prior to evaluation", expr.Idx, expr)
 	}
 	return s.result, nil
 }
@@ -110,7 +112,7 @@ func (v *subqueryVisitor) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.E
 			result.execMode = distsqlrun.SubqueryExecModeAllRows
 			// Multi-row types are always wrapped in a tuple-type, but the ARRAY
 			// flatten operator wants the unwrapped type.
-			sub.SetType(sub.ResolvedType().(types.TTuple).Types[0])
+			sub.SetType(&sub.ResolvedType().TupleContents()[0])
 		}
 
 	case *tree.Subquery:
@@ -196,11 +198,11 @@ func (v *subqueryVisitor) extractSubquery(
 		switch desiredColumns {
 		case 1:
 			plan.Close(v.ctx)
-			return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+			return nil, pgerror.Newf(pgerror.CodeSyntaxError,
 				"subquery must return only one column, found %d", len(cols))
 		default:
 			plan.Close(v.ctx)
-			return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+			return nil, pgerror.Newf(pgerror.CodeSyntaxError,
 				"subquery must return %d columns, found %d", desiredColumns, len(cols))
 		}
 	}
@@ -212,6 +214,8 @@ func (v *subqueryVisitor) extractSubquery(
 	if log.V(2) {
 		log.Infof(v.ctx, "collected subquery: %q -> %d", sub, sub.Idx)
 	}
+
+	telemetry.Inc(sqltelemetry.SubqueryUseCounter)
 
 	// The typing for subqueries is complex, but regular.
 	//
@@ -268,15 +272,13 @@ func (v *subqueryVisitor) extractSubquery(
 	if len(cols) == 1 {
 		sub.SetType(cols[0].Typ)
 	} else {
-		colTypes := types.TTuple{
-			Types:  make([]types.T, len(cols)),
-			Labels: make([]string, len(cols)),
-		}
+		contents := make([]types.T, len(cols))
+		labels := make([]string, len(cols))
 		for i, col := range cols {
-			colTypes.Types[i] = col.Typ
-			colTypes.Labels[i] = col.Name
+			contents[i] = *col.Typ
+			labels[i] = col.Name
 		}
-		sub.SetType(colTypes)
+		sub.SetType(types.MakeLabeledTuple(contents, labels))
 	}
 
 	if multiRow {
@@ -290,7 +292,7 @@ func (v *subqueryVisitor) extractSubquery(
 		// subquery works with the current type checking code, but seems
 		// semantically incorrect. A tuple represents a fixed number of
 		// elements. Instead, we should introduce a new vtuple type.
-		sub.SetType(types.TTuple{Types: []types.T{sub.ResolvedType()}})
+		sub.SetType(types.MakeTuple([]types.T{*sub.ResolvedType()}))
 	}
 
 	return result, nil

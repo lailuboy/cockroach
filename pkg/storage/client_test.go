@@ -62,6 +62,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/kr/pretty"
 	"github.com/pkg/errors"
 	"go.etcd.io/etcd/raft"
@@ -128,13 +129,17 @@ func createTestStoreWithOpts(
 
 	rpcContext := rpc.NewContext(
 		ac, &base.Config{Insecure: true}, storeCfg.Clock, stopper, &storeCfg.Settings.Version)
+	// Ensure that tests using this test context and restart/shut down
+	// their servers do not inadvertently start talking to servers from
+	// unrelated concurrent tests.
+	rpcContext.ClusterID.Set(context.TODO(), uuid.MakeV4())
 	nodeDesc := &roachpb.NodeDescriptor{
 		NodeID:  1,
 		Address: util.MakeUnresolvedAddr("tcp", "invalid.invalid:26257"),
 	}
 	server := rpc.NewServer(rpcContext) // never started
 	storeCfg.Gossip = gossip.NewTest(
-		nodeDesc.NodeID, rpcContext, server, stopper, metric.NewRegistry(),
+		nodeDesc.NodeID, rpcContext, server, stopper, metric.NewRegistry(), storeCfg.DefaultZoneConfig,
 	)
 	storeCfg.ScanMaxIdleTime = 1 * time.Second
 	stores := storage.NewStores(ac, storeCfg.Clock, storeCfg.Settings.Version.MinSupportedVersion, storeCfg.Settings.Version.ServerVersion)
@@ -148,6 +153,7 @@ func createTestStoreWithOpts(
 	distSender := kv.NewDistSender(kv.DistSenderConfig{
 		AmbientCtx: ac,
 		Clock:      storeCfg.Clock,
+		RPCContext: rpcContext,
 		TestingKnobs: kv.ClientTestingKnobs{
 			TransportFactory: kv.SenderTransportFactory(tracer, stores),
 		},
@@ -169,18 +175,18 @@ func createTestStoreWithOpts(
 	// TODO(bdarnell): arrange to have the transport closed.
 	ctx := context.Background()
 	if !opts.dontBootstrap {
-		if err := storage.Bootstrap(
+		if err := storage.InitEngine(
 			ctx, eng, roachpb.StoreIdent{NodeID: 1, StoreID: 1},
 			storeCfg.Settings.Version.BootstrapVersion(),
 		); err != nil {
 			t.Fatal(err)
 		}
 	}
-	store := storage.NewStore(storeCfg, eng, nodeDesc)
+	store := storage.NewStore(ctx, storeCfg, eng, nodeDesc)
 	if !opts.dontBootstrap {
 		var kvs []roachpb.KeyValue
 		var splits []roachpb.RKey
-		kvs, tableSplits := sqlbase.MakeMetadataSchema().GetInitialValues()
+		kvs, tableSplits := sqlbase.MakeMetadataSchema(storeCfg.DefaultZoneConfig, storeCfg.DefaultSystemZoneConfig).GetInitialValues()
 		if !opts.dontCreateSystemRanges {
 			splits = config.StaticSplits()
 			splits = append(splits, tableSplits...)
@@ -188,11 +194,12 @@ func createTestStoreWithOpts(
 				return splits[i].Less(splits[j])
 			})
 		}
-		err := store.WriteInitialData(
+		err := storage.WriteInitialClusterData(
 			ctx,
-			kvs,
+			eng,
+			kvs, /* initialValues */
 			storeCfg.Settings.Version.BootstrapVersion().Version,
-			1 /* numStores */, splits)
+			1 /* numStores */, splits, storeCfg.Clock.PhysicalNow())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -337,6 +344,14 @@ func (m *multiTestContext) Start(t testing.TB, numStores int) {
 	if m.rpcContext == nil {
 		m.rpcContext = rpc.NewContext(log.AmbientContext{Tracer: st.Tracer}, &base.Config{Insecure: true}, m.clock,
 			m.transportStopper, &st.Version)
+		// Ensure that tests using this test context and restart/shut down
+		// their servers do not inadvertently start talking to servers from
+		// unrelated concurrent tests.
+		m.rpcContext.ClusterID.Set(context.TODO(), uuid.MakeV4())
+		// We are sharing the same RPC context for all simulated nodes, so we can't enforce
+		// some of the RPC check validation.
+		m.rpcContext.TestingAllowNamedRPCToAnonymousServer = true
+
 		// Create a breaker which never trips and never backs off to avoid
 		// introducing timing-based flakes.
 		m.rpcContext.BreakerFactory = func() *circuit.Breaker {
@@ -544,8 +559,7 @@ func (t *multiTestContextKVTransport) SendNext(
 	// Clone txn of ba args for sending.
 	ba.Replica = rep.ReplicaDescriptor
 	if txn := ba.Txn; txn != nil {
-		txnClone := ba.Txn.Clone()
-		ba.Txn = &txnClone
+		ba.Txn = ba.Txn.Clone()
 	}
 	var br *roachpb.BatchResponse
 	var pErr *roachpb.Error
@@ -642,7 +656,7 @@ func (rd rangeDescByAge) Less(i, j int) bool {
 	}
 	// If two RangeDescriptor versions have the same NextReplicaID, then the one
 	// with the fewest replicas is the newest.
-	return len(rd[i].Replicas) > len(rd[j].Replicas)
+	return len(rd[i].InternalReplicas) > len(rd[j].InternalReplicas)
 }
 
 // FirstRange implements the RangeDescriptorDB interface. It returns the range
@@ -721,6 +735,7 @@ func (m *multiTestContext) populateDB(idx int, stopper *stop.Stopper) {
 	m.distSenders[idx] = kv.NewDistSender(kv.DistSenderConfig{
 		AmbientCtx: ambient,
 		Clock:      m.clocks[idx],
+		RPCContext: m.rpcContext,
 		RangeDescriptorDB: mtcRangeDescriptorDB{
 			multiTestContext: m,
 			ds:               &m.distSenders[idx],
@@ -811,6 +826,7 @@ func (m *multiTestContext) addStore(idx int) {
 		grpcServer,
 		m.transportStopper,
 		metric.NewRegistry(),
+		config.DefaultZoneConfigRef(),
 	)
 
 	nodeID := roachpb.NodeID(idx + 1)
@@ -829,18 +845,17 @@ func (m *multiTestContext) addStore(idx int) {
 
 	ctx := context.Background()
 	if needBootstrap {
-		if err := storage.Bootstrap(ctx, eng, roachpb.StoreIdent{
+		if err := storage.InitEngine(ctx, eng, roachpb.StoreIdent{
 			NodeID:  roachpb.NodeID(idx + 1),
 			StoreID: roachpb.StoreID(idx + 1),
 		}, cfg.Settings.Version.BootstrapVersion()); err != nil {
 			m.t.Fatal(err)
 		}
 	}
-	store := storage.NewStore(cfg, eng, &roachpb.NodeDescriptor{NodeID: nodeID})
 	if needBootstrap && idx == 0 {
-		// Bootstrap the initial range on the first store.
+		// Bootstrap the initial range on the first engine.
 		var splits []roachpb.RKey
-		kvs, tableSplits := sqlbase.MakeMetadataSchema().GetInitialValues()
+		kvs, tableSplits := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig).GetInitialValues()
 		if !m.startWithSingleRange {
 			splits = config.StaticSplits()
 			splits = append(splits, tableSplits...)
@@ -848,15 +863,17 @@ func (m *multiTestContext) addStore(idx int) {
 				return splits[i].Less(splits[j])
 			})
 		}
-		err := store.WriteInitialData(
+		err := storage.WriteInitialClusterData(
 			ctx,
-			kvs,
+			eng,
+			kvs, /* initialValues */
 			cfg.Settings.Version.BootstrapVersion().Version,
-			len(m.engines), splits)
+			len(m.engines), splits, cfg.Clock.PhysicalNow())
 		if err != nil {
 			m.t.Fatal(err)
 		}
 	}
+	store := storage.NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: nodeID})
 	if err := store.Start(ctx, stopper); err != nil {
 		m.t.Fatal(err)
 	}
@@ -900,7 +917,7 @@ func (m *multiTestContext) addStore(idx int) {
 	// having to worry about such conditions we pre-warm the connection
 	// cache. See #8440 for an example of the headaches the long dial times
 	// cause.
-	if _, err := m.rpcContext.GRPCDial(ln.Addr().String()).Connect(ctx); err != nil {
+	if _, err := m.rpcContext.GRPCDialNode(ln.Addr().String(), nodeID).Connect(ctx); err != nil {
 		m.t.Fatal(err)
 	}
 
@@ -1000,10 +1017,9 @@ func (m *multiTestContext) restartStoreWithoutHeartbeat(i int) {
 	cfg.DB = m.dbs[i]
 	cfg.NodeLiveness = m.nodeLivenesses[i]
 	cfg.StorePool = m.storePools[i]
-	store := storage.NewStore(cfg, m.engines[i], &roachpb.NodeDescriptor{NodeID: roachpb.NodeID(i + 1)})
-	m.stores[i] = store
-
 	ctx := context.Background()
+	store := storage.NewStore(ctx, cfg, m.engines[i], &roachpb.NodeDescriptor{NodeID: roachpb.NodeID(i + 1)})
+	m.stores[i] = store
 
 	// Need to start the store before adding it so that the store ID is initialized.
 	if err := store.Start(ctx, stopper); err != nil {
@@ -1062,7 +1078,7 @@ func (m *multiTestContext) findMemberStoreLocked(desc roachpb.RangeDescriptor) *
 			// Store is stopped.
 			continue
 		}
-		for _, r := range desc.Replicas {
+		for _, r := range desc.InternalReplicas {
 			if s.StoreID() == r.StoreID {
 				return s
 			}
@@ -1091,16 +1107,6 @@ func (m *multiTestContext) changeReplicas(
 ) (roachpb.ReplicaID, error) {
 	ctx := context.Background()
 
-	// Perform a consistent read to get the updated range descriptor (as
-	// opposed to just going to one of the stores), to make sure we have
-	// the effects of any previous ChangeReplicas call. By the time
-	// ChangeReplicas returns the raft leader is guaranteed to have the
-	// updated version, but followers are not.
-	var desc roachpb.RangeDescriptor
-	if err := m.dbs[0].GetProto(ctx, keys.RangeDescriptorKey(startKey), &desc); err != nil {
-		return 0, err
-	}
-
 	var alreadyDoneErr string
 	switch changeType {
 	case roachpb.ADD_REPLICA:
@@ -1113,13 +1119,25 @@ func (m *multiTestContext) changeReplicas(
 		InitialBackoff: time.Millisecond,
 		MaxBackoff:     50 * time.Millisecond,
 	}
+	var desc roachpb.RangeDescriptor
 	for r := retry.Start(retryOpts); r.Next(); {
-		err := m.dbs[0].AdminChangeReplicas(
+
+		// Perform a consistent read to get the updated range descriptor (as
+		// opposed to just going to one of the stores), to make sure we have
+		// the effects of any previous ChangeReplicas call. By the time
+		// ChangeReplicas returns the raft leader is guaranteed to have the
+		// updated version, but followers are not.
+		if err := m.dbs[0].GetProto(ctx, keys.RangeDescriptorKey(startKey), &desc); err != nil {
+			return 0, err
+		}
+
+		_, err := m.dbs[0].AdminChangeReplicas(
 			ctx, startKey.AsRawKey(), changeType,
 			[]roachpb.ReplicationTarget{{
 				NodeID:  m.idents[dest].NodeID,
 				StoreID: m.idents[dest].StoreID,
 			}},
+			desc,
 		)
 
 		if err == nil || testutils.IsError(err, alreadyDoneErr) {
@@ -1414,6 +1432,20 @@ func heartbeatArgs(
 	}, roachpb.Header{Txn: txn}
 }
 
+func pushTxnArgs(
+	pusher, pushee *roachpb.Transaction, pushType roachpb.PushTxnType,
+) *roachpb.PushTxnRequest {
+	return &roachpb.PushTxnRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key: pushee.Key,
+		},
+		PushTo:    pusher.Timestamp.Next(),
+		PusherTxn: *pusher,
+		PusheeTxn: pushee.TxnMeta,
+		PushType:  pushType,
+	}
+}
+
 func TestSortRangeDescByAge(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	var replicaDescs []roachpb.ReplicaDescriptor
@@ -1426,10 +1458,10 @@ func TestSortRangeDescByAge(t *testing.T) {
 	newRangeVersion := func(marker string) {
 		currentRepls := append([]roachpb.ReplicaDescriptor(nil), replicaDescs...)
 		rangeDescs = append(rangeDescs, &roachpb.RangeDescriptor{
-			RangeID:       roachpb.RangeID(1),
-			Replicas:      currentRepls,
-			NextReplicaID: roachpb.ReplicaID(nextReplID),
-			EndKey:        roachpb.RKey(marker),
+			RangeID:          roachpb.RangeID(1),
+			InternalReplicas: currentRepls,
+			NextReplicaID:    roachpb.ReplicaID(nextReplID),
+			EndKey:           roachpb.RKey(marker),
 		})
 	}
 

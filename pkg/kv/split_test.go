@@ -112,7 +112,7 @@ func TestRangeSplitMeta(t *testing.T) {
 	for _, splitRKey := range splitKeys {
 		splitKey := roachpb.Key(splitRKey)
 		log.Infof(ctx, "starting split at key %q...", splitKey)
-		if err := s.DB.AdminSplit(ctx, splitKey, splitKey); err != nil {
+		if err := s.DB.AdminSplit(ctx, splitKey, splitKey, true /* manual */); err != nil {
 			t.Fatal(err)
 		}
 		log.Infof(ctx, "split at key %q complete", splitKey)
@@ -158,7 +158,7 @@ func TestRangeSplitsWithConcurrentTxns(t *testing.T) {
 			<-txnChannel
 		}
 		log.Infof(ctx, "starting split at key %q...", splitKey)
-		if pErr := s.DB.AdminSplit(context.TODO(), splitKey, splitKey); pErr != nil {
+		if pErr := s.DB.AdminSplit(context.TODO(), splitKey, splitKey, true /* manual */); pErr != nil {
 			t.Error(pErr)
 		}
 		log.Infof(ctx, "split at key %q complete", splitKey)
@@ -178,13 +178,15 @@ func TestRangeSplitsWithConcurrentTxns(t *testing.T) {
 func TestRangeSplitsWithWritePressure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	// Override default zone config.
-	cfg := config.DefaultZoneConfig()
+	cfg := config.DefaultZoneConfigRef()
 	cfg.RangeMaxBytes = proto.Int64(1 << 18)
-	defer config.TestingSetDefaultZoneConfig(cfg)()
 
 	// Manually create the local test cluster so that the split queue
 	// is not disabled (LocalTestCluster disables it by default).
 	s := &localtestcluster.LocalTestCluster{
+		Cfg: storage.StoreConfig{
+			DefaultZoneConfig: cfg,
+		},
 		StoreTestingKnobs: &storage.StoreTestingKnobs{
 			DisableScanner: true,
 		},
@@ -249,11 +251,64 @@ func TestRangeSplitsWithSameKeyTwice(t *testing.T) {
 
 	splitKey := roachpb.Key("aa")
 	log.Infof(ctx, "starting split at key %q...", splitKey)
-	if err := s.DB.AdminSplit(ctx, splitKey, splitKey); err != nil {
+	if err := s.DB.AdminSplit(ctx, splitKey, splitKey, true /* manual */); err != nil {
 		t.Fatal(err)
 	}
 	log.Infof(ctx, "split at key %q first time complete", splitKey)
-	if err := s.DB.AdminSplit(ctx, splitKey, splitKey); err != nil {
+	if err := s.DB.AdminSplit(ctx, splitKey, splitKey, true /* manual */); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestSplitStickyBit checks that the sticky bit is set when performing a manual
+// split. There are two cases to consider:
+// 1. Range is split so sticky bit is set on RHS.
+// 2. Range is already split and split key is the start key of a range, so set
+//    the sticky bit of that range, but no range is split.
+func TestRangeSplitsStickyBit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := createTestDBWithContextAndKnobs(t, client.DefaultDBContext(), &storage.StoreTestingKnobs{
+		DisableScanner:    true,
+		DisableSplitQueue: true,
+		DisableMergeQueue: true,
+	})
+	defer s.Stop()
+
+	ctx := context.TODO()
+	splitKey := roachpb.RKey("aa")
+	descKey := keys.RangeDescriptorKey(splitKey)
+
+	// Splitting range.
+	if err := s.DB.AdminSplit(ctx, splitKey.AsRawKey(), splitKey.AsRawKey(), true /* manual */); err != nil {
+		t.Fatal(err)
+	}
+
+	// Checking sticky bit.
+	var desc roachpb.RangeDescriptor
+	err := s.DB.GetProto(ctx, descKey, &desc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desc.StickyBit == nil {
+		t.Fatal("Sticky bit not set after splitting")
+	}
+
+	// Removing sticky bit.
+	if err := s.DB.AdminUnsplit(ctx, splitKey.AsRawKey()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Splitting range.
+	if err := s.DB.AdminSplit(ctx, splitKey.AsRawKey(), splitKey.AsRawKey(), true /* manual */); err != nil {
+		t.Fatal(err)
+	}
+
+	// Checking sticky bit.
+	err = s.DB.GetProto(ctx, descKey, &desc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desc.StickyBit == nil {
+		t.Fatal("Sticky bit not set after splitting")
 	}
 }

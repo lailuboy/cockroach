@@ -87,8 +87,9 @@ func (tu *tableUpserterBase) init(txn *client.Txn, evalCtx *tree.EvalContext) er
 		// because even though we might insert values into mutation columns, we
 		// never return them back to the user.
 		tu.colIDToReturnIndex = map[sqlbase.ColumnID]int{}
-		for i, col := range tableDesc.Columns {
-			tu.colIDToReturnIndex[col.ID] = i
+		for i := range tableDesc.Columns {
+			id := tableDesc.Columns[i].ID
+			tu.colIDToReturnIndex[id] = i
 		}
 
 		if len(tu.ri.InsertColIDtoRowIndex) == len(tu.colIDToReturnIndex) {
@@ -189,11 +190,6 @@ func (tu *tableUpserterBase) makeResultFromRow(
 		}
 	}
 	return resultRow
-}
-
-// fkSpanCollector is part of the tableWriter interface.
-func (tu *tableUpserterBase) fkSpanCollector() row.FkSpanCollector {
-	return tu.ri.Fks
 }
 
 type tableUpsertEvaler interface {
@@ -319,8 +315,9 @@ func (tu *tableUpserter) init(txn *client.Txn, evalCtx *tree.EvalContext) error 
 	}
 
 	var valNeededForCol util.FastIntSet
-	for i, col := range tu.fetchCols {
-		if _, ok := tu.fetchColIDtoRowIndex[col.ID]; ok {
+	for i := range tu.fetchCols {
+		id := tu.fetchCols[i].ID
+		if _, ok := tu.fetchColIDtoRowIndex[id]; ok {
 			valNeededForCol.Add(i)
 		}
 	}
@@ -562,6 +559,16 @@ func (tu *tableUpserter) updateConflictingRow(
 		// of updateValues.
 		updateValues, err = tu.evaler.evalComputedCols(newValues, updateValues)
 		if err != nil {
+			return nil, err
+		}
+
+		// Ensure that all the values produced by SET comply with the schema constraints.
+		// We can assume that values *prior* to SET are OK because:
+		// - data source values have been validated by GenerateInsertRow() already.
+		// - values coming from the table are valid by construction.
+		// However the SET expression can be arbitrary and can introduce errors
+		// downstream, so we need to (re)validate here.
+		if err := enforceLocalColumnConstraints(updateValues, tu.ru.UpdateCols); err != nil {
 			return nil, err
 		}
 
@@ -858,7 +865,7 @@ func (tu *tableUpserter) upsertRowPKSpans(
 			}
 		} else if len(result.Rows) > 1 {
 			panic(fmt.Errorf(
-				"Expected <= 1 but got %d conflicts for row %s", len(result.Rows), tu.insertRows.At(i)))
+				"expected <= 1 but got %d conflicts for row %s", len(result.Rows), tu.insertRows.At(i)))
 		}
 	}
 

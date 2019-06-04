@@ -100,7 +100,13 @@ func (t *TableName) String() string { return AsString(t) }
 // FQString renders the table name in full, not omitting the prefix
 // schema and catalog names. Suitable for logging, etc.
 func (t *TableName) FQString() string {
-	return AsStringWithFlags(t, FmtAlwaysQualifyTableNames)
+	ctx := NewFmtCtx(FmtSimple)
+	ctx.FormatNode(&t.CatalogName)
+	ctx.WriteByte('.')
+	ctx.FormatNode(&t.SchemaName)
+	ctx.WriteByte('.')
+	ctx.FormatNode(&t.TableName)
+	return ctx.CloseAndGetString()
 }
 
 // Table retrieves the unqualified table name.
@@ -112,6 +118,25 @@ func (t *TableName) Table() string {
 // the ExplicitSchema/ExplicitCatalog flags).
 func (t *TableName) Equals(other *TableName) bool {
 	return *t == *other
+}
+
+// ToUnresolvedObjectName converts the table name to an unresolved object name.
+// Schema and catalog are included if indicated by the ExplicitSchema and
+// ExplicitCatalog flags.
+func (t *TableName) ToUnresolvedObjectName() *UnresolvedObjectName {
+	u := &UnresolvedObjectName{}
+
+	u.NumParts = 1
+	u.Parts[0] = string(t.TableName)
+	if t.ExplicitSchema {
+		u.Parts[u.NumParts] = string(t.SchemaName)
+		u.NumParts++
+	}
+	if t.ExplicitCatalog {
+		u.Parts[u.NumParts] = string(t.CatalogName)
+		u.NumParts++
+	}
+	return u
 }
 
 // tableExpr implements the TableExpr interface.
@@ -194,12 +219,20 @@ func (ts *TableNames) Format(ctx *FmtCtx) {
 }
 func (ts *TableNames) String() string { return AsString(ts) }
 
-// TableIndexName is the name of an index, used in statements that
-// specifically refer to an index.
+// TableIndexName refers to a table index. There are a few cases:
 //
-// The table name is optional. It is possible to specify the schema or catalog
-// without specifying a table name; in this case, Table.TableNamePrefix has the
-// fields set but Table.TableName is empty.
+//  - if both the table name and the index name are set, refers to a specific
+//    index in a specific table.
+//
+//  - if the table name is set and index name is empty, refers to the primary
+//    index of that table.
+//
+//  - if the table name is empty and the index name is set, refers to an index
+//    of that name among all tables within a catalog/schema; if there is a
+//    duplicate name, that will result in an error. Note that it is possible to
+//    specify the schema or catalog without specifying a table name; in this
+//    case, Table.TableNamePrefix has the fields set but Table.TableName is
+//    empty.
 type TableIndexName struct {
 	Table TableName
 	Index UnrestrictedName
@@ -208,8 +241,6 @@ type TableIndexName struct {
 // Format implements the NodeFormatter interface.
 func (n *TableIndexName) Format(ctx *FmtCtx) {
 	if n.Index == "" {
-		// This case is only for ZoneSpecifier.TableOrIndex; normally an empty Index
-		// is not valid.
 		ctx.FormatNode(&n.Table)
 		return
 	}

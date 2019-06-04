@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
@@ -44,25 +43,14 @@ var backpressureRangeSizeMultiplier = settings.RegisterValidatedFloatSetting(
 	},
 )
 
-// backpressurableReqMethods is the set of all request methods that can
-// be backpressured. If a batch contains any method in this set, it may
-// be backpressured.
-var backpressurableReqMethods = util.MakeFastIntSet(
-	int(roachpb.Put),
-	int(roachpb.InitPut),
-	int(roachpb.ConditionalPut),
-	int(roachpb.Merge),
-	int(roachpb.Increment),
-	int(roachpb.Delete),
-	int(roachpb.DeleteRange),
-)
-
 // backpressurableSpans contains spans of keys where write backpressuring
 // is permitted. Writes to any keys within these spans may cause a batch
 // to be backpressured.
 var backpressurableSpans = []roachpb.Span{
 	{Key: keys.TimeseriesPrefix, EndKey: keys.TimeseriesKeyMax},
-	{Key: keys.TableDataMin, EndKey: keys.TableDataMax},
+	// Backpressure from the end of the system config forward instead of
+	// over all table data to avoid backpressuring unsplittable ranges.
+	{Key: keys.SystemConfigTableDataMax, EndKey: keys.TableDataMax},
 }
 
 // canBackpressureBatch returns whether the provided BatchRequest is eligible
@@ -77,7 +65,7 @@ func canBackpressureBatch(ba roachpb.BatchRequest) bool {
 	// method that is within a "backpressurable" key span.
 	for _, ru := range ba.Requests {
 		req := ru.GetInner()
-		if !backpressurableReqMethods.Contains(int(req.Method())) {
+		if !roachpb.CanBackpressure(req) {
 			continue
 		}
 
@@ -142,10 +130,14 @@ func (r *Replica) maybeBackpressureWriteBatch(ctx context.Context, ba roachpb.Ba
 		// Wait for the callback to be called.
 		select {
 		case <-ctx.Done():
-			return errors.Wrap(ctx.Err(), "aborted while applying backpressure")
+			return errors.Wrapf(
+				ctx.Err(), "aborted while applying backpressure to %s on range %s", ba, r.Desc(),
+			)
 		case err := <-splitC:
 			if err != nil {
-				return errors.Wrap(err, "split failed while applying backpressure")
+				return errors.Wrapf(
+					err, "split failed while applying backpressure to %s on range %s", ba, r.Desc(),
+				)
 			}
 		}
 	}

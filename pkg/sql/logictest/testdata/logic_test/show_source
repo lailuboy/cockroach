@@ -33,12 +33,12 @@ client_min_messages                  notice
 database                             test
 datestyle                            ISO, MDY
 default_int_size                     8
+default_tablespace                   ·
 default_transaction_isolation        serializable
 default_transaction_read_only        off
 distsql                              off
-experimental_enable_zigzag_join      off
+experimental_enable_zigzag_join      on
 experimental_force_split_at          off
-experimental_reorder_joins_limit     4
 experimental_serial_normalization    rowid
 experimental_vectorize               off
 extra_float_digits                   0
@@ -49,6 +49,7 @@ intervalstyle                        postgres
 lock_timeout                         0
 max_index_keys                       32
 node_id                              1
+reorder_joins_limit                  4
 results_buffer_size                  16384
 row_security                         off
 search_path                          public
@@ -67,11 +68,11 @@ transaction_priority                 normal
 transaction_read_only                off
 transaction_status                   NoTxn
 
-query I colnames
+query T colnames
 SELECT * FROM [SHOW CLUSTER SETTING sql.defaults.distsql]
 ----
 sql.defaults.distsql
-0
+off
 
 query TTTT colnames
 SELECT * FROM [SHOW ALL CLUSTER SETTINGS] WHERE variable LIKE '%organization'
@@ -101,7 +102,7 @@ SELECT * FROM [SHOW ZONE CONFIGURATION FOR TABLE system.users] LIMIT 0
 ----
 zone_name  config_sql
 
-query T colnames
+query T colnames,rowsort
 SELECT * FROM [SHOW DATABASES]
 ----
 database_name
@@ -110,7 +111,7 @@ postgres
 system
 test
 
-query TTTTT colnames
+query TTTTT colnames,rowsort
 SELECT * FROM [SHOW GRANTS ON system.descriptor]
 ----
 database_name  schema_name  table_name  grantee  privilege_type
@@ -137,7 +138,7 @@ SELECT * FROM [SHOW KEYS FROM system.descriptor]
 table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit
 descriptor  primary     false       1             id           ASC        false    false
 
-query T colnames
+query T colnames,rowsort
 SELECT * FROM [SHOW SCHEMAS FROM system]
 ----
 schema_name
@@ -151,7 +152,7 @@ SELECT * FROM [SHOW SEQUENCES FROM system]
 ----
 sequence_name
 
-query T colnames
+query T colnames,rowsort
 SELECT * FROM [SHOW TABLES FROM system]
 ----
 table_name
@@ -171,25 +172,25 @@ users
 web_sessions
 zones
 
-query TT colnames
+query TT colnames,rowsort
 SELECT * FROM [SHOW TABLES FROM system WITH COMMENT]
 ----
 table_name        comment
-comments          NULL
-descriptor        NULL
-eventlog          NULL
-jobs              NULL
-lease             NULL
-locations         NULL
-namespace         NULL
-rangelog          NULL
-role_members      NULL
-settings          NULL
-table_statistics  NULL
-ui                NULL
-users             NULL
-web_sessions      NULL
-zones             NULL
+namespace         ·
+descriptor        ·
+users             ·
+zones             ·
+settings          ·
+lease             ·
+eventlog          ·
+rangelog          ·
+ui                ·
+jobs              ·
+web_sessions      ·
+table_statistics  ·
+locations         ·
+role_members      ·
+comments          ·
 
 query ITTT colnames
 SELECT node_id, user_name, application_name, active_queries
@@ -206,7 +207,7 @@ node_id  user_name  query
 1        root       SELECT node_id, user_name, query FROM [SHOW CLUSTER QUERIES]
 
 
-query T colnames
+query T colnames,rowsort
 SELECT * FROM [SHOW SCHEMAS]
 ----
 schema_name
@@ -306,27 +307,59 @@ SELECT * FROM [SHOW COMPACT TRACE FOR SESSION] LIMIT 0
 ----
 age  message  tag  operation
 
-query ITTTTTTTTTRTI colnames
+query ITTTTTTTTTTRTI colnames
 SELECT * FROM [SHOW JOBS] LIMIT 0
 ----
-job_id  job_type  description  user_name  status  running_status  created  started  finished  modified  fraction_completed  error  coordinator_id
+job_id  job_type  description  statement  user_name  status  running_status  created  started  finished  modified  fraction_completed  error  coordinator_id
 
 query TT colnames
 SELECT * FROM [SHOW SYNTAX 'select 1; select 2']
 ----
-field  text
+field  message
 sql    SELECT 1
 sql    SELECT 2
 
 # Test the SHOW SYNTAX statement. We avoid printing out the line number
 # here because that is highly likely to change as code is edited.
 query TT colnames
-SELECT field, replace(text, e'\n', ' ') AS text FROM [SHOW SYNTAX 'foo']
+SELECT field, replace(message, e'\n', ' ') AS message FROM [SHOW SYNTAX 'foo']
  WHERE field != 'line'
 ----
-field     text
+field     message
 error     syntax error at or near "foo"
 code      42601
-file      sql/show_syntax.go
-function  runShowSyntax
+file      sql/parser/show_syntax.go
+function  RunShowSyntax
 detail    source SQL: foo ^
+
+
+# Test the SHOW INDEXES FROM DATABSE COMMAND
+statement ok
+CREATE DATABASE showdbindexestest;
+
+statement ok
+CREATE TABLE showdbindexestest.table1 (key1 INT PRIMARY KEY);
+
+statement ok
+CREATE TABLE showdbindexestest.table2 (key2 INT PRIMARY KEY);
+
+query TTBITTBB
+SHOW INDEXES FROM DATABASE showdbindexestest;
+----
+table1 primary false 1 key1 ASC false false
+table2 primary false 1 key2 ASC false false
+
+statement ok
+CREATE DATABASE "$peci@l";
+
+statement ok
+CREATE TABLE "$peci@l".table1 (key1 INT PRIMARY KEY);
+
+statement ok
+CREATE TABLE "$peci@l".table2 (key2 INT PRIMARY KEY);
+
+query TTBITTBB
+SHOW INDEXES FROM DATABASE "$peci@l";
+----
+table1 primary false 1 key1 ASC false false
+table2 primary false 1 key2 ASC false false

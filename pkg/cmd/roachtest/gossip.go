@@ -38,7 +38,7 @@ import (
 func registerGossip(r *registry) {
 	runGossipChaos := func(ctx context.Context, t *test, c *cluster) {
 		c.Put(ctx, cockroach, "./cockroach", c.All())
-		c.Start(ctx, t, c.All(), startArgs("--sequential"))
+		c.Start(ctx, t, c.All())
 
 		gossipNetwork := func(node int) string {
 			const query = `
@@ -430,6 +430,11 @@ SELECT count(replicas)
 	}
 
 	g.checkConnectedAndFunctional(ctx, t, c)
+
+	// Stop our special snowflake process which won't be recognized by the test
+	// harness, and start it again on the regular.
+	c.Stop(ctx, c.Node(1))
+	c.Start(ctx, t, c.Node(1))
 }
 
 func runCheckLocalityIPAddress(ctx context.Context, t *test, c *cluster) {

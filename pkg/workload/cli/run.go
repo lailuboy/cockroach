@@ -33,8 +33,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -74,7 +76,7 @@ func init() {
 			}
 
 			genInitCmd := SetCmdDefaults(&cobra.Command{
-				Use:   meta.Name,
+				Use:   meta.Name + " [pgurl...]",
 				Short: meta.Description,
 				Long:  meta.Description + meta.Details,
 				Args:  cobra.ArbitraryArgs,
@@ -109,7 +111,7 @@ func init() {
 			}
 
 			genRunCmd := SetCmdDefaults(&cobra.Command{
-				Use:   meta.Name,
+				Use:   meta.Name + " [pgurl...]",
 				Short: meta.Description,
 				Long:  meta.Description + meta.Details,
 				Args:  cobra.ArbitraryArgs,
@@ -142,6 +144,14 @@ func CmdHelper(
 	const crdbDefaultURL = `postgres://root@localhost:26257?sslmode=disable`
 
 	return HandleErrs(func(cmd *cobra.Command, args []string) error {
+		if ls := cmd.Flags().Lookup(logflags.LogToStderrName); ls != nil {
+			if !ls.Changed {
+				// Unless the settings were overridden by the user, default to logging
+				// to stderr.
+				_ = ls.Value.Set(log.Severity_INFO.String())
+			}
+		}
+
 		if h, ok := gen.(workload.Hookser); ok {
 			if h.Hooks().Validate != nil {
 				if err := h.Hooks().Validate(); err != nil {
@@ -299,6 +309,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			if !*tolerateErrors {
 				return err
 			}
+			log.Infof(ctx, "retrying after error during init: %v", err)
 		}
 	}
 
@@ -313,10 +324,17 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 	if !ok {
 		return errors.Errorf(`no operations defined for %s`, gen.Meta().Name)
 	}
-	reg := workload.NewHistogramRegistry()
-	ops, err := o.Ops(urls, reg)
-	if err != nil {
-		return err
+	reg := histogram.NewRegistry()
+	var ops workload.QueryLoad
+	for {
+		ops, err = o.Ops(urls, reg)
+		if err == nil {
+			break
+		}
+		if !*tolerateErrors {
+			return err
+		}
+		log.Infof(ctx, "retrying after error while creating load: %v", err)
 	}
 
 	const splitConcurrency = 384 // TODO(dan): Don't hardcode this.
@@ -415,7 +433,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 
 		case <-ticker.C:
 			startElapsed := timeutil.Since(start)
-			reg.Tick(func(t workload.HistogramTick) {
+			reg.Tick(func(t histogram.Tick) {
 				if i%20 == 0 {
 					fmt.Println("_elapsed___errors__ops/sec(inst)___ops/sec(cum)__p50(ms)__p95(ms)__p99(ms)_pMax(ms)")
 				}
@@ -442,7 +460,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			rampDone = nil
 			start = timeutil.Now()
 			i = 0
-			reg.Tick(func(t workload.HistogramTick) {
+			reg.Tick(func(t histogram.Tick) {
 				t.Cumulative.Reset()
 				t.Hist.Reset()
 			})
@@ -455,7 +473,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			const totalHeader = "\n_elapsed___errors_____ops(total)___ops/sec(cum)__avg(ms)__p50(ms)__p95(ms)__p99(ms)_pMax(ms)"
 			fmt.Println(totalHeader + `__total`)
 			startElapsed := timeutil.Since(start)
-			printTotalHist := func(t workload.HistogramTick) {
+			printTotalHist := func(t histogram.Tick) {
 				if t.Cumulative == nil {
 					return
 				}
@@ -475,8 +493,8 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 				)
 			}
 
-			resultTick := workload.HistogramTick{Name: ops.ResultHist}
-			reg.Tick(func(t workload.HistogramTick) {
+			resultTick := histogram.Tick{Name: ops.ResultHist}
+			reg.Tick(func(t histogram.Tick) {
 				printTotalHist(t)
 				if jsonEnc != nil {
 					// Note that we're outputting the delta from the last tick. The

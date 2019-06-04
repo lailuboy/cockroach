@@ -9,17 +9,16 @@
 package importccl
 
 import (
-	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
 	"context"
 	"io"
 	"io/ioutil"
 	"math/rand"
-	"sort"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -27,24 +26,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/pkg/errors"
 )
-
-var useWorkloadFastpath = envutil.EnvOrDefaultBool("COCKROACH_IMPORT_WORKLOAD_FASTER", false)
 
 type readFileFunc func(context.Context, io.Reader, int32, string, progressFn) error
 
@@ -139,7 +136,7 @@ func readInputFiles(
 			}
 
 			if err := fileFunc(ctx, src, dataFileIndex, dataFile, wrappedProgressFn); err != nil {
-				return errors.Wrap(err, dataFile)
+				return pgerror.Wrap(err, pgerror.CodeDataExceptionError, dataFile)
 			}
 			if updateFromFiles {
 				if err := progressFn(float32(currentFile) / float32(len(dataFiles))); err != nil {
@@ -194,15 +191,13 @@ func (b *byteCounter) Read(p []byte) (int, error) {
 	return n, err
 }
 
-type kvBatch []roachpb.KeyValue
-
 type rowConverter struct {
 	// current row buf
 	datums []tree.Datum
 
 	// kv destination and current batch
-	kvCh     chan<- kvBatch
-	kvBatch  kvBatch
+	kvCh     chan<- []roachpb.KeyValue
+	kvBatch  []roachpb.KeyValue
 	batchCap int
 
 	tableDesc *sqlbase.ImmutableTableDescriptor
@@ -213,7 +208,7 @@ type rowConverter struct {
 	evalCtx               *tree.EvalContext
 	cols                  []sqlbase.ColumnDescriptor
 	visibleCols           []sqlbase.ColumnDescriptor
-	visibleColTypes       []types.T
+	visibleColTypes       []*types.T
 	defaultExprs          []tree.TypedExpr
 	computedIVarContainer sqlbase.RowIndexedVarContainer
 }
@@ -221,7 +216,7 @@ type rowConverter struct {
 const kvBatchSize = 5000
 
 func newRowConverter(
-	tableDesc *sqlbase.TableDescriptor, evalCtx *tree.EvalContext, kvCh chan<- kvBatch,
+	tableDesc *sqlbase.TableDescriptor, evalCtx *tree.EvalContext, kvCh chan<- []roachpb.KeyValue,
 ) (*rowConverter, error) {
 	immutDesc := sqlbase.NewImmutableTableDescriptor(*tableDesc)
 	c := &rowConverter{
@@ -233,7 +228,7 @@ func newRowConverter(
 	ri, err := row.MakeInserter(nil /* txn */, immutDesc, nil, /* fkTables */
 		immutDesc.Columns, false /* checkFKs */, &sqlbase.DatumAlloc{})
 	if err != nil {
-		return nil, errors.Wrap(err, "make row inserter")
+		return nil, pgerror.Wrap(err, pgerror.CodeDataExceptionError, "make row inserter")
 	}
 	c.ri = ri
 
@@ -243,13 +238,13 @@ func newRowConverter(
 	// allows those expressions to run.
 	cols, defaultExprs, err := sqlbase.ProcessDefaultColumns(immutDesc.Columns, immutDesc, &txCtx, c.evalCtx)
 	if err != nil {
-		return nil, errors.Wrap(err, "process default columns")
+		return nil, pgerror.Wrap(err, pgerror.CodeDataExceptionError, "process default columns")
 	}
 	c.cols = cols
 	c.defaultExprs = defaultExprs
 
 	c.visibleCols = immutDesc.VisibleColumns()
-	c.visibleColTypes = make([]types.T, len(c.visibleCols))
+	c.visibleColTypes = make([]*types.T, len(c.visibleCols))
 	for i := range c.visibleCols {
 		c.visibleColTypes[i] = c.visibleCols[i].DatumType()
 	}
@@ -257,7 +252,8 @@ func newRowConverter(
 
 	// Check for a hidden column. This should be the unique_rowid PK if present.
 	c.hidden = -1
-	for i, col := range cols {
+	for i := range cols {
+		col := &cols[i]
 		if col.Hidden {
 			if col.DefaultExpr == nil || *col.DefaultExpr != "unique_rowid()" || c.hidden != -1 {
 				return nil, errors.New("unexpected hidden column")
@@ -272,7 +268,7 @@ func newRowConverter(
 
 	padding := 2 * (len(immutDesc.Indexes) + len(immutDesc.Families))
 	c.batchCap = kvBatchSize + padding
-	c.kvBatch = make(kvBatch, 0, c.batchCap)
+	c.kvBatch = make([]roachpb.KeyValue, 0, c.batchCap)
 
 	c.computedIVarContainer = sqlbase.RowIndexedVarContainer{
 		Mapping: ri.InsertColIDtoRowIndex,
@@ -304,9 +300,10 @@ func (c *rowConverter) row(ctx context.Context, fileIndex int32, rowIndex int64)
 	var computedCols []sqlbase.ColumnDescriptor
 
 	insertRow, err := sql.GenerateInsertRow(
-		c.defaultExprs, computeExprs, c.cols, computedCols, *c.evalCtx, c.tableDesc, c.datums, &c.computedIVarContainer)
+		c.defaultExprs, computeExprs, c.cols, computedCols, c.evalCtx, c.tableDesc, c.datums, &c.computedIVarContainer)
 	if err != nil {
-		return errors.Wrapf(err, "generate insert row")
+		return pgerror.Wrap(err, pgerror.CodeDataExceptionError,
+			"generate insert row")
 	}
 	if err := c.ri.InsertRow(
 		ctx,
@@ -319,7 +316,7 @@ func (c *rowConverter) row(ctx context.Context, fileIndex int32, rowIndex int64)
 		row.SkipFKs,
 		false, /* traceKV */
 	); err != nil {
-		return errors.Wrapf(err, "insert row")
+		return pgerror.Wrap(err, pgerror.CodeDataExceptionError, "insert row")
 	}
 	// If our batch is full, flush it and start a new one.
 	if len(c.kvBatch) >= kvBatchSize {
@@ -339,13 +336,13 @@ func (c *rowConverter) sendBatch(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	c.kvBatch = make(kvBatch, 0, c.batchCap)
+	c.kvBatch = make([]roachpb.KeyValue, 0, c.batchCap)
 	return nil
 }
 
-var csvOutputTypes = []sqlbase.ColumnType{
-	{SemanticType: sqlbase.ColumnType_BYTES},
-	{SemanticType: sqlbase.ColumnType_BYTES},
+var csvOutputTypes = []types.T{
+	*types.Bytes,
+	*types.Bytes,
 }
 
 func newReadImportDataProcessor(
@@ -385,7 +382,7 @@ type readImportDataProcessor struct {
 
 var _ distsqlrun.Processor = &readImportDataProcessor{}
 
-func (cp *readImportDataProcessor) OutputTypes() []sqlbase.ColumnType {
+func (cp *readImportDataProcessor) OutputTypes() []types.T {
 	return csvOutputTypes
 }
 
@@ -414,7 +411,7 @@ func (cp *readImportDataProcessor) Run(ctx context.Context) {
 // wrapper, doing the correct DrainAndClose error handling logic.
 func (cp *readImportDataProcessor) doRun(ctx context.Context) error {
 	group := ctxgroup.WithContext(ctx)
-	kvCh := make(chan kvBatch, 10)
+	kvCh := make(chan []roachpb.KeyValue, 10)
 	evalCtx := cp.flowCtx.NewEvalCtx()
 
 	var singleTable *sqlbase.TableDescriptor
@@ -424,8 +421,6 @@ func (cp *readImportDataProcessor) doRun(ctx context.Context) error {
 		}
 	}
 
-	typeBytes := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BYTES}
-
 	if format := cp.spec.Format.Format; singleTable == nil && !isMultiTableFormat(format) {
 		return errors.Errorf("%s only supports reading a single, pre-specified table", format.String())
 	}
@@ -434,7 +429,7 @@ func (cp *readImportDataProcessor) doRun(ctx context.Context) error {
 	var err error
 	switch cp.spec.Format.Format {
 	case roachpb.IOFileFormat_CSV:
-		isWorkload := useWorkloadFastpath
+		isWorkload := true
 		for _, file := range cp.spec.Uri {
 			if conf, err := storageccl.ExportStorageConfFromURI(file); err != nil || conf.Provider != roachpb.ExportStorageProvider_Workload {
 				isWorkload = false
@@ -442,9 +437,9 @@ func (cp *readImportDataProcessor) doRun(ctx context.Context) error {
 			}
 		}
 		if isWorkload {
-			conv, err = newWorkloadReader(kvCh, singleTable, evalCtx)
+			conv = newWorkloadReader(kvCh, singleTable, evalCtx)
 		} else {
-			conv = newCSVInputReader(kvCh, cp.spec.Format.Csv, singleTable, cp.flowCtx)
+			conv = newCSVInputReader(kvCh, cp.spec.Format.Csv, singleTable, evalCtx)
 		}
 	case roachpb.IOFileFormat_MysqlOutfile:
 		conv, err = newMysqloutfileReader(kvCh, cp.spec.Format.MysqlOut, singleTable, evalCtx)
@@ -490,6 +485,21 @@ func (cp *readImportDataProcessor) doRun(ctx context.Context) error {
 	})
 
 	if cp.spec.IngestDirectly {
+		for _, tbl := range cp.spec.Tables {
+			for _, span := range tbl.AllIndexSpans() {
+				if err := cp.flowCtx.ClientDB.AdminSplit(ctx, span.Key, span.Key, false /* manual */); err != nil {
+					return err
+				}
+
+				log.VEventf(ctx, 1, "scattering index range %s", span.Key)
+				scatterReq := &roachpb.AdminScatterRequest{
+					RequestHeader: roachpb.RequestHeaderFromSpan(span),
+				}
+				if _, pErr := client.SendWrapped(ctx, cp.flowCtx.ClientDB.NonTransactionalSender(), scatterReq); pErr != nil {
+					log.Errorf(ctx, "failed to scatter span %s: %s", span.Key, pErr)
+				}
+			}
+		}
 		// IngestDirectly means this reader will just ingest the KVs that the
 		// producer emitted to the chan, and the only result we push into distsql at
 		// the end is one row containing an encoded BulkOpSummary.
@@ -498,11 +508,12 @@ func (cp *readImportDataProcessor) doRun(ctx context.Context) error {
 			defer tracing.FinishSpan(span)
 
 			writeTS := hlc.Timestamp{WallTime: cp.spec.WalltimeNanos}
-			adder, err := cp.flowCtx.BulkAdder(ctx, cp.flowCtx.ClientDB, 32<<20 /* flush at 32mb */, writeTS)
+			const bufferSize, flushSize = 64 << 20, 16 << 20
+			adder, err := cp.flowCtx.BulkAdder(ctx, cp.flowCtx.ClientDB, bufferSize, flushSize, writeTS)
 			if err != nil {
 				return err
 			}
-			defer adder.Close()
+			defer adder.Close(ctx)
 
 			// Drain the kvCh using the BulkAdder until it closes.
 			if err := ingestKvs(ctx, adder, kvCh); err != nil {
@@ -515,8 +526,8 @@ func (cp *readImportDataProcessor) doRun(ctx context.Context) error {
 				return err
 			}
 			cs, err := cp.out.EmitRow(ctx, sqlbase.EncDatumRow{
-				sqlbase.DatumToEncDatum(typeBytes, tree.NewDBytes(tree.DBytes(countsBytes))),
-				sqlbase.DatumToEncDatum(typeBytes, tree.NewDBytes(tree.DBytes([]byte{}))),
+				sqlbase.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes(countsBytes))),
+				sqlbase.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes([]byte{}))),
 			})
 			if err != nil {
 				return err
@@ -570,14 +581,14 @@ func (cp *readImportDataProcessor) doRun(ctx context.Context) error {
 						var row sqlbase.EncDatumRow
 						if rowRequired {
 							row = sqlbase.EncDatumRow{
-								sqlbase.DatumToEncDatum(typeBytes, tree.NewDBytes(tree.DBytes(kv.Key))),
-								sqlbase.DatumToEncDatum(typeBytes, tree.NewDBytes(tree.DBytes(kv.Value.RawBytes))),
+								sqlbase.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes(kv.Key))),
+								sqlbase.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes(kv.Value.RawBytes))),
 							}
 						} else {
 							// Don't send the value for rows returned for sampling
 							row = sqlbase.EncDatumRow{
-								sqlbase.DatumToEncDatum(typeBytes, tree.NewDBytes(tree.DBytes(kv.Key))),
-								sqlbase.DatumToEncDatum(typeBytes, tree.NewDBytes(tree.DBytes([]byte{}))),
+								sqlbase.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes(kv.Key))),
+								sqlbase.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes([]byte{}))),
 							}
 						}
 
@@ -613,13 +624,25 @@ func (s sampleRate) sample(kv roachpb.KeyValue) bool {
 	return prob > s.rnd.Float64()
 }
 
-func makeRowErr(file string, row int64, format string, args ...interface{}) error {
-	return errors.Errorf("%q: row %d: "+format, append([]interface{}{file, row}, args...)...)
+func makeRowErr(file string, row int64, code, format string, args ...interface{}) error {
+	return pgerror.NewWithDepthf(1, code,
+		"%q: row %d: "+format, append([]interface{}{file, row}, args...)...)
+}
+
+func wrapRowErr(err error, file string, row int64, code, format string, args ...interface{}) error {
+	newFormat := "%q: row %d"
+	if format != "" {
+		newFormat = newFormat + ": " + format
+	}
+	return pgerror.WrapWithDepthf(1, err, code,
+		newFormat, append([]interface{}{file, row}, args...)...)
 }
 
 // ingestKvs drains kvs from the channel until it closes, ingesting them using
 // the BulkAdder. It handles the required buffering/sorting/etc.
-func ingestKvs(ctx context.Context, adder storagebase.BulkAdder, kvCh <-chan kvBatch) error {
+func ingestKvs(
+	ctx context.Context, adder storagebase.BulkAdder, kvCh <-chan []roachpb.KeyValue,
+) error {
 	const sortBatchSize = 48 << 20 // 48MB
 
 	// TODO(dt): buffer to disk instead of all in-mem.
@@ -643,19 +666,15 @@ func ingestKvs(ctx context.Context, adder storagebase.BulkAdder, kvCh <-chan kvB
 		if len(buf) == 0 {
 			return nil
 		}
-		sort.Sort(buf)
 		for i := range buf {
 			if err := adder.Add(ctx, buf[i].Key, buf[i].Value.RawBytes); err != nil {
-				if i > 0 && bytes.Equal(buf[i].Key, buf[i-1].Key) {
-					return errors.Wrapf(err, errSSTCreationMaybeDuplicateTemplate, buf[i].Key)
+				if _, ok := err.(storagebase.DuplicateKeyError); ok {
+					return pgerror.Wrap(err, pgerror.CodeDataExceptionError, "")
 				}
 				return err
 			}
 		}
-		if err := adder.Flush(ctx); err != nil {
-			return err
-		}
-		return adder.Reset()
+		return nil
 	}
 
 	for kvBatch := range kvCh {
@@ -688,6 +707,13 @@ func ingestKvs(ctx context.Context, adder storagebase.BulkAdder, kvCh <-chan kvB
 		if err := flush(ctx, buf); err != nil {
 			return err
 		}
+	}
+
+	if err := adder.Flush(ctx); err != nil {
+		if err, ok := err.(storagebase.DuplicateKeyError); ok {
+			return pgerror.Wrap(err, pgerror.CodeDataExceptionError, "")
+		}
+		return err
 	}
 	return nil
 }

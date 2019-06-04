@@ -17,7 +17,7 @@ package pgerror
 import (
 	"bytes"
 	"fmt"
-	"runtime"
+	"regexp"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
@@ -28,6 +28,7 @@ import (
 
 var _ error = &Error{}
 
+// Error implements the error interface.
 func (pg *Error) Error() string {
 	return pg.Message
 }
@@ -60,9 +61,9 @@ func formatMsgHintDetail(prefix, msg, hint, detail string) string {
 	return b.String()
 }
 
-// NewErrorWithDepthf creates an Error and extracts the context
+// NewWithDepthf creates an Error and extracts the context
 // information at the specified depth level.
-func NewErrorWithDepthf(depth int, code string, format string, args ...interface{}) *Error {
+func NewWithDepthf(depth int, code string, format string, args ...interface{}) *Error {
 	srcCtx := makeSrcCtx(depth + 1)
 	return &Error{
 		Message: fmt.Sprintf(format, args...),
@@ -71,35 +72,29 @@ func NewErrorWithDepthf(depth int, code string, format string, args ...interface
 	}
 }
 
-// NewError creates an Error.
-func NewError(code string, msg string) *Error {
-	return NewErrorWithDepthf(1, code, "%s", msg)
+// New creates an Error.
+func New(code string, msg string) *Error {
+	return NewWithDepthf(1, code, "%s", msg)
 }
 
-// NewErrorWithDepth creates an Error with context extracted from the
-// specified depth.
-func NewErrorWithDepth(depth int, code string, msg string) *Error {
-	return NewErrorWithDepthf(depth+1, code, "%s", msg)
+// Newf creates an Error with a format string.
+func Newf(code string, format string, args ...interface{}) *Error {
+	return NewWithDepthf(1, code, format, args...)
 }
 
-// NewErrorf creates an Error with a format string.
-func NewErrorf(code string, format string, args ...interface{}) *Error {
-	return NewErrorWithDepthf(1, code, format, args...)
-}
-
-// NewDangerousStatementErrorf creates a new Error for "rejected dangerous statements".
-func NewDangerousStatementErrorf(format string, args ...interface{}) *Error {
+// DangerousStatementf creates a new Error for "rejected dangerous statements".
+func DangerousStatementf(format string, args ...interface{}) *Error {
 	var buf bytes.Buffer
 	buf.WriteString("rejected: ")
 	fmt.Fprintf(&buf, format, args...)
 	buf.WriteString(" (sql_safe_updates = true)")
-	return NewErrorWithDepthf(1, CodeWarningError, "%s", buf.String())
+	return NewWithDepthf(1, CodeWarningError, "%s", buf.String())
 }
 
-// NewWrongNumberOfPreparedStatements creates new an Error for trying to prepare
+// WrongNumberOfPreparedStatements creates new an Error for trying to prepare
 // a query string containing more than one statement.
-func NewWrongNumberOfPreparedStatements(n int) *Error {
-	return NewErrorWithDepthf(1, CodeInvalidPreparedStatementDefinitionError,
+func WrongNumberOfPreparedStatements(n int) *Error {
+	return NewWithDepthf(1, CodeInvalidPreparedStatementDefinitionError,
 		"prepared statement had %d statements, expected 1", n)
 }
 
@@ -113,6 +108,13 @@ func (pg *Error) SetHintf(f string, args ...interface{}) *Error {
 func (pg *Error) SetDetailf(f string, args ...interface{}) *Error {
 	pg.Detail = fmt.Sprintf(f, args...)
 	return pg
+}
+
+// ResetSource resets the Source field of the Error object
+// with the details on the depth-level caller of ResetSource.
+func (pg *Error) ResetSource(depth int) {
+	srcCtx := makeSrcCtx(depth + 1)
+	pg.Source = &srcCtx
 }
 
 // makeSrcCtx creates a Error_Source value with contextual information
@@ -133,91 +135,53 @@ func GetPGCause(err error) (*Error, bool) {
 	}
 }
 
-const assertionErrorHint = `You have encountered an unexpected error inside CockroachDB.
-
-Please check https://github.com/cockroachdb/cockroach/issues to check
-whether this problem is already tracked. If you cannot find it there,
-please report the error with details at:
-
-    https://github.com/cockroachdb/cockroach/issues/new/choose
-
-If you would rather not post publicly, please contact us directly at:
-
-    support@cockroachlabs.com
-
-The Cockroach Labs team appreciates your feedback.
-`
-
-// NewAssertionErrorf creates an internal error.
-func NewAssertionErrorf(format string, args ...interface{}) error {
-	err := NewErrorWithDepthf(1, CodeInternalError, "internal error: "+format, args...)
-	err.InternalCommand = captureTrace()
-	err.Detail = err.InternalCommand
-	err.Hint = assertionErrorHint
-	return err
-}
-
-// NewInternalTrackingError instantiates an error
-// meant for use with telemetry.ReportError directly.
-func NewInternalTrackingError(issue int, detail string) error {
-	prefix := fmt.Sprintf("#%d.%s", issue, detail)
-	err := NewErrorWithDepthf(1, CodeInternalError, "internal error: %s", prefix)
-	err.InternalCommand = prefix + " " + captureTrace()
-	return err.SetHintf("See: https://github.com/cockroachdb/cockroach/issues/%d", issue)
-}
-
-func captureTrace() string {
-	var pc [50]uintptr
-	n := runtime.Callers(3, pc[:])
-	frames := runtime.CallersFrames(pc[:n])
-	var buf bytes.Buffer
-	sep := ""
-	for {
-		frame, more := frames.Next()
-		if !more {
-			break
-		}
-		file := frame.File
-		if index := strings.LastIndexByte(file, '/'); index >= 0 {
-			file = file[index+1:]
-		}
-		fmt.Fprintf(&buf, "%s%s:%d", sep, file, frame.Line)
-		sep = ","
-	}
-	return buf.String()
-}
-
-// UnimplementedWithIssueErrorf constructs an error with the formatted message
+// UnimplementedWithIssuef constructs an error with the formatted message
 // and a link to the passed issue. Recorded as "#<issue>" in tracking.
-func UnimplementedWithIssueErrorf(issue int, format string, args ...interface{}) error {
-	err := NewErrorWithDepthf(1, CodeFeatureNotSupportedError, "unimplemented: "+format, args...)
-	err.InternalCommand = fmt.Sprintf("#%d", issue)
+func UnimplementedWithIssuef(issue int, format string, args ...interface{}) *Error {
+	err := NewWithDepthf(1, CodeFeatureNotSupportedError, "unimplemented: "+format, args...)
+	err.TelemetryKey = fmt.Sprintf("#%d", issue)
 	return err.SetHintf("See: https://github.com/cockroachdb/cockroach/issues/%d", issue)
 }
 
-// UnimplementedWithIssueError constructs an error with the given message
+// UnimplementedWithIssue constructs an error with the given message
 // and a link to the passed issue. Recorded as "#<issue>" in tracking.
-func UnimplementedWithIssueError(issue int, msg string) error {
-	err := NewErrorWithDepthf(1, CodeFeatureNotSupportedError, "unimplemented: %s", msg)
-	err.InternalCommand = fmt.Sprintf("#%d", issue)
+func UnimplementedWithIssue(issue int, msg string) *Error {
+	err := NewWithDepthf(1, CodeFeatureNotSupportedError, "unimplemented: %s", msg)
+	err.TelemetryKey = fmt.Sprintf("#%d", issue)
 	return err.SetHintf("See: https://github.com/cockroachdb/cockroach/issues/%d", issue)
 }
 
-// UnimplementedWithIssueDetailError constructs an error with the given message
+// UnimplementedWithIssueDetail constructs an error with the given message
 // and a link to the passed issue. Recorded as "#<issue>.detail" in tracking.
 // This is useful when we need an extra axis of information to drill down into.
-func UnimplementedWithIssueDetailError(issue int, detail, msg string) error {
-	err := NewErrorWithDepthf(1, CodeFeatureNotSupportedError, "unimplemented: %s", msg)
-	err.InternalCommand = fmt.Sprintf("#%d.%s", issue, detail)
+func UnimplementedWithIssueDetail(issue int, detail, msg string) *Error {
+	err := NewWithDepthf(1, CodeFeatureNotSupportedError, "unimplemented: %s", msg)
+	if detail == "" {
+		err.TelemetryKey = fmt.Sprintf("#%d", issue)
+	} else {
+		err.TelemetryKey = fmt.Sprintf("#%d.%s", issue, detail)
+	}
 	return err.SetHintf("See: https://github.com/cockroachdb/cockroach/issues/%d", issue)
 }
 
-// UnimplementedWithIssueHintError constructs an error with the given
+// UnimplementedWithIssueDetailf is like the above
+// but supports message formatting.
+func UnimplementedWithIssueDetailf(issue int, detail, format string, args ...interface{}) *Error {
+	err := NewWithDepthf(1, CodeFeatureNotSupportedError, "unimplemented: "+format, args...)
+	if detail == "" {
+		err.TelemetryKey = fmt.Sprintf("#%d", issue)
+	} else {
+		err.TelemetryKey = fmt.Sprintf("#%d.%s", issue, detail)
+	}
+	return err.SetHintf("See: https://github.com/cockroachdb/cockroach/issues/%d", issue)
+}
+
+// UnimplementedWithIssueHint constructs an error with the given
 // message, hint, and a link to the passed issue. Recorded as "#<issue>"
 // in tracking.
-func UnimplementedWithIssueHintError(issue int, msg, hint string) error {
-	err := NewErrorWithDepthf(1, CodeFeatureNotSupportedError, "unimplemented: %s", msg)
-	err.InternalCommand = fmt.Sprintf("#%d", issue)
+func UnimplementedWithIssueHint(issue int, msg, hint string) *Error {
+	err := NewWithDepthf(1, CodeFeatureNotSupportedError, "unimplemented: %s", msg)
+	err.TelemetryKey = fmt.Sprintf("#%d", issue)
 	return err.SetHintf("%s\nSee: https://github.com/cockroachdb/cockroach/issues/%d", hint, issue)
 }
 
@@ -236,53 +200,85 @@ If you would rather not post publicly, please contact us directly at:
 The Cockroach Labs team appreciates your feedback.
 `
 
-// Unimplemented constructs an unimplemented feature error.
+// Unimplemented constructs an unimplemented feature error with a format string.
 //
-// `feature` is used for tracking, and is not included when the error printed.
-func Unimplemented(feature, msg string, args ...interface{}) *Error {
-	return UnimplementedWithDepth(1, feature, msg, args...)
+// `feature` is used for tracking, and is not included when the error is printed.
+func Unimplemented(feature, msg string) *Error {
+	return UnimplementedWithDepthf(1, feature, "%s", msg)
 }
 
-// UnimplementedWithDepth constructs an implemented feature error,
+// Unimplementedf constructs an unimplemented feature error.
+//
+// `feature` is used for tracking, and is not included when the error is printed.
+func Unimplementedf(feature, format string, args ...interface{}) *Error {
+	return UnimplementedWithDepthf(1, feature, format, args...)
+}
+
+// UnimplementedWithDepthf constructs an implemented feature error,
 // tracking the context at the specified depth.
-func UnimplementedWithDepth(depth int, feature, msg string, args ...interface{}) *Error {
-	err := NewErrorWithDepthf(depth+1, CodeFeatureNotSupportedError, msg, args...)
-	err.InternalCommand = feature
+func UnimplementedWithDepthf(depth int, feature, format string, args ...interface{}) *Error {
+	err := NewWithDepthf(depth+1, CodeFeatureNotSupportedError, "unimplemented: "+format, args...)
+	err.TelemetryKey = feature
 	err.Hint = unimplementedErrorHint
 	return err
 }
 
-// Wrap wraps an error into a pgerror. The code is used
-// if the original error was not a pgerror already. The errContext
-// string is used to populate the InternalCommand. If InternalCommand
-// already exists, the errContext is prepended.
-func Wrap(err error, code, errContext string) error {
-	var pgErr Error
-	origErr, ok := GetPGCause(err)
-	if ok {
-		// Copy the error. We can't use the existing error directly
-		// because it may be a global (const) object and we want to modify
-		// it below.
-		pgErr = *origErr
-	} else {
-		pgErr = Error{
-			Code: code,
-			// Keep the stack trace if one was available in the original
-			// non-Error error (e.g. when constructed via errors.Wrap).
-			InternalCommand: log.ErrorSource(err),
+var _ fmt.Formatter = &Error{}
+
+// Format implements the fmt.Formatter interface.
+//
+// %v/%s prints the rror as usual.
+// %#v adds the pg error code at the beginning.
+// %+v prints all the details, including the embedded stack traces.
+func (pg *Error) Format(s fmt.State, verb rune) {
+	switch {
+	case verb == 'v' && s.Flag('+'):
+		// %+v prints all details.
+		if pg.Source != nil {
+			fmt.Fprintf(s, "%s:%d in %s(): ", pg.Source.File, pg.Source.Line, pg.Source.Function)
 		}
+		fmt.Fprintf(s, "(%s) %s", pg.Code, pg.Message)
+		for _, d := range pg.SafeDetail {
+			fmt.Fprintf(s, "\n-- detail --\n%s", d.SafeMessage)
+			if d.EncodedStackTrace != "" {
+				if st, ok := log.DecodeStackTrace(d.EncodedStackTrace); ok {
+					fmt.Fprintf(s, "\n%s", log.PrintStackTrace(st))
+				}
+			}
+		}
+		return
+	case verb == 'v' && s.Flag('#'):
+		// %#v spells out the code as prefix.
+		fmt.Fprintf(s, "(%s) %s", pg.Code, pg.Message)
+	case verb == 'v':
+		fallthrough
+	case verb == 's':
+		fmt.Fprintf(s, "%s", pg.Message)
+	case verb == 'q':
+		fmt.Fprintf(s, "%q", pg.Message)
 	}
+}
 
-	// Prepend the context to the existing message.
-	prefix := errContext + ": "
-	pgErr.Message = prefix + err.Error()
-
-	// Prepend the context also to the internal command, to ensure it
-	// goes to telemetry.
-	if pgErr.InternalCommand != "" {
-		pgErr.InternalCommand = prefix + pgErr.InternalCommand
-	} else {
-		pgErr.InternalCommand = errContext
+// IsSQLRetryableError returns true if err is retryable. This is true
+// for errors that show a connection issue or an issue with the node
+// itself. This can occur when a node is restarting or is unstable in
+// some other way. Note that retryable errors may occur event in cases
+// where the SQL execution ran to completion.
+//
+// TODO(bdarnell): Why are RPC errors in this list? These should
+// generally be retried on the server side or transformed into
+// ambiguous result errors ("connection reset/refused" are needed for
+// the pgwire connection, but anything RPC-related should be handled
+// within the cluster).
+func IsSQLRetryableError(err error) bool {
+	// Don't forget to update the corresponding test when making adjustments
+	// here.
+	errString := FullError(err)
+	matched, merr := regexp.MatchString(
+		"(no inbound stream connection|connection reset by peer|connection refused|failed to send RPC|rpc error: code = Unavailable|EOF|result is ambiguous)",
+		errString)
+	if merr != nil {
+		return false
 	}
-	return &pgErr
+	return matched
 }

@@ -4,9 +4,18 @@ package main
 
 import "strconv"
 
-const _tpchBench_name = "sql20"
+func _() {
+	// An "invalid array index" compiler error signifies that the constant values have changed.
+	// Re-run the stringer command to generate them again.
+	var x [1]struct{}
+	_ = x[sql20-0]
+	_ = x[tpch-1]
+	_ = x[tpchVec-2]
+}
 
-var _tpchBench_index = [...]uint8{0, 5}
+const _tpchBench_name = "sql20tpchtpchVec"
+
+var _tpchBench_index = [...]uint8{0, 5, 9, 16}
 
 func (i tpchBench) String() string {
 	if i < 0 || i >= tpchBench(len(_tpchBench_index)-1) {

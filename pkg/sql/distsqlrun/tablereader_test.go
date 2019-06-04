@@ -255,7 +255,7 @@ ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1), (ARRAY[1], 2), (ARRAY[
 		}
 
 		var res sqlbase.EncDatumRows
-		var metas []*ProducerMetadata
+		var metas []*distsqlpb.ProducerMetadata
 		for {
 			row, meta := results.Next()
 			if meta != nil {
@@ -310,11 +310,6 @@ func TestLimitScans(t *testing.T) {
 		"num INT PRIMARY KEY",
 		100, /* numRows */
 		sqlutils.ToRowFn(sqlutils.RowIdxFn))
-
-	// Prevent the merge queue from immediately discarding our splits.
-	if _, err := sqlDB.Exec("SET CLUSTER SETTING kv.range_merge.queue_enabled = false"); err != nil {
-		t.Fatal(err)
-	}
 
 	if _, err := sqlDB.Exec("ALTER TABLE t SPLIT AT VALUES (5)"); err != nil {
 		t.Fatal(err)

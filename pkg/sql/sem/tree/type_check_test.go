@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 )
 
@@ -88,6 +88,10 @@ func TestTypeCheck(t *testing.T) {
 		{`ARRAY['a', 'b', 'c']`, `ARRAY['a':::STRING, 'b':::STRING, 'c':::STRING]`},
 		{`ARRAY[1.5, 2.5, 3.5]`, `ARRAY[1.5:::DECIMAL, 2.5:::DECIMAL, 3.5:::DECIMAL]`},
 		{`ARRAY[NULL]`, `ARRAY[NULL]`},
+		{`ARRAY[NULL]:::int[]`, `ARRAY[NULL]`},
+		{`ARRAY[NULL, NULL]:::int[]`, `ARRAY[NULL, NULL]`},
+		{`ARRAY[]::INT8[]`, `ARRAY[]::INT8[]`},
+		{`ARRAY[]:::INT8[]`, `ARRAY[]`},
 		{`1 = ANY ARRAY[1.5, 2.5, 3.5]`, `1:::DECIMAL = ANY ARRAY[1.5:::DECIMAL, 2.5:::DECIMAL, 3.5:::DECIMAL]`},
 		{`true = SOME (ARRAY[true, false])`, `true = SOME ARRAY[true, false]`},
 		{`1.3 = ALL ARRAY[1, 2, 3]`, `1.3:::DECIMAL = ALL ARRAY[1:::DECIMAL, 2:::DECIMAL, 3:::DECIMAL]`},
@@ -232,8 +236,8 @@ func TestTypeCheckError(t *testing.T) {
 		{`ANNOTATE_TYPE('a', int)`, `could not parse "a" as type int`},
 		{`ANNOTATE_TYPE(ANNOTATE_TYPE(1, int8), decimal)`, `incompatible type annotation for ANNOTATE_TYPE(1, INT8) as decimal, found type: int`},
 		{`3:::int[]`, `incompatible type annotation for 3 as int[], found type: int`},
-		{`B'1001'::decimal`, `invalid cast: varbit -> DECIMAL`},
-		{`101.3::bit`, `invalid cast: decimal -> BIT`},
+		{`B'1001'::decimal`, `invalid cast: varbit -> decimal`},
+		{`101.3::bit`, `invalid cast: decimal -> bit`},
 		{
 			`((1,2) AS a)`,
 			`mismatch in tuple definition: 2 expressions, 1 labels`,

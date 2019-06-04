@@ -15,13 +15,12 @@
 package optbuilder
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // analyzeOrderBy analyzes an Ordering physical property from the ORDER BY
@@ -94,7 +93,8 @@ func (b *Builder) findIndexByName(table cat.Table, name tree.UnrestrictedName) (
 		}
 	}
 
-	return nil, fmt.Errorf(`index %q not found`, name)
+	return nil, pgerror.Newf(pgerror.CodeUndefinedObjectError,
+		`index %q not found`, name)
 }
 
 // addExtraColumn builds extraCol.expr as a column in extraColsScope; if it is
@@ -128,7 +128,7 @@ func (b *Builder) analyzeOrderByIndex(
 		// Columns which are indexable are always orderable.
 		col := index.Column(i)
 		if err != nil {
-			panic(err)
+			panic(builderError{err})
 		}
 
 		desc := col.Descending
@@ -251,7 +251,11 @@ func (b *Builder) analyzeExtraArgument(
 }
 
 func ensureColumnOrderable(e tree.TypedExpr) {
-	if _, ok := e.ResolvedType().(types.TArray); ok || e.ResolvedType() == types.JSON {
-		panic(unimplementedf("can't order by column type %s", e.ResolvedType()))
+	typ := e.ResolvedType()
+	if typ.Family() == types.ArrayFamily {
+		panic(unimplementedWithIssueDetailf(32707, "", "can't order by column type %s", typ))
+	}
+	if typ.Family() == types.JsonFamily {
+		panic(unimplementedWithIssueDetailf(32706, "", "can't order by column type jsonb"))
 	}
 }

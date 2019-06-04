@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/pkg/errors"
 )
@@ -64,7 +64,7 @@ type AnalyzeExprFunction func(
 	raw tree.Expr,
 	sources MultiSourceInfo,
 	iVarHelper tree.IndexedVarHelper,
-	expectedType types.T,
+	expectedType *types.T,
 	requireType bool,
 	typingContext string,
 ) (tree.TypedExpr, error)
@@ -74,7 +74,7 @@ type AnalyzeExprFunction func(
 func NewEvalCheckHelper(
 	ctx context.Context, analyzeExpr AnalyzeExprFunction, tableDesc *ImmutableTableDescriptor,
 ) (*CheckHelper, error) {
-	if len(tableDesc.AllChecks()) == 0 {
+	if len(tableDesc.ActiveChecks()) == 0 {
 		return nil, nil
 	}
 
@@ -85,9 +85,9 @@ func NewEvalCheckHelper(
 		ResultColumnsFromColDescs(tableDesc.Columns),
 	)
 
-	c.Exprs = make([]tree.TypedExpr, len(tableDesc.AllChecks()))
-	exprStrings := make([]string, len(tableDesc.AllChecks()))
-	for i, check := range tableDesc.AllChecks() {
+	c.Exprs = make([]tree.TypedExpr, len(tableDesc.ActiveChecks()))
+	exprStrings := make([]string, len(tableDesc.ActiveChecks()))
+	for i, check := range tableDesc.ActiveChecks() {
 		exprStrings[i] = check.Expr
 	}
 	exprs, err := parser.ParseExprs(exprStrings)
@@ -176,7 +176,7 @@ func (c *CheckHelper) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum
 }
 
 // IndexedVarResolvedType implements the tree.IndexedVarContainer interface.
-func (c *CheckHelper) IndexedVarResolvedType(idx int) types.T {
+func (c *CheckHelper) IndexedVarResolvedType(idx int) *types.T {
 	return c.sourceInfo.SourceColumns[idx].Typ
 }
 
@@ -197,7 +197,7 @@ func (c *CheckHelper) CheckEval(ctx *tree.EvalContext) error {
 			return err
 		} else if !res && d != tree.DNull {
 			// Failed to satisfy CHECK constraint.
-			return pgerror.NewErrorf(pgerror.CodeCheckViolationError,
+			return pgerror.Newf(pgerror.CodeCheckViolationError,
 				"failed to satisfy CHECK constraint (%s)", expr)
 		}
 	}
@@ -209,11 +209,11 @@ func (c *CheckHelper) CheckEval(ctx *tree.EvalContext) error {
 // CheckInput reports a constraint violation error.
 func (c *CheckHelper) CheckInput(checkVals tree.Datums) error {
 	if len(checkVals) != c.checkSet.Len() {
-		return pgerror.NewAssertionErrorf(
+		return pgerror.AssertionFailedf(
 			"mismatched check constraint columns: expected %d, got %d", c.checkSet.Len(), len(checkVals))
 	}
 
-	for i, check := range c.tableDesc.AllChecks() {
+	for i, check := range c.tableDesc.ActiveChecks() {
 		if !c.checkSet.Contains(i) {
 			continue
 		}
@@ -222,7 +222,7 @@ func (c *CheckHelper) CheckInput(checkVals tree.Datums) error {
 			return err
 		} else if !res && checkVals[i] != tree.DNull {
 			// Failed to satisfy CHECK constraint.
-			return pgerror.NewErrorf(pgerror.CodeCheckViolationError,
+			return pgerror.Newf(pgerror.CodeCheckViolationError,
 				"failed to satisfy CHECK constraint (%s)", check.Expr)
 		}
 	}

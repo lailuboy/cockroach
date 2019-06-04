@@ -13,12 +13,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -32,11 +33,11 @@ const (
 	changeFrontierProcName   = `changefntr`
 )
 
-var changefeedResultTypes = []sqlbase.ColumnType{
-	{SemanticType: sqlbase.ColumnType_BYTES},  // resolved span
-	{SemanticType: sqlbase.ColumnType_STRING}, // topic
-	{SemanticType: sqlbase.ColumnType_BYTES},  // key
-	{SemanticType: sqlbase.ColumnType_BYTES},  // value
+var changefeedResultTypes = []types.T{
+	*types.Bytes,  // resolved span
+	*types.String, // topic
+	*types.Bytes,  // key
+	*types.Bytes,  // value
 }
 
 // distChangefeedFlow plans and runs a distributed changefeed.
@@ -71,6 +72,13 @@ func distChangefeedFlow(
 		return err
 	}
 
+	execCfg := phs.ExecCfg()
+	if PushEnabled.Get(&execCfg.Settings.SV) {
+		telemetry.Count(`changefeed.run.push.enabled`)
+	} else {
+		telemetry.Count(`changefeed.run.push.disabled`)
+	}
+
 	spansTS := details.StatementTime
 	var initialHighWater hlc.Timestamp
 	if h := progress.GetHighWater(); h != nil && *h != (hlc.Timestamp{}) {
@@ -80,7 +88,6 @@ func distChangefeedFlow(
 		spansTS = initialHighWater
 	}
 
-	execCfg := phs.ExecCfg()
 	trackedSpans, err := fetchSpansForTargets(ctx, execCfg.DB, details.Targets, spansTS)
 	if err != nil {
 		return err

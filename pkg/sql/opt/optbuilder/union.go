@@ -15,13 +15,11 @@
 package optbuilder
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // buildUnion builds a set of memo groups that represent the given union
@@ -30,7 +28,7 @@ import (
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
 func (b *Builder) buildUnion(
-	clause *tree.UnionClause, desiredTypes []types.T, inScope *scope,
+	clause *tree.UnionClause, desiredTypes []*types.T, inScope *scope,
 ) (outScope *scope) {
 	leftScope := b.buildSelect(clause.Left, desiredTypes, inScope)
 	rightScope := b.buildSelect(clause.Right, desiredTypes, inScope)
@@ -41,15 +39,14 @@ func (b *Builder) buildUnion(
 
 	// Check that the number of columns matches.
 	if len(leftScope.cols) != len(rightScope.cols) {
-		panic(builderError{pgerror.NewErrorf(
+		panic(pgerror.Newf(
 			pgerror.CodeSyntaxError,
 			"each %v query must have the same number of columns: %d vs %d",
 			clause.Type, len(leftScope.cols), len(rightScope.cols),
-		)})
+		))
 	}
 
 	outScope = inScope.push()
-	outScope.appendColumnsFromScope(leftScope)
 
 	// newColsNeeded indicates whether or not we need to synthesize output
 	// columns. This is always required for a UNION, because the output columns
@@ -57,20 +54,20 @@ func (b *Builder) buildUnion(
 	// synthesize new columns to contain these values. This is not necessary for
 	// INTERSECT or EXCEPT, since these operations are basically filters on the
 	// left relation.
-	//
-	// Another benefit to synthesizing new columns is to handle the case
-	// when the type of one of the columns in the left relation is unknown, but
-	// the type of the matching column in the right relation is known.
+	newColsNeeded := clause.Type == tree.UnionOp
+	if newColsNeeded {
+		outScope.cols = make([]scopeColumn, 0, len(leftScope.cols))
+	}
+
+	// propagateTypesLeft/propagateTypesRight indicate whether we need to wrap
+	// the left/right side in a projection to cast some of the columns to the
+	// correct type.
 	// For example:
 	//   SELECT NULL UNION SELECT 1
 	// The type of NULL is unknown, and the type of 1 is int. We need to
-	// synthesize a new column so the output column will have the correct type.
-	newColsNeeded := clause.Type == tree.UnionOp
-	if newColsNeeded {
-		// Create a new scope to hold the new synthesized columns.
-		outScope = outScope.push()
-		outScope.cols = make([]scopeColumn, 0, len(leftScope.cols))
-	}
+	// wrap the left side in a project operation with a Cast expression so the
+	// output column will have the correct type.
+	var propagateTypesLeft, propagateTypesRight bool
 
 	// Build map from left columns to right columns.
 	for i := range leftScope.cols {
@@ -79,25 +76,40 @@ func (b *Builder) buildUnion(
 		// TODO(dan): This currently checks whether the types are exactly the same,
 		// but Postgres is more lenient:
 		// http://www.postgresql.org/docs/9.5/static/typeconv-union-case.html.
-		if !(l.typ.Equivalent(r.typ) || l.typ == types.Unknown || r.typ == types.Unknown) {
-			panic(builderError{pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
-				"%v types %s and %s cannot be matched", clause.Type, l.typ, r.typ)})
+		if !(l.typ.Equivalent(r.typ) ||
+			l.typ.Family() == types.UnknownFamily ||
+			r.typ.Family() == types.UnknownFamily) {
+			panic(pgerror.Newf(pgerror.CodeDatatypeMismatchError,
+				"%v types %s and %s cannot be matched", clause.Type, l.typ, r.typ))
 		}
 		if l.hidden != r.hidden {
 			// This should never happen.
-			panic(fmt.Errorf("%v types cannot be matched", clause.Type))
+			panic(pgerror.AssertionFailedf("%v types cannot be matched", clause.Type))
+		}
+
+		var typ *types.T
+		if l.typ.Family() != types.UnknownFamily {
+			typ = l.typ
+			if r.typ.Family() == types.UnknownFamily {
+				propagateTypesRight = true
+			}
+		} else {
+			typ = r.typ
+			if r.typ.Family() != types.UnknownFamily {
+				propagateTypesLeft = true
+			}
 		}
 
 		if newColsNeeded {
-			var typ types.T
-			if l.typ != types.Unknown {
-				typ = l.typ
-			} else {
-				typ = r.typ
-			}
-
 			b.synthesizeColumn(outScope, string(l.name), typ, nil, nil /* scalar */)
 		}
+	}
+
+	if propagateTypesLeft {
+		leftScope = b.propagateTypes(leftScope, rightScope)
+	}
+	if propagateTypesRight {
+		rightScope = b.propagateTypes(rightScope, leftScope)
 	}
 
 	// Create the mapping between the left-side columns, right-side columns and
@@ -108,6 +120,7 @@ func (b *Builder) buildUnion(
 	if newColsNeeded {
 		newCols = colsToColList(outScope.cols)
 	} else {
+		outScope.appendColumnsFromScope(leftScope)
 		newCols = leftCols
 	}
 
@@ -136,4 +149,32 @@ func (b *Builder) buildUnion(
 	}
 
 	return outScope
+}
+
+// propagateTypes propagates the types of the source columns to the destination
+// columns by wrapping the destination in a Project operation. The Project
+// operation passes through columns that already have the correct type, and
+// creates cast expressions for those that don't.
+func (b *Builder) propagateTypes(dst, src *scope) *scope {
+	expr := dst.expr.(memo.RelExpr)
+	dstCols := dst.cols
+
+	dst = dst.push()
+	dst.cols = make([]scopeColumn, 0, len(dstCols))
+
+	for i := 0; i < len(dstCols); i++ {
+		dstType := dstCols[i].typ
+		srcType := src.cols[i].typ
+		if dstType.Family() == types.UnknownFamily && srcType.Family() != types.UnknownFamily {
+			// Create a new column which casts the old column to the correct type.
+			castExpr := b.factory.ConstructCast(b.factory.ConstructVariable(dstCols[i].id), srcType)
+			b.synthesizeColumn(dst, string(dstCols[i].name), srcType, nil /* expr */, castExpr)
+		} else {
+			// The column is already the correct type, so add it as a passthrough
+			// column.
+			dst.appendColumn(&dstCols[i])
+		}
+	}
+	dst.expr = b.constructProject(expr, dst.cols)
+	return dst
 }

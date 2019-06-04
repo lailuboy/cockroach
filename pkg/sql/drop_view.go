@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -38,7 +39,7 @@ func (p *planner) DropView(ctx context.Context, n *tree.DropView) (planNode, err
 	td := make([]toDelete, 0, len(n.Names))
 	for i := range n.Names {
 		tn := &n.Names[i]
-		droppedDesc, err := p.prepareDrop(ctx, tn, !n.IfExists, requireViewDesc)
+		droppedDesc, err := p.prepareDrop(ctx, tn, !n.IfExists, ResolveRequireViewDesc)
 		if err != nil {
 			return nil, err
 		}
@@ -227,7 +228,8 @@ func (p *planner) getViewDescForCascade(
 	viewDesc, err := p.Tables().getMutableTableVersionByID(ctx, viewID, p.txn)
 	if err != nil {
 		log.Warningf(ctx, "unable to retrieve descriptor for view %d: %v", viewID, err)
-		return nil, errors.Wrapf(err, "error resolving dependent view ID %d", viewID)
+		return nil, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+			"error resolving dependent view ID %d", viewID)
 	}
 	if behavior != tree.DropCascade {
 		viewName := viewDesc.Name

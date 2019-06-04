@@ -17,12 +17,13 @@ package rowcontainer
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
-	"github.com/pkg/errors"
 )
 
 // DiskRowContainer is a SortableRowContainer that stores rows on disk according
@@ -52,7 +53,7 @@ type DiskRowContainer struct {
 	rowID uint64
 
 	// types is the schema of rows in the container.
-	types []sqlbase.ColumnType
+	types []types.T
 	// ordering is the order in which rows should be sorted.
 	ordering sqlbase.ColumnOrdering
 	// encodings keeps around the DatumEncoding equivalents of the encoding
@@ -80,7 +81,7 @@ var _ SortableRowContainer = &DiskRowContainer{}
 // 	- e is the underlying store that rows are stored on.
 func MakeDiskRowContainer(
 	diskMonitor *mon.BytesMonitor,
-	types []sqlbase.ColumnType,
+	types []types.T,
 	ordering sqlbase.ColumnOrdering,
 	e diskmap.Factory,
 ) DiskRowContainer {
@@ -115,7 +116,7 @@ func MakeDiskRowContainer(
 		// returns true may not necessarily need to be encoded in the value, so
 		// make this more fine-grained. See IsComposite() methods in
 		// pkg/sql/parser/datum.go.
-		if _, ok := orderingIdxs[i]; !ok || sqlbase.HasCompositeKeyEncoding(d.types[i].SemanticType) {
+		if _, ok := orderingIdxs[i]; !ok || sqlbase.HasCompositeKeyEncoding(d.types[i].Family()) {
 			d.valueIdxs = append(d.valueIdxs, i)
 		}
 	}
@@ -162,7 +163,8 @@ func (d *DiskRowContainer) AddRow(ctx context.Context, row sqlbase.EncDatumRow) 
 	// mess with key decoding.
 	d.scratchKey = encoding.EncodeUvarintAscending(d.scratchKey, d.rowID)
 	if err := d.diskAcc.Grow(ctx, int64(len(d.scratchKey)+len(d.scratchVal))); err != nil {
-		return errors.Wrapf(err, "this query requires additional disk space")
+		return pgerror.Wrapf(err, pgerror.CodeOutOfMemoryError,
+			"this query requires additional disk space")
 	}
 	if err := d.bufferedRows.Put(d.scratchKey, d.scratchVal); err != nil {
 		return err
@@ -244,7 +246,7 @@ func (d *DiskRowContainer) Close(ctx context.Context) {
 func (d *DiskRowContainer) keyValToRow(k []byte, v []byte) (sqlbase.EncDatumRow, error) {
 	for i, orderInfo := range d.ordering {
 		// Types with composite key encodings are decoded from the value.
-		if sqlbase.HasCompositeKeyEncoding(d.types[orderInfo.ColIdx].SemanticType) {
+		if sqlbase.HasCompositeKeyEncoding(d.types[orderInfo.ColIdx].Family()) {
 			// Skip over the encoded key.
 			encLen, err := encoding.PeekLength(k)
 			if err != nil {
@@ -257,14 +259,16 @@ func (d *DiskRowContainer) keyValToRow(k []byte, v []byte) (sqlbase.EncDatumRow,
 		col := orderInfo.ColIdx
 		d.scratchEncRow[col], k, err = sqlbase.EncDatumFromBuffer(&d.types[col], d.encodings[i], k)
 		if err != nil {
-			return nil, errors.Wrap(err, "unable to decode row")
+			return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+				"unable to decode row, column idx %d", log.Safe(col))
 		}
 	}
 	for _, i := range d.valueIdxs {
 		var err error
 		d.scratchEncRow[i], v, err = sqlbase.EncDatumFromBuffer(&d.types[i], sqlbase.DatumEncoding_VALUE, v)
 		if err != nil {
-			return nil, errors.Wrap(err, "unable to decode row")
+			return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+				"unable to decode row, value idx %d", log.Safe(i))
 		}
 	}
 	return d.scratchEncRow, nil
@@ -298,9 +302,9 @@ func (d *DiskRowContainer) NewIterator(ctx context.Context) RowIterator {
 // until the next call to Row().
 func (r *diskRowIterator) Row() (sqlbase.EncDatumRow, error) {
 	if ok, err := r.Valid(); err != nil {
-		return nil, errors.Wrap(err, "unable to check row validity")
+		return nil, pgerror.NewAssertionErrorWithWrappedErrf(err, "unable to check row validity")
 	} else if !ok {
-		return nil, errors.New("invalid row")
+		return nil, pgerror.AssertionFailedf("invalid row")
 	}
 
 	return r.rowContainer.keyValToRow(r.Key(), r.Value())

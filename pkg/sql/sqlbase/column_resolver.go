@@ -71,19 +71,16 @@ func (r *ColumnResolver) FindSourceMatchingName(
 	srcMeta tree.ColumnSourceMeta,
 	err error,
 ) {
-	// log.VEventf(ctx, 2, "FindSourceMatchingName(%s) w/\n%s", tn, r.Sources.String())
-	// defer func() {
-	// 	log.VEventf(ctx, 2, "FindSourceMachingName(%s) -> %v %v %v %v",
-	// 		&tn, res, prefix, srcMeta, err)
-	// }()
 	found := false
 	for srcIdx, src := range r.Sources {
-		for colSetIdx, alias := range src.SourceAliases {
+		for colSetIdx := range src.SourceAliases {
+			alias := &src.SourceAliases[colSetIdx]
 			if !sourceNameMatches(&alias.Name, tn) {
 				continue
 			}
 			if found {
-				return tree.MoreThanOne, nil, nil, newAmbiguousSourceError(&tn)
+				tnAlloc := tn
+				return tree.MoreThanOne, nil, nil, newAmbiguousSourceError(&tnAlloc)
 			}
 			found = true
 			prefix = &alias.Name
@@ -104,11 +101,6 @@ const invalidSrcIdx = -1
 func (r *ColumnResolver) FindSourceProvidingColumn(
 	ctx context.Context, col tree.Name,
 ) (prefix *tree.TableName, srcMeta tree.ColumnSourceMeta, colHint int, err error) {
-	// log.VEventf(ctx, 2, "FindSourceProvidingColumn(%s) w/\n%s", col, r.Sources.String())
-	// defer func() {
-	// 	log.VEventf(ctx, 2, "FindSourceProvidingColumn(%s) -> %q %v %v %v",
-	// 		col, prefix, srcMeta, colHint, err)
-	// }()
 	colIdx := invalidColIdx
 	srcIdx := 0
 	colName := string(col)
@@ -150,7 +142,8 @@ func (r *ColumnResolver) FindSourceProvidingColumn(
 		}
 	}
 	if colIdx == invalidColIdx {
-		return nil, nil, -1, NewUndefinedColumnError(tree.ErrString(&col))
+		colAlloc := col
+		return nil, nil, -1, NewUndefinedColumnError(tree.ErrString(&colAlloc))
 	}
 	r.ResolverState.SrcIdx = srcIdx
 	r.ResolverState.ColIdx = colIdx
@@ -218,7 +211,7 @@ func (r *ColumnResolver) findColHelper(
 		// column expression from an UPDATE/DELETE.
 		if backfillThreshold := len(src.SourceColumns) - src.NumBackfillColumns; idx >= backfillThreshold && !r.ResolverState.ForUpdateOrDelete {
 			return invalidSrcIdx, invalidColIdx,
-				pgerror.NewErrorf(pgerror.CodeInvalidColumnReferenceError,
+				pgerror.Newf(pgerror.CodeInvalidColumnReferenceError,
 					"column %q is being backfilled", tree.ErrString(src.NodeFormatter(idx)))
 		}
 		if colIdx != invalidColIdx {
@@ -242,7 +235,7 @@ func (r *ColumnResolver) findColHelper(
 					sep = ", "
 				}
 			}
-			return invalidSrcIdx, invalidColIdx, pgerror.NewErrorf(pgerror.CodeAmbiguousColumnError,
+			return invalidSrcIdx, invalidColIdx, pgerror.Newf(pgerror.CodeAmbiguousColumnError,
 				"column reference %q is ambiguous (candidates: %s)", colString, msgBuf.String())
 		}
 		srcIdx = iSrc
@@ -253,11 +246,11 @@ func (r *ColumnResolver) findColHelper(
 
 func newAmbiguousSourceError(tn *tree.TableName) error {
 	if tn.Catalog() == "" {
-		return pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
+		return pgerror.Newf(pgerror.CodeAmbiguousAliasError,
 			"ambiguous source name: %q", tree.ErrString(tn))
 
 	}
-	return pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
+	return pgerror.Newf(pgerror.CodeAmbiguousAliasError,
 		"ambiguous source name: %q (within database %q)",
 		tree.ErrString(&tn.TableName), tree.ErrString(&tn.CatalogName))
 }

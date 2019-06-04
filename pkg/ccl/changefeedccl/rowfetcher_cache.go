@@ -52,7 +52,9 @@ func (c *rowFetcherCache) TableDescForKey(
 		// own caching.
 		tableDesc, _, err = c.leaseMgr.Acquire(ctx, ts, tableID)
 		if err != nil {
-			return nil, err
+			// LeaseManager can return all kinds of errors during chaos, but based on
+			// its usage, none of them should ever be terminal.
+			return nil, MarkRetryableError(err)
 		}
 		// Immediately release the lease, since we only need it for the exact
 		// timestamp requested.
@@ -89,8 +91,8 @@ func (c *rowFetcherCache) RowFetcherForTableDesc(
 	// TODO(dan): Allow for decoding a subset of the columns.
 	colIdxMap := make(map[sqlbase.ColumnID]int)
 	var valNeededForCol util.FastIntSet
-	for colIdx, col := range tableDesc.Columns {
-		colIdxMap[col.ID] = colIdx
+	for colIdx := range tableDesc.Columns {
+		colIdxMap[tableDesc.Columns[colIdx].ID] = colIdx
 		valNeededForCol.Add(colIdx)
 	}
 

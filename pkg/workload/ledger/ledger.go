@@ -23,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 )
@@ -33,7 +34,6 @@ type ledger struct {
 
 	seed              int64
 	customers         int
-	parallelStmts     bool
 	interleaved       bool
 	inlineArgs        bool
 	splits            int
@@ -44,7 +44,7 @@ type ledger struct {
 	txs  []tx
 	deck []int // contains indexes into the txs slice
 
-	reg      *workload.HistogramRegistry
+	reg      *histogram.Registry
 	rngPool  *sync.Pool
 	hashPool *sync.Pool
 }
@@ -63,7 +63,6 @@ var ledgerMeta = workload.Meta{
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		g.flags.Int64Var(&g.seed, `seed`, 1, `Random number generator seed`)
 		g.flags.IntVar(&g.customers, `customers`, 1000, `Number of customers`)
-		g.flags.BoolVar(&g.parallelStmts, `parallel-stmts`, false, `Use parallel statement execution`)
 		g.flags.BoolVar(&g.interleaved, `interleaved`, false, `Use interleaved tables`)
 		g.flags.BoolVar(&g.inlineArgs, `inline-args`, false, `Use inline query arguments`)
 		g.flags.IntVar(&g.splits, `splits`, 0, `Number of splits to perform before starting normal operations`)
@@ -131,8 +130,9 @@ func (w *ledger) Tables() []workload.Table {
 	customer := workload.Table{
 		Name:   `customer`,
 		Schema: ledgerCustomerSchema,
-		InitialRows: workload.Tuples(
+		InitialRows: workload.TypedTuples(
 			w.customers,
+			ledgerCustomerColTypes,
 			w.ledgerCustomerInitialRow,
 		),
 		Splits: workload.Tuples(
@@ -143,8 +143,9 @@ func (w *ledger) Tables() []workload.Table {
 	transaction := workload.Table{
 		Name:   `transaction`,
 		Schema: ledgerTransactionSchema,
-		InitialRows: workload.Tuples(
+		InitialRows: workload.TypedTuples(
 			numTxnsPerCustomer*w.customers,
+			ledgerTransactionColTypes,
 			w.ledgerTransactionInitialRow,
 		),
 		Splits: workload.Tuples(
@@ -182,7 +183,7 @@ func (w *ledger) Tables() []workload.Table {
 }
 
 // Ops implements the Opser interface.
-func (w *ledger) Ops(urls []string, reg *workload.HistogramRegistry) (workload.QueryLoad, error) {
+func (w *ledger) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
 	if err != nil {
 		return workload.QueryLoad{}, err

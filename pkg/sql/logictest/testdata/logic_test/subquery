@@ -1,4 +1,4 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata
+# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata
 
 # Tests for subqueries (SELECT statements which are part of a bigger statement).
 
@@ -157,10 +157,6 @@ CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
 statement ok
 INSERT INTO abc VALUES (1, 2, 3), (4, 5, 6)
 
-# Prevent the merge queue from immediately discarding our splits.
-statement ok
-SET CLUSTER SETTING kv.range_merge.queue_enabled = false;
-
 statement ok
 ALTER TABLE abc SPLIT AT VALUES ((SELECT 1))
 
@@ -201,7 +197,7 @@ SELECT * FROM abc WHERE a = 7
 ----
 7 8 9
 
-statement error value type tuple{int, int, int} doesn't match type INT8 of column "a"
+statement error value type tuple{int, int, int} doesn't match type int of column "a"
 INSERT INTO abc VALUES ((SELECT (10, 11, 12)))
 
 statement error subquery must return only one column, found 3
@@ -234,7 +230,7 @@ SELECT * FROM xyz
 7 8 10
 10 11 12
 
-statement error value type tuple{int, int} doesn't match type INT8 of column "z"
+statement error value type tuple{int, int} doesn't match type int of column "z"
 UPDATE xyz SET z = (SELECT (10, 11)) WHERE x = 7
 
 # HP and CBO return slightly different (but reasonable) errors, so accept both.

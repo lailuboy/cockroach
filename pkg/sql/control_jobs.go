@@ -20,8 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 type controlJobsNode struct {
@@ -37,17 +36,19 @@ var jobCommandToDesiredStatus = map[tree.JobCommand]jobs.Status{
 }
 
 func (p *planner) ControlJobs(ctx context.Context, n *tree.ControlJobs) (planNode, error) {
-	rows, err := p.newPlan(ctx, n.Jobs, []types.T{types.Int})
+	rows, err := p.newPlan(ctx, n.Jobs, []*types.T{types.Int})
 	if err != nil {
 		return nil, err
 	}
 	cols := planColumns(rows)
 	if len(cols) != 1 {
-		return nil, errors.Errorf("%s JOBS expects a single column source, got %d columns",
+		return nil, pgerror.Newf(pgerror.CodeSyntaxError,
+			"%s JOBS expects a single column source, got %d columns",
 			tree.JobCommandToStatement[n.Command], len(cols))
 	}
-	if !cols[0].Typ.Equivalent(types.Int) {
-		return nil, errors.Errorf("%s JOBS requires int values, not type %s",
+	if cols[0].Typ.Family() != types.IntFamily {
+		return nil, pgerror.Newf(pgerror.CodeDatatypeMismatchError,
+			"%s JOBS requires int values, not type %s",
 			tree.JobCommandToStatement[n.Command], cols[0].Typ)
 	}
 
@@ -80,7 +81,7 @@ func (n *controlJobsNode) startExec(params runParams) error {
 
 		jobID, ok := tree.AsDInt(jobIDDatum)
 		if !ok {
-			return pgerror.NewAssertionErrorf("%q: expected *DInt, found %T", jobIDDatum, jobIDDatum)
+			return pgerror.AssertionFailedf("%q: expected *DInt, found %T", jobIDDatum, jobIDDatum)
 		}
 
 		switch n.desiredStatus {
@@ -91,7 +92,7 @@ func (n *controlJobsNode) startExec(params runParams) error {
 		case jobs.StatusCanceled:
 			err = reg.Cancel(params.ctx, params.p.txn, int64(jobID))
 		default:
-			err = pgerror.NewAssertionErrorf("unhandled status %v", n.desiredStatus)
+			err = pgerror.AssertionFailedf("unhandled status %v", n.desiredStatus)
 		}
 		if err != nil {
 			return err

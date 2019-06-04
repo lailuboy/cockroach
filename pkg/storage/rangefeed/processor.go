@@ -75,6 +75,9 @@ type Config struct {
 	// CheckStreamsInterval specifies interval at which a Processor will check
 	// all streams to make sure they have not been canceled.
 	CheckStreamsInterval time.Duration
+
+	// Metrics is for production monitoring of RangeFeeds.
+	Metrics *Metrics
 }
 
 // SetDefaults initializes unset fields in Config to values
@@ -293,7 +296,8 @@ func (p *Processor) Start(stopper *stop.Stopper, rtsIter engine.SimpleIterator) 
 
 			// Exit on stopper.
 			case <-stopper.ShouldQuiesce():
-				p.reg.Disconnect(all)
+				pErr := roachpb.NewError(&roachpb.NodeUnavailableError{})
+				p.reg.DisconnectWithErr(all, pErr)
 				return
 			}
 		}
@@ -340,6 +344,9 @@ func (p *Processor) sendStop(pErr *roachpb.Error) {
 // The optionally provided "catch-up" iterator is used to read changes from the
 // engine which occurred after the provided start timestamp.
 //
+// If the method returns false, the processor will have been stopped, so calling
+// Stop is not necessary.
+//
 // NOT safe to call on nil Processor.
 func (p *Processor) Register(
 	span roachpb.RSpan,
@@ -347,27 +354,21 @@ func (p *Processor) Register(
 	catchupIter engine.SimpleIterator,
 	stream Stream,
 	errC chan<- *roachpb.Error,
-) {
+) bool {
 	// Synchronize the event channel so that this registration doesn't see any
 	// events that were consumed before this registration was called. Instead,
 	// it should see these events during its catch up scan.
 	p.syncEventC()
 
 	r := newRegistration(
-		span.AsRawSpanWithNoLocals(), startTS, catchupIter, p.Config.EventChanCap, stream, errC,
+		span.AsRawSpanWithNoLocals(), startTS, catchupIter, p.Config.EventChanCap,
+		p.Metrics, stream, errC,
 	)
 	select {
 	case p.regC <- r:
+		return true
 	case <-p.stoppedC:
-		if catchupIter != nil {
-			catchupIter.Close() // clean up
-		}
-		// errC has a capacity of 1. If it is already full, we don't need to send
-		// another error.
-		select {
-		case errC <- roachpb.NewErrorf("rangefeed processor closed"):
-		default:
-		}
+		return false
 	}
 }
 
@@ -452,11 +453,7 @@ func (p *Processor) sendEvent(e event, timeout time.Duration) bool {
 // setResolvedTSInitialized informs the Processor that its resolved timestamp has
 // all the information it needs to be considered initialized.
 func (p *Processor) setResolvedTSInitialized() {
-	select {
-	case p.eventC <- event{initRTS: true}:
-	case <-p.stoppedC:
-		// Already stopped. Do nothing.
-	}
+	p.sendEvent(event{initRTS: true}, 0 /* timeout */)
 }
 
 // syncEventC synchronizes access to the Processor goroutine, allowing the
@@ -520,6 +517,9 @@ func (p *Processor) consumeLogicalOps(ctx context.Context, ops []enginepb.MVCCLo
 			p.publishValue(ctx, t.Key, t.Timestamp, t.Value)
 
 		case *enginepb.MVCCAbortIntentOp:
+			// No updates to publish.
+
+		case *enginepb.MVCCAbortTxnOp:
 			// No updates to publish.
 
 		default:

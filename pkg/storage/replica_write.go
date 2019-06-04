@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
 )
 
 // executeWriteBatch is the entry point for client requests which may mutate the
@@ -38,31 +39,6 @@ import (
 // to allow commands which commute to be proposed in parallel. The naive
 // alternative, submitting requests to Raft one after another, paying massive
 // latency, is only taken for commands whose effects may overlap.
-//
-// Internally, multiple iterations of the above process may take place
-// due to the Raft proposal failing retryably, possibly due to proposal
-// reordering or re-proposals. We call these retry "re-evaluations" since the
-// request is evaluated again (against a fresh engine snapshot).
-func (r *Replica) executeWriteBatch(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, *roachpb.Error) {
-	for {
-		// TODO(andrei): export some metric about re-evaluations.
-		br, pErr, retry := r.tryExecuteWriteBatch(ctx, ba)
-		if retry == proposalIllegalLeaseIndex {
-			log.VEventf(ctx, 2, "retry: proposalIllegalLeaseIndex")
-			if pErr != nil {
-				log.Fatalf(ctx, "both error and retry returned: %s", pErr)
-			}
-			continue // retry
-		}
-		return br, pErr
-	}
-}
-
-// tryExecuteWriteBatch is invoked by executeWriteBatch, which will
-// call this method until it returns a non-retryable result (i.e. no
-// proposalRetryReason is returned).
 //
 // Concretely,
 //
@@ -87,18 +63,24 @@ func (r *Replica) executeWriteBatch(
 // NB: changing BatchRequest to a pointer here would have to be done cautiously
 // as this method makes the assumption that it operates on a shallow copy (see
 // call to applyTimestampCache).
-func (r *Replica) tryExecuteWriteBatch(
+func (r *Replica) executeWriteBatch(
 	ctx context.Context, ba roachpb.BatchRequest,
-) (br *roachpb.BatchResponse, pErr *roachpb.Error, retry proposalReevaluationReason) {
+) (br *roachpb.BatchResponse, pErr *roachpb.Error) {
 	startTime := timeutil.Now()
 
 	if err := r.maybeBackpressureWriteBatch(ctx, ba); err != nil {
-		return nil, roachpb.NewError(err), proposalNoReevaluation
+		return nil, roachpb.NewError(err)
+	}
+
+	// NB: must be performed before collecting request spans.
+	ba, err := maybeStripInFlightWrites(ba)
+	if err != nil {
+		return nil, roachpb.NewError(err)
 	}
 
 	spans, err := r.collectSpans(&ba)
 	if err != nil {
-		return nil, roachpb.NewError(err), proposalNoReevaluation
+		return nil, roachpb.NewError(err)
 	}
 
 	var endCmds *endCmds
@@ -111,7 +93,7 @@ func (r *Replica) tryExecuteWriteBatch(
 		var err error
 		endCmds, err = r.beginCmds(ctx, &ba, spans)
 		if err != nil {
-			return nil, roachpb.NewError(err), proposalNoReevaluation
+			return nil, roachpb.NewError(err)
 		}
 	}
 
@@ -119,7 +101,7 @@ func (r *Replica) tryExecuteWriteBatch(
 	// wrapped to delay pErr evaluation to its value when returning.
 	defer func() {
 		if endCmds != nil {
-			endCmds.done(br, pErr, retry)
+			endCmds.done(br, pErr)
 		}
 	}()
 
@@ -132,21 +114,21 @@ func (r *Replica) tryExecuteWriteBatch(
 		// Other write commands require that this replica has the range
 		// lease.
 		if status, pErr = r.redirectOnOrAcquireLease(ctx); pErr != nil {
-			return nil, pErr, proposalNoReevaluation
+			return nil, pErr
 		}
 		lease = status.Lease
 	}
 	r.limitTxnMaxTimestamp(ctx, &ba, status)
 
 	minTS, untrack := r.store.cfg.ClosedTimestamp.Tracker.Track(ctx)
-	defer untrack(ctx, 0, 0) // covers all error returns below
+	defer untrack(ctx, 0, 0, 0) // covers all error returns below
 
 	// Examine the read and write timestamp caches for preceding
 	// commands which require this command to move its timestamp
 	// forward. Or, in the case of a transactional write, the txn
 	// timestamp and possible write-too-old bool.
 	if bumped, pErr := r.applyTimestampCache(ctx, &ba, minTS); pErr != nil {
-		return nil, pErr, proposalNoReevaluation
+		return nil, pErr
 	} else if bumped {
 		// If we bump the transaction's timestamp, we must absolutely
 		// tell the client in a response transaction (for otherwise it
@@ -168,7 +150,7 @@ func (r *Replica) tryExecuteWriteBatch(
 
 	log.Event(ctx, "applied timestamp cache")
 
-	ch, tryAbandon, maxLeaseIndex, pErr := r.propose(ctx, lease, ba, endCmds, spans)
+	ch, tryAbandon, maxLeaseIndex, pErr := r.evalAndPropose(ctx, lease, ba, endCmds, spans)
 	if pErr != nil {
 		if maxLeaseIndex != 0 {
 			log.Fatalf(
@@ -176,12 +158,14 @@ func (r *Replica) tryExecuteWriteBatch(
 				maxLeaseIndex, ba, pErr,
 			)
 		}
-		return nil, pErr, proposalNoReevaluation
+		return nil, pErr
 	}
 	// A max lease index of zero is returned when no proposal was made or a lease was proposed.
-	// In both cases, we don't need to communicate a MLAI.
+	// In both cases, we don't need to communicate a MLAI. Furthermore, for lease proposals we
+	// cannot communicate under the lease's epoch. Instead the code calls EmitMLAI explicitly
+	// as a side effect of stepping up as leaseholder.
 	if maxLeaseIndex != 0 {
-		untrack(ctx, r.RangeID, ctpb.LAI(maxLeaseIndex))
+		untrack(ctx, ctpb.Epoch(lease.Epoch), r.RangeID, ctpb.LAI(maxLeaseIndex))
 	}
 
 	// After the command is proposed to Raft, invoking endCmds.done is now the
@@ -218,7 +202,7 @@ func (r *Replica) tryExecuteWriteBatch(
 					log.Warning(ctx, err)
 				}
 			}
-			return propResult.Reply, propResult.Err, propResult.ProposalRetry
+			return propResult.Reply, propResult.Err
 		case <-slowTimer.C:
 			slowTimer.Read = true
 			log.Warningf(ctx, `have been waiting %.2fs for proposing command %s.
@@ -242,11 +226,10 @@ and the following Raft status: %+v`,
 				r.store.metrics.SlowRaftRequests.Dec(1)
 				log.Infof(
 					ctx,
-					"slow command %s finished after %.2fs with error %v, retry %d",
+					"slow command %s finished after %.2fs with error %v",
 					ba,
 					timeutil.Since(tBegin).Seconds(),
 					pErr,
-					retry,
 				)
 			}()
 
@@ -259,7 +242,7 @@ and the following Raft status: %+v`,
 			if tryAbandon() {
 				log.VEventf(ctx, 2, "context cancellation after %0.1fs of attempting command %s",
 					timeutil.Since(startTime).Seconds(), ba)
-				return nil, roachpb.NewError(roachpb.NewAmbiguousResultError(ctx.Err().Error())), proposalNoReevaluation
+				return nil, roachpb.NewError(roachpb.NewAmbiguousResultError(ctx.Err().Error()))
 			}
 			ctxDone = nil
 		case <-shouldQuiesce:
@@ -272,7 +255,7 @@ and the following Raft status: %+v`,
 			if tryAbandon() {
 				log.VEventf(ctx, 2, "shutdown cancellation after %0.1fs of attempting command %s",
 					timeutil.Since(startTime).Seconds(), ba)
-				return nil, roachpb.NewError(roachpb.NewAmbiguousResultError("server shutdown")), proposalNoReevaluation
+				return nil, roachpb.NewError(roachpb.NewAmbiguousResultError("server shutdown"))
 			}
 			shouldQuiesce = nil
 		}
@@ -322,7 +305,7 @@ func (r *Replica) evaluateWriteBatch(
 			ctx, idKey, rec, &ms, strippedBa, spans, retryLocally,
 		)
 		if pErr == nil && (ba.Timestamp == br.Timestamp ||
-			(retryLocally && !batcheval.IsEndTransactionExceedingDeadline(br.Timestamp, *etArg))) {
+			(retryLocally && !batcheval.IsEndTransactionExceedingDeadline(br.Timestamp, etArg))) {
 			clonedTxn := ba.Txn.Clone()
 			clonedTxn.Status = roachpb.COMMITTED
 			// Make sure the returned txn has the actual commit
@@ -338,7 +321,7 @@ func (r *Replica) evaluateWriteBatch(
 				ms = enginepb.MVCCStats{}
 			} else {
 				// Run commit trigger manually.
-				innerResult, err := batcheval.RunCommitTrigger(ctx, rec, batch, &ms, *etArg, &clonedTxn)
+				innerResult, err := batcheval.RunCommitTrigger(ctx, rec, batch, &ms, etArg, clonedTxn)
 				if err != nil {
 					return batch, ms, br, res, roachpb.NewErrorf("failed to run commit trigger: %s", err)
 				}
@@ -347,7 +330,7 @@ func (r *Replica) evaluateWriteBatch(
 				}
 			}
 
-			br.Txn = &clonedTxn
+			br.Txn = clonedTxn
 			// Add placeholder responses for begin & end transaction requests.
 			var resps []roachpb.ResponseUnion
 			if hasBegin {
@@ -369,7 +352,7 @@ func (r *Replica) evaluateWriteBatch(
 			if pErr != nil {
 				return batch, ms, nil, result.Result{}, pErr
 			} else if ba.Timestamp != br.Timestamp {
-				err := roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN)
+				err := roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN, "Require1PC batch pushed")
 				return batch, ms, nil, result.Result{}, roachpb.NewError(err)
 			}
 			log.Fatal(ctx, "unreachable")
@@ -481,11 +464,149 @@ func isOnePhaseCommit(ba roachpb.BatchRequest, knobs *StoreTestingKnobs) bool {
 	}
 	arg, _ := ba.GetArg(roachpb.EndTransaction)
 	etArg := arg.(*roachpb.EndTransactionRequest)
-	if batcheval.IsEndTransactionExceedingDeadline(ba.Txn.Timestamp, *etArg) {
+	if batcheval.IsEndTransactionExceedingDeadline(ba.Txn.Timestamp, etArg) {
 		return false
 	}
-	if retry, _ := batcheval.IsEndTransactionTriggeringRetryError(ba.Txn, *etArg); retry {
+	if retry, _, _ := batcheval.IsEndTransactionTriggeringRetryError(ba.Txn, etArg); retry {
 		return false
 	}
 	return !knobs.DisableOptional1PC || etArg.Require1PC
+}
+
+// maybeStripInFlightWrites attempts to remove all point writes and query
+// intents that ended up in the same batch as an EndTransaction request from
+// that EndTransaction request's "in-flight" write set. The entire batch will
+// commit atomically, so there is no need to consider the writes in the same
+// batch concurrent.
+//
+// The transformation can lead to bypassing the STAGING state for a transaction
+// entirely. This is possible if the function removes all of the in-flight
+// writes from an EndTransaction request that was committing in parallel with
+// writes which all happened to be on the same range as the transaction record.
+func maybeStripInFlightWrites(ba roachpb.BatchRequest) (roachpb.BatchRequest, error) {
+	args, hasET := ba.GetArg(roachpb.EndTransaction)
+	if !hasET {
+		return ba, nil
+	}
+
+	et := args.(*roachpb.EndTransactionRequest)
+	otherReqs := ba.Requests[:len(ba.Requests)-1]
+	if !et.IsParallelCommit() || len(otherReqs) == 0 {
+		return ba, nil
+	}
+
+	// Clone the BatchRequest and the EndTransaction request before modifying
+	// it. We nil out the request's in-flight writes and make the intent spans
+	// immutable on append. Code below can use origET to recreate the in-flight
+	// write set if any elements remain in it.
+	origET := et
+	et = origET.ShallowCopy().(*roachpb.EndTransactionRequest)
+	et.InFlightWrites = nil
+	et.IntentSpans = et.IntentSpans[:len(et.IntentSpans):len(et.IntentSpans)] // immutable
+	ba.Requests = append([]roachpb.RequestUnion(nil), ba.Requests...)
+	ba.Requests[len(ba.Requests)-1].MustSetInner(et)
+
+	// Fast-path: If we know that this batch contains all of the transaction's
+	// in-flight writes, then we can avoid searching in the in-flight writes set
+	// for each request. Instead, we can blindly merge all in-flight writes into
+	// the intent spans and clear out the in-flight writes set.
+	if len(otherReqs) >= len(origET.InFlightWrites) {
+		writes := 0
+		for _, ru := range otherReqs {
+			req := ru.GetInner()
+			switch {
+			case roachpb.IsTransactionWrite(req) && !roachpb.IsRange(req):
+				// Concurrent point write.
+				writes++
+			case req.Method() == roachpb.QueryIntent:
+				// Earlier pipelined point write that hasn't been proven yet.
+				writes++
+			default:
+				// Ranged write or read. See below.
+			}
+		}
+		if len(origET.InFlightWrites) < writes {
+			return ba, errors.New("more write in batch with EndTransaction than listed in in-flight writes")
+		} else if len(origET.InFlightWrites) == writes {
+			et.IntentSpans = make([]roachpb.Span, len(origET.IntentSpans)+len(origET.InFlightWrites))
+			copy(et.IntentSpans, origET.IntentSpans)
+			for i, w := range origET.InFlightWrites {
+				et.IntentSpans[len(origET.IntentSpans)+i] = roachpb.Span{Key: w.Key}
+			}
+			// See below for why we set Header.DistinctSpans here.
+			et.IntentSpans, ba.Header.DistinctSpans = roachpb.MergeSpans(et.IntentSpans)
+			return ba, nil
+		}
+	}
+
+	// Slow-path: If not then we remove each transaction write in the batch from
+	// the in-flight write set and merge it into the intent spans.
+	copiedTo := 0
+	for _, ru := range otherReqs {
+		req := ru.GetInner()
+		seq := req.Header().Sequence
+		switch {
+		case roachpb.IsTransactionWrite(req) && !roachpb.IsRange(req):
+			// Concurrent point write.
+		case req.Method() == roachpb.QueryIntent:
+			// Earlier pipelined point write that hasn't been proven yet. We
+			// could remove from the in-flight writes set when we see these,
+			// but doing so would prevent us from using the optimization we
+			// have below where we rely on increasing sequence numbers for
+			// each subsequent request.
+			//
+			// We already don't intend on sending QueryIntent requests in the
+			// same batch as EndTransaction requests because doing so causes
+			// a pipeline stall, so this doesn't seem worthwhile to support.
+			continue
+		default:
+			// Ranged write or read. These can make it into the final batch with
+			// a parallel committing EndTransaction request if the entire batch
+			// issued by DistSender lands on the same range. Skip.
+			continue
+		}
+
+		// Remove the write from the in-flight writes set. We only need to
+		// search from after the previously removed sequence number forward
+		// because both the InFlightWrites and the Requests in the batch are
+		// stored in increasing sequence order.
+		//
+		// Maintaining an iterator into the in-flight writes slice and scanning
+		// instead of performing a binary search on each request changes the
+		// complexity of this loop from O(n*log(m)) to O(m) where n is the
+		// number of point writes in the batch and m is the number of in-flight
+		// writes. These complexities aren't directly comparable, but copying
+		// all unstripped writes back into et.InFlightWrites is already O(m),
+		// so the approach here was preferred over repeat binary searches.
+		match := -1
+		for i, w := range origET.InFlightWrites[copiedTo:] {
+			if w.Sequence == seq {
+				match = i + copiedTo
+				break
+			}
+		}
+		if match == -1 {
+			return ba, errors.New("write in batch with EndTransaction missing from in-flight writes")
+		}
+		w := origET.InFlightWrites[match]
+		notInBa := origET.InFlightWrites[copiedTo:match]
+		et.InFlightWrites = append(et.InFlightWrites, notInBa...)
+		copiedTo = match + 1
+
+		// Move the write to the intent spans set since it's
+		// no longer being tracked in the in-flight write set.
+		et.IntentSpans = append(et.IntentSpans, roachpb.Span{Key: w.Key})
+	}
+	if et != origET {
+		// Finish building up the remaining in-flight writes.
+		notInBa := origET.InFlightWrites[copiedTo:]
+		et.InFlightWrites = append(et.InFlightWrites, notInBa...)
+		// Re-sort and merge the intent spans. We can set the batch request's
+		// DistinctSpans flag based on whether any of in-flight writes in this
+		// batch overlap with each other. This will have (rare) false negatives
+		// when the in-flight writes overlap with existing intent spans, but
+		// never false positives.
+		et.IntentSpans, ba.Header.DistinctSpans = roachpb.MergeSpans(et.IntentSpans)
+	}
+	return ba, nil
 }

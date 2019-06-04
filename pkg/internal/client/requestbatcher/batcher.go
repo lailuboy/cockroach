@@ -35,6 +35,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
@@ -81,7 +82,7 @@ import (
 
 // TODO(ajwerner): Consider a more general purpose interface for this package.
 // While several interface-oriented interfaces have been explored they all felt
-// heavy and allocation intensive
+// heavy and allocation intensive.
 
 // TODO(ajwerner): Consider providing an interface which enables a single
 // goroutine to dispatch a number of requests destined for different ranges to
@@ -95,7 +96,7 @@ import (
 // Config contains the dependencies and configuration for a Batcher.
 type Config struct {
 
-	// Name of the batcher, used for logging and stopper.
+	// Name of the batcher, used for logging, timeout errors, and the stopper.
 	Name string
 
 	// Sender can round-trip a batch. Sender must not be nil.
@@ -164,6 +165,10 @@ type RequestBatcher struct {
 	pool pool
 	cfg  Config
 
+	// sendBatchOpName is the string passed to contextutil.RunWithTimeout when
+	// sending a batch.
+	sendBatchOpName string
+
 	batches batchQueue
 
 	requestChan  chan *request
@@ -187,6 +192,7 @@ func New(cfg Config) *RequestBatcher {
 		requestChan:  make(chan *request),
 		sendDoneChan: make(chan struct{}),
 	}
+	b.sendBatchOpName = b.cfg.Name + ".sendBatch"
 	if err := cfg.Stopper.RunAsyncTask(context.Background(), b.cfg.Name, b.run); err != nil {
 		panic(err)
 	}
@@ -226,7 +232,8 @@ func (b *RequestBatcher) SendWithChan(
 }
 
 // Send sends req as a part of a batch. An error is returned if the context
-// is canceled before the sending of the request completes.
+// is canceled before the sending of the request completes. The context with
+// the latest deadline for a batch is used to send the underlying batch request.
 func (b *RequestBatcher) Send(
 	ctx context.Context, rangeID roachpb.RangeID, req roachpb.Request,
 ) (roachpb.Response, error) {
@@ -247,7 +254,8 @@ func (b *RequestBatcher) Send(
 	}
 }
 
-func (b *RequestBatcher) sendDone() {
+func (b *RequestBatcher) sendDone(ba *batch) {
+	b.pool.putBatch(ba)
 	select {
 	case b.sendDoneChan <- struct{}{}:
 	case <-b.cfg.Stopper.ShouldQuiesce():
@@ -255,16 +263,31 @@ func (b *RequestBatcher) sendDone() {
 }
 
 func (b *RequestBatcher) sendBatch(ctx context.Context, ba *batch) {
+	var br *roachpb.BatchResponse
+	send := func(ctx context.Context) error {
+		var pErr *roachpb.Error
+		if br, pErr = b.cfg.Sender.Send(ctx, ba.batchRequest()); pErr != nil {
+			return pErr.GoError()
+		}
+		return nil
+	}
+	if !ba.sendDeadline.IsZero() {
+		actualSend := send
+		send = func(context.Context) error {
+			return contextutil.RunWithTimeout(
+				ctx, b.sendBatchOpName, timeutil.Until(ba.sendDeadline), actualSend)
+		}
+	}
 	b.cfg.Stopper.RunWorker(ctx, func(ctx context.Context) {
-		defer b.sendDone()
-		resp, pErr := b.cfg.Sender.Send(ctx, ba.batchRequest())
+		defer b.sendDone(ba)
+		err := send(ctx)
 		for i, r := range ba.reqs {
 			res := Response{}
-			if resp != nil && i < len(resp.Responses) {
-				res.Resp = resp.Responses[i].GetInner()
+			if br != nil && i < len(br.Responses) {
+				res.Resp = br.Responses[i].GetInner()
 			}
-			if pErr != nil {
-				res.Err = pErr.GoError()
+			if err != nil {
+				res.Err = err
 			}
 			b.sendResponse(r, res)
 		}
@@ -278,9 +301,23 @@ func (b *RequestBatcher) sendResponse(req *request, resp Response) {
 }
 
 func addRequestToBatch(cfg *Config, now time.Time, ba *batch, r *request) (shouldSend bool) {
+	// Update the deadline for the batch if this requests's deadline is later
+	// than the current latest.
+	rDeadline, rHasDeadline := r.ctx.Deadline()
+	// If this is the first request or
+	if len(ba.reqs) == 0 ||
+		// there are already requests and there is a deadline and
+		(len(ba.reqs) > 0 && !ba.sendDeadline.IsZero() &&
+			// this request either doesn't have a deadline or has a later deadline,
+			(!rHasDeadline || rDeadline.After(ba.sendDeadline))) {
+		// set the deadline to this request's deadline.
+		ba.sendDeadline = rDeadline
+	}
+
 	ba.reqs = append(ba.reqs, r)
 	ba.size += r.req.Size()
 	ba.lastUpdated = now
+
 	if cfg.MaxIdle > 0 {
 		ba.deadline = ba.lastUpdated.Add(cfg.MaxIdle)
 	}
@@ -359,7 +396,7 @@ func (b *RequestBatcher) run(ctx context.Context) {
 			if !deadline.Equal(nextDeadline) || timer.Read {
 				deadline = nextDeadline
 				if !deadline.IsZero() {
-					timer.Reset(time.Until(deadline))
+					timer.Reset(timeutil.Until(deadline))
 				} else {
 					// Clear the current timer due to a sole batch already sent before
 					// the timer fired.
@@ -401,11 +438,19 @@ type batch struct {
 	reqs []*request
 	size int // bytes
 
+	// sendDeadline is the latest deadline reported by a request's context.
+	// It will be zero valued if any request does not contain a deadline.
+	sendDeadline time.Time
+
 	// idx is the batch's index in the batchQueue.
 	idx int
 
-	deadline    time.Time
-	startTime   time.Time
+	// deadline is the time at which this batch should be sent according to the
+	// Batcher's configuration.
+	deadline time.Time
+	// startTime is the time at which the first request was added to the batch.
+	startTime time.Time
+	// lastUpdated is the latest time when a request was added to the batch.
 	lastUpdated time.Time
 }
 
@@ -482,6 +527,11 @@ func (p *pool) newBatch(now time.Time) *batch {
 		idx:       -1,
 	}
 	return ba
+}
+
+func (p *pool) putBatch(b *batch) {
+	*b = batch{}
+	p.batchPool.Put(b)
 }
 
 // batchQueue is a container for batch objects which offers O(1) get based on

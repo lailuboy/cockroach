@@ -54,9 +54,20 @@ var MergeQueueInterval = func() *settings.DurationSetting {
 		"how long the merge queue waits between processing replicas",
 		time.Second,
 	)
-	s.Hide()
+	s.SetSensitive()
 	return s
 }()
+
+// ManualSplitTTL is the amount of time that the merge queue will not consider
+// a manually split range for merging if it is nonzero. If ManualSplitTTL is
+// zero, then no manual splits are considered for automatic merging. If a range
+// is split in a LHS and a RHS, then the merge queue will not consider to merge
+// the RHS with the range to its left until ManualSplitTTL time has passed.
+var ManualSplitTTL = settings.RegisterNonNegativeDurationSetting(
+	"kv.range_merge.manual_split.ttl",
+	"if nonzero, manual splits older than this duration will be considered for automatic range merging",
+	0,
+)
 
 // mergeQueue manages a queue of ranges slated to be merged with their right-
 // hand neighbor.
@@ -268,9 +279,9 @@ func (mq *mergeQueue) process(
 		return nil
 	}
 
-	if !replicaSetsEqual(lhsDesc.Replicas, rhsDesc.Replicas) {
+	if !replicaSetsEqual(lhsDesc.Replicas().Unwrap(), rhsDesc.Replicas().Unwrap()) {
 		var targets []roachpb.ReplicationTarget
-		for _, lhsReplDesc := range lhsDesc.Replicas {
+		for _, lhsReplDesc := range lhsDesc.Replicas().Unwrap() {
 			targets = append(targets, roachpb.ReplicationTarget{
 				NodeID: lhsReplDesc.NodeID, StoreID: lhsReplDesc.StoreID,
 			})
@@ -289,6 +300,19 @@ func (mq *mergeQueue) process(
 		if err := mq.store.DB().AdminRelocateRange(ctx, rhsDesc.StartKey, targets); err != nil {
 			return err
 		}
+	}
+
+	// Range was manually split and not expired, so skip merging.
+	if rhsDesc.StickyBit != nil {
+		manualSplitTTL := ManualSplitTTL.Get(&mq.store.ClusterSettings().SV)
+		manualSplitExpired := manualSplitTTL != 0 && rhsDesc.StickyBit.GoTime().Add(manualSplitTTL).Before(mq.store.Clock().PhysicalTime())
+		if !manualSplitExpired {
+			log.VEventf(ctx, 2, "skipping merge: ranges were manually split and sticky bit was not expired")
+			// TODO(jeffreyxiao): Consider returning a purgatory error to avoid
+			// repeatedly processing ranges that cannot be merged.
+			return nil
+		}
+		log.VEventf(ctx, 2, "ranges were manually split, but sticky bit was expired")
 	}
 
 	log.VEventf(ctx, 2, "merging to produce range: %s-%s", mergedDesc.StartKey, mergedDesc.EndKey)
@@ -310,7 +334,7 @@ func (mq *mergeQueue) process(
 		// On seeing a ConditionFailedError, don't return an error and enqueue
 		// this replica again in case it still needs to be merged.
 		log.Infof(ctx, "merge saw concurrent descriptor modification; maybe retrying")
-		mq.MaybeAdd(lhsRepl, mq.store.Clock().Now())
+		mq.MaybeAddAsync(ctx, lhsRepl, mq.store.Clock().Now())
 	default:
 		// While range merges are unstable, be extra cautious and mark every error
 		// as purgatory-worthy.

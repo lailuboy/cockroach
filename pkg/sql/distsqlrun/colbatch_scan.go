@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -27,7 +28,7 @@ import (
 )
 
 // colBatchScan is the exec.Operator implementation of TableReader. It reads a table
-// from kv, presenting it as ColBatches via the exec.Operator interface.
+// from kv, presenting it as coldata.Batches via the exec.Operator interface.
 type colBatchScan struct {
 	spans     roachpb.Spans
 	flowCtx   *FlowCtx
@@ -48,13 +49,28 @@ func (s *colBatchScan) Init() {
 	}
 }
 
-func (s *colBatchScan) Next() exec.ColBatch {
-	bat, err := s.rf.NextBatch(s.ctx)
+func (s *colBatchScan) Next(ctx context.Context) coldata.Batch {
+	bat, err := s.rf.NextBatch(ctx)
 	if err != nil {
 		panic(err)
 	}
 	bat.SetSelection(false)
 	return bat
+}
+
+// DrainMeta is part of the MetadataSource interface.
+func (s *colBatchScan) DrainMeta(ctx context.Context) []distsqlpb.ProducerMetadata {
+	var trailingMeta []distsqlpb.ProducerMetadata
+	if !s.flowCtx.local {
+		ranges := misplannedRanges(ctx, s.rf.GetRangesInfo(), s.flowCtx.nodeID)
+		if ranges != nil {
+			trailingMeta = append(trailingMeta, distsqlpb.ProducerMetadata{Ranges: ranges})
+		}
+	}
+	if meta := getTxnCoordMeta(ctx, s.flowCtx.txn); meta != nil {
+		trailingMeta = append(trailingMeta, distsqlpb.ProducerMetadata{TxnCoordMeta: meta})
+	}
+	return trailingMeta
 }
 
 // newColBatchScan creates a new colBatchScan operator.

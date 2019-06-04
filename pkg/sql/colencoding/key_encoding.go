@@ -15,14 +15,14 @@
 package colencoding
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // DecodeIndexKeyToCols decodes an index key into the idx'th position of the
@@ -33,12 +33,12 @@ import (
 // for. The input key will also be mutated if matches is false.
 // See the analog in sqlbase/index_encoding.go.
 func DecodeIndexKeyToCols(
-	vecs []exec.ColVec,
+	vecs []coldata.Vec,
 	idx uint16,
 	desc *sqlbase.ImmutableTableDescriptor,
 	index *sqlbase.IndexDescriptor,
 	indexColIdx []int,
-	types []sqlbase.ColumnType,
+	types []types.T,
 	colDirs []sqlbase.IndexDescriptor_Direction,
 	key roachpb.Key,
 ) (remainingKey roachpb.Key, matches bool, _ error) {
@@ -121,10 +121,10 @@ func DecodeIndexKeyToCols(
 // encoding.Ascending.
 // See the analog in sqlbase/index_encoding.go.
 func DecodeKeyValsToCols(
-	vecs []exec.ColVec,
+	vecs []coldata.Vec,
 	idx uint16,
 	indexColIdx []int,
-	types []sqlbase.ColumnType,
+	types []types.T,
 	directions []sqlbase.IndexDescriptor_Direction,
 	key []byte,
 ) ([]byte, error) {
@@ -136,7 +136,7 @@ func DecodeKeyValsToCols(
 		var err error
 		i := indexColIdx[j]
 		if i == -1 {
-			// Don't need the col - skip it.
+			// Don't need the coldata - skip it.
 			key, err = skipTableKey(&types[j], key, enc)
 		} else {
 			key, err = decodeTableKeyToCol(vecs[i], idx, &types[j], key, enc)
@@ -149,27 +149,23 @@ func DecodeKeyValsToCols(
 }
 
 // decodeTableKeyToCol decodes a value encoded by EncodeTableKey, writing the result
-// to the idx'th slot of the input exec.ColVec.
+// to the idx'th slot of the input exec.Vec.
 // See the analog, DecodeTableKey, in
 func decodeTableKeyToCol(
-	vec exec.ColVec,
-	idx uint16,
-	valType *sqlbase.ColumnType,
-	key []byte,
-	dir sqlbase.IndexDescriptor_Direction,
+	vec coldata.Vec, idx uint16, valType *types.T, key []byte, dir sqlbase.IndexDescriptor_Direction,
 ) ([]byte, error) {
 	if (dir != sqlbase.IndexDescriptor_ASC) && (dir != sqlbase.IndexDescriptor_DESC) {
-		return nil, errors.Errorf("invalid direction: %d", dir)
+		return nil, pgerror.AssertionFailedf("invalid direction: %d", log.Safe(dir))
 	}
 	var isNull bool
 	if key, isNull = encoding.DecodeIfNull(key); isNull {
-		vec.SetNull(idx)
+		vec.Nulls().SetNull(idx)
 		return key, nil
 	}
 	var rkey []byte
 	var err error
-	switch valType.SemanticType {
-	case sqlbase.ColumnType_BOOL:
+	switch valType.Family() {
+	case types.BoolFamily:
 		var i int64
 		if dir == sqlbase.IndexDescriptor_ASC {
 			rkey, i, err = encoding.DecodeVarintAscending(key)
@@ -177,14 +173,14 @@ func decodeTableKeyToCol(
 			rkey, i, err = encoding.DecodeVarintDescending(key)
 		}
 		vec.Bool()[idx] = i != 0
-	case sqlbase.ColumnType_INT:
+	case types.IntFamily:
 		var i int64
 		if dir == sqlbase.IndexDescriptor_ASC {
 			rkey, i, err = encoding.DecodeVarintAscending(key)
 		} else {
 			rkey, i, err = encoding.DecodeVarintDescending(key)
 		}
-		switch valType.Width {
+		switch valType.Width() {
 		case 8:
 			vec.Int8()[idx] = int8(i)
 		case 16:
@@ -194,7 +190,7 @@ func decodeTableKeyToCol(
 		case 0, 64:
 			vec.Int64()[idx] = i
 		}
-	case sqlbase.ColumnType_FLOAT:
+	case types.FloatFamily:
 		var f float64
 		if dir == sqlbase.IndexDescriptor_ASC {
 			rkey, f, err = encoding.DecodeFloatAscending(key)
@@ -202,7 +198,7 @@ func decodeTableKeyToCol(
 			rkey, f, err = encoding.DecodeFloatDescending(key)
 		}
 		vec.Float64()[idx] = f
-	case sqlbase.ColumnType_DECIMAL:
+	case types.DecimalFamily:
 		var d apd.Decimal
 		if dir == sqlbase.IndexDescriptor_ASC {
 			rkey, d, err = encoding.DecodeDecimalAscending(key, nil)
@@ -210,7 +206,7 @@ func decodeTableKeyToCol(
 			rkey, d, err = encoding.DecodeDecimalDescending(key, nil)
 		}
 		vec.Decimal()[idx] = d
-	case sqlbase.ColumnType_BYTES, sqlbase.ColumnType_STRING, sqlbase.ColumnType_NAME:
+	case types.BytesFamily, types.StringFamily:
 		var r []byte
 		if dir == sqlbase.IndexDescriptor_ASC {
 			rkey, r, err = encoding.DecodeBytesAscending(key, nil)
@@ -218,7 +214,7 @@ func decodeTableKeyToCol(
 			rkey, r, err = encoding.DecodeBytesDescending(key, nil)
 		}
 		vec.Bytes()[idx] = r
-	case sqlbase.ColumnType_DATE:
+	case types.DateFamily:
 		var t int64
 		if dir == sqlbase.IndexDescriptor_ASC {
 			rkey, t, err = encoding.DecodeVarintAscending(key)
@@ -227,7 +223,7 @@ func decodeTableKeyToCol(
 		}
 		vec.Int64()[idx] = t
 	default:
-		panic(fmt.Sprintf("unsupported type %+v", valType))
+		return rkey, pgerror.AssertionFailedf("unsupported type %+v", log.Safe(valType))
 	}
 	return rkey, err
 }
@@ -237,10 +233,10 @@ func decodeTableKeyToCol(
 // TODO(jordan): each type could be optimized here.
 // TODO(jordan): should use this approach in the normal row fetcher.
 func skipTableKey(
-	valType *sqlbase.ColumnType, key []byte, dir sqlbase.IndexDescriptor_Direction,
+	valType *types.T, key []byte, dir sqlbase.IndexDescriptor_Direction,
 ) ([]byte, error) {
 	if (dir != sqlbase.IndexDescriptor_ASC) && (dir != sqlbase.IndexDescriptor_DESC) {
-		return nil, errors.Errorf("invalid direction: %d", dir)
+		return nil, pgerror.AssertionFailedf("invalid direction: %d", log.Safe(dir))
 	}
 	var isNull bool
 	if key, isNull = encoding.DecodeIfNull(key); isNull {
@@ -248,33 +244,33 @@ func skipTableKey(
 	}
 	var rkey []byte
 	var err error
-	switch valType.SemanticType {
-	case sqlbase.ColumnType_BOOL, sqlbase.ColumnType_INT, sqlbase.ColumnType_DATE:
+	switch valType.Family() {
+	case types.BoolFamily, types.IntFamily, types.DateFamily:
 		if dir == sqlbase.IndexDescriptor_ASC {
 			rkey, _, err = encoding.DecodeVarintAscending(key)
 		} else {
 			rkey, _, err = encoding.DecodeVarintDescending(key)
 		}
-	case sqlbase.ColumnType_FLOAT:
+	case types.FloatFamily:
 		if dir == sqlbase.IndexDescriptor_ASC {
 			rkey, _, err = encoding.DecodeFloatAscending(key)
 		} else {
 			rkey, _, err = encoding.DecodeFloatDescending(key)
 		}
-	case sqlbase.ColumnType_BYTES, sqlbase.ColumnType_STRING, sqlbase.ColumnType_NAME:
+	case types.BytesFamily, types.StringFamily:
 		if dir == sqlbase.IndexDescriptor_ASC {
 			rkey, _, err = encoding.DecodeBytesAscending(key, nil)
 		} else {
 			rkey, _, err = encoding.DecodeBytesDescending(key, nil)
 		}
-	case sqlbase.ColumnType_DECIMAL:
+	case types.DecimalFamily:
 		if dir == sqlbase.IndexDescriptor_ASC {
 			rkey, _, err = encoding.DecodeDecimalAscending(key, nil)
 		} else {
 			rkey, _, err = encoding.DecodeDecimalDescending(key, nil)
 		}
 	default:
-		panic(fmt.Sprintf("unsupported type %+v", valType))
+		return key, pgerror.AssertionFailedf("unsupported type %+v", log.Safe(valType))
 	}
 	if err != nil {
 		return key, err
@@ -283,27 +279,27 @@ func skipTableKey(
 }
 
 // UnmarshalColumnValueToCol decodes the value from a roachpb.Value using the
-// type expected by the column, writing into the input ColVec at the given row
+// type expected by the column, writing into the input Vec at the given row
 // idx. An error is returned if the value's type does
 // not match the column's type.
 // See the analog, UnmarshalColumnValue, in sqlbase/column_type_encoding.go
 func UnmarshalColumnValueToCol(
-	vec exec.ColVec, idx uint16, typ sqlbase.ColumnType, value roachpb.Value,
+	vec coldata.Vec, idx uint16, typ *types.T, value roachpb.Value,
 ) error {
 	if value.RawBytes == nil {
-		vec.SetNull(idx)
+		vec.Nulls().SetNull(idx)
 	}
 
 	var err error
-	switch typ.SemanticType {
-	case sqlbase.ColumnType_BOOL:
+	switch typ.Family() {
+	case types.BoolFamily:
 		var v bool
 		v, err = value.GetBool()
 		vec.Bool()[idx] = v
-	case sqlbase.ColumnType_INT:
+	case types.IntFamily:
 		var v int64
 		v, err = value.GetInt()
-		switch typ.Width {
+		switch typ.Width() {
 		case 8:
 			vec.Int8()[idx] = int8(v)
 		case 16:
@@ -315,22 +311,22 @@ func UnmarshalColumnValueToCol(
 			// We map these to 64-bit INT now. See #34161.
 			vec.Int64()[idx] = v
 		}
-	case sqlbase.ColumnType_FLOAT:
+	case types.FloatFamily:
 		var v float64
 		v, err = value.GetFloat()
 		vec.Float64()[idx] = v
-	case sqlbase.ColumnType_DECIMAL:
+	case types.DecimalFamily:
 		err = value.GetDecimalInto(&vec.Decimal()[idx])
-	case sqlbase.ColumnType_BYTES, sqlbase.ColumnType_STRING, sqlbase.ColumnType_NAME:
+	case types.BytesFamily, types.StringFamily:
 		var v []byte
 		v, err = value.GetBytes()
 		vec.Bytes()[idx] = v
-	case sqlbase.ColumnType_DATE:
+	case types.DateFamily:
 		var v int64
 		v, err = value.GetInt()
 		vec.Int64()[idx] = v
 	default:
-		return errors.Errorf("unsupported column type: %s", typ.SemanticType)
+		return pgerror.AssertionFailedf("unsupported column type: %s", log.Safe(typ.Family()))
 	}
 	return err
 }

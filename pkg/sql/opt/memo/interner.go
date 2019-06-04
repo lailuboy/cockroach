@@ -21,13 +21,12 @@ import (
 	"reflect"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
 
@@ -234,7 +233,7 @@ func (c *internCache) Next() bool {
 // checked that the item is not yet in the cache.
 func (c *internCache) Add(item interface{}) {
 	if item == nil {
-		panic("cannot add the nil value to the cache")
+		panic(pgerror.AssertionFailedf("cannot add the nil value to the cache"))
 	}
 
 	if c.prev.item == nil {
@@ -332,14 +331,14 @@ func (h *hasher) HashOperator(val opt.Operator) {
 	h.HashUint64(uint64(val))
 }
 
-func (h *hasher) HashType(val reflect.Type) {
+func (h *hasher) HashGoType(val reflect.Type) {
 	h.HashUint64(uint64(reflect.ValueOf(val).Pointer()))
 }
 
 func (h *hasher) HashDatum(val tree.Datum) {
 	// Distinguish distinct values with the same representation (i.e. 1 can
 	// be a Decimal or Int) using the reflect.Type of the value.
-	h.HashType(reflect.TypeOf(val))
+	h.HashGoType(reflect.TypeOf(val))
 
 	// Special case some datum types that are simple to hash. For the others,
 	// hash the key encoding or string representation.
@@ -355,7 +354,7 @@ func (h *hasher) HashDatum(val tree.Datum) {
 	case *tree.DBytes:
 		h.HashBytes([]byte(*t))
 	case *tree.DDate:
-		h.HashUint64(uint64(*t))
+		h.HashUint64(uint64(t.PGEpochDays()))
 	case *tree.DTime:
 		h.HashUint64(uint64(*t))
 	case *tree.DJSON:
@@ -363,7 +362,7 @@ func (h *hasher) HashDatum(val tree.Datum) {
 	case *tree.DTuple:
 		// If labels are present, then hash of tuple's static type is needed to
 		// disambiguate when everything is the same except labels.
-		alwaysHashType := len(t.ResolvedType().(types.TTuple).Labels) != 0
+		alwaysHashType := len(t.ResolvedType().TupleLabels()) != 0
 		h.hashDatumsWithType(t.D, t.ResolvedType(), alwaysHashType)
 	case *tree.DArray:
 		// If the array is empty, then hash of tuple's static type is needed to
@@ -376,7 +375,7 @@ func (h *hasher) HashDatum(val tree.Datum) {
 	}
 }
 
-func (h *hasher) hashDatumsWithType(datums tree.Datums, typ types.T, alwaysHashType bool) {
+func (h *hasher) hashDatumsWithType(datums tree.Datums, typ *types.T, alwaysHashType bool) {
 	for _, d := range datums {
 		if d == tree.DNull {
 			// At least one NULL exists, so need to compare static types (e.g. a
@@ -386,19 +385,12 @@ func (h *hasher) hashDatumsWithType(datums tree.Datums, typ types.T, alwaysHashT
 		h.HashDatum(d)
 	}
 	if alwaysHashType {
-		h.HashDatumType(typ)
+		h.HashType(typ)
 	}
 }
 
-func (h *hasher) HashDatumType(val types.T) {
+func (h *hasher) HashType(val *types.T) {
 	h.HashString(val.String())
-}
-
-func (h *hasher) HashColType(val coltypes.T) {
-	buf := bytes.NewBuffer(h.bytes[:0])
-	val.Format(buf, lex.EncNoFlags)
-	h.bytes = buf.Bytes()
-	h.HashBytes(h.bytes)
 }
 
 func (h *hasher) HashTypedExpr(val tree.TypedExpr) {
@@ -491,6 +483,18 @@ func (h *hasher) HashShowTraceType(val tree.ShowTraceType) {
 	h.HashString(string(val))
 }
 
+func (h *hasher) HashWindowFrame(val *tree.WindowFrame) {
+	// TODO(justin): remove when we support OFFSET.
+	if val.Bounds.StartBound.BoundType == tree.OffsetPreceding ||
+		val.Bounds.EndBound.BoundType == tree.OffsetFollowing {
+		panic(pgerror.AssertionFailedf("expected to have rejected offset"))
+	}
+
+	h.HashInt(int(val.Bounds.StartBound.BoundType))
+	h.HashInt(int(val.Bounds.EndBound.BoundType))
+	h.HashInt(int(val.Mode))
+}
+
 func (h *hasher) HashTupleOrdinal(val TupleOrdinal) {
 	h.HashUint64(uint64(val))
 }
@@ -540,11 +544,27 @@ func (h *hasher) HashAggregationsExpr(val AggregationsExpr) {
 	}
 }
 
+func (h *hasher) HashWindowsExpr(val WindowsExpr) {
+	for i := range val {
+		item := &val[i]
+		h.HashColumnID(item.Col)
+		h.HashScalarExpr(item.Function)
+	}
+}
+
 func (h *hasher) HashZipExpr(val ZipExpr) {
 	for i := range val {
 		item := &val[i]
 		h.HashColList(item.Cols)
 		h.HashScalarExpr(item.Func)
+	}
+}
+
+func (h *hasher) HashPresentation(val physical.Presentation) {
+	for i := range val {
+		col := &val[i]
+		h.HashString(col.Alias)
+		h.HashColumnID(col.ID)
 	}
 }
 
@@ -583,7 +603,7 @@ func (h *hasher) IsBytesEqual(l, r []byte) bool {
 	return bytes.Equal(l, r)
 }
 
-func (h *hasher) IsTypeEqual(l, r reflect.Type) bool {
+func (h *hasher) IsGoTypeEqual(l, r reflect.Type) bool {
 	return l == r
 }
 
@@ -591,18 +611,8 @@ func (h *hasher) IsOperatorEqual(l, r opt.Operator) bool {
 	return l == r
 }
 
-func (h *hasher) IsDatumTypeEqual(l, r types.T) bool {
+func (h *hasher) IsTypeEqual(l, r *types.T) bool {
 	return l.String() == r.String()
-}
-
-func (h *hasher) IsColTypeEqual(l, r coltypes.T) bool {
-	lbuf := bytes.NewBuffer(h.bytes[:0])
-	l.Format(lbuf, lex.EncNoFlags)
-	rbuf := bytes.NewBuffer(h.bytes2[:0])
-	r.Format(rbuf, lex.EncNoFlags)
-	h.bytes = lbuf.Bytes()
-	h.bytes2 = rbuf.Bytes()
-	return bytes.Equal(h.bytes, h.bytes2)
 }
 
 func (h *hasher) IsDatumEqual(l, r tree.Datum) bool {
@@ -629,7 +639,7 @@ func (h *hasher) IsDatumEqual(l, r tree.Datum) bool {
 		}
 	case *tree.DDate:
 		if rt, ok := r.(*tree.DDate); ok {
-			return uint64(*lt) == uint64(*rt)
+			return lt.Date == rt.Date
 		}
 	case *tree.DTime:
 		if rt, ok := r.(*tree.DTime); ok {
@@ -643,12 +653,12 @@ func (h *hasher) IsDatumEqual(l, r tree.Datum) bool {
 		if rt, ok := r.(*tree.DTuple); ok {
 			// Compare datums and then compare static types if nulls or labels
 			// are present.
-			ltyp := lt.ResolvedType().(types.TTuple)
-			rtyp := rt.ResolvedType().(types.TTuple)
+			ltyp := lt.ResolvedType()
+			rtyp := rt.ResolvedType()
 			if !h.areDatumsWithTypeEqual(lt.D, rt.D, ltyp, rtyp) {
 				return false
 			}
-			return len(ltyp.Labels) == 0 || h.IsDatumTypeEqual(ltyp, rtyp)
+			return len(ltyp.TupleLabels()) == 0 || h.IsTypeEqual(ltyp, rtyp)
 		}
 	case *tree.DArray:
 		if rt, ok := r.(*tree.DArray); ok {
@@ -659,7 +669,7 @@ func (h *hasher) IsDatumEqual(l, r tree.Datum) bool {
 			if !h.areDatumsWithTypeEqual(lt.Array, rt.Array, ltyp, rtyp) {
 				return false
 			}
-			return len(lt.Array) != 0 || h.IsDatumTypeEqual(ltyp, rtyp)
+			return len(lt.Array) != 0 || h.IsTypeEqual(ltyp, rtyp)
 		}
 	default:
 		h.bytes = encodeDatum(h.bytes[:0], l)
@@ -670,7 +680,7 @@ func (h *hasher) IsDatumEqual(l, r tree.Datum) bool {
 	return false
 }
 
-func (h *hasher) areDatumsWithTypeEqual(ldatums, rdatums tree.Datums, ltyp, rtyp types.T) bool {
+func (h *hasher) areDatumsWithTypeEqual(ldatums, rdatums tree.Datums, ltyp, rtyp *types.T) bool {
 	if len(ldatums) != len(rdatums) {
 		return false
 	}
@@ -686,7 +696,7 @@ func (h *hasher) areDatumsWithTypeEqual(ldatums, rdatums tree.Datums, ltyp, rtyp
 		}
 	}
 	if foundNull {
-		return h.IsDatumTypeEqual(ltyp, rtyp)
+		return h.IsTypeEqual(ltyp, rtyp)
 	}
 	return true
 }
@@ -753,6 +763,20 @@ func (h *hasher) IsStatementTypeEqual(l, r tree.StatementType) bool {
 
 func (h *hasher) IsShowTraceTypeEqual(l, r tree.ShowTraceType) bool {
 	return l == r
+}
+
+func (h *hasher) IsWindowFrameEqual(l, r *tree.WindowFrame) bool {
+	// TODO(justin): remove when we support OFFSET.
+	if l.Bounds.StartBound.BoundType == tree.OffsetPreceding ||
+		l.Bounds.EndBound.BoundType == tree.OffsetFollowing ||
+		r.Bounds.StartBound.BoundType == tree.OffsetPreceding ||
+		r.Bounds.EndBound.BoundType == tree.OffsetFollowing {
+		panic(pgerror.AssertionFailedf("expected to have rejected offset"))
+	}
+
+	return l.Bounds.StartBound.BoundType == r.Bounds.StartBound.BoundType &&
+		l.Bounds.EndBound.BoundType == r.Bounds.EndBound.BoundType &&
+		l.Mode == r.Mode
 }
 
 func (h *hasher) IsTupleOrdinalEqual(l, r TupleOrdinal) bool {
@@ -823,12 +847,36 @@ func (h *hasher) IsAggregationsExprEqual(l, r AggregationsExpr) bool {
 	return true
 }
 
+func (h *hasher) IsWindowsExprEqual(l, r WindowsExpr) bool {
+	if len(l) != len(r) {
+		return false
+	}
+	for i := range l {
+		if l[i].Col != r[i].Col || l[i].Function != r[i].Function {
+			return false
+		}
+	}
+	return true
+}
+
 func (h *hasher) IsZipExprEqual(l, r ZipExpr) bool {
 	if len(l) != len(r) {
 		return false
 	}
 	for i := range l {
 		if !l[i].Cols.Equals(r[i].Cols) || l[i].Func != r[i].Func {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *hasher) IsPresentationEqual(l, r physical.Presentation) bool {
+	if len(l) != len(r) {
+		return false
+	}
+	for i := range l {
+		if l[i].ID != r[i].ID || l[i].Alias != r[i].Alias {
 			return false
 		}
 	}

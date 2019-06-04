@@ -21,8 +21,10 @@ import (
 	"container/heap"
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
@@ -66,13 +68,15 @@ type orderedSynchronizer struct {
 
 	sources []srcInfo
 
-	types []sqlbase.ColumnType
+	types []types.T
 
 	// state dictates the operation mode.
 	state orderedSynchronizerState
 
-	// heap of source indexes, ordered by the current row. Sources with no more
-	// rows are not in the heap.
+	// heap of source indexes. In state notInitialized, heap holds all source
+	// indexes. Once initialized (initHeap is called), heap will be ordered by the
+	// current row from each source and will only contain source indexes of
+	// sources that are not done.
 	heap []srcIdx
 	// needsAdvance is set when the row at the root of the heap has already been
 	// consumed and thus producing a new row requires the root to be advanced.
@@ -89,13 +93,13 @@ type orderedSynchronizer struct {
 
 	// metadata is accumulated from all the sources and is passed on as soon as
 	// possible.
-	metadata []*ProducerMetadata
+	metadata []*distsqlpb.ProducerMetadata
 }
 
 var _ RowSource = &orderedSynchronizer{}
 
 // OutputTypes is part of the RowSource interface.
-func (s *orderedSynchronizer) OutputTypes() []sqlbase.ColumnType {
+func (s *orderedSynchronizer) OutputTypes() []types.T {
 	return s.types
 }
 
@@ -139,21 +143,24 @@ func (s *orderedSynchronizer) Pop() interface{} {
 func (s *orderedSynchronizer) initHeap() error {
 	// consumeErr is the last error encountered while consuming metadata.
 	var consumeErr error
-	for i := range s.sources {
-		src := &s.sources[i]
+
+	// s.heap contains all the sources. Go through the sources and get the first
+	// row from each source, removing them if they're already finished.
+	toDelete := 0
+	for i, srcIdx := range s.heap {
+		src := &s.sources[srcIdx]
 		err := s.consumeMetadata(src, stopOnRowOrError)
 		if err != nil {
 			consumeErr = err
 		}
-		// We add the source to the heap either if we have received a row from
-		// it or there was an error reading from this source. We still add to
-		// the heap in case of error so that these sources can be drained in
-		// `drainSources`.
-		if src.row != nil || err != nil {
-			// Add to the heap array (it won't be a heap until we call heap.Init).
-			s.heap = append(s.heap, srcIdx(i))
+		if src.row == nil && err == nil {
+			// Source is done. Swap current element with the first of the valid
+			// sources then truncate array after the loop so that i is still valid.
+			s.heap[toDelete], s.heap[i] = s.heap[i], s.heap[toDelete]
+			toDelete++
 		}
 	}
+	s.heap = s.heap[toDelete:]
 	if consumeErr != nil {
 		return consumeErr
 	}
@@ -273,11 +280,11 @@ func (s *orderedSynchronizer) Start(ctx context.Context) context.Context {
 }
 
 // Next is part of the RowSource interface.
-func (s *orderedSynchronizer) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (s *orderedSynchronizer) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	if s.state == notInitialized {
 		if err := s.initHeap(); err != nil {
 			s.ConsumerDone()
-			return nil, &ProducerMetadata{Err: err}
+			return nil, &distsqlpb.ProducerMetadata{Err: err}
 		}
 		s.state = returningRows
 	} else if s.state == returningRows && s.needsAdvance {
@@ -285,7 +292,7 @@ func (s *orderedSynchronizer) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 		// the next row for that source.
 		if err := s.advanceRoot(); err != nil {
 			s.ConsumerDone()
-			return nil, &ProducerMetadata{Err: err}
+			return nil, &distsqlpb.ProducerMetadata{Err: err}
 		}
 	}
 
@@ -300,7 +307,7 @@ func (s *orderedSynchronizer) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 	if len(s.metadata) != 0 {
 		// TODO(andrei): We return the metadata records one by one. The interface
 		// should support returning all of them at once.
-		var meta *ProducerMetadata
+		var meta *distsqlpb.ProducerMetadata
 		meta, s.metadata = s.metadata[0], s.metadata[1:]
 		s.needsAdvance = false
 		return nil, meta
@@ -366,6 +373,7 @@ func makeOrderedSync(
 	}
 	for i := range s.sources {
 		s.sources[i].src = sources[i]
+		s.heap = append(s.heap, srcIdx(i))
 	}
 	return s, nil
 }

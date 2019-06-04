@@ -45,6 +45,14 @@
   revision = "d6e3b3328b783f23731bc4d058875b0371ff8109"
 
 [[projects]]
+  digest = "1:9f3b30d9f8e0d7040f729b82dcbc8f0dead820a133b3147ce355fc451f32d761"
+  name = "github.com/BurntSushi/toml"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "3012a1dbe2e4bd1391d42b32f0577cb7bbc7f005"
+  version = "v0.3.1"
+
+[[projects]]
   digest = "1:ed77032e4241e3b8329c9304d66452ed196e795876e14be677a546f36b94e67a"
   name = "github.com/DataDog/zstd"
   packages = ["."]
@@ -143,11 +151,11 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:dfe2c5eadcbaf622a726116baf37582aa82fa8d364f05e168b58fbe96551832d"
+  digest = "1:caed868e37c6cda382a217d8ad4f55da579e1a1d046836de57f11a569e383443"
   name = "github.com/andy-kimball/arenaskl"
   packages = ["."]
   pruneopts = "UT"
-  revision = "224761e552afe64db9d93004f8d5d3a686b89771"
+  revision = "6bf06cf57626e536063e9398a57dfe1417ed0799"
 
 [[projects]]
   digest = "1:66b3310cf22cdc96c35ef84ede4f7b9b370971c4025f394c89a2638729653b11"
@@ -156,6 +164,21 @@
   pruneopts = "UT"
   revision = "901648c87902174f774fac311d7f176f8647bdaa"
   version = "v1.0.0"
+
+[[projects]]
+  branch = "master"
+  digest = "1:1a148d5a83dc8e077ad6e201f723a97bc652c72ffb40294947036be0080b005c"
+  name = "github.com/apache/arrow"
+  packages = [
+    "go/arrow",
+    "go/arrow/array",
+    "go/arrow/internal/bitutil",
+    "go/arrow/internal/cpu",
+    "go/arrow/internal/debug",
+    "go/arrow/memory",
+  ]
+  pruneopts = "UT"
+  revision = "338c62a2a20574072fde5c478fcd42bf27a2d4b6"
 
 [[projects]]
   digest = "1:b39cf81d5f440b9c0757a25058432d33af867e5201109bf53621356d9dab4b73"
@@ -701,12 +724,11 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:a33e657a9724e1dcaffade9d45dd579ad560313313dbc776e677ae20e1d82668"
+  digest = "1:b87c6f69cfb9f9b332c582ed93f7371150d21f40da6118d6547534e69b12cabb"
   name = "github.com/golang/leveldb"
   packages = [
     "crc",
     "db",
-    "memfs",
     "table",
   ]
   pruneopts = "UT"
@@ -758,6 +780,14 @@
   packages = ["."]
   pruneopts = "UT"
   revision = "4030bb1f1f0c35b30ca7009e9ebd06849dd45306"
+
+[[projects]]
+  digest = "1:e02b687ade0c19c038ecce3ea326d756519adc4bba1203a9e76d620b12354892"
+  name = "github.com/google/flatbuffers"
+  packages = ["go"]
+  pruneopts = "UT"
+  revision = "c0698cc33f1e534bb59c455909b88cc2726089af"
+  version = "v1.10.0"
 
 [[projects]]
   digest = "1:63ede27834b468648817fb80cfb95d40abfc61341f89cb7a0d6779b6aa955425"
@@ -899,16 +929,15 @@
   revision = "c2b33e84"
 
 [[projects]]
-  branch = "master"
-  digest = "1:af4c7e781221c1c249933f9b43eefeb0c5e29853ac1d638b5324cf42500c3fa9"
-  name = "github.com/jteeuwen/go-bindata"
+  digest = "1:31efb71bd0559b8d4ddd0e69821443dea008170c6a69515f28fe6623b53b8024"
+  name = "github.com/kevinburke/go-bindata"
   packages = [
     ".",
     "go-bindata",
   ]
   pruneopts = "UT"
-  revision = "6b667f85196e80d8420d634ca3fecca389a53207"
-  source = "https://github.com/dim13/go-bindata"
+  revision = "53d73b98acf3bd9f56d7f9136ed8e1be64756e1d"
+  version = "v3.13.0"
 
 [[projects]]
   digest = "1:395909746961a45abfc8b4a566a53cb6335e580768eae7d29d4a196b2bed2d07"
@@ -985,6 +1014,17 @@
   pruneopts = "UT"
   revision = "e2ffdb16a802fe2bb95e2e35ff34f0e53aeef34f"
   version = "v0.1.0"
+
+[[projects]]
+  branch = "master"
+  digest = "1:ed8219bed9a7adf8f0450a97b278fde8b289a5285b580fda20f6c23087fcce41"
+  name = "github.com/leanovate/gopter"
+  packages = [
+    ".",
+    "prop",
+  ]
+  pruneopts = "UT"
+  revision = "634a59d12406abc51545000deab7cf43ebc32378"
 
 [[projects]]
   digest = "1:8ef506fc2bb9ced9b151dafa592d4046063d744c646c1bbe801982ce87e4bc24"
@@ -1446,6 +1486,14 @@
 
 [[projects]]
   branch = "master"
+  digest = "1:d87af402fc3f371d6b008f58903e98bee8873db45263dc54762f00735c582495"
+  name = "golang.org/x/exp"
+  packages = ["rand"]
+  pruneopts = "UT"
+  revision = "01c40f57f5f67e0faa42df53dbcfb58f5a65bb4e"
+
+[[projects]]
+  branch = "master"
   digest = "1:aa2a7acc4a2f78d9bc0e6ffc795e24221d25f1b1d56fb472f834e377ebed7d28"
   name = "golang.org/x/net"
   packages = [
@@ -1547,23 +1595,63 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:0919b0cefec5fdf196797c85e728a197b19a531a50e1044a6d1c7313be283332"
+  digest = "1:1466e9d841b30213a2bdb0db95ff122e996983a7ad7a5fea4ef5ba88f13cf070"
   name = "golang.org/x/tools"
   packages = [
     "cmd/goyacc",
     "cmd/stringer",
     "container/intsets",
     "cover",
+    "go/analysis",
+    "go/analysis/internal/analysisflags",
+    "go/analysis/internal/checker",
+    "go/analysis/internal/facts",
+    "go/analysis/passes/asmdecl",
+    "go/analysis/passes/assign",
+    "go/analysis/passes/atomic",
+    "go/analysis/passes/bools",
+    "go/analysis/passes/buildtag",
+    "go/analysis/passes/cgocall",
+    "go/analysis/passes/composite",
+    "go/analysis/passes/copylock",
+    "go/analysis/passes/ctrlflow",
+    "go/analysis/passes/httpresponse",
+    "go/analysis/passes/inspect",
+    "go/analysis/passes/internal/analysisutil",
+    "go/analysis/passes/loopclosure",
+    "go/analysis/passes/lostcancel",
+    "go/analysis/passes/nilfunc",
+    "go/analysis/passes/printf",
+    "go/analysis/passes/shadow",
+    "go/analysis/passes/shadow/cmd/shadow",
+    "go/analysis/passes/shift",
+    "go/analysis/passes/stdmethods",
+    "go/analysis/passes/structtag",
+    "go/analysis/passes/tests",
+    "go/analysis/passes/unmarshal",
+    "go/analysis/passes/unreachable",
+    "go/analysis/passes/unsafeptr",
+    "go/analysis/passes/unusedresult",
+    "go/analysis/singlechecker",
+    "go/analysis/unitchecker",
     "go/ast/astutil",
+    "go/ast/inspector",
     "go/buildutil",
+    "go/cfg",
     "go/gcexportdata",
     "go/internal/cgo",
     "go/internal/gcimporter",
+    "go/internal/packagesdriver",
     "go/loader",
+    "go/packages",
+    "go/types/objectpath",
     "go/types/typeutil",
+    "internal/fastwalk",
+    "internal/gopathwalk",
+    "internal/semver",
   ]
   pruneopts = "UT"
-  revision = "bf090417da8b6150dcfe96795325f5aa78fff718"
+  revision = "63859f3815cb436d25749575cb14aef1153e5634"
 
 [[projects]]
   digest = "1:768c35ec83dd17029060ea581d6ca9fdcaef473ec87e93e4bb750949035f6070"
@@ -1662,25 +1750,37 @@
   source = "https://github.com/cockroachdb/yaml"
 
 [[projects]]
-  digest = "1:ce504fbb2b67961ac269fc0a9fcf16a48f638d622af3d87f5cdff766e2559161"
+  digest = "1:be57199733b1f758f0de225280c40dbc5435a8b60224d8ddb773b1dad84ad934"
   name = "honnef.co/go/tools"
   packages = [
-    "callgraph",
-    "callgraph/static",
+    "arg",
+    "cmd/staticcheck",
+    "config",
     "deprecated",
+    "facts",
     "functions",
+    "go/types/typeutil",
+    "internal/cache",
+    "internal/passes/buildssa",
+    "internal/renameio",
     "internal/sharedcheck",
     "lint",
+    "lint/lintdsl",
+    "lint/lintutil",
+    "lint/lintutil/format",
+    "loader",
+    "printf",
     "simple",
     "ssa",
-    "ssa/ssautil",
+    "ssautil",
     "staticcheck",
     "staticcheck/vrp",
+    "stylecheck",
     "unused",
+    "version",
   ]
   pruneopts = "UT"
-  revision = "d73ab98e7c39fdcf9ba65062e43d34310f198353"
-  version = "2017.2.2"
+  revision = "4187a5ff696fcfe80ef2204f78a3ae8262b2d54d"
 
 [[projects]]
   branch = "no-flag-names-parens"
@@ -1714,6 +1814,9 @@
     "github.com/VividCortex/ewma",
     "github.com/abourget/teamcity",
     "github.com/andy-kimball/arenaskl",
+    "github.com/apache/arrow/go/arrow",
+    "github.com/apache/arrow/go/arrow/array",
+    "github.com/apache/arrow/go/arrow/memory",
     "github.com/armon/circbuf",
     "github.com/aws/aws-sdk-go/aws",
     "github.com/aws/aws-sdk-go/aws/awsutil",
@@ -1765,12 +1868,12 @@
     "github.com/golang-commonmark/markdown",
     "github.com/golang/dep/cmd/dep",
     "github.com/golang/leveldb/db",
-    "github.com/golang/leveldb/memfs",
     "github.com/golang/leveldb/table",
     "github.com/golang/lint/golint",
     "github.com/golang/protobuf/proto",
     "github.com/golang/snappy",
     "github.com/google/btree",
+    "github.com/google/flatbuffers/go",
     "github.com/google/go-github/github",
     "github.com/google/pprof/driver",
     "github.com/google/pprof/profile",
@@ -1781,13 +1884,15 @@
     "github.com/jackc/pgx",
     "github.com/jackc/pgx/pgproto3",
     "github.com/jackc/pgx/pgtype",
-    "github.com/jteeuwen/go-bindata/go-bindata",
+    "github.com/kevinburke/go-bindata/go-bindata",
     "github.com/kisielk/errcheck",
     "github.com/kisielk/gotool",
     "github.com/knz/go-libedit",
     "github.com/knz/strtime",
     "github.com/kr/pretty",
     "github.com/kr/text",
+    "github.com/leanovate/gopter",
+    "github.com/leanovate/gopter/prop",
     "github.com/lib/pq",
     "github.com/lib/pq/oid",
     "github.com/lightstep/lightstep-tracer-go",
@@ -1834,6 +1939,7 @@
     "golang.org/x/crypto/ssh/agent",
     "golang.org/x/crypto/ssh/knownhosts",
     "golang.org/x/crypto/ssh/terminal",
+    "golang.org/x/exp/rand",
     "golang.org/x/net/html",
     "golang.org/x/net/http2",
     "golang.org/x/net/trace",
@@ -1852,8 +1958,8 @@
     "golang.org/x/tools/cmd/goyacc",
     "golang.org/x/tools/cmd/stringer",
     "golang.org/x/tools/container/intsets",
+    "golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow",
     "golang.org/x/tools/go/buildutil",
-    "golang.org/x/tools/go/loader",
     "google.golang.org/api/iterator",
     "google.golang.org/api/option",
     "google.golang.org/grpc",
@@ -1870,10 +1976,8 @@
     "google.golang.org/grpc/status",
     "google.golang.org/grpc/transport",
     "gopkg.in/yaml.v2",
+    "honnef.co/go/tools/cmd/staticcheck",
     "honnef.co/go/tools/lint",
-    "honnef.co/go/tools/simple",
-    "honnef.co/go/tools/staticcheck",
-    "honnef.co/go/tools/unused",
     "vitess.io/vitess/go/sqltypes",
     "vitess.io/vitess/go/vt/sqlparser",
   ]

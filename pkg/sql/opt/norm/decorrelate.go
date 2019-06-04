@@ -15,13 +15,13 @@
 package norm
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // HasHoistableSubquery returns true if the given scalar expression contains a
@@ -314,8 +314,12 @@ func (c *CustomFuncs) HoistProjectSetSubquery(input memo.RelExpr, zip memo.ZipEx
 		}
 	}
 
+	// The process of hoisting will introduce additional columns, so we introduce
+	// a projection to not include those in the output.
+	outputCols := c.OutputCols(input).Union(zip.OutputCols())
+
 	projectSet := c.f.ConstructProjectSet(hoister.input(), newZip)
-	return c.f.ConstructProject(projectSet, memo.EmptyProjectionsExpr, c.OutputCols(input))
+	return c.f.ConstructProject(projectSet, memo.EmptyProjectionsExpr, outputCols)
 }
 
 // ConstructNonApplyJoin constructs the non-apply join operator that corresponds
@@ -337,7 +341,7 @@ func (c *CustomFuncs) ConstructNonApplyJoin(
 	case opt.AntiJoinOp, opt.AntiJoinApplyOp:
 		return c.f.ConstructAntiJoin(left, right, on, private)
 	}
-	panic(fmt.Sprintf("unexpected join operator: %v", joinOp))
+	panic(pgerror.AssertionFailedf("unexpected join operator: %v", log.Safe(joinOp)))
 }
 
 // ConstructApplyJoin constructs the apply join operator that corresponds
@@ -359,13 +363,13 @@ func (c *CustomFuncs) ConstructApplyJoin(
 	case opt.AntiJoinOp, opt.AntiJoinApplyOp:
 		return c.f.ConstructAntiJoinApply(left, right, on, private)
 	}
-	panic(fmt.Sprintf("unexpected join operator: %v", joinOp))
+	panic(pgerror.AssertionFailedf("unexpected join operator: %v", log.Safe(joinOp)))
 }
 
 // EnsureKey finds the shortest strong key for the input expression. If no
-// strong key exists, then EnsureKey wraps the input in a RowNumber operator,
+// strong key exists, then EnsureKey wraps the input in a Ordinality operator,
 // which provides a key column by uniquely numbering the rows. EnsureKey returns
-// the input expression (perhaps wrapped by RowNumber).
+// the input expression (perhaps wrapped by Ordinality).
 func (c *CustomFuncs) EnsureKey(in memo.RelExpr) memo.RelExpr {
 	_, ok := c.CandidateKey(in)
 	if ok {
@@ -373,8 +377,8 @@ func (c *CustomFuncs) EnsureKey(in memo.RelExpr) memo.RelExpr {
 	}
 
 	colID := c.f.Metadata().AddColumn("rownum", types.Int)
-	private := memo.RowNumberPrivate{ColID: colID}
-	return c.f.ConstructRowNumber(in, &private)
+	private := memo.OrdinalityPrivate{ColID: colID}
+	return c.f.ConstructOrdinality(in, &private)
 }
 
 // KeyCols returns a column set consisting of the columns that make up the
@@ -382,7 +386,7 @@ func (c *CustomFuncs) EnsureKey(in memo.RelExpr) memo.RelExpr {
 func (c *CustomFuncs) KeyCols(in memo.RelExpr) opt.ColSet {
 	keyCols, ok := c.CandidateKey(in)
 	if !ok {
-		panic("expected expression to have key")
+		panic(pgerror.AssertionFailedf("expected expression to have key"))
 	}
 	return keyCols
 }
@@ -392,7 +396,7 @@ func (c *CustomFuncs) KeyCols(in memo.RelExpr) opt.ColSet {
 func (c *CustomFuncs) NonKeyCols(in memo.RelExpr) opt.ColSet {
 	keyCols, ok := c.CandidateKey(in)
 	if !ok {
-		panic("expected expression to have key")
+		panic(pgerror.AssertionFailedf("expected expression to have key"))
 	}
 	return c.OutputCols(in).Difference(keyCols)
 }
@@ -546,7 +550,7 @@ func (c *CustomFuncs) TranslateNonIgnoreAggs(
 				if canaryCol == 0 {
 					id, ok := oldIn.Relational().NotNullCols.Next(0)
 					if !ok {
-						panic("expected input expression to have not-null column")
+						panic(pgerror.AssertionFailedf("expected input expression to have not-null column"))
 					}
 					canaryCol = opt.ColumnID(id)
 				}
@@ -561,7 +565,7 @@ func (c *CustomFuncs) TranslateNonIgnoreAggs(
 				// we translate that into Count.
 				// TestAllAggsIgnoreNullsOrNullOnEmpty verifies that this assumption is
 				// true.
-				panic(fmt.Sprintf("can't decorrelate with aggregate %s", agg.Op()))
+				panic(pgerror.AssertionFailedf("can't decorrelate with aggregate %s", log.Safe(agg.Op())))
 			}
 
 			if projections == nil {
@@ -608,7 +612,7 @@ func (c *CustomFuncs) EnsureAggsCanIgnoreNulls(
 			// Translate CountRows() to Count(notNullCol).
 			id, ok := in.Relational().NotNullCols.Next(0)
 			if !ok {
-				panic("expected input expression to have not-null column")
+				panic(pgerror.AssertionFailedf("expected input expression to have not-null column"))
 			}
 			notNullColID := opt.ColumnID(id)
 			newAgg = c.f.ConstructCount(c.f.ConstructVariable(notNullColID))
@@ -667,6 +671,16 @@ func (c *CustomFuncs) AddColsToGrouping(
 	}
 }
 
+// AddColsToPartition unions the given set of columns with a window private's
+// partition columns.
+func (c *CustomFuncs) AddColsToPartition(
+	priv *memo.WindowPrivate, cols opt.ColSet,
+) *memo.WindowPrivate {
+	cpy := *priv
+	cpy.Partition = cpy.Partition.Union(cols)
+	return &cpy
+}
+
 // ConstructAnyCondition builds an expression that compares the given scalar
 // expression with the first (and only) column of the input rowset, using the
 // given comparison operator.
@@ -697,7 +711,7 @@ func (c *CustomFuncs) ConstructNoColsRow() memo.RelExpr {
 func (c *CustomFuncs) referenceSingleColumn(in memo.RelExpr) opt.ScalarExpr {
 	cols := in.Relational().OutputCols
 	if cols.Len() != 1 {
-		panic("expression does not have exactly one column")
+		panic(pgerror.AssertionFailedf("expression does not have exactly one column"))
 	}
 	colID, _ := cols.Next(0)
 	return c.f.ConstructVariable(opt.ColumnID(colID))

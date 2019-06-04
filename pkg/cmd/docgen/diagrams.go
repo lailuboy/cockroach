@@ -448,6 +448,7 @@ var specs = []stmtSpec{
 			"transaction_mode_list",
 			"opt_comma",
 			"transaction_read_mode",
+			"as_of_clause",
 		},
 		exclude: []*regexp.Regexp{
 			regexp.MustCompile("'START'"),
@@ -474,6 +475,11 @@ var specs = []stmtSpec{
 		name:   "col_qualification",
 		stmt:   "col_qualification",
 		inline: []string{"col_qualification_elem"},
+	},
+	{
+		name:   "comment_stmt",
+		stmt:   "comment_stmt",
+		unlink: []string{"column_path"},
 	},
 	{
 		name:   "commit_transaction",
@@ -777,13 +783,33 @@ var specs = []stmtSpec{
 		inline: []string{"opt_storing", "storing", "index_params", "opt_name"},
 	},
 	{
-		name: "import_table",
-		stmt: "import_stmt",
+		name:   "import_csv",
+		stmt:   "import_stmt",
+		inline: []string{"string_or_placeholder_list", "opt_with_options"},
+		exclude: []*regexp.Regexp{
+			regexp.MustCompile("'IMPORT' import_format"),
+			regexp.MustCompile("'FROM' import_format"),
+			regexp.MustCompile("'WITH' 'OPTIONS'"),
+		},
+		replace: map[string]string{
+			"string_or_placeholder": "file_location",
+			"import_format":         "'CSV'",
+		},
+		unlink: []string{"file_location"},
+	},
+	{
+		name:   "import_dump",
+		stmt:   "import_stmt",
+		inline: []string{"string_or_placeholder_list", "opt_with_options"},
+		exclude: []*regexp.Regexp{
+			regexp.MustCompile("CREATE' 'USING'"),
+			regexp.MustCompile("table_elem_list"),
+			regexp.MustCompile("'WITH' 'OPTIONS'"),
+		},
 		replace: map[string]string{
 			"string_or_placeholder": "file_location",
 		},
-		inline: []string{"opt_with_options"},
-		unlink: []string{"import_format", "file_location", "file_location_list"},
+		unlink: []string{"file_location"},
 	},
 	{
 		name:    "insert_stmt",
@@ -838,14 +864,22 @@ var specs = []stmtSpec{
 	{
 		name:   "release_savepoint",
 		stmt:   "release_stmt",
-		inline: []string{"savepoint_name"}},
+		inline: []string{"savepoint_name"},
+	},
 	{
 		name:    "rename_column",
 		stmt:    "alter_rename_table_stmt",
 		inline:  []string{"opt_column"},
 		match:   []*regexp.Regexp{regexp.MustCompile("'ALTER' 'TABLE' .* 'RENAME' ('COLUMN'|name)")},
 		replace: map[string]string{"relation_expr": "table_name", "name 'TO'": "current_name 'TO'"},
-		unlink:  []string{"table_name", "current_name"}},
+		unlink:  []string{"table_name", "current_name"},
+	},
+	{
+		name:    "rename_constraint",
+		stmt:    "alter_onetable_stmt",
+		replace: map[string]string{"relation_expr": "table_name", "alter_table_cmds": "'RENAME' 'CONSTRAINT' current_name 'TO' name"},
+		unlink:  []string{"table_name", "current_name"},
+	},
 	{
 		name:  "rename_database",
 		stmt:  "alter_rename_database_stmt",
@@ -1031,6 +1065,7 @@ var specs = []stmtSpec{
 			"transaction_read_mode",
 			"transaction_user_priority",
 			"user_priority",
+			"as_of_clause",
 			"opt_comma",
 		},
 		match: []*regexp.Regexp{regexp.MustCompile("'SET' 'TRANSACTION'")},
@@ -1097,8 +1132,9 @@ var specs = []stmtSpec{
 		unlink:  []string{"table_name"},
 	},
 	{
-		name: "show_jobs",
-		stmt: "show_jobs_stmt",
+		name:   "show_jobs",
+		stmt:   "show_jobs_stmt",
+		inline: []string{"opt_automatic"},
 	},
 	{
 		name:  "show_keys",
@@ -1106,8 +1142,9 @@ var specs = []stmtSpec{
 		match: []*regexp.Regexp{regexp.MustCompile("'SHOW' 'KEYS'")},
 	},
 	{
-		name: "show_queries",
-		stmt: "show_queries_stmt",
+		name:   "show_queries",
+		stmt:   "show_queries_stmt",
+		inline: []string{"opt_cluster"},
 	},
 	{
 		name: "show_roles_stmt",
@@ -1126,17 +1163,20 @@ var specs = []stmtSpec{
 		stmt: "show_sequences_stmt",
 	},
 	{
-		name: "show_sessions",
-		stmt: "show_sessions_stmt",
+		name:   "show_sessions",
+		stmt:   "show_sessions_stmt",
+		inline: []string{"opt_cluster"},
 	},
 	{
 		name: "show_stats",
 		stmt: "show_stats_stmt",
 	},
 	{
-		name:  "show_tables",
-		stmt:  "show_stmt",
-		match: []*regexp.Regexp{regexp.MustCompile("'SHOW' 'TABLES'")},
+		name:    "show_tables",
+		stmt:    "show_tables_stmt",
+		inline:  []string{"with_comment"},
+		replace: map[string]string{"'FROM' name": "'FROM' database_name", "'.' name": "'.' schema_name"},
+		unlink:  []string{"schema.name"},
 	},
 	{
 		name:    "show_trace",

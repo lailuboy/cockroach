@@ -18,15 +18,16 @@ package tpcc
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach-go/crdb"
+	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/jackc/pgx/pgtype"
 	"github.com/pkg/errors"
+	"golang.org/x/exp/rand"
 )
 
 // From the TPCC spec, section 2.6:
@@ -68,6 +69,8 @@ type orderStatus struct {
 	selectByLastName workload.StmtHandle
 	selectOrder      workload.StmtHandle
 	selectItems      workload.StmtHandle
+
+	a bufalloc.ByteAllocator
 }
 
 var _ tpccTx = &orderStatus{}
@@ -127,7 +130,7 @@ func createOrderStatus(
 func (o *orderStatus) run(ctx context.Context, wID int) (interface{}, error) {
 	atomic.AddUint64(&o.config.auditor.orderStatusTransactions, 1)
 
-	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	rng := rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano())))
 
 	d := orderStatusData{
 		dID: rng.Intn(10) + 1,
@@ -136,7 +139,7 @@ func (o *orderStatus) run(ctx context.Context, wID int) (interface{}, error) {
 	// 2.6.1.2: The customer is randomly selected 60% of the time by last name
 	// and 40% by number.
 	if rng.Intn(100) < 60 {
-		d.cLast = randCLast(rng)
+		d.cLast = string(randCLast(rng, &o.a))
 		atomic.AddUint64(&o.config.auditor.orderStatusByLastName, 1)
 	} else {
 		d.cID = randCustomerID(rng)

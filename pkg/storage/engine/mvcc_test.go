@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
+	"github.com/stretchr/testify/require"
 )
 
 // Constants for system-reserved keys in the KV map.
@@ -90,7 +91,7 @@ func makeTxn(baseTxn roachpb.Transaction, ts hlc.Timestamp) *roachpb.Transaction
 	txn := baseTxn.Clone()
 	txn.OrigTimestamp = ts
 	txn.Timestamp = ts
-	return &txn
+	return txn
 }
 
 type mvccKeys []MVCCKey
@@ -342,6 +343,25 @@ func TestMVCCEmptyKey(t *testing.T) {
 	if err := MVCCResolveWriteIntent(ctx, engine, nil, roachpb.Intent{}); err == nil {
 		t.Error("expected empty key error")
 	}
+}
+
+func TestMVCCGetNegativeTimestampError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	engine := createTestEngine()
+	defer engine.Close()
+
+	err := MVCCPut(ctx, engine, nil, testKey1, hlc.Timestamp{Logical: 1}, value1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	timestamp := hlc.Timestamp{WallTime: -1}
+	expectedErrorString := fmt.Sprintf("cannot write to %q at timestamp %s", testKey1, timestamp)
+
+	_, intent, err := MVCCGet(ctx, engine, testKey1, timestamp, MVCCGetOptions{})
+	require.EqualError(t, err, expectedErrorString, intent)
 }
 
 func TestMVCCGetNotExist(t *testing.T) {
@@ -2917,6 +2937,43 @@ func TestMVCCReverseScanFirstKeyInFuture(t *testing.T) {
 	}
 }
 
+// Exposes a bug where the reverse MVCC scan can get stuck in an infinite loop
+// until we OOM. It happened in the code path optimized to use `SeekForPrev()`
+// after N `Prev()`s do not reach another logical key. Further, a write intent
+// needed to be present on the logical key to make it conflict with our chosen
+// `SeekForPrev()` target (logical key + '\0').
+func TestMVCCReverseScanSeeksOverRepeatedKeys(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	engine := createTestEngine()
+	defer engine.Close()
+
+	// 10 is the value of `kMaxItersBeforeSeek` at the time this test case was
+	// written. Repeat the key enough times to make sure the `SeekForPrev()`
+	// optimization will be used.
+	for i := 1; i <= 10; i++ {
+		if err := MVCCPut(ctx, engine, nil, testKey2, hlc.Timestamp{WallTime: int64(i)}, value2, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	txn1ts := makeTxn(*txn1, hlc.Timestamp{WallTime: 11})
+	if err := MVCCPut(ctx, engine, nil, testKey2, txn1ts.OrigTimestamp, value2, txn1ts); err != nil {
+		t.Fatal(err)
+	}
+
+	kvs, _, _, err := MVCCScan(ctx, engine, testKey1, testKey3, math.MaxInt64,
+		hlc.Timestamp{WallTime: 1}, MVCCScanOptions{Reverse: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kvs) != 1 ||
+		!bytes.Equal(kvs[0].Key, testKey2) ||
+		!bytes.Equal(kvs[0].Value.RawBytes, value2.RawBytes) {
+		t.Fatal("unexpected scan results")
+	}
+}
+
 func TestMVCCResolveTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -3012,7 +3069,7 @@ func TestMVCCResolveIntentTxnTimestampMismatch(t *testing.T) {
 	txn.TxnMeta.Timestamp.Forward(tsEarly.Add(10, 0))
 
 	// Write an intent which has txn.Timestamp > meta.timestamp.
-	if err := MVCCPut(ctx, engine, nil, testKey1, tsEarly, value1, &txn); err != nil {
+	if err := MVCCPut(ctx, engine, nil, testKey1, tsEarly, value1, txn); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3150,6 +3207,21 @@ func TestMVCCMultiplePutOldTimestamp(t *testing.T) {
 		t.Fatalf("expected timestamp=%s (got %s), value=%q (got %q)",
 			value.Timestamp, expTS, value3.RawBytes, value.RawBytes)
 	}
+}
+
+func TestMVCCPutNegativeTimestampError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	engine := createTestEngine()
+	defer engine.Close()
+
+	timestamp := hlc.Timestamp{WallTime: -1}
+	expectedErrorString := fmt.Sprintf("cannot write to %q at timestamp %s", testKey1, timestamp)
+
+	err := MVCCPut(ctx, engine, nil, testKey1, timestamp, value1, nil)
+
+	require.EqualError(t, err, expectedErrorString)
 }
 
 // TestMVCCPutOldOrigTimestampNewCommitTimestamp tests a case where a
@@ -3459,7 +3531,7 @@ func TestMVCCWriteWithSequence(t *testing.T) {
 
 	testCases := []struct {
 		name     string
-		sequence int32
+		sequence enginepb.TxnSeq
 		value    roachpb.Value
 		expWrite bool
 		expErr   string
@@ -3526,7 +3598,7 @@ func TestMVCCDeleteRangeWithSequence(t *testing.T) {
 
 	testCases := []struct {
 		name     string
-		sequence int32
+		sequence enginepb.TxnSeq
 		expErr   string
 	}{
 		{"old seq", 5, "missing an intent"},
@@ -3538,7 +3610,7 @@ func TestMVCCDeleteRangeWithSequence(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			prefix := roachpb.Key(fmt.Sprintf("key-%d", tc.sequence))
 			txn := *txn1
-			for i := int32(0); i < 3; i++ {
+			for i := enginepb.TxnSeq(0); i < 3; i++ {
 				key := append(prefix, []byte(strconv.Itoa(int(i)))...)
 				txn.Sequence = 2 + i
 				if err := MVCCPut(ctx, engine, nil, key, txn.Timestamp, value1, &txn); err != nil {

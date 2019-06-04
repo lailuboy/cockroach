@@ -53,6 +53,12 @@ func TestStats(t *testing.T) {
 	runDataDrivenTest(t, "testdata/stats/", flags)
 }
 
+func TestStatsQuality(t *testing.T) {
+	flags := memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps | memo.ExprFmtHideQualifications |
+		memo.ExprFmtHideScalars
+	runDataDrivenTest(t, "testdata/stats_quality/", flags)
+}
+
 func TestMemoInit(t *testing.T) {
 	catalog := testcat.New()
 	_, err := catalog.ExecuteDDL("CREATE TABLE abc (a INT PRIMARY KEY, b INT, c STRING, INDEX (c))")
@@ -111,6 +117,18 @@ func TestMemoIsStale(t *testing.T) {
 			t.Fatal(err)
 		} else if !isStale {
 			t.Errorf("memo should be stale")
+		}
+
+		// If we did not initialize the Memo's copy of a SessionData setting, the
+		// tests as written still pass if the default value is 0. To detect this, we
+		// create a new memo with the changed setting and verify it's not stale.
+		var o2 xform.Optimizer
+		opttestutils.BuildQuery(t, &o2, catalog, &evalCtx, "SELECT a, b+1 FROM abcview WHERE c='foo'")
+
+		if isStale, err := o2.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
+			t.Fatal(err)
+		} else if isStale {
+			t.Errorf("memo should not be stale")
 		}
 	}
 

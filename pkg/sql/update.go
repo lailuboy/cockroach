@@ -16,6 +16,7 @@ package sql
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -23,11 +24,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
 )
 
 var updateNodePool = sync.Pool{
@@ -55,11 +55,11 @@ var _ autoCommitNode = &updateNode{}
 //   Notes: postgres requires UPDATE. Requires SELECT with WHERE clause with table.
 //          mysql requires UPDATE. Also requires SELECT with WHERE clause with table.
 func (p *planner) Update(
-	ctx context.Context, n *tree.Update, desiredTypes []types.T,
+	ctx context.Context, n *tree.Update, desiredTypes []*types.T,
 ) (result planNode, resultErr error) {
 	// UX friendliness safeguard.
 	if n.Where == nil && p.SessionData().SafeUpdates {
-		return nil, pgerror.NewDangerousStatementErrorf("UPDATE without WHERE clause")
+		return nil, pgerror.DangerousStatementf("UPDATE without WHERE clause")
 	}
 
 	// CTE analysis.
@@ -91,7 +91,7 @@ func (p *planner) Update(
 	}
 
 	// Find which table we're working on, check the permissions.
-	desc, err := ResolveExistingObject(ctx, p, tn, true /*required*/, requireTableDesc)
+	desc, err := ResolveExistingObject(ctx, p, tn, true /*required*/, ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +173,7 @@ func (p *planner) Update(
 		// TODO(dan): This could be made tighter, just the rows needed for RETURNING
 		// exprs.
 		requestedCols = desc.Columns
-	} else if len(desc.AllChecks()) > 0 {
+	} else if len(desc.ActiveChecks()) > 0 {
 		// Request any columns we'll need when validating check constraints. We
 		// could be smarter and only validate check constraints which depend on
 		// columns that are being modified in the UPDATE statement, in which
@@ -185,10 +185,11 @@ func (p *planner) Update(
 		// desc.Columns, there's no reason to enter this block if rowsNeeded is
 		// true. Remove this when the TODO above is addressed.
 		var requestedColSet util.FastIntSet
-		for _, col := range requestedCols {
-			requestedColSet.Add(int(col.ID))
+		for i := range requestedCols {
+			id := int(requestedCols[i].ID)
+			requestedColSet.Add(id)
 		}
-		for _, ck := range desc.AllChecks() {
+		for _, ck := range desc.ActiveChecks() {
 			cols, err := ck.ColumnsUsed(desc.TableDesc())
 			if err != nil {
 				return nil, err
@@ -197,7 +198,8 @@ func (p *planner) Update(
 				if !requestedColSet.Contains(int(colID)) {
 					col, err := desc.FindColumnByID(colID)
 					if err != nil {
-						return nil, errors.Wrapf(err, "error finding column %d in table %s",
+						return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+							"error finding column %d in table %s",
 							colID, desc.Name)
 					}
 					requestedCols = append(requestedCols, *col)
@@ -320,10 +322,11 @@ func (p *planner) Update(
 
 			case *tree.Subquery:
 				selectExpr := tree.SelectExpr{Expr: t}
-				desiredTupleType := types.TTuple{Types: make([]types.T, len(setExpr.Names))}
+				contents := make([]types.T, len(setExpr.Names))
 				for i := range setExpr.Names {
-					desiredTupleType.Types[i] = updateCols[currentUpdateIdx+i].Type.ToDatumType()
+					contents[i] = updateCols[currentUpdateIdx+i].Type
 				}
+				desiredTupleType := types.MakeTuple(contents)
 				col, expr, err := p.computeRender(ctx, selectExpr, desiredTupleType,
 					render.sourceInfo, render.ivarHelper, autoGenerateRenderOutputName)
 				if err != nil {
@@ -344,7 +347,7 @@ func (p *planner) Update(
 				currentUpdateIdx += len(setExpr.Names)
 
 			default:
-				return nil, pgerror.NewAssertionErrorf("assigning to tuple with expression that is neither a tuple nor a subquery: %s", setExpr.Expr)
+				return nil, pgerror.AssertionFailedf("assigning to tuple with expression that is neither a tuple nor a subquery: %s", setExpr.Expr)
 			}
 
 		} else {
@@ -367,7 +370,7 @@ func (p *planner) Update(
 	// using checkColumnType. This step also verifies that the expression
 	// types match the column types.
 	for _, sourceSlot := range sourceSlots {
-		if err := sourceSlot.checkColumnTypes(render.render, &p.semaCtx.Placeholders); err != nil {
+		if err := sourceSlot.checkColumnTypes(render.render); err != nil {
 			return nil, err
 		}
 	}
@@ -375,8 +378,9 @@ func (p *planner) Update(
 	// updateColsIdx inverts the mapping of UpdateCols to FetchCols. See
 	// the explanatory comments in updateRun.
 	updateColsIdx := make(map[sqlbase.ColumnID]int, len(ru.UpdateCols))
-	for i, col := range ru.UpdateCols {
-		updateColsIdx[col.ID] = i
+	for i := range ru.UpdateCols {
+		id := ru.UpdateCols[i].ID
+		updateColsIdx[id] = i
 	}
 
 	un := updateNodePool.Get().(*updateNode)
@@ -578,7 +582,6 @@ func (u *updateNode) BatchedNext(params runParams) (bool, error) {
 
 	// Possibly initiate a run of CREATE STATISTICS.
 	params.ExecCfg().StatsRefresher.NotifyMutation(
-		&params.EvalContext().Settings.SV,
 		u.run.tu.tableDesc().ID,
 		u.run.rowCount,
 	)
@@ -631,8 +634,9 @@ func (u *updateNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 		// So we need to construct a buffer that groups them together.
 		// iVarContainerForComputedCols does this.
 		copy(u.run.iVarContainerForComputedCols.CurSourceRow, oldValues)
-		for i, col := range u.run.tu.ru.UpdateCols {
-			u.run.iVarContainerForComputedCols.CurSourceRow[u.run.tu.ru.FetchColIDtoRowIndex[col.ID]] = u.run.updateValues[i]
+		for i := range u.run.tu.ru.UpdateCols {
+			id := u.run.tu.ru.UpdateCols[i].ID
+			u.run.iVarContainerForComputedCols.CurSourceRow[u.run.tu.ru.FetchColIDtoRowIndex[id]] = u.run.updateValues[i]
 		}
 
 		// Now (re-)compute the computed columns.
@@ -643,7 +647,7 @@ func (u *updateNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 			d, err := u.run.computeExprs[i].Eval(params.EvalContext())
 			if err != nil {
 				params.EvalContext().IVarContainer = nil
-				return errors.Wrapf(err,
+				return pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
 					"computed column %s", tree.ErrString((*tree.Name)(&u.run.computedCols[i].Name)))
 			}
 			u.run.updateValues[u.run.updateColsIdx[u.run.computedCols[i].ID]] = d
@@ -654,21 +658,8 @@ func (u *updateNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 	// Verify the schema constraints. For consistency with INSERT/UPSERT
 	// and compatibility with PostgreSQL, we must do this before
 	// processing the CHECK constraints.
-	for i, val := range u.run.updateValues {
-		col := &u.run.tu.ru.UpdateCols[i]
-		if val == tree.DNull {
-			// Verify no NULL makes it to a nullable column.
-			if !col.Nullable {
-				return sqlbase.NewNonNullViolationError(col.Name)
-			}
-		} else {
-			// Verify that the data width matches the column constraint.
-			newVal, err := sqlbase.LimitValueWidth(col.Type, val, &col.Name)
-			if err != nil {
-				return err
-			}
-			u.run.updateValues[i] = newVal
-		}
+	if err := enforceLocalColumnConstraints(u.run.updateValues, u.run.tu.ru.UpdateCols); err != nil {
+		return err
 	}
 
 	// Run the CHECK constraints, if any. CheckHelper will either evaluate the
@@ -756,8 +747,7 @@ type sourceSlot interface {
 	extractValues(resultRow tree.Datums) tree.Datums
 	// checkColumnTypes compares the types of the results that this slot refers to to the types of
 	// the columns those values will be assigned to. It returns an error if those types don't match up.
-	// It also populates the types of any placeholders by way of calling into sqlbase.CheckColumnType.
-	checkColumnTypes(row []tree.TypedExpr, pmap *tree.PlaceholderInfo) error
+	checkColumnTypes(row []tree.TypedExpr) error
 }
 
 type tupleSlot struct {
@@ -775,10 +765,11 @@ func (ts tupleSlot) extractValues(row tree.Datums) tree.Datums {
 	return row[ts.sourceIndex].(*tree.DTuple).D
 }
 
-func (ts tupleSlot) checkColumnTypes(row []tree.TypedExpr, pmap *tree.PlaceholderInfo) error {
+func (ts tupleSlot) checkColumnTypes(row []tree.TypedExpr) error {
 	renderedResult := row[ts.sourceIndex]
-	for i, typ := range renderedResult.ResolvedType().(types.TTuple).Types {
-		if err := sqlbase.CheckDatumTypeFitsColumnType(ts.columns[i], typ, pmap); err != nil {
+	tupleContents := renderedResult.ResolvedType().TupleContents()
+	for i := range tupleContents {
+		if err := sqlbase.CheckDatumTypeFitsColumnType(&ts.columns[i], &tupleContents[i]); err != nil {
 			return err
 		}
 	}
@@ -794,10 +785,10 @@ func (ss scalarSlot) extractValues(row tree.Datums) tree.Datums {
 	return row[ss.sourceIndex : ss.sourceIndex+1]
 }
 
-func (ss scalarSlot) checkColumnTypes(row []tree.TypedExpr, pmap *tree.PlaceholderInfo) error {
+func (ss scalarSlot) checkColumnTypes(row []tree.TypedExpr) error {
 	renderedResult := row[ss.sourceIndex]
 	typ := renderedResult.ResolvedType()
-	return sqlbase.CheckDatumTypeFitsColumnType(ss.column, typ, pmap)
+	return sqlbase.CheckDatumTypeFitsColumnType(&ss.column, typ)
 }
 
 // addOrMergeExpr inserts an Expr into a renderNode, attempting to reuse
@@ -813,7 +804,7 @@ func (p *planner) addOrMergeExpr(
 ) (colIdx int, err error) {
 	e = fillDefault(e, currentUpdateIdx, defaultExprs)
 	selectExpr := tree.SelectExpr{Expr: e}
-	typ := updateCols[currentUpdateIdx].Type.ToDatumType()
+	typ := &updateCols[currentUpdateIdx].Type
 	col, expr, err := p.computeRender(ctx, selectExpr, typ,
 		render.sourceInfo, render.ivarHelper, autoGenerateRenderOutputName)
 	if err != nil {
@@ -875,8 +866,9 @@ func (p *planner) namesForExprs(
 			n := -1
 			switch t := expr.Expr.(type) {
 			case *tree.Subquery:
-				if tup, ok := t.ResolvedType().(types.TTuple); ok {
-					n = len(tup.Types)
+				typ := t.ResolvedType()
+				if typ.Family() == types.TupleFamily {
+					n = len(typ.TupleContents())
 				}
 			case *tree.Tuple:
 				n = len(t.Exprs)
@@ -884,11 +876,12 @@ func (p *planner) namesForExprs(
 				n = len(t.D)
 			}
 			if n < 0 {
-				return nil, nil, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError,
-					"unsupported tuple assignment: %T", expr.Expr)
+				return nil, nil, pgerror.UnimplementedWithIssueDetailf(35713,
+					fmt.Sprintf("%T", expr.Expr),
+					"source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression; not supported: %T", expr.Expr)
 			}
 			if len(expr.Names) != n {
-				return nil, nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				return nil, nil, pgerror.Newf(pgerror.CodeSyntaxError,
 					"number of columns (%d) does not match number of values (%d)", len(expr.Names), n)
 			}
 		}
@@ -913,6 +906,33 @@ func checkHasNoComputedCols(cols []sqlbase.ColumnDescriptor) error {
 		if cols[i].IsComputed() {
 			return sqlbase.CannotWriteToComputedColError(cols[i].Name)
 		}
+	}
+	return nil
+}
+
+// enforceLocalColumnConstraints asserts the column constraints that
+// do not require data validation from other sources than the row data
+// itself. This includes:
+// - rejecting null values in non-nullable columns;
+// - checking width constraints from the column type;
+// - truncating results to the requested precision (not width).
+// Note: the second point is what distinguishes this operation
+// from a regular SQL cast -- here widths are checked, not
+// used to truncate the value silently.
+//
+// The row buffer is modified in-place with the result of the
+// checks.
+func enforceLocalColumnConstraints(row tree.Datums, cols []sqlbase.ColumnDescriptor) error {
+	for i := range cols {
+		col := &cols[i]
+		if !col.Nullable && row[i] == tree.DNull {
+			return sqlbase.NewNonNullViolationError(col.Name)
+		}
+		outVal, err := sqlbase.LimitValueWidth(&col.Type, row[i], &col.Name)
+		if err != nil {
+			return err
+		}
+		row[i] = outVal
 	}
 	return nil
 }

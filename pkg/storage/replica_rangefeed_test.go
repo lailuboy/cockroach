@@ -24,10 +24,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 	"google.golang.org/grpc/metadata"
@@ -601,12 +603,16 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		mtc.transport.Listen(partitionStore.Ident.StoreID, &unreliableRaftHandler{
 			rangeID:            rangeID,
 			RaftMessageHandler: partitionStore,
-			drop: func(req *storage.RaftMessageRequest, _ *storage.RaftMessageResponse) bool {
+			dropReq: func(req *storage.RaftMessageRequest) bool {
 				// Make sure that even going forward no MsgApp for what we just truncated can
 				// make it through. The Raft transport is asynchronous so this is necessary
 				// to make the test pass reliably.
-				return req != nil && req.Message.Type == raftpb.MsgApp && req.Message.Index <= index
+				// NB: the Index on the message is the log index that _precedes_ any of the
+				// entries in the MsgApp, so filter where msg.Index < index, not <= index.
+				return req.Message.Type == raftpb.MsgApp && req.Message.Index < index
 			},
+			dropHB:   func(*storage.RaftHeartbeat) bool { return false },
+			dropResp: func(*storage.RaftMessageResponse) bool { return false },
 		})
 
 		// Check the error.
@@ -649,4 +655,109 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		pErr := <-streamErrC
 		assertRangefeedRetryErr(t, pErr, roachpb.RangeFeedRetryError_REASON_LOGICAL_OPS_MISSING)
 	})
+}
+
+// TestReplicaRangefeedNudgeSlowClosedTimestamp tests that rangefeed detects
+// that its closed timestamp updates have stalled and requests new information
+// from its Range's leaseholder. This is a regression test for #35142.
+func TestReplicaRangefeedNudgeSlowClosedTimestamp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	tc, db, desc, repls := setupTestClusterForClosedTimestampTesting(ctx, t, testingTargetDuration)
+	defer tc.Stopper().Stop(ctx)
+
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
+	// While we're here, drop the target duration. This was set to
+	// testingTargetDuration above, but this is higher then it needs to be now
+	// that cluster and schema setup is complete.
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10ms'`)
+
+	// Make sure all the nodes have gotten the rangefeed enabled setting from
+	// gossip, so that they will immediately be able to accept RangeFeeds. The
+	// target_duration one is just to speed up the test, we don't care if it has
+	// propagated everywhere yet.
+	testutils.SucceedsSoon(t, func() error {
+		for i := 0; i < tc.NumServers(); i++ {
+			var enabled bool
+			if err := tc.ServerConn(i).QueryRow(
+				`SHOW CLUSTER SETTING kv.rangefeed.enabled`,
+			).Scan(&enabled); err != nil {
+				return err
+			}
+			if !enabled {
+				return errors.Errorf(`waiting for rangefeed to be enabled on node %d`, i)
+			}
+		}
+		return nil
+	})
+
+	ts1 := tc.Server(0).Clock().Now()
+	rangeFeedCtx, rangeFeedCancel := context.WithCancel(ctx)
+	defer rangeFeedCancel()
+	rangeFeedChs := make([]chan *roachpb.RangeFeedEvent, len(repls))
+	rangeFeedErrC := make(chan error, len(repls))
+	for i := range repls {
+		ds := tc.Server(i).DistSender()
+		rangeFeedCh := make(chan *roachpb.RangeFeedEvent)
+		rangeFeedChs[i] = rangeFeedCh
+		go func() {
+			span := roachpb.Span{
+				Key: desc.StartKey.AsRawKey(), EndKey: desc.EndKey.AsRawKey(),
+			}
+			rangeFeedErrC <- ds.RangeFeed(rangeFeedCtx, span, ts1, rangeFeedCh)
+		}()
+	}
+
+	// Wait for a RangeFeed checkpoint on each RangeFeed after the RangeFeed
+	// initial scan time (which is the timestamp passed in the request) to make
+	// sure everything is set up. We intentionally don't care about the spans in
+	// the checkpoints, just verifying that something has made it past the
+	// initial scan and is running.
+	waitForCheckpoint := func(ts hlc.Timestamp) {
+		t.Helper()
+		for _, rangeFeedCh := range rangeFeedChs {
+			checkpointed := false
+			for !checkpointed {
+				select {
+				case event := <-rangeFeedCh:
+					if c := event.Checkpoint; c != nil && ts.Less(c.ResolvedTS) {
+						checkpointed = true
+					}
+				case err := <-rangeFeedErrC:
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	waitForCheckpoint(ts1)
+
+	// Clear the closed timestamp storage on each server. This simulates the case
+	// where a closed timestamp message is lost or a node restarts. To recover,
+	// the servers will need to request an update from the leaseholder.
+	for i := 0; i < tc.NumServers(); i++ {
+		stores := tc.Server(i).GetStores().(*storage.Stores)
+		err := stores.VisitStores(func(s *storage.Store) error {
+			s.ClearClosedTimestampStorage()
+			return nil
+		})
+		require.NoError(t, err)
+	}
+
+	// Wait for another RangeFeed checkpoint after the store was cleared. Without
+	// RangeFeed nudging closed timestamps, this doesn't happen on its own. Again,
+	// we intentionally don't care about the spans in the checkpoints, just
+	// verifying that something has made it past the cleared time.
+	ts2 := tc.Server(0).Clock().Now()
+	waitForCheckpoint(ts2)
+
+	// Make sure the RangeFeed hasn't errored yet.
+	select {
+	case err := <-rangeFeedErrC:
+		t.Fatal(err)
+	default:
+	}
+	// Now cancel it and wait for it to shut down.
+	rangeFeedCancel()
 }

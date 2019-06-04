@@ -1,4 +1,4 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata 5node-local 5node-dist 5node-dist-opt 5node-dist-metadata 5node-dist-disk
+# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata 5node-local 5node-dist 5node-dist-opt 5node-dist-metadata 5node-dist-disk
 
 statement ok
 CREATE TABLE kv (
@@ -265,13 +265,25 @@ SELECT avg(k) OVER (PARTITION BY a) FROM kv
 query error column "a" does not exist
 SELECT avg(k) OVER (ORDER BY a) FROM kv
 
-query error pgcode 42803 aggregate function calls cannot contain window function calls
+# TODO(justin): this should have pgcode 42803 but CBO currently doesn't get
+# it right.
+query error window functions are not allowed in aggregate
 SELECT avg(avg(k) OVER ()) FROM kv ORDER BY 1
 
 query R
 SELECT avg(avg(k)) OVER () FROM kv ORDER BY 1
 ----
 5
+
+query RR
+SELECT avg(k) OVER (), avg(v) OVER () FROM kv ORDER BY 1
+----
+5  2.3333333333333333333
+5  2.3333333333333333333
+5  2.3333333333333333333
+5  2.3333333333333333333
+5  2.3333333333333333333
+5  2.3333333333333333333
 
 query error OVER specified, but now\(\) is neither a window function nor an aggregate function
 SELECT now() OVER () FROM kv ORDER BY 1
@@ -1306,10 +1318,10 @@ SELECT k, lead(k, w) OVER (PARTITION BY v ORDER BY w, k) FROM kv ORDER BY 1
 10  NULL
 11  NULL
 
-query error could not parse "FOO" as type int
+query error unknown signature: lag\(int, int, string\)
 SELECT k, lag(k, 1, 'FOO') OVER () FROM kv ORDER BY 1
 
-query error could not parse "FOO" as type int
+query error unknown signature: lead\(int, int, string\)
 SELECT k, lead(k, 1, 'FOO') OVER () FROM kv ORDER BY 1
 
 query error unknown signature: lag\(int, int, string\)
@@ -1721,7 +1733,7 @@ SELECT k, last_value(v) OVER (PARTITION BY k) FROM kv ORDER BY 1
 10  4
 11  NULL
 
-query error could not parse "FOO" as type int
+query error unknown signature: nth_value\(int, string\)
 SELECT k, nth_value(v, 'FOO') OVER () FROM kv ORDER BY 1
 
 query error argument of nth_value\(\) must be greater than zero
@@ -2269,6 +2281,9 @@ Tablet      Samsung          200.00   6450.00
 statement error aggregate functions are not allowed in FILTER
 SELECT count(*) FILTER (WHERE count(*) > 5) OVER () FROM products
 
+statement error window functions are not allowed in FILTER
+SELECT count(*) FILTER (WHERE count(*) OVER () > 5) OVER () FROM products
+
 statement error incompatible FILTER expression type: int
 SELECT count(*) FILTER (WHERE 1) OVER () FROM products
 
@@ -2329,7 +2344,7 @@ SELECT sum(price) OVER (ORDER BY ptimestamptz RANGE BETWEEN 123 PRECEDING AND CU
 statement error could not parse "1 days" as type decimal
 SELECT sum(price) OVER (ORDER BY price RANGE BETWEEN 123.4 PRECEDING AND '1 days' FOLLOWING) FROM products
 
-statement error RANGE with offset PRECEDING/FOLLOWING is not supported for column type string
+statement error RANGE with offset PRECEDING/FOLLOWING is not supported for column type varchar
 SELECT sum(price) OVER (ORDER BY product_name RANGE 'foo' PRECEDING) FROM products
 
 query TTRR
@@ -2973,3 +2988,131 @@ SELECT a, json_agg(a) OVER (ORDER BY a) FROM x ORDER BY a
 1 [1]
 2 [1, 2]
 3 [1, 2, 3]
+
+# Test for #35267
+query I
+SELECT
+    row_number() OVER (PARTITION BY s)
+FROM
+    (SELECT sum(a) AS s FROM (SELECT a FROM x UNION ALL SELECT a FROM x) GROUP BY a)
+----
+1
+1
+1
+
+# Tests for #32050
+
+statement error window function calls cannot be nested
+SELECT sum(a) OVER (PARTITION BY count(a) OVER ()) FROM x
+
+statement error window function calls cannot be nested
+SELECT sum(a) OVER (ORDER BY count(a) OVER ()) FROM x
+
+statement error window function calls cannot be nested
+SELECT sum(a) OVER (PARTITION BY count(a) OVER () + 1) FROM x
+
+statement error window function calls cannot be nested
+SELECT sum(a) OVER (ORDER BY count(a) OVER () + 1) FROM x
+
+# TODO(justin): blocked by #37134.
+# statement error more than one row returned by a subquery used as an expression
+# SELECT sum(a) OVER (PARTITION BY (SELECT count(*) FROM x GROUP BY a)) FROM x
+
+query I
+SELECT sum(a) OVER (PARTITION BY (SELECT count(*) FROM x GROUP BY a LIMIT 1))::INT FROM x
+----
+6
+6
+6
+
+# Regression test for #27293 - make sure comparing two tuple types when
+# generating window functions expressions doesn't panic.
+
+query II
+SELECT
+    min(a) OVER (PARTITION BY (a, a)) AS min,
+    max(a) OVER (PARTITION BY (a, a)) AS max
+FROM
+    (SELECT 1 AS a)
+----
+1 1
+
+query II
+SELECT
+    min(a) OVER (PARTITION BY (())) AS min,
+    max(a) OVER (PARTITION BY (())) AS max
+FROM
+    (SELECT 1 AS a)
+----
+1 1
+
+query T
+SELECT string_agg('foo', s) OVER () FROM (SELECT * FROM kv LIMIT 1)
+----
+foo
+
+# Regression test for #37201.
+query I
+SELECT jsonb_agg(a) OVER (ORDER BY a GROUPS BETWEEN 5 FOLLOWING AND UNBOUNDED FOLLOWING) FROM x
+----
+NULL
+NULL
+NULL
+
+statement ok
+CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
+
+statement ok
+INSERT INTO abc VALUES
+  (1, 10, 20),
+  (2, 10, 20),
+  (3, 10, 20),
+  (4, 10, 30),
+  (5, 10, 30),
+  (6, 10, 30)
+
+query TTTTTTTTTTTT rowsort
+SELECT
+  avg(a) OVER (),
+  avg(a) OVER (ORDER BY a),
+  avg(a) OVER (ORDER BY b),
+  avg(a) OVER (ORDER BY c),
+  avg(b) OVER (),
+  avg(b) OVER (ORDER BY a),
+  avg(b) OVER (ORDER BY b),
+  avg(b) OVER (ORDER BY c),
+  avg(c) OVER (),
+  avg(c) OVER (ORDER BY a),
+  avg(c) OVER (ORDER BY b),
+  avg(c) OVER (ORDER BY c)
+FROM abc
+----
+3.5  1    3.5  2    10  10  10  10  25  20    25  20
+3.5  1.5  3.5  2    10  10  10  10  25  20    25  20
+3.5  2    3.5  2    10  10  10  10  25  20    25  20
+3.5  2.5  3.5  3.5  10  10  10  10  25  22.5  25  25
+3.5  3    3.5  3.5  10  10  10  10  25  24    25  25
+3.5  3.5  3.5  3.5  10  10  10  10  25  25    25  25
+
+query TTTTTTTTTTTT rowsort
+SELECT
+  avg(a) OVER            (RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+  avg(a) OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+  avg(a) OVER (ORDER BY b RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+  avg(a) OVER (ORDER BY c RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+  avg(b) OVER            (RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+  avg(b) OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+  avg(b) OVER (ORDER BY b RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+  avg(b) OVER (ORDER BY c RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+  avg(c) OVER            (RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+  avg(c) OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+  avg(c) OVER (ORDER BY b RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+  avg(c) OVER (ORDER BY c RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+FROM abc
+----
+3.5  3.5  3.5  3.5  10  10  10  10  25  25  25  25
+3.5  3.5  3.5  3.5  10  10  10  10  25  25  25  25
+3.5  3.5  3.5  3.5  10  10  10  10  25  25  25  25
+3.5  3.5  3.5  3.5  10  10  10  10  25  25  25  25
+3.5  3.5  3.5  3.5  10  10  10  10  25  25  25  25
+3.5  3.5  3.5  3.5  10  10  10  10  25  25  25  25

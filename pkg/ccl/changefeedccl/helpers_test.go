@@ -22,9 +22,6 @@ import (
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -285,6 +282,43 @@ func pollerTest(
 	}
 }
 
+func cloudStorageTest(
+	testFn func(*testing.T, *gosql.DB, cdctest.TestFeedFactory),
+) func(*testing.T) {
+	return func(t *testing.T) {
+		ctx := context.Background()
+
+		dir, dirCleanupFn := testutils.TempDir(t)
+		defer dirCleanupFn()
+
+		flushCh := make(chan struct{}, 1)
+		defer close(flushCh)
+		knobs := base.TestingKnobs{DistSQL: &distsqlrun.TestingKnobs{Changefeed: &TestingKnobs{
+			AfterSinkFlush: func() error {
+				select {
+				case flushCh <- struct{}{}:
+				default:
+				}
+				return nil
+			},
+		}}}
+
+		s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+			UseDatabase:   "d",
+			ExternalIODir: dir,
+			Knobs:         knobs,
+		})
+		defer s.Stopper().Stop(ctx)
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
+		sqlDB.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '1s'`)
+		sqlDB.Exec(t, `CREATE DATABASE d`)
+
+		f := cdctest.MakeCloudFeedFactory(s, db, dir, flushCh)
+		testFn(t, db, f)
+	}
+}
+
 func feed(
 	t testing.TB, f cdctest.TestFeedFactory, create string, args ...interface{},
 ) cdctest.TestFeed {
@@ -310,17 +344,5 @@ func forceTableGC(
 	database, table string,
 ) {
 	t.Helper()
-	tblID := sqlutils.QueryTableID(t, sqlDB.DB, database, table)
-
-	tblKey := roachpb.Key(keys.MakeTablePrefix(tblID))
-	gcr := roachpb.GCRequest{
-		RequestHeader: roachpb.RequestHeader{
-			Key:    tblKey,
-			EndKey: tblKey.PrefixEnd(),
-		},
-		Threshold: tsi.Clock().Now(),
-	}
-	if _, err := client.SendWrapped(context.Background(), tsi.DistSender(), &gcr); err != nil {
-		t.Fatal(err)
-	}
+	serverutils.ForceTableGC(t, tsi, sqlDB.DB, database, table, tsi.Clock().Now())
 }

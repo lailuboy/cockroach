@@ -43,7 +43,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -102,7 +101,7 @@ import (
 //
 // Logic tests can start with a directive as follows:
 //
-//   # LogicTest: local local-parallel-stmts fakedist
+//   # LogicTest: local fakedist
 //
 // This directive lists configurations; the test is run once in each
 // configuration (in separate subtests). The configurations are defined by
@@ -398,10 +397,6 @@ type testClusterConfig struct {
 	distSQLMetadataTestEnabled bool
 	// if set and the -test.short flag is passed, skip this config.
 	skipShort bool
-	// if set, any logic statement expected to succeed and parallelizable
-	// using RETURNING NOTHING syntax will be parallelized transparently.
-	// See logicStatement.parallelizeStmts.
-	parallelStmts bool
 	// If not empty, bootstrapVersion controls what version the cluster will be
 	// bootstrapped at.
 	bootstrapVersion cluster.ClusterVersion
@@ -430,7 +425,6 @@ var logicTestConfigs = []testClusterConfig{
 		disableUpgrade: true,
 	},
 	{name: "local-opt", numNodes: 1, overrideDistSQLMode: "off", overrideOptimizerMode: "on", overrideAutoStats: "false"},
-	{name: "local-parallel-stmts", numNodes: 1, parallelStmts: true, overrideDistSQLMode: "off", overrideOptimizerMode: "off"},
 	{name: "local-vec", numNodes: 1, overrideOptimizerMode: "off", overrideExpVectorize: "on"},
 	{name: "fakedist", numNodes: 3, useFakeSpanResolver: true, overrideDistSQLMode: "on", overrideOptimizerMode: "off"},
 	{name: "fakedist-opt", numNodes: 3, useFakeSpanResolver: true, overrideDistSQLMode: "on", overrideOptimizerMode: "on", overrideAutoStats: "false"},
@@ -579,30 +573,6 @@ func (ls *logicStatement) readSQL(
 		}
 	}
 	return separator, nil
-}
-
-var parallelizableRe = regexp.MustCompile(`^\s*(INSERT|UPSERT|UPDATE|DELETE).*$`)
-
-// parallelizeStmts maps all parallelizable statement types in the logic
-// statement which are not expected to throw an error to their parallelized
-// form. The transformation operates directly on the SQL syntax.
-func (ls *logicStatement) parallelizeStmts() {
-	// If the statement expects an error, we cannot parallelize it blindly
-	// because statement parallelism changes expected error semantics. For
-	// instance, errors seen when executing a parallelized statement may
-	// been reported when executing later statements.
-	if ls.expectErr != "" {
-		return
-	}
-	stmts := strings.Split(ls.sql, ";")
-	for i, stmt := range stmts {
-		// We can opt-in to statement parallelization for any parallelizable
-		// statement type that isn't already RETURNING values.
-		if parallelizableRe.MatchString(stmt) && !strings.Contains(stmt, "RETURNING") {
-			stmts[i] = stmt + " RETURNING NOTHING"
-		}
-	}
-	ls.sql = strings.Join(stmts, "; ")
 }
 
 // logicSorter sorts result rows (or not) depending on Test-Script's
@@ -964,9 +934,6 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 			// don't want those to take long on large machines).
 			SQLMemoryPoolSize: 192 * 1024 * 1024,
 			Knobs: base.TestingKnobs{
-				SQLExecutor: &sql.ExecutorTestingKnobs{
-					CheckStmtStringChange: true,
-				},
 				Store: &storage.StoreTestingKnobs{
 					// The consistency queue makes a lot of noisy logs during logic tests.
 					DisableConsistencyQueue: true,
@@ -1025,7 +992,10 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 	}
 
 	// Update the defaults for automatic statistics to avoid delays in testing.
-	stats.DefaultAsOfTime = time.Microsecond
+	// Avoid making the DefaultAsOfTime too small to avoid interacting with
+	// schema changes and causing transaction retries.
+	// TODO(radu): replace these with testing knobs.
+	stats.DefaultAsOfTime = 10 * time.Millisecond
 	stats.DefaultRefreshInterval = time.Millisecond
 
 	t.cluster = serverutils.StartTestCluster(t.t, cfg.numNodes, params)
@@ -1034,29 +1004,35 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 		t.cluster.Server(t.nodeIdx).SetDistSQLSpanResolver(fakeResolver)
 	}
 
+	if _, err := t.cluster.ServerConn(0).Exec(
+		"SET CLUSTER SETTING sql.stats.automatic_collection.min_stale_rows = $1::int", 5,
+	); err != nil {
+		t.Fatal(err)
+	}
+
 	if cfg.overrideDistSQLMode != "" {
 		if _, err := t.cluster.ServerConn(0).Exec(
 			"SET CLUSTER SETTING sql.defaults.distsql = $1::string", cfg.overrideDistSQLMode,
 		); err != nil {
 			t.Fatal(err)
 		}
-		wantedMode, ok := sessiondata.DistSQLExecModeFromString(cfg.overrideDistSQLMode)
+		_, ok := sessiondata.DistSQLExecModeFromString(cfg.overrideDistSQLMode)
 		if !ok {
 			t.Fatalf("invalid distsql mode override: %s", cfg.overrideDistSQLMode)
 		}
 		// Wait until all servers are aware of the setting.
 		testutils.SucceedsSoon(t.t, func() error {
 			for i := 0; i < t.cluster.NumServers(); i++ {
-				var m sessiondata.DistSQLExecMode
+				var m string
 				err := t.cluster.ServerConn(i % t.cluster.NumServers()).QueryRow(
 					"SHOW CLUSTER SETTING sql.defaults.distsql",
 				).Scan(&m)
 				if err != nil {
 					t.Fatal(errors.Wrapf(err, "%d", i))
 				}
-				if m != wantedMode {
+				if m != cfg.overrideDistSQLMode {
 					return errors.Errorf("node %d is still waiting for update of DistSQLMode to %s (have %s)",
-						i, wantedMode, m,
+						i, cfg.overrideDistSQLMode, m,
 					)
 				}
 			}
@@ -1072,7 +1048,27 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 	}
 	if cfg.overrideAutoStats != "" {
 		if _, err := t.cluster.ServerConn(0).Exec(
-			"SET CLUSTER SETTING sql.stats.experimental_automatic_collection.enabled = $1::bool", cfg.overrideAutoStats,
+			"SET CLUSTER SETTING sql.stats.automatic_collection.enabled = $1::bool", cfg.overrideAutoStats,
+		); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		// Background stats collection is enabled by default, but we've seen tests
+		// flake with it on. When the issue manifests, it seems to be around a
+		// schema change transaction getting pushed, which causes it to increment a
+		// table ID twice instead of once, causing non-determinism.
+		//
+		// In the short term, we disable auto stats by default to avoid the flakes.
+		//
+		// In the long run, these tests should be running with default settings as
+		// much as possible, so we likely want to address this. Two options are
+		// either making schema changes more resilient to being pushed or possibly
+		// making auto stats avoid pushing schema change transactions. There might
+		// be other better alternatives than these.
+		//
+		// See #37751 for details.
+		if _, err := t.cluster.ServerConn(0).Exec(
+			"SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false",
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -1343,9 +1339,6 @@ func (t *logicTest) processSubtest(
 			}
 			if _, err := stmt.readSQL(t, s, false /* allowSeparator */); err != nil {
 				return err
-			}
-			if config.parallelStmts {
-				stmt.parallelizeStmts()
 			}
 			if !s.skip {
 				for i := 0; i < repeat; i++ {
@@ -1687,7 +1680,7 @@ func (t *logicTest) verifyError(
 		}
 
 		errString := pgerror.FullError(err)
-		newErr := errors.Errorf("%s: %s\nexpected %q, but found %q", pos, sql, expectErr, errString)
+		newErr := errors.Errorf("%s: %s\nexpected:\n%s\n\ngot:\n%s", pos, sql, expectErr, errString)
 		if err != nil && strings.Contains(errString, expectErr) {
 			if t.subtestT != nil {
 				t.subtestT.Logf("The output string contained the input regexp. Perhaps you meant to write:\n"+
@@ -1698,6 +1691,18 @@ func (t *logicTest) verifyError(
 			}
 		}
 		return (err == nil) == (expectErr == ""), newErr
+	}
+	if err != nil {
+		pqErr, ok := err.(*pq.Error)
+		if ok &&
+			strings.HasPrefix(string(pqErr.Code), "XX" /* internal error, corruption, etc */) &&
+			string(pqErr.Code) != pgerror.CodeUncategorizedError /* this is also XX but innocuous */ {
+			if expectErrCode != string(pqErr.Code) {
+				return false, errors.Errorf(
+					"%s: %s: serious error with code %q occurred; if expected, must use 'error pgcode %s ...' in test:\n%s",
+					pos, sql, pqErr.Code, pqErr.Code, pgerror.FullError(err))
+			}
+		}
 	}
 	if expectErrCode != "" {
 		if err != nil {
@@ -1721,6 +1726,25 @@ func (t *logicTest) verifyError(
 	return true, nil
 }
 
+// formatErr attempts to provide more details if present.
+func formatErr(err error) string {
+	if pqErr, ok := err.(*pq.Error); ok {
+		var buf bytes.Buffer
+		fmt.Fprintf(&buf, "(%s) %s", pqErr.Code, pqErr.Message)
+		if pqErr.File != "" || pqErr.Line != "" || pqErr.Routine != "" {
+			fmt.Fprintf(&buf, "\n%s:%s: in %s()", pqErr.File, pqErr.Line, pqErr.Routine)
+		}
+		if pqErr.Detail != "" {
+			fmt.Fprintf(&buf, "\nDETAIL: %s", pqErr.Detail)
+		}
+		if pqErr.Code == pgerror.CodeInternalError {
+			fmt.Fprintln(&buf, "\nNOTE: internal errors may have more details in logs. Use -show-logs.")
+		}
+		return buf.String()
+	}
+	return err.Error()
+}
+
 // unexpectedError handles ignoring queries that fail during prepare
 // when -allow-prepare-fail is specified. The argument "sql" is "" to indicate the
 // work is done on behalf of a statement, which always fail upon an
@@ -1734,16 +1758,16 @@ func (t *logicTest) unexpectedError(sql string, pos string, err error) bool {
 		stmt, err := t.db.Prepare(sql)
 		if err != nil {
 			if *showSQL {
-				t.outf("\t-- fails prepare: %s", err)
+				t.outf("\t-- fails prepare: %s", formatErr(err))
 			}
 			t.signalIgnoredError(err, pos, sql)
 			return true
 		}
 		if err := stmt.Close(); err != nil {
-			t.Errorf("%s: %s\nerror when closing prepared statement: %s", sql, pos, err)
+			t.Errorf("%s: %s\nerror when closing prepared statement: %s", sql, pos, formatErr(err))
 		}
 	}
-	t.Errorf("%s: %s\nexpected success, but found\n%s", pos, sql, err)
+	t.Errorf("%s: %s\nexpected success, but found\n%s", pos, sql, formatErr(err))
 	return false
 }
 
@@ -2056,10 +2080,9 @@ var logicTestsConfigFilter = envutil.EnvOrDefaultString("COCKROACH_LOGIC_TESTS_C
 // RunLogicTest is the main entry point for the logic test. The globs parameter
 // specifies the default sets of files to run.
 func RunLogicTest(t *testing.T, globs ...string) {
-	if testutils.NightlyStress() {
-		// See https://github.com/cockroachdb/cockroach/pull/10966.
-		t.Skip()
-	}
+	// Note: there is special code in teamcity-trigger/main.go to run this package
+	// with less concurrency in the nightly stress runs. If you see problems
+	// please make adjustments there.
 
 	if skipLogicTests {
 		t.Skip("COCKROACH_LOGIC_TESTS_SKIP")
@@ -2144,7 +2167,7 @@ func RunLogicTest(t *testing.T, globs ...string) {
 						// the batch size is a global variable.
 						// TODO(jordan, radu): make sqlbase.kvBatchSize non-global to fix this.
 						if filepath.Base(path) != "select_index_span_ranges" {
-							t.Parallel()
+							t.Parallel() // SAFE FOR TESTING (this comments satisfies the linter)
 						}
 					}
 					lt := logicTest{

@@ -16,14 +16,18 @@ package sql
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -62,7 +66,7 @@ func (p *planner) SetClusterSetting(
 			expr := n.Value
 			expr = unresolvedNameToStrVal(expr)
 
-			var requiredType types.T
+			var requiredType *types.T
 			switch setting.(type) {
 			case *settings.StringSetting, *settings.StateMachineSetting, *settings.ByteSizeSetting:
 				requiredType = types.String
@@ -149,6 +153,24 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			); err != nil {
 				return err
 			}
+		}
+
+		// Report tracked cluster settings via telemetry.
+		// TODO(justin): implement a more general mechanism for tracking these.
+		switch n.name {
+		case stats.AutoStatsClusterSettingName:
+			switch expectedEncodedValue {
+			case "true":
+				telemetry.Inc(sqltelemetry.TurnAutoStatsOnUseCounter)
+			case "false":
+				telemetry.Inc(sqltelemetry.TurnAutoStatsOffUseCounter)
+			}
+		case ReorderJoinsLimitClusterSettingName:
+			val, err := strconv.ParseInt(expectedEncodedValue, 10, 64)
+			if err != nil {
+				break
+			}
+			sqltelemetry.ReportJoinReorderLimit(int(val))
 		}
 
 		return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(

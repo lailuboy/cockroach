@@ -31,11 +31,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 )
 
@@ -288,7 +289,7 @@ type DistSQLReceiver struct {
 	stmtType tree.StatementType
 
 	// outputTypes are the types of the result columns produced by the plan.
-	outputTypes []sqlbase.ColumnType
+	outputTypes []types.T
 
 	// resultToStreamColMap maps result columns to columns in the distsqlrun results
 	// stream.
@@ -469,7 +470,7 @@ func (r *DistSQLReceiver) SetError(err error) {
 
 // Push is part of the RowReceiver interface.
 func (r *DistSQLReceiver) Push(
-	row sqlbase.EncDatumRow, meta *distsqlrun.ProducerMetadata,
+	row sqlbase.EncDatumRow, meta *distsqlpb.ProducerMetadata,
 ) distsqlrun.ConsumerStatus {
 	if meta != nil {
 		if meta.TxnCoordMeta != nil {
@@ -592,6 +593,7 @@ func errPriority(err error) errorPriority {
 	if err == nil {
 		return scoreNoError
 	}
+	err = errors.Cause(err)
 	if retryErr, ok := err.(*roachpb.UnhandledRetryableError); ok {
 		pErr := retryErr.PErr
 		switch pErr.GetDetail().(type) {
@@ -623,7 +625,7 @@ func (r *DistSQLReceiver) ProducerDone() {
 }
 
 // Types is part of the RowReceiver interface.
-func (r *DistSQLReceiver) Types() []sqlbase.ColumnType {
+func (r *DistSQLReceiver) Types() []types.T {
 	return r.outputTypes
 }
 
@@ -738,7 +740,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	var rows *rowcontainer.RowContainer
 	if subqueryPlan.execMode == distsqlrun.SubqueryExecModeExists {
 		subqueryRecv.noColsRequired = true
-		typ = sqlbase.ColTypeInfoFromColTypes([]sqlbase.ColumnType{})
+		typ = sqlbase.ColTypeInfoFromColTypes([]types.T{})
 	} else {
 		// Apply the PlanToStreamColMap projection to the ResultTypes to get the
 		// final set of output types for the subquery. The reason this is necessary
@@ -746,7 +748,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 		// to merge the streams, but that aren't required by the final output of the
 		// query. These get projected out, so we need to similarly adjust the
 		// expected result types of the subquery here.
-		colTypes := make([]sqlbase.ColumnType, len(subqueryPhysPlan.PlanToStreamColMap))
+		colTypes := make([]types.T, len(subqueryPhysPlan.PlanToStreamColMap))
 		for i, resIdx := range subqueryPhysPlan.PlanToStreamColMap {
 			colTypes[i] = subqueryPhysPlan.ResultTypes[resIdx]
 		}
@@ -803,7 +805,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 				subqueryPlans[planIdx].result = &tree.DTuple{D: rows.At(0)}
 			}
 		default:
-			return pgerror.NewErrorf(pgerror.CodeCardinalityViolationError,
+			return pgerror.Newf(pgerror.CodeCardinalityViolationError,
 				"more than one row returned by a subquery used as an expression")
 		}
 	default:

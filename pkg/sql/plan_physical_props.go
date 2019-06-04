@@ -39,6 +39,8 @@ func planPhysicalProps(plan planNode) physicalProps {
 		return planPhysicalProps(n.plan)
 	case *spoolNode:
 		return planPhysicalProps(n.source)
+	case *saveTableNode:
+		return planPhysicalProps(n.source)
 	case *indexJoinNode:
 		return n.props
 	case *serializeNode:
@@ -90,6 +92,9 @@ func planPhysicalProps(plan planNode) physicalProps {
 		return n.props
 	case *zigzagJoinNode:
 		return n.props
+	case *applyJoinNode:
+	case *bufferNode:
+	case *scanBufferNode:
 
 	// Every other node simply has no guarantees on its output rows.
 	case *CreateUserNode:
@@ -100,6 +105,9 @@ func planPhysicalProps(plan planNode) physicalProps {
 	case *alterUserSetPasswordNode:
 	case *cancelQueriesNode:
 	case *cancelSessionsNode:
+	case *commentOnTableNode:
+	case *commentOnColumnNode:
+	case *commentOnDatabaseNode:
 	case *controlJobsNode:
 	case *createDatabaseNode:
 	case *createIndexNode:
@@ -114,6 +122,7 @@ func planPhysicalProps(plan planNode) physicalProps {
 	case *dropSequenceNode:
 	case *dropTableNode:
 	case *dropViewNode:
+	case *errorIfRowsNode:
 	case *explainDistSQLNode:
 	case *hookFnNode:
 	case *relocateNode:
@@ -132,8 +141,8 @@ func planPhysicalProps(plan planNode) physicalProps {
 	case *showFingerprintsNode:
 	case *showTraceNode:
 	case *showTraceReplicaNode:
-	case *showZoneConfigNode:
 	case *splitNode:
+	case *unsplitNode:
 	case *truncateNode:
 	case *unaryNode:
 	case *valuesNode:

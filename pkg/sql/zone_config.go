@@ -106,12 +106,12 @@ func getZoneConfig(
 	return 0, nil, 0, nil, errNoZoneConfigApplies
 }
 
-// CompleteZoneConfig takes a zone config pointer and fills in the
+// completeZoneConfig takes a zone config pointer and fills in the
 // missing fields by following the chain of inheritance.
 // In the worst case, will have to inherit from the default zone config.
 // NOTE: This will not work for subzones. To complete subzones, find a complete
 // parent zone (index or table) and apply InheritFromParent to it.
-func CompleteZoneConfig(
+func completeZoneConfig(
 	cfg *config.ZoneConfig, id uint32, getKey func(roachpb.Key) (*roachpb.Value, error),
 ) error {
 	if cfg.IsComplete() {
@@ -131,7 +131,7 @@ func CompleteZoneConfig(
 			if err != nil {
 				return err
 			}
-			cfg.InheritFromParent(*dbzone)
+			cfg.InheritFromParent(dbzone)
 		}
 	}
 
@@ -143,13 +143,14 @@ func CompleteZoneConfig(
 	if err != nil {
 		return err
 	}
-	cfg.InheritFromParent(*defaultZone)
+	cfg.InheritFromParent(defaultZone)
 	return nil
 }
 
 // ZoneConfigHook returns the zone config for the object with id using the
 // cached system config. If keySuffix is within a subzone, the subzone's config
-// is returned instead.
+// is returned instead. The bool is set to true when the value returned is
+// cached.
 func ZoneConfigHook(
 	cfg *config.SystemConfig, id uint32,
 ) (*config.ZoneConfig, *config.ZoneConfig, bool, error) {
@@ -163,7 +164,7 @@ func ZoneConfigHook(
 	} else if err != nil {
 		return nil, nil, false, err
 	}
-	if err = CompleteZoneConfig(zone, zoneID, getKey); err != nil {
+	if err = completeZoneConfig(zone, zoneID, getKey); err != nil {
 		return nil, nil, false, err
 	}
 	return zone, placeholder, true, nil
@@ -191,7 +192,7 @@ func GetZoneConfigInTxn(
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	if err = CompleteZoneConfig(zone, zoneID, getKey); err != nil {
+	if err = completeZoneConfig(zone, zoneID, getKey); err != nil {
 		return 0, nil, nil, err
 	}
 	var subzone *config.Subzone
@@ -199,17 +200,17 @@ func GetZoneConfigInTxn(
 		if placeholder != nil {
 			if subzone = placeholder.GetSubzone(uint32(index.ID), partition); subzone != nil {
 				if indexSubzone := placeholder.GetSubzone(uint32(index.ID), ""); indexSubzone != nil {
-					subzone.Config.InheritFromParent(indexSubzone.Config)
+					subzone.Config.InheritFromParent(&indexSubzone.Config)
 				}
-				subzone.Config.InheritFromParent(*zone)
+				subzone.Config.InheritFromParent(zone)
 				return placeholderID, placeholder, subzone, nil
 			}
 		} else {
 			if subzone = zone.GetSubzone(uint32(index.ID), partition); subzone != nil {
 				if indexSubzone := zone.GetSubzone(uint32(index.ID), ""); indexSubzone != nil {
-					subzone.Config.InheritFromParent(indexSubzone.Config)
+					subzone.Config.InheritFromParent(&indexSubzone.Config)
 				}
-				subzone.Config.InheritFromParent(*zone)
+				subzone.Config.InheritFromParent(zone)
 			}
 		}
 	}
@@ -233,7 +234,7 @@ var GenerateSubzoneSpans = func(
 
 func zoneSpecifierNotFoundError(zs tree.ZoneSpecifier) error {
 	if zs.NamedZone != "" {
-		return pgerror.NewErrorf(
+		return pgerror.Newf(
 			pgerror.CodeInvalidCatalogNameError, "zone %q does not exist", zs.NamedZone)
 	} else if zs.Database != "" {
 		return sqlbase.NewUndefinedDatabaseError(string(zs.Database))
@@ -260,7 +261,7 @@ func (p *planner) resolveTableForZone(
 		var immutRes *ImmutableTableDescriptor
 		p.runWithOptions(resolveFlags{skipCache: true}, func() {
 			immutRes, err = ResolveExistingObject(
-				ctx, p, &zs.TableOrIndex.Table, true /*required*/, anyDescType,
+				ctx, p, &zs.TableOrIndex.Table, true /*required*/, ResolveAnyDescType,
 			)
 		})
 		if err != nil {

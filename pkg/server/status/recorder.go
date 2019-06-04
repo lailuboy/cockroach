@@ -541,6 +541,8 @@ func extractValue(mtr interface{}) (float64, error) {
 		return float64(mtr.Count()), nil
 	case *metric.Gauge:
 		return float64(mtr.Value()), nil
+	case *metric.Rate:
+		return mtr.Value(), nil
 	case *metric.GaugeFloat64:
 		return mtr.Value(), nil
 	default:
@@ -599,8 +601,8 @@ func (rr registryRecorder) record(dest *[]tspb.TimeSeriesData) {
 	})
 }
 
-// GetTotalMemory returns either the total system memory or if possible the
-// cgroups available memory.
+// GetTotalMemory returns either the total system memory (in bytes) or if
+// possible the cgroups available memory.
 func GetTotalMemory(ctx context.Context) (int64, error) {
 	memory, warning, err := GetTotalMemoryWithoutLogging()
 	if err != nil {

@@ -57,7 +57,7 @@ func TestLogSplits(t *testing.T) {
 	initialSplits := countSplits()
 
 	// Generate an explicit split event.
-	if err := kvDB.AdminSplit(ctx, "splitkey", "splitkey"); err != nil {
+	if err := kvDB.AdminSplit(ctx, "splitkey", "splitkey", true /* manual */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -178,10 +178,10 @@ func TestLogMerges(t *testing.T) {
 	}
 
 	// Create two ranges, then merge them.
-	if err := kvDB.AdminSplit(ctx, "a", "a"); err != nil {
+	if err := kvDB.AdminSplit(ctx, "a", "a", true /* manual */); err != nil {
 		t.Fatal(err)
 	}
-	if err := kvDB.AdminSplit(ctx, "b", "b"); err != nil {
+	if err := kvDB.AdminSplit(ctx, "b", "b", true /* manual */); err != nil {
 		t.Fatal(err)
 	}
 	if err := kvDB.AdminMerge(ctx, "a"); err != nil {
@@ -262,7 +262,7 @@ func TestLogRebalances(t *testing.T) {
 	const details = "test"
 	logEvent := func(changeType roachpb.ReplicaChangeType, reason storagepb.RangeLogEventReason) {
 		if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-			return store.LogReplicaChangeTest(ctx, txn, changeType, desc.Replicas[0], *desc, reason, details)
+			return store.LogReplicaChangeTest(ctx, txn, changeType, desc.InternalReplicas[0], *desc, reason, details)
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -324,7 +324,7 @@ func TestLogRebalances(t *testing.T) {
 		if int64(info.UpdatedDesc.RangeID) != rangeID {
 			t.Errorf("recorded wrong updated descriptor %s for add replica of range %d", info.UpdatedDesc, rangeID)
 		}
-		if a, e := *info.AddedReplica, desc.Replicas[0]; a != e {
+		if a, e := *info.AddedReplica, desc.InternalReplicas[0]; a != e {
 			t.Errorf("recorded wrong updated replica %s for add replica of range %d, expected %s",
 				a, rangeID, e)
 		}
@@ -376,7 +376,7 @@ func TestLogRebalances(t *testing.T) {
 		if int64(info.UpdatedDesc.RangeID) != rangeID {
 			t.Errorf("recorded wrong updated descriptor %s for remove replica of range %d", info.UpdatedDesc, rangeID)
 		}
-		if a, e := *info.RemovedReplica, desc.Replicas[0]; a != e {
+		if a, e := *info.RemovedReplica, desc.InternalReplicas[0]; a != e {
 			t.Errorf("recorded wrong updated replica %s for remove replica of range %d, expected %s",
 				a, rangeID, e)
 		}

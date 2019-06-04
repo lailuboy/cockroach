@@ -23,7 +23,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/storage/split"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	humanize "github.com/dustin/go-humanize"
 	_ "github.com/lib/pq"
@@ -50,11 +49,9 @@ func registerLoadSplits(r *registry) {
 		MinVersion: "v2.2.0",
 		Cluster:    makeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			// After load based splitting is turned on, from experiments
-			// it's clear that at least 20 splits will happen. We could
-			// change this. Used 20 using pure intuition for a suitable split
-			// count from LBS with this kind of workload.
-			expSplits := 20
+			// This number was determined experimentally. Often, but not always,
+			// more splits will happen.
+			expSplits := 10
 			runLoadSplits(ctx, t, c, splitParams{
 				maxSize:       10 << 30,      // 10 GB
 				concurrency:   64,            // 64 concurrent workers
@@ -78,8 +75,15 @@ func registerLoadSplits(r *registry) {
 				// even with the expected number of splits. This puts a bound on how high the
 				// `expSplits` value can go.
 				// Add 1s for each split for the overhead of the splitting process.
-				waitDuration: time.Duration(int64(math.Ceil(math.Ceil(math.Log2(float64(expSplits)))*
-					float64((split.RecordDurationThreshold/time.Second))))+int64(expSplits)) * time.Second,
+				// waitDuration: time.Duration(int64(math.Ceil(math.Ceil(math.Log2(float64(expSplits)))*
+				// 	float64((split.RecordDurationThreshold/time.Second))))+int64(expSplits)) * time.Second,
+				//
+				// NB: the above has proven flaky. Just use a fixed duration
+				// that we think should be good enough. For example, for five
+				// expected splits we get ~35s, for ten ~50s, and for 20 ~1m10s.
+				// These are all pretty short, so any random abnormality will mess
+				// things up.
+				waitDuration: 10 * time.Minute,
 			})
 		},
 	})
@@ -94,7 +98,10 @@ func registerLoadSplits(r *registry) {
 				readPercent:   0,        // 0% reads
 				qpsThreshold:  100,      // 100 queries per second
 				minimumRanges: 1,        // We expect no splits so require only 1 range.
-				maximumRanges: 1,        // We expect no splits so require only 1 range.
+				// We expect no splits so require only 1 range. However, in practice we
+				// sometimes see a split early in, presumably when the sampling gets
+				// lucky.
+				maximumRanges: 2,
 				sequential:    true,
 				waitDuration:  60 * time.Second,
 			})

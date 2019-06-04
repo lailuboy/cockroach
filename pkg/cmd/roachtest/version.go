@@ -20,10 +20,12 @@ import (
 	"fmt"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 	_ "github.com/lib/pq"
+	"github.com/pkg/errors"
 )
 
 func registerVersion(r *registry) {
@@ -95,7 +97,7 @@ func registerVersion(r *registry) {
 				// Make sure everyone is still running.
 				for i := 1; i <= nodes; i++ {
 					t.WorkerStatus("checking ", i)
-					db := c.Conn(ctx, 1)
+					db := c.Conn(ctx, i)
 					defer db.Close()
 					rows, err := db.Query(`SHOW DATABASES`)
 					if err != nil {
@@ -103,6 +105,17 @@ func registerVersion(r *registry) {
 					}
 					if err := rows.Close(); err != nil {
 						return err
+					}
+					// Regression test for #37425. We can't run this in 2.1 because
+					// 19.1 changed downstream-of-raft semantics for consistency
+					// checks but unfortunately our versioning story for these
+					// checks had been broken for a long time. See:
+					//
+					// https://github.com/cockroachdb/cockroach/issues/37737#issuecomment-496026918
+					if !strings.HasPrefix(version, "2.") {
+						if err := c.CheckReplicaDivergenceOnDB(ctx, db); err != nil {
+							return errors.Wrapf(err, "node %d", i)
+						}
 					}
 				}
 				return nil
@@ -225,21 +238,18 @@ func registerVersion(r *registry) {
 		m.Wait()
 	}
 
-	mixedWithVersion := r.PredecessorVersion()
-	var skip string
-	if mixedWithVersion == "" {
-		skip = "unable to determine predecessor version"
-	}
-
 	for _, n := range []int{3, 5} {
 		r.Add(testSpec{
-			Name:       fmt.Sprintf("version/mixedWith=%s/nodes=%d", mixedWithVersion, n),
+			Name:       fmt.Sprintf("version/mixed/nodes=%d", n),
 			MinVersion: "v2.1.0",
 			Cluster:    makeClusterSpec(n + 1),
 			Run: func(ctx context.Context, t *test, c *cluster) {
-				runVersion(ctx, t, c, mixedWithVersion)
+				pred, err := r.PredecessorVersion()
+				if err != nil {
+					t.Fatal(err)
+				}
+				runVersion(ctx, t, c, pred)
 			},
-			Skip: skip,
 		})
 	}
 }

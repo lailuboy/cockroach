@@ -32,6 +32,7 @@ export default function (props: GraphDashboardProps) {
         <Metric name="cr.store.replicas.leaders_not_leaseholders" title="Leaders w/o Lease" />
         <Metric name="cr.store.ranges.unavailable" title="Unavailable" />
         <Metric name="cr.store.ranges.underreplicated" title="Under-replicated" />
+        <Metric name="cr.store.ranges.overreplicated" title="Over-replicated" />
       </Axis>
     </LineGraph>,
 
@@ -111,6 +112,7 @@ export default function (props: GraphDashboardProps) {
     <LineGraph title="Range Operations" sources={storeSources}>
       <Axis label="ranges">
         <Metric name="cr.store.range.splits" title="Splits" nonNegativeRate />
+        <Metric name="cr.store.range.merges" title="Merges" nonNegativeRate />
         <Metric name="cr.store.range.adds" title="Adds" nonNegativeRate />
         <Metric name="cr.store.range.removes" title="Removes" nonNegativeRate />
         <Metric name="cr.store.leases.transfers.success" title="Lease Transfers" nonNegativeRate />

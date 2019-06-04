@@ -228,11 +228,11 @@ func (fe *fieldExtract) Extract(s string) error {
 	// of which fields have already been set in order to keep picking
 	// out field data.
 	textMonth := !fe.Wants(fieldMonth)
-	for _, n := range numbers {
+	for i := range numbers {
 		if fe.wanted == 0 {
 			return inputErrorf("too many input fields")
 		}
-		if err := fe.interpretNumber(n, textMonth); err != nil {
+		if err := fe.interpretNumber(numbers, i, textMonth); err != nil {
 			return err
 		}
 	}
@@ -248,7 +248,8 @@ func (fe *fieldExtract) Get(field field) (int, bool) {
 
 // interpretNumber applies pattern-matching rules to figure out which
 // field the next chunk of input should be applied to.
-func (fe *fieldExtract) interpretNumber(chunk numberChunk, textMonth bool) error {
+func (fe *fieldExtract) interpretNumber(numbers []numberChunk, idx int, textMonth bool) error {
+	chunk := numbers[idx]
 	switch {
 	case chunk.separator == '.':
 		// Example: 04:04:04.913231+00:00, a fractional second.
@@ -318,14 +319,22 @@ func (fe *fieldExtract) interpretNumber(chunk numberChunk, textMonth bool) error
 		return fe.SetDayOfYear(chunk)
 
 	case fe.Wants(fieldYear) && fe.Wants(fieldMonth) && fe.Wants(fieldDay):
+		var nextSep rune
+		if len(numbers) > idx+1 {
+			nextSep = numbers[idx+1].separator
+		}
 		// Example: All date formats, we're starting from scratch.
 		switch {
-		case chunk.magnitude >= 6:
+		// We examine the next separator to decide if this is a
+		// concatenated date or a really long year. If it's a - or /
+		// then this is one part of a date instead of the whole date.
+		case chunk.magnitude >= 6 && chunk.separator != '-' && nextSep != '-' && nextSep != '/':
 			// Example: "YYMMDD"
 			//           ^^^^^^
 			// Example: "YYYYMMDD"
 			//           ^^^^^^^^
-			// We're looking at some kind of concatenated date.
+			// We're looking at some kind of concatenated date. We do want
+			// to exclude large-magnitude, negative years from this test.
 
 			// Record whether or not it's a two-digit year.
 			fe.tweakYear = chunk.magnitude == 6
@@ -350,7 +359,9 @@ func (fe *fieldExtract) interpretNumber(chunk numberChunk, textMonth bool) error
 			// year-first mode, we'll accept the first chunk and possibly
 			// adjust a two-digit value later on.  This means that
 			// 99 would get adjusted to 1999, but 0099 would not.
-			if chunk.magnitude <= 2 {
+			if chunk.separator == '-' {
+				chunk.v *= -1
+			} else if chunk.magnitude <= 2 {
 				fe.tweakYear = true
 			}
 			return fe.SetChunk(fieldYear, chunk)
@@ -516,7 +527,7 @@ func (fe *fieldExtract) interpretNumber(chunk numberChunk, textMonth bool) error
 		// timezone is in the middle of a timestamp.
 		fe.has = fe.has.AddAll(tzFields)
 		fe.wanted = fe.wanted.ClearAll(tzFields)
-		return fe.interpretNumber(chunk, textMonth)
+		return fe.interpretNumber(numbers, idx, textMonth)
 
 	case !fe.Wants(fieldTZHour) && !fe.Wants(fieldTZMinute) && fe.Wants(fieldTZSecond):
 		// Example: "<Time> +04:05:06"
@@ -533,7 +544,7 @@ func (fe *fieldExtract) interpretNumber(chunk numberChunk, textMonth bool) error
 		// See the case above.
 		fe.has = fe.has.Add(fieldTZSecond)
 		fe.wanted = fe.wanted.Clear(fieldTZSecond)
-		return fe.interpretNumber(chunk, textMonth)
+		return fe.interpretNumber(numbers, idx, textMonth)
 
 	case fe.Wants(fieldHour) && fe.Wants(fieldMinute) && fe.Wants(fieldSecond):
 		// Example: "[Date] HH:MM:SS"
@@ -585,15 +596,21 @@ func (fe *fieldExtract) interpretNumber(chunk numberChunk, textMonth bool) error
 
 // MakeDate returns a time.Time containing only the date components
 // of the extract.
-func (fe *fieldExtract) MakeDate() time.Time {
+func (fe *fieldExtract) MakeDate() (Date, error) {
 	if fe.sentinel != nil {
-		return *fe.sentinel
+		switch *fe.sentinel {
+		case TimeInfinity:
+			return PosInfDate, nil
+		case TimeNegativeInfinity:
+			return NegInfDate, nil
+		}
+		return MakeDateFromTime(*fe.sentinel)
 	}
 
 	year, _ := fe.Get(fieldYear)
 	month, _ := fe.Get(fieldMonth)
 	day, _ := fe.Get(fieldDay)
-	return time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+	return MakeDateFromTime(time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC))
 }
 
 // MakeTime returns only the time component of the extract.
@@ -658,7 +675,7 @@ func (fe *fieldExtract) matchedSentinel(value time.Time, match string) error {
 // Reset replaces a value of an already-set field.
 func (fe *fieldExtract) Reset(field field, v int) error {
 	if !fe.has.Has(field) {
-		return pgerror.NewAssertionErrorf("field %s is not already set", field.Pretty())
+		return pgerror.AssertionFailedf("field %s is not already set", field.Pretty())
 	}
 	fe.data[field] = v
 	return nil
@@ -668,7 +685,7 @@ func (fe *fieldExtract) Reset(field field, v int) error {
 // the field has already been set.
 func (fe *fieldExtract) Set(field field, v int) error {
 	if !fe.wanted.Has(field) {
-		return pgerror.NewAssertionErrorf("field %s is not wanted in %v", field.Pretty(), fe.wanted)
+		return pgerror.AssertionFailedf("field %s is not wanted in %v", field.Pretty(), fe.wanted)
 	}
 	fe.data[field] = v
 	fe.has = fe.has.Add(field)
@@ -738,7 +755,7 @@ func (fe *fieldExtract) SetDayOfYear(chunk numberChunk) error {
 
 	y, ok := fe.Get(fieldYear)
 	if !ok {
-		return pgerror.NewAssertionErrorf("year must be set before day of year")
+		return pgerror.AssertionFailedf("year must be set before day of year")
 	}
 	y, m, d := julianDayToDate(dateToJulianDay(y, 1, 1) + chunk.v - 1)
 	if err := fe.Reset(fieldYear, y); err != nil {
@@ -777,6 +794,9 @@ func (fe *fieldExtract) validate() error {
 	}
 
 	if year, ok := fe.Get(fieldYear); ok {
+		if year == 0 {
+			return outOfRangeError("year", year)
+		}
 		// Update for BC dates.
 		if era, ok := fe.Get(fieldEra); ok && era < 0 {
 			// No year 0

@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
@@ -69,7 +69,7 @@ func (l *intervalLexer) consumeNum() (int64, bool, float64) {
 		// Try to convert.
 		value, err := strconv.ParseFloat(l.str[start:l.offset], 64)
 		if err != nil {
-			l.err = pgerror.NewErrorf(
+			l.err = pgerror.Newf(
 				pgerror.CodeInvalidDatetimeFormatError, "interval: %v", err)
 			return 0, false, 0
 		}
@@ -78,7 +78,7 @@ func (l *intervalLexer) consumeNum() (int64, bool, float64) {
 
 	// Ensure we have something.
 	if offset == l.offset {
-		l.err = pgerror.NewErrorf(
+		l.err = pgerror.Newf(
 			pgerror.CodeInvalidDatetimeFormatError, "interval: missing number at position %d: %q", offset, l.str)
 		return 0, false, 0
 	}
@@ -110,12 +110,12 @@ func (l *intervalLexer) consumeInt() int64 {
 
 	x, err := strconv.ParseInt(l.str[start:l.offset], 10, 64)
 	if err != nil {
-		l.err = pgerror.NewErrorf(
+		l.err = pgerror.Newf(
 			pgerror.CodeInvalidDatetimeFormatError, "interval: %v", err)
 		return 0
 	}
 	if start == l.offset {
-		l.err = pgerror.NewErrorf(
+		l.err = pgerror.Newf(
 			pgerror.CodeInvalidDatetimeFormatError, "interval: missing number at position %d: %q", start, l.str)
 		return 0
 	}
@@ -138,7 +138,7 @@ func (l *intervalLexer) consumeUnit(skipCharacter byte) string {
 	}
 
 	if offset == l.offset {
-		l.err = pgerror.NewErrorf(
+		l.err = pgerror.Newf(
 			pgerror.CodeInvalidDatetimeFormatError, "interval: missing unit at position %d: %q", offset, l.str)
 		return ""
 	}
@@ -180,7 +180,7 @@ const (
 )
 
 func newInvalidSQLDurationError(s string) error {
-	return pgerror.NewErrorf(pgerror.CodeInvalidDatetimeFormatError, errInvalidSQLDuration, s)
+	return pgerror.Newf(pgerror.CodeInvalidDatetimeFormatError, errInvalidSQLDuration, s)
 }
 
 // Parses a SQL standard interval string.
@@ -368,7 +368,7 @@ func iso8601ToDuration(s string) (duration.Duration, error) {
 		if unit, ok := unitMap[u]; ok {
 			d = d.Add(unit.Mul(v))
 		} else {
-			return d, pgerror.NewErrorf(
+			return d, pgerror.Newf(
 				pgerror.CodeInvalidDatetimeFormatError,
 				"interval: unknown unit %s in ISO-8601 duration %s", u, s)
 		}
@@ -395,7 +395,6 @@ var unitMap = func(
 }(map[string]duration.Duration{
 	// Use DecodeDuration here because ns is the only unit for which we do not
 	// want to round nanoseconds since it is only used for multiplication.
-	"nanosecond":  duration.DecodeDuration(0, 0, time.Nanosecond.Nanoseconds()),
 	"microsecond": duration.MakeDuration(time.Microsecond.Nanoseconds(), 0, 0),
 	"millisecond": duration.MakeDuration(time.Millisecond.Nanoseconds(), 0, 0),
 	"second":      duration.MakeDuration(time.Second.Nanoseconds(), 0, 0),
@@ -406,7 +405,6 @@ var unitMap = func(
 	"month":       duration.MakeDuration(0, 0, 1),
 	"year":        duration.MakeDuration(0, 0, 12),
 }, map[string][]string{
-	"nanosecond": {"ns", "nsec", "nsecs", "nsecond", "nseconds"},
 	// Include PostgreSQL's unit keywords for compatibility; see
 	// https://github.com/postgres/postgres/blob/a01d0fa1d889cc2003e1941e8b98707c4d701ba9/src/backend/utils/adt/datetime.c#L175-L240
 	//
@@ -432,7 +430,7 @@ func parseDuration(s string) (duration.Duration, error) {
 	l.consumeSpaces()
 
 	if l.offset == len(l.str) {
-		return d, pgerror.NewErrorf(
+		return d, pgerror.Newf(
 			pgerror.CodeInvalidDatetimeFormatError, "interval: invalid input syntax: %q", l.str)
 	}
 	for l.offset != len(l.str) {
@@ -466,10 +464,10 @@ func parseDuration(s string) (duration.Duration, error) {
 		}
 
 		if u != "" {
-			return d, pgerror.NewErrorf(
+			return d, pgerror.Newf(
 				pgerror.CodeInvalidDatetimeFormatError, "interval: unknown unit %q in duration %q", u, s)
 		}
-		return d, pgerror.NewErrorf(
+		return d, pgerror.Newf(
 			pgerror.CodeInvalidDatetimeFormatError, "interval: missing unit at position %d: %q", l.offset, s)
 	}
 	return d, l.err
@@ -484,7 +482,7 @@ func (l *intervalLexer) parseShortDuration(h int64, hasSign bool) (duration.Dura
 	// first number, so that we can check here there are no unwanted
 	// spaces.
 	if l.str[l.offset] != ':' {
-		return duration.Duration{}, pgerror.NewErrorf(
+		return duration.Duration{}, pgerror.Newf(
 			pgerror.CodeInvalidDatetimeFormatError, "interval: invalid format %s", l.str[l.offset:])
 	}
 	l.offset++
@@ -492,7 +490,7 @@ func (l *intervalLexer) parseShortDuration(h int64, hasSign bool) (duration.Dura
 	m, hasDecimal, mp := l.consumeNum()
 
 	if m < 0 {
-		return duration.Duration{}, pgerror.NewErrorf(
+		return duration.Duration{}, pgerror.Newf(
 			pgerror.CodeInvalidDatetimeFormatError, "interval: invalid format: %s", l.str)
 	}
 	// We have three possible formats:
@@ -521,7 +519,7 @@ func (l *intervalLexer) parseShortDuration(h int64, hasSign bool) (duration.Dura
 		l.offset++
 		s, _, sp = l.consumeNum()
 		if s < 0 {
-			return duration.Duration{}, pgerror.NewErrorf(
+			return duration.Duration{}, pgerror.Newf(
 				pgerror.CodeInvalidDatetimeFormatError, "interval: invalid format: %s", l.str)
 		}
 	}

@@ -21,14 +21,16 @@ import (
 	"github.com/axiomhq/hyperloglog"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 )
 
@@ -39,7 +41,7 @@ type sampleAggregator struct {
 
 	spec    *distsqlpb.SampleAggregatorSpec
 	input   RowSource
-	inTypes []sqlbase.ColumnType
+	inTypes []types.T
 	sr      stats.SampleReservoir
 
 	tableID     sqlbase.ID
@@ -60,7 +62,7 @@ const sampleAggregatorProcName = "sample aggregator"
 
 // SampleAggregatorProgressInterval is the frequency at which the
 // SampleAggregator processor will report progress. It is mutable for testing.
-var SampleAggregatorProgressInterval = time.Second
+var SampleAggregatorProgressInterval = 5 * time.Second
 
 func newSampleAggregator(
 	flowCtx *FlowCtx,
@@ -112,7 +114,7 @@ func newSampleAggregator(
 	s.sr.Init(int(spec.SampleSize), input.OutputTypes()[:rankCol])
 
 	if err := s.Init(
-		nil, post, []sqlbase.ColumnType{}, flowCtx, processorID, output, nil, /* memMonitor */
+		nil, post, []types.T{}, flowCtx, processorID, output, nil, /* memMonitor */
 		// this proc doesn't implement RowSource and doesn't use ProcessorBase to drain
 		ProcStateOpts{},
 	); err != nil {
@@ -152,32 +154,44 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err er
 		}
 	}
 
-	progFn := func(pct float32) error {
+	lastReportedFractionCompleted := float32(-1)
+	// Report progress (0 to 1).
+	progFn := func(fractionCompleted float32) error {
 		if jobID == 0 {
 			return nil
 		}
-		return job.FractionProgressed(ctx, func(ctx context.Context, _ jobspb.ProgressDetails) float32 {
-			// Float addition can round such that the sum is > 1.
-			if pct > 1 {
-				pct = 1
-			}
-			return pct
-		})
+		// If it changed by less than 1%, just check for cancellation (which is more
+		// efficient).
+		if fractionCompleted < 1.0 && fractionCompleted < lastReportedFractionCompleted+0.01 {
+			return job.CheckStatus(ctx)
+		}
+		lastReportedFractionCompleted = fractionCompleted
+		return job.FractionProgressed(ctx, jobs.FractionUpdater(fractionCompleted))
 	}
 
-	fractionCompleted := float32(0)
+	var rowsProcessed uint64
 	progressUpdates := util.Every(SampleAggregatorProgressInterval)
 	var da sqlbase.DatumAlloc
 	var tmpSketch hyperloglog.Sketch
 	for {
 		row, meta := s.input.Next()
 		if meta != nil {
-			if meta.Progress != nil {
-				inputProg := meta.Progress.Progress.(*jobspb.Progress_FractionCompleted).FractionCompleted
-				fractionCompleted += inputProg / float32(s.spec.InputProcCnt)
+			if meta.SamplerProgress != nil {
+				rowsProcessed += meta.SamplerProgress.RowsProcessed
 				if progressUpdates.ShouldProcess(timeutil.Now()) {
 					// Periodically report fraction progressed and check that the job has
 					// not been paused or canceled.
+					var fractionCompleted float32
+					if s.spec.RowsExpected > 0 {
+						fractionCompleted = float32(float64(rowsProcessed) / float64(s.spec.RowsExpected))
+						const maxProgress = 0.99
+						if fractionCompleted > maxProgress {
+							// Since the total number of rows expected is just an estimate,
+							// don't report more than 99% completion until the very end.
+							fractionCompleted = maxProgress
+						}
+					}
+
 					if err := progFn(fractionCompleted); err != nil {
 						return false, err
 					}
@@ -200,7 +214,7 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err er
 			// This must be a sampled row.
 			rank, err := row[s.rankCol].GetInt()
 			if err != nil {
-				return false, errors.Wrapf(err, "decoding rank column")
+				return false, pgerror.NewAssertionErrorWithWrappedErrf(err, "decoding rank column")
 			}
 			// Retain the rows with the top ranks.
 			if err := s.sr.SampleRow(row[:s.rankCol], uint64(rank)); err != nil {
@@ -235,13 +249,13 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err er
 		}
 		d := row[s.sketchCol].Datum
 		if d == tree.DNull {
-			return false, errors.Errorf("NULL sketch data")
+			return false, pgerror.AssertionFailedf("NULL sketch data")
 		}
 		if err := tmpSketch.UnmarshalBinary([]byte(*d.(*tree.DBytes))); err != nil {
 			return false, err
 		}
 		if err := s.sketches[sketchIdx].sketch.Merge(&tmpSketch); err != nil {
-			return false, errors.Wrapf(err, "merging sketch data")
+			return false, pgerror.NewAssertionErrorWithWrappedErrf(err, "merging sketch data")
 		}
 	}
 	// Report progress one last time so we don't write results if the job was
@@ -254,16 +268,24 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err er
 
 // writeResults inserts the new statistics into system.table_statistics.
 func (s *sampleAggregator) writeResults(ctx context.Context) error {
+	// Turn off tracing so these writes don't affect the results of EXPLAIN
+	// ANALYZE.
+	if span := opentracing.SpanFromContext(ctx); span != nil && tracing.IsRecording(span) {
+		// TODO(rytaft): this also hides writes in this function from SQL session
+		// traces.
+		ctx = opentracing.ContextWithSpan(ctx, nil)
+	}
+
 	// TODO(andrei): This method would benefit from a session interface on the
 	// internal executor instead of doing this weird thing where it uses the
 	// internal executor to execute one statement at a time inside a db.Txn()
 	// closure.
-	return s.flowCtx.ClientDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	if err := s.flowCtx.ClientDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		for _, si := range s.sketches {
 			var histogram *stats.HistogramData
 			if si.spec.GenerateHistogram && len(s.sr.Get()) != 0 {
 				colIdx := int(si.spec.Columns[0])
-				typ := s.inTypes[colIdx]
+				typ := &s.inTypes[colIdx]
 
 				h, err := generateHistogram(
 					s.evalCtx,
@@ -298,7 +320,6 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 			// Insert the new stat.
 			if err := stats.InsertNewStat(
 				ctx,
-				s.flowCtx.Gossip,
 				s.flowCtx.executor,
 				txn,
 				s.tableID,
@@ -314,7 +335,12 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 		}
 
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	// Gossip invalidation of the stat caches for this table.
+	return stats.GossipTableStatAdded(s.flowCtx.Gossip, s.tableID)
 }
 
 // generateHistogram returns a histogram (on a given column) from a set of
@@ -324,7 +350,7 @@ func generateHistogram(
 	evalCtx *tree.EvalContext,
 	samples []stats.SampledRow,
 	colIdx int,
-	colType sqlbase.ColumnType,
+	colType *types.T,
 	numRows int64,
 	maxBuckets int,
 ) (stats.HistogramData, error) {
@@ -334,7 +360,7 @@ func generateHistogram(
 		ed := &s.Row[colIdx]
 		// Ignore NULLs (they are counted separately).
 		if !ed.IsNull() {
-			if err := ed.EnsureDecoded(&colType, &da); err != nil {
+			if err := ed.EnsureDecoded(colType, &da); err != nil {
 				return stats.HistogramData{}, err
 			}
 			values = append(values, ed.Datum)

@@ -27,10 +27,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -51,8 +52,6 @@ const (
 	// BackupDescriptorCheckpointName is the file name used to store the
 	// serialized BackupDescriptor proto while the backup is in progress.
 	BackupDescriptorCheckpointName = "BACKUP-CHECKPOINT"
-	// BackupFormatInitialVersion is the first version of backup and its files.
-	BackupFormatInitialVersion uint32 = 0
 	// BackupFormatDescriptorTrackingVersion added tracking of complete DBs.
 	BackupFormatDescriptorTrackingVersion uint32 = 1
 )
@@ -272,7 +271,8 @@ func allSQLDescriptors(ctx context.Context, txn *client.Txn) ([]sqlbase.Descript
 	sqlDescs := make([]sqlbase.Descriptor, len(rows))
 	for i, row := range rows {
 		if err := row.ValueProto(&sqlDescs[i]); err != nil {
-			return nil, errors.Wrapf(err, "%s: unable to unmarshal SQL descriptor", row.Key)
+			return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+				"%s: unable to unmarshal SQL descriptor", row.Key)
 		}
 	}
 	return sqlDescs, nil
@@ -311,13 +311,15 @@ func ensureInterleavesIncluded(tables []*sqlbase.TableDescriptor) error {
 func allRangeDescriptors(ctx context.Context, txn *client.Txn) ([]roachpb.RangeDescriptor, error) {
 	rows, err := txn.Scan(ctx, keys.Meta2Prefix, keys.MetaMax, 0)
 	if err != nil {
-		return nil, errors.Wrap(err, "unable to scan range descriptors")
+		return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+			"unable to scan range descriptors")
 	}
 
 	rangeDescs := make([]roachpb.RangeDescriptor, len(rows))
 	for i, row := range rows {
 		if err := row.ValueProto(&rangeDescs[i]); err != nil {
-			return nil, errors.Wrapf(err, "%s: unable to unmarshal range descriptor", row.Key)
+			return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+				"%s: unable to unmarshal range descriptor", row.Key)
 		}
 	}
 	return rangeDescs, nil
@@ -339,7 +341,7 @@ func spansForAllTableIndexes(
 	for _, table := range tables {
 		for _, index := range table.AllNonDropIndexes() {
 			if err := sstIntervalTree.Insert(intervalSpan(table.IndexSpan(index.ID)), false); err != nil {
-				panic(errors.Wrap(err, "IndexSpan"))
+				panic(pgerror.NewAssertionErrorWithWrappedErrf(err, "IndexSpan"))
 			}
 			added[tableAndIndex{tableID: table.ID, indexID: index.ID}] = true
 		}
@@ -353,7 +355,7 @@ func spansForAllTableIndexes(
 				key := tableAndIndex{tableID: tbl.ID, indexID: idx.ID}
 				if !added[key] {
 					if err := sstIntervalTree.Insert(intervalSpan(tbl.IndexSpan(idx.ID)), false); err != nil {
-						panic(errors.Wrap(err, "IndexSpan"))
+						panic(pgerror.NewAssertionErrorWithWrappedErrf(err, "IndexSpan"))
 					}
 					added[key] = true
 				}
@@ -453,7 +455,11 @@ func optsToKVOptions(opts map[string]string) tree.KVOptions {
 }
 
 func backupJobDescription(
-	backup *tree.Backup, to string, incrementalFrom []string, opts map[string]string,
+	p sql.PlanHookState,
+	backup *tree.Backup,
+	to string,
+	incrementalFrom []string,
+	opts map[string]string,
 ) (string, error) {
 	b := &tree.Backup{
 		AsOf:    backup.AsOf,
@@ -474,7 +480,9 @@ func backupJobDescription(
 		}
 		b.IncrementalFrom = append(b.IncrementalFrom, tree.NewDString(sanitizedFrom))
 	}
-	return tree.AsStringWithFlags(b, tree.FmtAlwaysQualifyTableNames), nil
+
+	ann := p.ExtendedEvalContext().Annotations
+	return tree.AsStringWithFQNames(b, ann), nil
 }
 
 // clusterNodeCount returns the approximate number of nodes in the cluster.
@@ -631,11 +639,7 @@ func backup(
 		allSpans = append(allSpans, spanAndTime{span: s, start: backupDesc.StartTime, end: backupDesc.EndTime})
 	}
 
-	progressLogger := jobs.ProgressLogger{
-		Job:           job,
-		TotalChunks:   len(spans),
-		StartFraction: job.FractionCompleted(),
-	}
+	progressLogger := jobs.NewChunkProgressLogger(job, len(spans), job.FractionCompleted(), jobs.ProgressUpdateOnly)
 
 	// We're already limiting these on the server-side, but sending all the
 	// Export requests at once would fill up distsender/grpc/something and cause
@@ -745,7 +749,8 @@ func backup(
 	})
 
 	if err := g.Wait(); err != nil {
-		return mu.exported, errors.Wrapf(err, "exporting %d ranges", len(spans))
+		return mu.exported, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+			"exporting %d ranges", log.Safe(len(spans)))
 	}
 
 	// No more concurrency, so no need to acquire locks below.
@@ -773,18 +778,21 @@ func VerifyUsableExportTarget(
 		// TODO(dt): If we audit exactly what not-exists error each ExportStorage
 		// returns (and then wrap/tag them), we could narrow this check.
 		r.Close()
-		return errors.Errorf("%s already contains a %s file",
+		return pgerror.Newf(pgerror.CodeDuplicateFileError,
+			"%s already contains a %s file",
 			readable, BackupDescriptorName)
 	}
 	if r, err := exportStore.ReadFile(ctx, BackupDescriptorCheckpointName); err == nil {
 		r.Close()
-		return errors.Errorf("%s already contains a %s file (is another operation already in progress?)",
+		return pgerror.Newf(pgerror.CodeDuplicateFileError,
+			"%s already contains a %s file (is another operation already in progress?)",
 			readable, BackupDescriptorCheckpointName)
 	}
 	if err := writeBackupDescriptor(
 		ctx, exportStore, BackupDescriptorCheckpointName, &BackupDescriptor{},
 	); err != nil {
-		return errors.Wrapf(err, "cannot write to %s", readable)
+		return pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+			"cannot write to %s", readable)
 	}
 	return nil
 }
@@ -792,23 +800,23 @@ func VerifyUsableExportTarget(
 // backupPlanHook implements PlanHookFn.
 func backupPlanHook(
 	_ context.Context, stmt tree.Statement, p sql.PlanHookState,
-) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, error) {
+) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, bool, error) {
 	backupStmt, ok := stmt.(*tree.Backup)
 	if !ok {
-		return nil, nil, nil, nil
+		return nil, nil, nil, false, nil
 	}
 
 	toFn, err := p.TypeAsString(backupStmt.To, "BACKUP")
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	incrementalFromFn, err := p.TypeAsStringArray(backupStmt.IncrementalFrom, "BACKUP")
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	optsFn, err := p.TypeAsStringOpts(backupStmt.Options, backupOptionExpectValues)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 
 	header := sqlbase.ResultColumns{
@@ -907,13 +915,15 @@ func backupPlanHook(
 			for i, uri := range incrementalFrom {
 				desc, err := ReadBackupDescriptorFromURI(ctx, uri, p.ExecCfg().Settings)
 				if err != nil {
-					return errors.Wrapf(err, "failed to read backup from %q", uri)
+					return pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+						"failed to read backup from %q", uri)
 				}
 				// IDs are how we identify tables, and those are only meaningful in the
 				// context of their own cluster, so we need to ensure we only allow
 				// incremental previous backups that we created.
 				if !desc.ClusterID.Equal(clusterID) {
-					return errors.Errorf("previous BACKUP %q belongs to cluster %s", uri, desc.ClusterID.String())
+					return pgerror.Newf(pgerror.CodeDataExceptionError,
+						"previous BACKUP %q belongs to cluster %s", uri, desc.ClusterID.String())
 				}
 				prevBackups[i] = desc
 			}
@@ -997,10 +1007,12 @@ func backupPlanHook(
 					return errOnMissingRange(span, start, end)
 				})
 			if err != nil {
-				return errors.Wrap(err, "invalid previous backups (a new full backup may be required if a table has been created, dropped or truncated)")
+				return pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+					"invalid previous backups (a new full backup may be required if a table has been created, dropped or truncated)")
 			}
 			if coveredTime != startTime {
-				return errors.Errorf("expected previous backups to cover until time %v, got %v", startTime, coveredTime)
+				return pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+					"expected previous backups to cover until time %v, got %v", startTime, coveredTime)
 			}
 		}
 
@@ -1051,7 +1063,7 @@ func backupPlanHook(
 			return err
 		}
 
-		description, err := backupJobDescription(backupStmt, to, incrementalFrom, opts)
+		description, err := backupJobDescription(p, backupStmt, to, incrementalFrom, opts)
 		if err != nil {
 			return err
 		}
@@ -1082,35 +1094,39 @@ func backupPlanHook(
 		}
 		return <-errCh
 	}
-	return fn, header, nil, nil
+	return fn, header, nil, false, nil
 }
 
 type backupResumer struct {
+	job      *jobs.Job
 	settings *cluster.Settings
 	res      roachpb.BulkOpSummary
 }
 
+// Resume is part of the jobs.Resumer interface.
 func (b *backupResumer) Resume(
-	ctx context.Context, job *jobs.Job, phs interface{}, resultsCh chan<- tree.Datums,
+	ctx context.Context, phs interface{}, resultsCh chan<- tree.Datums,
 ) error {
-	details := job.Details().(jobspb.BackupDetails)
+	details := b.job.Details().(jobspb.BackupDetails)
 	p := phs.(sql.PlanHookState)
 
 	if len(details.BackupDescriptor) == 0 {
-		return errors.New("missing backup descriptor; cannot resume a backup from an older version")
+		return pgerror.Newf(pgerror.CodeDataExceptionError,
+			"missing backup descriptor; cannot resume a backup from an older version")
 	}
 
 	var backupDesc BackupDescriptor
 	if err := protoutil.Unmarshal(details.BackupDescriptor, &backupDesc); err != nil {
-		return errors.Wrap(err, "unmarshal backup descriptor")
+		return pgerror.Wrapf(err, pgerror.CodeDataCorruptedError,
+			"unmarshal backup descriptor")
 	}
 	conf, err := storageccl.ExportStorageConfFromURI(details.URI)
 	if err != nil {
-		return err
+		return pgerror.Wrapf(err, pgerror.CodeDataExceptionError, "export configuration")
 	}
 	exportStore, err := storageccl.MakeExportStorage(ctx, conf, b.settings)
 	if err != nil {
-		return err
+		return pgerror.Wrapf(err, pgerror.CodeDataExceptionError, "make storage")
 	}
 	var checkpointDesc *BackupDescriptor
 	if desc, err := readBackupDescriptor(ctx, exportStore, BackupDescriptorCheckpointName); err == nil {
@@ -1125,7 +1141,7 @@ func (b *backupResumer) Resume(
 		// checkpoint, which is more troubling. Sadly, storageccl doesn't provide a
 		// "not found" error that's consistent across all ExportStorage
 		// implementations.
-		log.Warningf(ctx, "unable to load backup checkpoint while resuming job %d: %v", *job.ID(), err)
+		log.Warningf(ctx, "unable to load backup checkpoint while resuming job %d: %v", *b.job.ID(), err)
 	}
 	res, err := backup(
 		ctx,
@@ -1133,7 +1149,7 @@ func (b *backupResumer) Resume(
 		p.ExecCfg().Gossip,
 		p.ExecCfg().Settings,
 		exportStore,
-		job,
+		b.job,
 		&backupDesc,
 		checkpointDesc,
 		resultsCh,
@@ -1142,15 +1158,19 @@ func (b *backupResumer) Resume(
 	return err
 }
 
-func (b *backupResumer) OnFailOrCancel(context.Context, *client.Txn, *jobs.Job) error { return nil }
-func (b *backupResumer) OnSuccess(context.Context, *client.Txn, *jobs.Job) error      { return nil }
+// OnFailOrCancel is part of the jobs.Resumer interface.
+func (b *backupResumer) OnFailOrCancel(context.Context, *client.Txn) error { return nil }
 
+// OnSuccess is part of the jobs.Resumer interface.
+func (b *backupResumer) OnSuccess(context.Context, *client.Txn) error { return nil }
+
+// OnTerminal is part of the jobs.Resumer interface.
 func (b *backupResumer) OnTerminal(
-	ctx context.Context, job *jobs.Job, status jobs.Status, resultsCh chan<- tree.Datums,
+	ctx context.Context, status jobs.Status, resultsCh chan<- tree.Datums,
 ) {
 	// Attempt to delete BACKUP-CHECKPOINT.
 	if err := func() error {
-		details := job.Details().(jobspb.BackupDetails)
+		details := b.job.Details().(jobspb.BackupDetails)
 		conf, err := storageccl.ExportStorageConfFromURI(details.URI)
 		if err != nil {
 			return err
@@ -1171,7 +1191,7 @@ func (b *backupResumer) OnTerminal(
 		// the current coordinator's counts.
 
 		resultsCh <- tree.Datums{
-			tree.NewDInt(tree.DInt(*job.ID())),
+			tree.NewDInt(tree.DInt(*b.job.ID())),
 			tree.NewDString(string(jobs.StatusSucceeded)),
 			tree.NewDFloat(tree.DFloat(1.0)),
 			tree.NewDInt(tree.DInt(b.res.Rows)),
@@ -1179,18 +1199,6 @@ func (b *backupResumer) OnTerminal(
 			tree.NewDInt(tree.DInt(b.res.SystemRecords)),
 			tree.NewDInt(tree.DInt(b.res.DataSize)),
 		}
-	}
-}
-
-var _ jobs.Resumer = &backupResumer{}
-
-func backupResumeHook(typ jobspb.Type, settings *cluster.Settings) jobs.Resumer {
-	if typ != jobspb.TypeBackup {
-		return nil
-	}
-
-	return &backupResumer{
-		settings: settings,
 	}
 }
 
@@ -1244,7 +1252,17 @@ func getAllRevisions(
 	return res, nil
 }
 
+var _ jobs.Resumer = &backupResumer{}
+
 func init() {
 	sql.AddPlanHook(backupPlanHook)
-	jobs.AddResumeHook(backupResumeHook)
+	jobs.RegisterConstructor(
+		jobspb.TypeBackup,
+		func(job *jobs.Job, settings *cluster.Settings) jobs.Resumer {
+			return &backupResumer{
+				job:      job,
+				settings: settings,
+			}
+		},
+	)
 }

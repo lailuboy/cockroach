@@ -248,6 +248,7 @@ func (b *Batch) fillResults(ctx context.Context) {
 			case *roachpb.EndTransactionRequest:
 			case *roachpb.AdminMergeRequest:
 			case *roachpb.AdminSplitRequest:
+			case *roachpb.AdminUnsplitRequest:
 			case *roachpb.AdminTransferLeaseRequest:
 			case *roachpb.AdminChangeReplicasRequest:
 			case *roachpb.AdminRelocateRangeRequest:
@@ -270,7 +271,7 @@ func (b *Batch) fillResults(ctx context.Context) {
 			}
 			// Fill up the resume span.
 			if result.Err == nil && reply != nil && reply.Header().ResumeSpan != nil {
-				result.ResumeSpan = *reply.Header().ResumeSpan
+				result.ResumeSpan = reply.Header().ResumeSpan
 				result.ResumeReason = reply.Header().ResumeReason
 				// The ResumeReason might be missing when talking to a 1.1 node; assume
 				// it's the key limit (which was the only reason why 1.1 would return a
@@ -587,7 +588,7 @@ func (b *Batch) adminMerge(key interface{}) {
 
 // adminSplit is only exported on DB. It is here for symmetry with the
 // other operations.
-func (b *Batch) adminSplit(spanKeyIn, splitKeyIn interface{}) {
+func (b *Batch) adminSplit(spanKeyIn, splitKeyIn interface{}, manual bool) {
 	spanKey, err := marshalKey(spanKeyIn)
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
@@ -602,8 +603,23 @@ func (b *Batch) adminSplit(spanKeyIn, splitKeyIn interface{}) {
 		RequestHeader: roachpb.RequestHeader{
 			Key: spanKey,
 		},
+		SplitKey: splitKey,
+		Manual:   manual,
 	}
-	req.SplitKey = splitKey
+	b.appendReqs(req)
+	b.initResult(1, 0, notRaw, nil)
+}
+
+func (b *Batch) adminUnsplit(splitKeyIn interface{}) {
+	splitKey, err := marshalKey(splitKeyIn)
+	if err != nil {
+		b.initResult(0, 0, notRaw, err)
+	}
+	req := &roachpb.AdminUnsplitRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key: splitKey,
+		},
+	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
 }
@@ -629,7 +645,10 @@ func (b *Batch) adminTransferLease(key interface{}, target roachpb.StoreID) {
 // adminChangeReplicas is only exported on DB. It is here for symmetry with the
 // other operations.
 func (b *Batch) adminChangeReplicas(
-	key interface{}, changeType roachpb.ReplicaChangeType, targets []roachpb.ReplicationTarget,
+	key interface{},
+	changeType roachpb.ReplicaChangeType,
+	targets []roachpb.ReplicationTarget,
+	expDesc roachpb.RangeDescriptor,
 ) {
 	k, err := marshalKey(key)
 	if err != nil {
@@ -642,6 +661,7 @@ func (b *Batch) adminChangeReplicas(
 		},
 		ChangeType: changeType,
 		Targets:    targets,
+		ExpDesc:    &expDesc,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)

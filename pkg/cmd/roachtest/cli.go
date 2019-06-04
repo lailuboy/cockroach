@@ -24,7 +24,7 @@ import (
 
 func runCLINodeStatus(ctx context.Context, t *test, c *cluster) {
 	c.Put(ctx, cockroach, "./cockroach")
-	c.Start(ctx, t, c.Range(1, 3), startArgs("--sequential"))
+	c.Start(ctx, t, c.Range(1, 3))
 
 	db := c.Conn(ctx, 1)
 	defer db.Close()
@@ -42,13 +42,14 @@ func runCLINodeStatus(ctx context.Context, t *test, c *cluster) {
 		return result
 	}
 
-	nodeStatus := func() []string {
+	nodeStatus := func() (raw string, _ []string) {
 		out, err := c.RunWithBuffer(ctx, t.l, c.Node(1),
 			"./cockroach node status --insecure -p {pgport:1}")
 		if err != nil {
 			t.Fatalf("%v\n%s", err, out)
 		}
-		return lastWords(string(out))
+		raw = string(out)
+		return raw, lastWords(string(out))
 	}
 
 	{
@@ -58,17 +59,18 @@ func runCLINodeStatus(ctx context.Context, t *test, c *cluster) {
 			"true true",
 			"true true",
 		}
-		actual := nodeStatus()
+		raw, actual := nodeStatus()
 		if !reflect.DeepEqual(expected, actual) {
-			t.Fatalf("expected %s, but found %s:\n", expected, actual)
+			t.Fatalf("expected %s, but found %s:\nfrom:\n%s", expected, actual, raw)
 		}
 	}
 
 	waitUntil := func(expected []string) {
+		var raw string
 		var actual []string
 		// Node liveness takes ~9s to time out. Give the test double that time.
 		for i := 0; i < 20; i++ {
-			actual = nodeStatus()
+			raw, actual = nodeStatus()
 			if reflect.DeepEqual(expected, actual) {
 				break
 			}
@@ -76,7 +78,7 @@ func runCLINodeStatus(ctx context.Context, t *test, c *cluster) {
 			time.Sleep(time.Second)
 		}
 		if !reflect.DeepEqual(expected, actual) {
-			t.Fatalf("expected %s, but found %s:\n", expected, actual)
+			t.Fatalf("expected %s, but found %s from:\n%s", expected, actual, raw)
 		}
 	}
 
@@ -116,4 +118,7 @@ func runCLINodeStatus(ctx context.Context, t *test, c *cluster) {
 		"true true",
 		"false false",
 	})
+
+	// Start node again to satisfy roachtest.
+	c.Start(ctx, t, c.Node(3))
 }

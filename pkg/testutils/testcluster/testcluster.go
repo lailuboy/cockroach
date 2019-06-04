@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -151,6 +150,17 @@ func StartTestCluster(t testing.TB, nodes int, args base.TestClusterArgs) *TestC
 		} else {
 			serverArgs = args.ServerArgs
 		}
+
+		// If there are multiple nodes, place them in different localities by
+		// default.
+		if nodes > 0 {
+			tiers := []roachpb.Tier{
+				{Key: "region", Value: "test"},
+				{Key: "dc", Value: fmt.Sprintf("dc%d", i+1)},
+			}
+			serverArgs.Locality = roachpb.Locality{Tiers: tiers}
+		}
+
 		if i > 0 {
 			serverArgs.JoinAddr = tc.Servers[0].ServingAddr()
 		}
@@ -352,18 +362,19 @@ func (tc *TestCluster) changeReplicas(
 	changeType roachpb.ReplicaChangeType, startKey roachpb.RKey, targets ...roachpb.ReplicationTarget,
 ) (roachpb.RangeDescriptor, error) {
 	ctx := context.TODO()
-	if err := tc.Servers[0].DB().AdminChangeReplicas(
-		ctx, startKey.AsRawKey(), changeType, targets,
-	); err != nil {
-		return roachpb.RangeDescriptor{}, errors.Wrap(err, "AdminChangeReplicas error")
-	}
-	var rangeDesc roachpb.RangeDescriptor
+	var beforeDesc roachpb.RangeDescriptor
 	if err := tc.Servers[0].DB().GetProto(
-		ctx, keys.RangeDescriptorKey(startKey), &rangeDesc,
+		ctx, keys.RangeDescriptorKey(startKey), &beforeDesc,
 	); err != nil {
 		return roachpb.RangeDescriptor{}, errors.Wrap(err, "range descriptor lookup error")
 	}
-	return rangeDesc, nil
+	desc, err := tc.Servers[0].DB().AdminChangeReplicas(
+		ctx, startKey.AsRawKey(), changeType, targets, beforeDesc,
+	)
+	if err != nil {
+		return roachpb.RangeDescriptor{}, errors.Wrap(err, "AdminChangeReplicas error")
+	}
+	return *desc, nil
 }
 
 // AddReplicas is part of TestClusterInterface.
@@ -443,8 +454,8 @@ func (tc *TestCluster) FindRangeLease(
 		}
 	} else {
 		hint = &roachpb.ReplicationTarget{
-			NodeID:  rangeDesc.Replicas[0].NodeID,
-			StoreID: rangeDesc.Replicas[0].StoreID}
+			NodeID:  rangeDesc.Replicas().Unwrap()[0].NodeID,
+			StoreID: rangeDesc.Replicas().Unwrap()[0].StoreID}
 	}
 
 	// Find the server indicated by the hint and send a LeaseInfoRequest through
@@ -502,7 +513,7 @@ func (tc *TestCluster) WaitForSplitAndReplication(startKey roachpb.Key) error {
 				startKey, desc.StartKey)
 		}
 		// Once we've verified the split, make sure that replicas exist.
-		for _, rDesc := range desc.Replicas {
+		for _, rDesc := range desc.Replicas().Unwrap() {
 			store, err := tc.findMemberStore(rDesc.StoreID)
 			if err != nil {
 				return err
@@ -540,7 +551,8 @@ func (tc *TestCluster) findMemberStore(storeID roachpb.StoreID) (*storage.Store,
 // WaitForFullReplication waits until all stores in the cluster
 // have no ranges with replication pending.
 func (tc *TestCluster) WaitForFullReplication() error {
-	if int32(len(tc.Servers)) < *config.DefaultZoneConfig().NumReplicas {
+	if len(tc.Servers) < 3 {
+		// If we have less than three nodes, we will never have full replication.
 		return nil
 	}
 
@@ -596,7 +608,8 @@ func (tc *TestCluster) WaitForFullReplication() error {
 func (tc *TestCluster) WaitForNodeStatuses(t testing.TB) {
 	testutils.SucceedsSoon(t, func() error {
 		url := tc.Server(0).ServingAddr()
-		conn, err := tc.Server(0).RPCContext().GRPCDial(url).Connect(context.Background())
+		nodeID := tc.Server(0).NodeID()
+		conn, err := tc.Server(0).RPCContext().GRPCDialNode(url, nodeID).Connect(context.Background())
 		if err != nil {
 			return err
 		}

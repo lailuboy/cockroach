@@ -37,7 +37,7 @@ func TestServer(t *testing.T) {
 	ctx := context.Background()
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
-	conn, err := s.RPCContext().GRPCDial(s.ServingAddr()).Connect(ctx)
+	conn, err := s.RPCContext().GRPCDialNode(s.ServingAddr(), s.NodeID()).Connect(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestServer(t *testing.T) {
 
 	var decoder StreamDecoder
 	var rows sqlbase.EncDatumRows
-	var metas []ProducerMetadata
+	var metas []distsqlpb.ProducerMetadata
 	for {
 		msg, err := stream.Recv()
 		if err != nil {

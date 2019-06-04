@@ -29,11 +29,15 @@ import (
 	"github.com/pkg/errors"
 )
 
-var importBatchSize = settings.RegisterByteSizeSetting(
-	"kv.import.batch_size",
-	"the maximum size of the payload in an AddSSTable request",
-	32<<20,
-)
+var importBatchSize = func() *settings.ByteSizeSetting {
+	s := settings.RegisterByteSizeSetting(
+		"kv.import.batch_size",
+		"the maximum size of the payload in an AddSSTable request",
+		32<<20,
+	)
+	s.SetSensitive()
+	return s
+}()
 
 // commandMetadataEstimate is an estimate of how much metadata Raft will add to
 // an AddSSTable command. It is intentionally a vast overestimate to avoid
@@ -41,7 +45,6 @@ var importBatchSize = settings.RegisterByteSizeSetting(
 const commandMetadataEstimate = 1 << 20 // 1 MB
 
 func init() {
-	importBatchSize.Hide()
 	storage.SetImportCmd(evalImport)
 
 	// Ensure that the user cannot set the maximum raft command size so low that
@@ -75,10 +78,10 @@ func evalImport(ctx context.Context, cArgs batcheval.CommandArgs) (*roachpb.Impo
 		return nil, errors.Wrap(err, "make key rewriter")
 	}
 
-	if err := cArgs.EvalCtx.GetLimiters().ConcurrentImports.Begin(ctx); err != nil {
+	if err := cArgs.EvalCtx.GetLimiters().ConcurrentImportRequests.Begin(ctx); err != nil {
 		return nil, err
 	}
-	defer cArgs.EvalCtx.GetLimiters().ConcurrentImports.Finish()
+	defer cArgs.EvalCtx.GetLimiters().ConcurrentImportRequests.Finish()
 
 	var iters []engine.SimpleIterator
 	for _, file := range args.Files {

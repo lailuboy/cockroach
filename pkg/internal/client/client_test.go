@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -251,7 +252,7 @@ func TestClientRunTransaction(t *testing.T) {
 			}
 			// Attempt to read in another txn.
 			conflictTxn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
-			conflictTxn.InternalSetPriority(roachpb.MaxTxnPriority)
+			conflictTxn.InternalSetPriority(enginepb.MaxTxnPriority)
 			if gr, err := conflictTxn.Get(ctx, key); err != nil {
 				return err
 			} else if gr.Value != nil {
@@ -319,10 +320,9 @@ func TestClientRunConcurrentTransaction(t *testing.T) {
 						concErrs[i] = err
 						return
 					}
-					// Attempt to read in another txn. We need to guarantee that the
-					// BeginTxnRequest has finished or we risk aborting the transaction.
+					// Attempt to read in another txn.
 					conflictTxn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
-					conflictTxn.InternalSetPriority(roachpb.MaxTxnPriority)
+					conflictTxn.InternalSetPriority(enginepb.MaxTxnPriority)
 					if gr, err := conflictTxn.Get(ctx, key); err != nil {
 						concErrs[i] = err
 						return

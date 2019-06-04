@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -82,6 +83,12 @@ var (
 	metaUnderReplicatedRangeCount = metric.Metadata{
 		Name:        "ranges.underreplicated",
 		Help:        "Number of ranges with fewer live replicas than the replication target",
+		Measurement: "Ranges",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaOverReplicatedRangeCount = metric.Metadata{
+		Name:        "ranges.overreplicated",
+		Help:        "Number of ranges with more live replicas than the replication target",
 		Measurement: "Ranges",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -445,6 +452,18 @@ var (
 	metaRaftCommandCommitLatency = metric.Metadata{
 		Name:        "raft.process.commandcommit.latency",
 		Help:        "Latency histogram for committing Raft commands",
+		Measurement: "Latency",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaRaftHandleReadyLatency = metric.Metadata{
+		Name:        "raft.process.handleready.latency",
+		Help:        "Latency histogram for handling a Raft ready",
+		Measurement: "Latency",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaRaftApplyCommittedLatency = metric.Metadata{
+		Name:        "raft.process.applycommitted.latency",
+		Help:        "Latency histogram for applying all committed Raft commands in a Raft ready",
 		Measurement: "Latency",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
@@ -828,6 +847,12 @@ var (
 		Measurement: "Txn Entries",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaGCTransactionSpanGCStaging = metric.Metadata{
+		Name:        "queue.gc.info.transactionspangcstaging",
+		Help:        "Number of GC'able entries corresponding to staging txns",
+		Measurement: "Txn Entries",
+		Unit:        metric.Unit_COUNT,
+	}
 	metaGCTransactionSpanGCPending = metric.Metadata{
 		Name:        "queue.gc.info.transactionspangcpending",
 		Help:        "Number of GC'able entries corresponding to pending txns",
@@ -918,6 +943,23 @@ var (
 		Measurement: "Ingestions",
 		Unit:        metric.Unit_COUNT,
 	}
+
+	// Encryption-at-rest metrics.
+	// TODO(mberhault): metrics for key age, per-key file/bytes counts.
+	metaEncryptionAlgorithm = metric.Metadata{
+		Name:        "rocksdb.encryption.algorithm",
+		Help:        "algorithm in use for encryption-at-rest, see ccl/storageccl/engineccl/enginepbccl/key_registry.proto",
+		Measurement: "Encryption At Rest",
+		Unit:        metric.Unit_CONST,
+	}
+
+	// Closed timestamp metrics.
+	metaClosedTimestampMaxBehindNanos = metric.Metadata{
+		Name:        "kv.closed_timestamp.max_behind_nanos",
+		Help:        "Largest latency between realtime and replica max closed timestamp",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
 )
 
 // StoreMetrics is the set of metrics for a given store.
@@ -936,6 +978,7 @@ type StoreMetrics struct {
 	RangeCount                *metric.Gauge
 	UnavailableRangeCount     *metric.Gauge
 	UnderReplicatedRangeCount *metric.Gauge
+	OverReplicatedRangeCount  *metric.Gauge
 
 	// Lease request metrics for successful and failed lease requests. These
 	// count proposals (i.e. it does not matter how many replicas apply the
@@ -1007,12 +1050,14 @@ type StoreMetrics struct {
 	RangeRaftLeaderTransfers        *metric.Counter
 
 	// Raft processing metrics.
-	RaftTicks                *metric.Counter
-	RaftWorkingDurationNanos *metric.Counter
-	RaftTickingDurationNanos *metric.Counter
-	RaftCommandsApplied      *metric.Counter
-	RaftLogCommitLatency     *metric.Histogram
-	RaftCommandCommitLatency *metric.Histogram
+	RaftTicks                 *metric.Counter
+	RaftWorkingDurationNanos  *metric.Counter
+	RaftTickingDurationNanos  *metric.Counter
+	RaftCommandsApplied       *metric.Counter
+	RaftLogCommitLatency      *metric.Histogram
+	RaftCommandCommitLatency  *metric.Histogram
+	RaftHandleReadyLatency    *metric.Histogram
+	RaftApplyCommittedLatency *metric.Histogram
 
 	// Raft message metrics.
 	RaftRcvdMsgProp           *metric.Counter
@@ -1090,6 +1135,7 @@ type StoreMetrics struct {
 	GCTransactionSpanScanned     *metric.Counter
 	GCTransactionSpanGCAborted   *metric.Counter
 	GCTransactionSpanGCCommitted *metric.Counter
+	GCTransactionSpanGCStaging   *metric.Counter
 	GCTransactionSpanGCPending   *metric.Counter
 	GCAbortSpanScanned           *metric.Counter
 	GCAbortSpanConsidered        *metric.Counter
@@ -1111,6 +1157,16 @@ type StoreMetrics struct {
 	AddSSTableProposals         *metric.Counter
 	AddSSTableApplications      *metric.Counter
 	AddSSTableApplicationCopies *metric.Counter
+
+	// Encryption-at-rest stats.
+	// EncryptionAlgorithm is an enum representing the cipher in use, so we use a gauge.
+	EncryptionAlgorithm *metric.Gauge
+
+	// RangeFeed counts.
+	RangeFeedMetrics *rangefeed.Metrics
+
+	// Closed timestamp metrics.
+	ClosedTimestampMaxBehindNanos *metric.Gauge
 
 	// Stats for efficient merges.
 	mu struct {
@@ -1136,6 +1192,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RangeCount:                metric.NewGauge(metaRangeCount),
 		UnavailableRangeCount:     metric.NewGauge(metaUnavailableRangeCount),
 		UnderReplicatedRangeCount: metric.NewGauge(metaUnderReplicatedRangeCount),
+		OverReplicatedRangeCount:  metric.NewGauge(metaOverReplicatedRangeCount),
 
 		// Lease request metrics.
 		LeaseRequestSuccessCount:  metric.NewCounter(metaLeaseRequestSuccessCount),
@@ -1202,12 +1259,14 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RangeRaftLeaderTransfers:        metric.NewCounter(metaRangeRaftLeaderTransfers),
 
 		// Raft processing metrics.
-		RaftTicks:                metric.NewCounter(metaRaftTicks),
-		RaftWorkingDurationNanos: metric.NewCounter(metaRaftWorkingDurationNanos),
-		RaftTickingDurationNanos: metric.NewCounter(metaRaftTickingDurationNanos),
-		RaftCommandsApplied:      metric.NewCounter(metaRaftCommandsApplied),
-		RaftLogCommitLatency:     metric.NewLatency(metaRaftLogCommitLatency, histogramWindow),
-		RaftCommandCommitLatency: metric.NewLatency(metaRaftCommandCommitLatency, histogramWindow),
+		RaftTicks:                 metric.NewCounter(metaRaftTicks),
+		RaftWorkingDurationNanos:  metric.NewCounter(metaRaftWorkingDurationNanos),
+		RaftTickingDurationNanos:  metric.NewCounter(metaRaftTickingDurationNanos),
+		RaftCommandsApplied:       metric.NewCounter(metaRaftCommandsApplied),
+		RaftLogCommitLatency:      metric.NewLatency(metaRaftLogCommitLatency, histogramWindow),
+		RaftCommandCommitLatency:  metric.NewLatency(metaRaftCommandCommitLatency, histogramWindow),
+		RaftHandleReadyLatency:    metric.NewLatency(metaRaftHandleReadyLatency, histogramWindow),
+		RaftApplyCommittedLatency: metric.NewLatency(metaRaftApplyCommittedLatency, histogramWindow),
 
 		// Raft message metrics.
 		RaftRcvdMsgProp:           metric.NewCounter(metaRaftRcvdProp),
@@ -1283,6 +1342,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		GCTransactionSpanScanned:     metric.NewCounter(metaGCTransactionSpanScanned),
 		GCTransactionSpanGCAborted:   metric.NewCounter(metaGCTransactionSpanGCAborted),
 		GCTransactionSpanGCCommitted: metric.NewCounter(metaGCTransactionSpanGCCommitted),
+		GCTransactionSpanGCStaging:   metric.NewCounter(metaGCTransactionSpanGCStaging),
 		GCTransactionSpanGCPending:   metric.NewCounter(metaGCTransactionSpanGCPending),
 		GCAbortSpanScanned:           metric.NewCounter(metaGCAbortSpanScanned),
 		GCAbortSpanConsidered:        metric.NewCounter(metaGCAbortSpanConsidered),
@@ -1303,6 +1363,15 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		AddSSTableProposals:         metric.NewCounter(metaAddSSTableProposals),
 		AddSSTableApplications:      metric.NewCounter(metaAddSSTableApplications),
 		AddSSTableApplicationCopies: metric.NewCounter(metaAddSSTableApplicationCopies),
+
+		// Encryption-at-rest.
+		EncryptionAlgorithm: metric.NewGauge(metaEncryptionAlgorithm),
+
+		// RangeFeed counters.
+		RangeFeedMetrics: rangefeed.NewMetrics(),
+
+		// Closed timestamp metrics.
+		ClosedTimestampMaxBehindNanos: metric.NewGauge(metaClosedTimestampMaxBehindNanos),
 	}
 
 	sm.raftRcvdMessages[raftpb.MsgProp] = sm.RaftRcvdMsgProp
@@ -1374,6 +1443,10 @@ func (sm *StoreMetrics) updateRocksDBStats(stats engine.Stats) {
 	sm.RdbFlushes.Update(stats.Flushes)
 	sm.RdbCompactions.Update(stats.Compactions)
 	sm.RdbTableReadersMemEstimate.Update(stats.TableReadersMemEstimate)
+}
+
+func (sm *StoreMetrics) updateEnvStats(stats engine.EnvStats) {
+	sm.EncryptionAlgorithm.Update(int64(stats.EncryptionType))
 }
 
 func (sm *StoreMetrics) handleMetricsResult(ctx context.Context, metric result.Metrics) {

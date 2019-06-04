@@ -59,7 +59,7 @@ func Load(
 
 	var txCtx transform.ExprTransformContext
 	curTime := timeutil.Unix(0, ts.WallTime)
-	evalCtx := tree.EvalContext{}
+	evalCtx := &tree.EvalContext{}
 	evalCtx.SetTxnTimestamp(curTime)
 	evalCtx.SetStmtTimestamp(curTime)
 
@@ -164,7 +164,7 @@ func Load(
 			// At this point the CREATE statements in the loaded SQL do not
 			// use the SERIAL type so we need not process SERIAL types here.
 			desc, err := sql.MakeTableDesc(ctx, txn, nil /* vt */, st, s, dbDesc.ID,
-				0 /* table ID */, ts, privs, affected, nil, &evalCtx)
+				0 /* table ID */, ts, privs, affected, nil, evalCtx)
 			if err != nil {
 				return backupccl.BackupDescriptor{}, errors.Wrap(err, "make table desc")
 			}
@@ -175,7 +175,8 @@ func Load(
 				Union: &sqlbase.Descriptor_Table{Table: desc.TableDesc()},
 			})
 
-			for _, col := range tableDesc.Columns {
+			for i := range tableDesc.Columns {
+				col := &tableDesc.Columns[i]
 				if col.IsComputed() {
 					return backupccl.BackupDescriptor{}, errors.Errorf("computed columns are not allowed")
 				}
@@ -187,7 +188,7 @@ func Load(
 				return backupccl.BackupDescriptor{}, errors.Wrap(err, "make row inserter")
 			}
 			cols, defaultExprs, err =
-				sqlbase.ProcessDefaultColumns(tableDesc.Columns, tableDesc, &txCtx, &evalCtx)
+				sqlbase.ProcessDefaultColumns(tableDesc.Columns, tableDesc, &txCtx, evalCtx)
 			if err != nil {
 				return backupccl.BackupDescriptor{}, errors.Wrap(err, "process default columns")
 			}
@@ -255,7 +256,7 @@ func insertStmtToKVs(
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	defaultExprs []tree.TypedExpr,
 	cols []sqlbase.ColumnDescriptor,
-	evalCtx tree.EvalContext,
+	evalCtx *tree.EvalContext,
 	ri row.Inserter,
 	stmt *tree.Insert,
 	f func(roachpb.KeyValue),
@@ -270,8 +271,8 @@ func insertStmtToKVs(
 		if len(stmt.Columns) != len(cols) {
 			return errors.Errorf("load insert: wrong number of columns: %q", stmt)
 		}
-		for i, col := range tableDesc.Columns {
-			if stmt.Columns[i].String() != col.Name {
+		for i := range tableDesc.Columns {
+			if stmt.Columns[i].String() != tableDesc.Columns[i].Name {
 				return errors.Errorf("load insert: unexpected column order: %q", stmt)
 			}
 		}
@@ -304,7 +305,7 @@ func insertStmtToKVs(
 				return errors.Errorf("unsupported expr: %q", expr)
 			}
 			var err error
-			insertRow[i], err = c.ResolveAsType(nil, tableDesc.Columns[i].Type.ToDatumType())
+			insertRow[i], err = c.ResolveAsType(nil, &tableDesc.Columns[i].Type)
 			if err != nil {
 				return err
 			}

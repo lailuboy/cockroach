@@ -70,6 +70,8 @@ func (ru ErrorDetail) GetInner() error {
 		return t.MergeInProgress
 	case *ErrorDetail_RangefeedRetry:
 		return t.RangefeedRetry
+	case *ErrorDetail_IndeterminateCommit:
+		return t.IndeterminateCommit
 	default:
 		return nil
 	}
@@ -100,6 +102,8 @@ func (ru RequestUnion) GetInner() Request {
 		return t.EndTransaction
 	case *RequestUnion_AdminSplit:
 		return t.AdminSplit
+	case *RequestUnion_AdminUnsplit:
+		return t.AdminUnsplit
 	case *RequestUnion_AdminMerge:
 		return t.AdminMerge
 	case *RequestUnion_AdminTransferLease:
@@ -114,6 +118,8 @@ func (ru RequestUnion) GetInner() Request {
 		return t.Gc
 	case *RequestUnion_PushTxn:
 		return t.PushTxn
+	case *RequestUnion_RecoverTxn:
+		return t.RecoverTxn
 	case *RequestUnion_ResolveIntent:
 		return t.ResolveIntent
 	case *RequestUnion_ResolveIntentRange:
@@ -190,6 +196,8 @@ func (ru ResponseUnion) GetInner() Response {
 		return t.EndTransaction
 	case *ResponseUnion_AdminSplit:
 		return t.AdminSplit
+	case *ResponseUnion_AdminUnsplit:
+		return t.AdminUnsplit
 	case *ResponseUnion_AdminMerge:
 		return t.AdminMerge
 	case *ResponseUnion_AdminTransferLease:
@@ -204,6 +212,8 @@ func (ru ResponseUnion) GetInner() Response {
 		return t.Gc
 	case *ResponseUnion_PushTxn:
 		return t.PushTxn
+	case *ResponseUnion_RecoverTxn:
+		return t.RecoverTxn
 	case *ResponseUnion_ResolveIntent:
 		return t.ResolveIntent
 	case *ResponseUnion_ResolveIntentRange:
@@ -315,6 +325,8 @@ func (ru *ErrorDetail) SetInner(r error) bool {
 		union = &ErrorDetail_MergeInProgress{t}
 	case *RangeFeedRetryError:
 		union = &ErrorDetail_RangefeedRetry{t}
+	case *IndeterminateCommitError:
+		union = &ErrorDetail_IndeterminateCommit{t}
 	default:
 		return false
 	}
@@ -348,6 +360,8 @@ func (ru *RequestUnion) SetInner(r Request) bool {
 		union = &RequestUnion_EndTransaction{t}
 	case *AdminSplitRequest:
 		union = &RequestUnion_AdminSplit{t}
+	case *AdminUnsplitRequest:
+		union = &RequestUnion_AdminUnsplit{t}
 	case *AdminMergeRequest:
 		union = &RequestUnion_AdminMerge{t}
 	case *AdminTransferLeaseRequest:
@@ -362,6 +376,8 @@ func (ru *RequestUnion) SetInner(r Request) bool {
 		union = &RequestUnion_Gc{t}
 	case *PushTxnRequest:
 		union = &RequestUnion_PushTxn{t}
+	case *RecoverTxnRequest:
+		union = &RequestUnion_RecoverTxn{t}
 	case *ResolveIntentRequest:
 		union = &RequestUnion_ResolveIntent{t}
 	case *ResolveIntentRangeRequest:
@@ -441,6 +457,8 @@ func (ru *ResponseUnion) SetInner(r Response) bool {
 		union = &ResponseUnion_EndTransaction{t}
 	case *AdminSplitResponse:
 		union = &ResponseUnion_AdminSplit{t}
+	case *AdminUnsplitResponse:
+		union = &ResponseUnion_AdminUnsplit{t}
 	case *AdminMergeResponse:
 		union = &ResponseUnion_AdminMerge{t}
 	case *AdminTransferLeaseResponse:
@@ -455,6 +473,8 @@ func (ru *ResponseUnion) SetInner(r Response) bool {
 		union = &ResponseUnion_Gc{t}
 	case *PushTxnResponse:
 		union = &ResponseUnion_PushTxn{t}
+	case *RecoverTxnResponse:
+		union = &ResponseUnion_RecoverTxn{t}
 	case *ResolveIntentResponse:
 		union = &ResponseUnion_ResolveIntent{t}
 	case *ResolveIntentRangeResponse:
@@ -506,7 +526,7 @@ func (ru *ResponseUnion) SetInner(r Response) bool {
 	return true
 }
 
-type reqCounts [41]int32
+type reqCounts [43]int32
 
 // getReqCounts returns the number of times each
 // request type appears in the batch.
@@ -536,66 +556,70 @@ func (ba *BatchRequest) getReqCounts() reqCounts {
 			counts[9]++
 		case *RequestUnion_AdminSplit:
 			counts[10]++
-		case *RequestUnion_AdminMerge:
+		case *RequestUnion_AdminUnsplit:
 			counts[11]++
-		case *RequestUnion_AdminTransferLease:
+		case *RequestUnion_AdminMerge:
 			counts[12]++
-		case *RequestUnion_AdminChangeReplicas:
+		case *RequestUnion_AdminTransferLease:
 			counts[13]++
-		case *RequestUnion_AdminRelocateRange:
+		case *RequestUnion_AdminChangeReplicas:
 			counts[14]++
-		case *RequestUnion_HeartbeatTxn:
+		case *RequestUnion_AdminRelocateRange:
 			counts[15]++
-		case *RequestUnion_Gc:
+		case *RequestUnion_HeartbeatTxn:
 			counts[16]++
-		case *RequestUnion_PushTxn:
+		case *RequestUnion_Gc:
 			counts[17]++
-		case *RequestUnion_ResolveIntent:
+		case *RequestUnion_PushTxn:
 			counts[18]++
-		case *RequestUnion_ResolveIntentRange:
+		case *RequestUnion_RecoverTxn:
 			counts[19]++
-		case *RequestUnion_Merge:
+		case *RequestUnion_ResolveIntent:
 			counts[20]++
-		case *RequestUnion_TruncateLog:
+		case *RequestUnion_ResolveIntentRange:
 			counts[21]++
-		case *RequestUnion_RequestLease:
+		case *RequestUnion_Merge:
 			counts[22]++
-		case *RequestUnion_ReverseScan:
+		case *RequestUnion_TruncateLog:
 			counts[23]++
-		case *RequestUnion_ComputeChecksum:
+		case *RequestUnion_RequestLease:
 			counts[24]++
-		case *RequestUnion_CheckConsistency:
+		case *RequestUnion_ReverseScan:
 			counts[25]++
-		case *RequestUnion_InitPut:
+		case *RequestUnion_ComputeChecksum:
 			counts[26]++
-		case *RequestUnion_TransferLease:
+		case *RequestUnion_CheckConsistency:
 			counts[27]++
-		case *RequestUnion_LeaseInfo:
+		case *RequestUnion_InitPut:
 			counts[28]++
-		case *RequestUnion_WriteBatch:
+		case *RequestUnion_TransferLease:
 			counts[29]++
-		case *RequestUnion_Export:
+		case *RequestUnion_LeaseInfo:
 			counts[30]++
-		case *RequestUnion_Import:
+		case *RequestUnion_WriteBatch:
 			counts[31]++
-		case *RequestUnion_QueryTxn:
+		case *RequestUnion_Export:
 			counts[32]++
-		case *RequestUnion_QueryIntent:
+		case *RequestUnion_Import:
 			counts[33]++
-		case *RequestUnion_AdminScatter:
+		case *RequestUnion_QueryTxn:
 			counts[34]++
-		case *RequestUnion_AddSstable:
+		case *RequestUnion_QueryIntent:
 			counts[35]++
-		case *RequestUnion_RecomputeStats:
+		case *RequestUnion_AdminScatter:
 			counts[36]++
-		case *RequestUnion_Refresh:
+		case *RequestUnion_AddSstable:
 			counts[37]++
-		case *RequestUnion_RefreshRange:
+		case *RequestUnion_RecomputeStats:
 			counts[38]++
-		case *RequestUnion_Subsume:
+		case *RequestUnion_Refresh:
 			counts[39]++
-		case *RequestUnion_RangeStats:
+		case *RequestUnion_RefreshRange:
 			counts[40]++
+		case *RequestUnion_Subsume:
+			counts[41]++
+		case *RequestUnion_RangeStats:
+			counts[42]++
 		default:
 			panic(fmt.Sprintf("unsupported request: %+v", ru))
 		}
@@ -615,6 +639,7 @@ var requestNames = []string{
 	"BeginTxn",
 	"EndTxn",
 	"AdmSplit",
+	"AdmUnsplit",
 	"AdmMerge",
 	"AdmTransferLease",
 	"AdmChangeReplicas",
@@ -622,6 +647,7 @@ var requestNames = []string{
 	"HeartbeatTxn",
 	"Gc",
 	"PushTxn",
+	"RecoverTxn",
 	"ResolveIntent",
 	"ResolveIntentRng",
 	"Merge",
@@ -724,6 +750,10 @@ type adminSplitResponseAlloc struct {
 	union ResponseUnion_AdminSplit
 	resp  AdminSplitResponse
 }
+type adminUnsplitResponseAlloc struct {
+	union ResponseUnion_AdminUnsplit
+	resp  AdminUnsplitResponse
+}
 type adminMergeResponseAlloc struct {
 	union ResponseUnion_AdminMerge
 	resp  AdminMergeResponse
@@ -751,6 +781,10 @@ type gCResponseAlloc struct {
 type pushTxnResponseAlloc struct {
 	union ResponseUnion_PushTxn
 	resp  PushTxnResponse
+}
+type recoverTxnResponseAlloc struct {
+	union ResponseUnion_RecoverTxn
+	resp  RecoverTxnResponse
 }
 type resolveIntentResponseAlloc struct {
 	union ResponseUnion_ResolveIntent
@@ -861,36 +895,38 @@ func (ba *BatchRequest) CreateReply() *BatchResponse {
 	var buf8 []beginTransactionResponseAlloc
 	var buf9 []endTransactionResponseAlloc
 	var buf10 []adminSplitResponseAlloc
-	var buf11 []adminMergeResponseAlloc
-	var buf12 []adminTransferLeaseResponseAlloc
-	var buf13 []adminChangeReplicasResponseAlloc
-	var buf14 []adminRelocateRangeResponseAlloc
-	var buf15 []heartbeatTxnResponseAlloc
-	var buf16 []gCResponseAlloc
-	var buf17 []pushTxnResponseAlloc
-	var buf18 []resolveIntentResponseAlloc
-	var buf19 []resolveIntentRangeResponseAlloc
-	var buf20 []mergeResponseAlloc
-	var buf21 []truncateLogResponseAlloc
-	var buf22 []requestLeaseResponseAlloc
-	var buf23 []reverseScanResponseAlloc
-	var buf24 []computeChecksumResponseAlloc
-	var buf25 []checkConsistencyResponseAlloc
-	var buf26 []initPutResponseAlloc
-	var buf27 []requestLeaseResponseAlloc
-	var buf28 []leaseInfoResponseAlloc
-	var buf29 []writeBatchResponseAlloc
-	var buf30 []exportResponseAlloc
-	var buf31 []importResponseAlloc
-	var buf32 []queryTxnResponseAlloc
-	var buf33 []queryIntentResponseAlloc
-	var buf34 []adminScatterResponseAlloc
-	var buf35 []addSSTableResponseAlloc
-	var buf36 []recomputeStatsResponseAlloc
-	var buf37 []refreshResponseAlloc
-	var buf38 []refreshRangeResponseAlloc
-	var buf39 []subsumeResponseAlloc
-	var buf40 []rangeStatsResponseAlloc
+	var buf11 []adminUnsplitResponseAlloc
+	var buf12 []adminMergeResponseAlloc
+	var buf13 []adminTransferLeaseResponseAlloc
+	var buf14 []adminChangeReplicasResponseAlloc
+	var buf15 []adminRelocateRangeResponseAlloc
+	var buf16 []heartbeatTxnResponseAlloc
+	var buf17 []gCResponseAlloc
+	var buf18 []pushTxnResponseAlloc
+	var buf19 []recoverTxnResponseAlloc
+	var buf20 []resolveIntentResponseAlloc
+	var buf21 []resolveIntentRangeResponseAlloc
+	var buf22 []mergeResponseAlloc
+	var buf23 []truncateLogResponseAlloc
+	var buf24 []requestLeaseResponseAlloc
+	var buf25 []reverseScanResponseAlloc
+	var buf26 []computeChecksumResponseAlloc
+	var buf27 []checkConsistencyResponseAlloc
+	var buf28 []initPutResponseAlloc
+	var buf29 []requestLeaseResponseAlloc
+	var buf30 []leaseInfoResponseAlloc
+	var buf31 []writeBatchResponseAlloc
+	var buf32 []exportResponseAlloc
+	var buf33 []importResponseAlloc
+	var buf34 []queryTxnResponseAlloc
+	var buf35 []queryIntentResponseAlloc
+	var buf36 []adminScatterResponseAlloc
+	var buf37 []addSSTableResponseAlloc
+	var buf38 []recomputeStatsResponseAlloc
+	var buf39 []refreshResponseAlloc
+	var buf40 []refreshRangeResponseAlloc
+	var buf41 []subsumeResponseAlloc
+	var buf42 []rangeStatsResponseAlloc
 
 	for i, r := range ba.Requests {
 		switch r.GetValue().(type) {
@@ -971,216 +1007,230 @@ func (ba *BatchRequest) CreateReply() *BatchResponse {
 			buf10[0].union.AdminSplit = &buf10[0].resp
 			br.Responses[i].Value = &buf10[0].union
 			buf10 = buf10[1:]
-		case *RequestUnion_AdminMerge:
+		case *RequestUnion_AdminUnsplit:
 			if buf11 == nil {
-				buf11 = make([]adminMergeResponseAlloc, counts[11])
+				buf11 = make([]adminUnsplitResponseAlloc, counts[11])
 			}
-			buf11[0].union.AdminMerge = &buf11[0].resp
+			buf11[0].union.AdminUnsplit = &buf11[0].resp
 			br.Responses[i].Value = &buf11[0].union
 			buf11 = buf11[1:]
-		case *RequestUnion_AdminTransferLease:
+		case *RequestUnion_AdminMerge:
 			if buf12 == nil {
-				buf12 = make([]adminTransferLeaseResponseAlloc, counts[12])
+				buf12 = make([]adminMergeResponseAlloc, counts[12])
 			}
-			buf12[0].union.AdminTransferLease = &buf12[0].resp
+			buf12[0].union.AdminMerge = &buf12[0].resp
 			br.Responses[i].Value = &buf12[0].union
 			buf12 = buf12[1:]
-		case *RequestUnion_AdminChangeReplicas:
+		case *RequestUnion_AdminTransferLease:
 			if buf13 == nil {
-				buf13 = make([]adminChangeReplicasResponseAlloc, counts[13])
+				buf13 = make([]adminTransferLeaseResponseAlloc, counts[13])
 			}
-			buf13[0].union.AdminChangeReplicas = &buf13[0].resp
+			buf13[0].union.AdminTransferLease = &buf13[0].resp
 			br.Responses[i].Value = &buf13[0].union
 			buf13 = buf13[1:]
-		case *RequestUnion_AdminRelocateRange:
+		case *RequestUnion_AdminChangeReplicas:
 			if buf14 == nil {
-				buf14 = make([]adminRelocateRangeResponseAlloc, counts[14])
+				buf14 = make([]adminChangeReplicasResponseAlloc, counts[14])
 			}
-			buf14[0].union.AdminRelocateRange = &buf14[0].resp
+			buf14[0].union.AdminChangeReplicas = &buf14[0].resp
 			br.Responses[i].Value = &buf14[0].union
 			buf14 = buf14[1:]
-		case *RequestUnion_HeartbeatTxn:
+		case *RequestUnion_AdminRelocateRange:
 			if buf15 == nil {
-				buf15 = make([]heartbeatTxnResponseAlloc, counts[15])
+				buf15 = make([]adminRelocateRangeResponseAlloc, counts[15])
 			}
-			buf15[0].union.HeartbeatTxn = &buf15[0].resp
+			buf15[0].union.AdminRelocateRange = &buf15[0].resp
 			br.Responses[i].Value = &buf15[0].union
 			buf15 = buf15[1:]
-		case *RequestUnion_Gc:
+		case *RequestUnion_HeartbeatTxn:
 			if buf16 == nil {
-				buf16 = make([]gCResponseAlloc, counts[16])
+				buf16 = make([]heartbeatTxnResponseAlloc, counts[16])
 			}
-			buf16[0].union.Gc = &buf16[0].resp
+			buf16[0].union.HeartbeatTxn = &buf16[0].resp
 			br.Responses[i].Value = &buf16[0].union
 			buf16 = buf16[1:]
-		case *RequestUnion_PushTxn:
+		case *RequestUnion_Gc:
 			if buf17 == nil {
-				buf17 = make([]pushTxnResponseAlloc, counts[17])
+				buf17 = make([]gCResponseAlloc, counts[17])
 			}
-			buf17[0].union.PushTxn = &buf17[0].resp
+			buf17[0].union.Gc = &buf17[0].resp
 			br.Responses[i].Value = &buf17[0].union
 			buf17 = buf17[1:]
-		case *RequestUnion_ResolveIntent:
+		case *RequestUnion_PushTxn:
 			if buf18 == nil {
-				buf18 = make([]resolveIntentResponseAlloc, counts[18])
+				buf18 = make([]pushTxnResponseAlloc, counts[18])
 			}
-			buf18[0].union.ResolveIntent = &buf18[0].resp
+			buf18[0].union.PushTxn = &buf18[0].resp
 			br.Responses[i].Value = &buf18[0].union
 			buf18 = buf18[1:]
-		case *RequestUnion_ResolveIntentRange:
+		case *RequestUnion_RecoverTxn:
 			if buf19 == nil {
-				buf19 = make([]resolveIntentRangeResponseAlloc, counts[19])
+				buf19 = make([]recoverTxnResponseAlloc, counts[19])
 			}
-			buf19[0].union.ResolveIntentRange = &buf19[0].resp
+			buf19[0].union.RecoverTxn = &buf19[0].resp
 			br.Responses[i].Value = &buf19[0].union
 			buf19 = buf19[1:]
-		case *RequestUnion_Merge:
+		case *RequestUnion_ResolveIntent:
 			if buf20 == nil {
-				buf20 = make([]mergeResponseAlloc, counts[20])
+				buf20 = make([]resolveIntentResponseAlloc, counts[20])
 			}
-			buf20[0].union.Merge = &buf20[0].resp
+			buf20[0].union.ResolveIntent = &buf20[0].resp
 			br.Responses[i].Value = &buf20[0].union
 			buf20 = buf20[1:]
-		case *RequestUnion_TruncateLog:
+		case *RequestUnion_ResolveIntentRange:
 			if buf21 == nil {
-				buf21 = make([]truncateLogResponseAlloc, counts[21])
+				buf21 = make([]resolveIntentRangeResponseAlloc, counts[21])
 			}
-			buf21[0].union.TruncateLog = &buf21[0].resp
+			buf21[0].union.ResolveIntentRange = &buf21[0].resp
 			br.Responses[i].Value = &buf21[0].union
 			buf21 = buf21[1:]
-		case *RequestUnion_RequestLease:
+		case *RequestUnion_Merge:
 			if buf22 == nil {
-				buf22 = make([]requestLeaseResponseAlloc, counts[22])
+				buf22 = make([]mergeResponseAlloc, counts[22])
 			}
-			buf22[0].union.RequestLease = &buf22[0].resp
+			buf22[0].union.Merge = &buf22[0].resp
 			br.Responses[i].Value = &buf22[0].union
 			buf22 = buf22[1:]
-		case *RequestUnion_ReverseScan:
+		case *RequestUnion_TruncateLog:
 			if buf23 == nil {
-				buf23 = make([]reverseScanResponseAlloc, counts[23])
+				buf23 = make([]truncateLogResponseAlloc, counts[23])
 			}
-			buf23[0].union.ReverseScan = &buf23[0].resp
+			buf23[0].union.TruncateLog = &buf23[0].resp
 			br.Responses[i].Value = &buf23[0].union
 			buf23 = buf23[1:]
-		case *RequestUnion_ComputeChecksum:
+		case *RequestUnion_RequestLease:
 			if buf24 == nil {
-				buf24 = make([]computeChecksumResponseAlloc, counts[24])
+				buf24 = make([]requestLeaseResponseAlloc, counts[24])
 			}
-			buf24[0].union.ComputeChecksum = &buf24[0].resp
+			buf24[0].union.RequestLease = &buf24[0].resp
 			br.Responses[i].Value = &buf24[0].union
 			buf24 = buf24[1:]
-		case *RequestUnion_CheckConsistency:
+		case *RequestUnion_ReverseScan:
 			if buf25 == nil {
-				buf25 = make([]checkConsistencyResponseAlloc, counts[25])
+				buf25 = make([]reverseScanResponseAlloc, counts[25])
 			}
-			buf25[0].union.CheckConsistency = &buf25[0].resp
+			buf25[0].union.ReverseScan = &buf25[0].resp
 			br.Responses[i].Value = &buf25[0].union
 			buf25 = buf25[1:]
-		case *RequestUnion_InitPut:
+		case *RequestUnion_ComputeChecksum:
 			if buf26 == nil {
-				buf26 = make([]initPutResponseAlloc, counts[26])
+				buf26 = make([]computeChecksumResponseAlloc, counts[26])
 			}
-			buf26[0].union.InitPut = &buf26[0].resp
+			buf26[0].union.ComputeChecksum = &buf26[0].resp
 			br.Responses[i].Value = &buf26[0].union
 			buf26 = buf26[1:]
-		case *RequestUnion_TransferLease:
+		case *RequestUnion_CheckConsistency:
 			if buf27 == nil {
-				buf27 = make([]requestLeaseResponseAlloc, counts[27])
+				buf27 = make([]checkConsistencyResponseAlloc, counts[27])
 			}
-			buf27[0].union.RequestLease = &buf27[0].resp
+			buf27[0].union.CheckConsistency = &buf27[0].resp
 			br.Responses[i].Value = &buf27[0].union
 			buf27 = buf27[1:]
-		case *RequestUnion_LeaseInfo:
+		case *RequestUnion_InitPut:
 			if buf28 == nil {
-				buf28 = make([]leaseInfoResponseAlloc, counts[28])
+				buf28 = make([]initPutResponseAlloc, counts[28])
 			}
-			buf28[0].union.LeaseInfo = &buf28[0].resp
+			buf28[0].union.InitPut = &buf28[0].resp
 			br.Responses[i].Value = &buf28[0].union
 			buf28 = buf28[1:]
-		case *RequestUnion_WriteBatch:
+		case *RequestUnion_TransferLease:
 			if buf29 == nil {
-				buf29 = make([]writeBatchResponseAlloc, counts[29])
+				buf29 = make([]requestLeaseResponseAlloc, counts[29])
 			}
-			buf29[0].union.WriteBatch = &buf29[0].resp
+			buf29[0].union.RequestLease = &buf29[0].resp
 			br.Responses[i].Value = &buf29[0].union
 			buf29 = buf29[1:]
-		case *RequestUnion_Export:
+		case *RequestUnion_LeaseInfo:
 			if buf30 == nil {
-				buf30 = make([]exportResponseAlloc, counts[30])
+				buf30 = make([]leaseInfoResponseAlloc, counts[30])
 			}
-			buf30[0].union.Export = &buf30[0].resp
+			buf30[0].union.LeaseInfo = &buf30[0].resp
 			br.Responses[i].Value = &buf30[0].union
 			buf30 = buf30[1:]
-		case *RequestUnion_Import:
+		case *RequestUnion_WriteBatch:
 			if buf31 == nil {
-				buf31 = make([]importResponseAlloc, counts[31])
+				buf31 = make([]writeBatchResponseAlloc, counts[31])
 			}
-			buf31[0].union.Import = &buf31[0].resp
+			buf31[0].union.WriteBatch = &buf31[0].resp
 			br.Responses[i].Value = &buf31[0].union
 			buf31 = buf31[1:]
-		case *RequestUnion_QueryTxn:
+		case *RequestUnion_Export:
 			if buf32 == nil {
-				buf32 = make([]queryTxnResponseAlloc, counts[32])
+				buf32 = make([]exportResponseAlloc, counts[32])
 			}
-			buf32[0].union.QueryTxn = &buf32[0].resp
+			buf32[0].union.Export = &buf32[0].resp
 			br.Responses[i].Value = &buf32[0].union
 			buf32 = buf32[1:]
-		case *RequestUnion_QueryIntent:
+		case *RequestUnion_Import:
 			if buf33 == nil {
-				buf33 = make([]queryIntentResponseAlloc, counts[33])
+				buf33 = make([]importResponseAlloc, counts[33])
 			}
-			buf33[0].union.QueryIntent = &buf33[0].resp
+			buf33[0].union.Import = &buf33[0].resp
 			br.Responses[i].Value = &buf33[0].union
 			buf33 = buf33[1:]
-		case *RequestUnion_AdminScatter:
+		case *RequestUnion_QueryTxn:
 			if buf34 == nil {
-				buf34 = make([]adminScatterResponseAlloc, counts[34])
+				buf34 = make([]queryTxnResponseAlloc, counts[34])
 			}
-			buf34[0].union.AdminScatter = &buf34[0].resp
+			buf34[0].union.QueryTxn = &buf34[0].resp
 			br.Responses[i].Value = &buf34[0].union
 			buf34 = buf34[1:]
-		case *RequestUnion_AddSstable:
+		case *RequestUnion_QueryIntent:
 			if buf35 == nil {
-				buf35 = make([]addSSTableResponseAlloc, counts[35])
+				buf35 = make([]queryIntentResponseAlloc, counts[35])
 			}
-			buf35[0].union.AddSstable = &buf35[0].resp
+			buf35[0].union.QueryIntent = &buf35[0].resp
 			br.Responses[i].Value = &buf35[0].union
 			buf35 = buf35[1:]
-		case *RequestUnion_RecomputeStats:
+		case *RequestUnion_AdminScatter:
 			if buf36 == nil {
-				buf36 = make([]recomputeStatsResponseAlloc, counts[36])
+				buf36 = make([]adminScatterResponseAlloc, counts[36])
 			}
-			buf36[0].union.RecomputeStats = &buf36[0].resp
+			buf36[0].union.AdminScatter = &buf36[0].resp
 			br.Responses[i].Value = &buf36[0].union
 			buf36 = buf36[1:]
-		case *RequestUnion_Refresh:
+		case *RequestUnion_AddSstable:
 			if buf37 == nil {
-				buf37 = make([]refreshResponseAlloc, counts[37])
+				buf37 = make([]addSSTableResponseAlloc, counts[37])
 			}
-			buf37[0].union.Refresh = &buf37[0].resp
+			buf37[0].union.AddSstable = &buf37[0].resp
 			br.Responses[i].Value = &buf37[0].union
 			buf37 = buf37[1:]
-		case *RequestUnion_RefreshRange:
+		case *RequestUnion_RecomputeStats:
 			if buf38 == nil {
-				buf38 = make([]refreshRangeResponseAlloc, counts[38])
+				buf38 = make([]recomputeStatsResponseAlloc, counts[38])
 			}
-			buf38[0].union.RefreshRange = &buf38[0].resp
+			buf38[0].union.RecomputeStats = &buf38[0].resp
 			br.Responses[i].Value = &buf38[0].union
 			buf38 = buf38[1:]
-		case *RequestUnion_Subsume:
+		case *RequestUnion_Refresh:
 			if buf39 == nil {
-				buf39 = make([]subsumeResponseAlloc, counts[39])
+				buf39 = make([]refreshResponseAlloc, counts[39])
 			}
-			buf39[0].union.Subsume = &buf39[0].resp
+			buf39[0].union.Refresh = &buf39[0].resp
 			br.Responses[i].Value = &buf39[0].union
 			buf39 = buf39[1:]
-		case *RequestUnion_RangeStats:
+		case *RequestUnion_RefreshRange:
 			if buf40 == nil {
-				buf40 = make([]rangeStatsResponseAlloc, counts[40])
+				buf40 = make([]refreshRangeResponseAlloc, counts[40])
 			}
-			buf40[0].union.RangeStats = &buf40[0].resp
+			buf40[0].union.RefreshRange = &buf40[0].resp
 			br.Responses[i].Value = &buf40[0].union
 			buf40 = buf40[1:]
+		case *RequestUnion_Subsume:
+			if buf41 == nil {
+				buf41 = make([]subsumeResponseAlloc, counts[41])
+			}
+			buf41[0].union.Subsume = &buf41[0].resp
+			br.Responses[i].Value = &buf41[0].union
+			buf41 = buf41[1:]
+		case *RequestUnion_RangeStats:
+			if buf42 == nil {
+				buf42 = make([]rangeStatsResponseAlloc, counts[42])
+			}
+			buf42[0].union.RangeStats = &buf42[0].resp
+			br.Responses[i].Value = &buf42[0].union
+			buf42 = buf42[1:]
 		default:
 			panic(fmt.Sprintf("unsupported request: %+v", r))
 		}

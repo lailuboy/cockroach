@@ -17,18 +17,18 @@ package sql
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"strconv"
 	"time"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
@@ -109,7 +109,7 @@ func newCopyMachine(
 		retErr = cleanup(ctx, retErr)
 	}()
 
-	tableDesc, err := ResolveExistingObject(ctx, &c.p, &n.Table, true /*required*/, requireTableDesc)
+	tableDesc, err := ResolveExistingObject(ctx, &c.p, &n.Table, true /*required*/, ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -122,8 +122,8 @@ func newCopyMachine(
 		return nil, err
 	}
 	c.resultColumns = make(sqlbase.ResultColumns, len(cols))
-	for i, col := range cols {
-		c.resultColumns[i] = sqlbase.ResultColumn{Typ: col.Type.ToDatumType()}
+	for i := range cols {
+		c.resultColumns[i] = sqlbase.ResultColumn{Typ: &cols[i].Type}
 	}
 	c.rowsMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()
 	c.bufMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()
@@ -179,7 +179,8 @@ Loop:
 			}
 			break Loop
 		case pgwirebase.ClientMsgCopyFail:
-			return fmt.Errorf("client canceled COPY")
+			return pgerror.Newf(pgerror.CodeDataExceptionError,
+				"client canceled COPY")
 		case pgwirebase.ClientMsgFlush, pgwirebase.ClientMsgSync:
 			// Spec says to "ignore Flush and Sync messages received during copy-in mode".
 		default:
@@ -354,7 +355,8 @@ func (c *copyMachine) addRow(ctx context.Context, line []byte) error {
 	var err error
 	parts := bytes.Split(line, fieldDelim)
 	if len(parts) != len(c.resultColumns) {
-		return fmt.Errorf("expected %d values, got %d", len(c.resultColumns), len(parts))
+		return pgerror.Newf(pgerror.CodeProtocolViolationError,
+			"expected %d values, got %d", len(c.resultColumns), len(parts))
 	}
 	exprs := make(tree.Exprs, len(parts))
 	for i, part := range parts {
@@ -363,15 +365,15 @@ func (c *copyMachine) addRow(ctx context.Context, line []byte) error {
 			exprs[i] = tree.DNull
 			continue
 		}
-		switch t := c.resultColumns[i].Typ; t {
-		case types.Bytes,
-			types.Date,
-			types.Interval,
-			types.INet,
-			types.String,
-			types.Timestamp,
-			types.TimestampTZ,
-			types.UUID:
+		switch t := c.resultColumns[i].Typ; t.Family() {
+		case types.BytesFamily,
+			types.DateFamily,
+			types.IntervalFamily,
+			types.INetFamily,
+			types.StringFamily,
+			types.TimestampFamily,
+			types.TimestampTZFamily,
+			types.UuidFamily:
 			s, err = decodeCopy(s)
 			if err != nil {
 				return err
@@ -410,7 +412,8 @@ func decodeCopy(in string) (string, error) {
 		buf.WriteString(in[start:i])
 		i++
 		if i >= n {
-			return "", fmt.Errorf("unknown escape sequence: %q", in[i-1:])
+			return "", pgerror.Newf(pgerror.CodeSyntaxError,
+				"unknown escape sequence: %q", in[i-1:])
 		}
 
 		ch := in[i]
@@ -420,12 +423,14 @@ func decodeCopy(in string) (string, error) {
 			// \x can be followed by 1 or 2 hex digits.
 			i++
 			if i >= n {
-				return "", fmt.Errorf("unknown escape sequence: %q", in[i-2:])
+				return "", pgerror.Newf(pgerror.CodeSyntaxError,
+					"unknown escape sequence: %q", in[i-2:])
 			}
 			ch = in[i]
 			digit, ok := decodeHexDigit(ch)
 			if !ok {
-				return "", fmt.Errorf("unknown escape sequence: %q", in[i-2:i])
+				return "", pgerror.Newf(pgerror.CodeSyntaxError,
+					"unknown escape sequence: %q", in[i-2:i])
 			}
 			if i+1 < n {
 				if v, ok := decodeHexDigit(in[i+1]); ok {
@@ -454,7 +459,8 @@ func decodeCopy(in string) (string, error) {
 			}
 			buf.WriteByte(digit)
 		} else {
-			return "", fmt.Errorf("unknown escape sequence: %q", in[i-1:i+1])
+			return "", pgerror.Newf(pgerror.CodeSyntaxError,
+				"unknown escape sequence: %q", in[i-1:i+1])
 		}
 		start = i + 1
 	}

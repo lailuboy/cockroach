@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	settings "github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -179,7 +180,7 @@ func registerUpgrade(r *registry) {
 			t.Fatal("cluster setting version shouldn't be upgraded before all non-decommissioned nodes are alive")
 		}
 
-		// Now decommission and stop the second last node.
+		// Now decommission and stop n3.
 		// The decommissioned nodes should not prevent auto upgrade.
 		if err := decommissionAndStop(nodes - 2); err != nil {
 			t.Fatal(err)
@@ -260,25 +261,23 @@ func registerUpgrade(r *registry) {
 		if downgradeVersion != "" {
 			t.Fatalf("cluster setting cluster.preserve_downgrade_option is %s, should be an empty string", downgradeVersion)
 		}
+
+		// Start n3 again to satisfy the dead node detector.
+		c.Start(ctx, t, c.Node(nodes-2))
 	}
 
-	mixedWithVersion := r.PredecessorVersion()
-	var skip string
-	if mixedWithVersion == "" {
-		skip = "unable to determine predecessor version"
-	}
-
-	for _, n := range []int{5} {
-		r.Add(testSpec{
-			Name:       fmt.Sprintf("upgrade/mixedWith=%s/nodes=%d", mixedWithVersion, n),
-			MinVersion: "v2.1.0",
-			Cluster:    makeClusterSpec(n),
-			Run: func(ctx context.Context, t *test, c *cluster) {
-				runUpgrade(ctx, t, c, mixedWithVersion)
-			},
-			Skip: skip,
-		})
-	}
+	r.Add(testSpec{
+		Name:       fmt.Sprintf("upgrade"),
+		MinVersion: "v2.1.0",
+		Cluster:    makeClusterSpec(5),
+		Run: func(ctx context.Context, t *test, c *cluster) {
+			pred, err := r.PredecessorVersion()
+			if err != nil {
+				t.Fatal(err)
+			}
+			runUpgrade(ctx, t, c, pred)
+		},
+	})
 }
 
 func runVersionUpgrade(ctx context.Context, t *test, c *cluster) {
@@ -371,6 +370,10 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster) {
 
 	// clusterVersionUpgrade performs a cluster version upgrade to its version.
 	// It waits until all nodes have seen the upgraded cluster version.
+	// If manual is set, we'll performe a SET CLUSTER SETTING version =
+	// <newVersion>. If it's not, we'll rely on the automatic cluster version
+	// upgrade mechanism (which is not inhibited by the
+	// cluster.preserve_downgrade_option cluster setting in this test.
 	var currentVersion string
 	clusterVersionUpgrade := func(newVersion string, manual bool) versionStep {
 		return versionStep{
@@ -463,16 +466,18 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster) {
 		binaryVersionUpgrade("v1.1.9", nodes),
 		clusterVersionUpgrade("1.1", true /* manual */),
 
-		// NB: v2.0.6 doesn't have https://github.com/cockroachdb/cockroach/issues/31380,
-		// so this acceptance test will fail on OSX Mojave. v2.0.7 will have the patch.
-		binaryVersionUpgrade("v2.0.6", nodes),
+		binaryVersionUpgrade("v2.0.7", nodes),
 		clusterVersionUpgrade("2.0", true /* manual */),
 
 		binaryVersionUpgrade("v2.1.2", nodes),
 		clusterVersionUpgrade("2.1", true /* manual */),
 
+		// TODO(bram): Update this to the full release version once it's out.
+		binaryVersionUpgrade("v19.1.0-rc.4", nodes),
+		clusterVersionUpgrade("19.1", false /* manual */),
+
 		binaryVersionUpgrade("HEAD", nodes),
-		clusterVersionUpgrade("", false /* manual */),
+		clusterVersionUpgrade(settings.BinaryServerVersion.String(), false /* manual */),
 	}
 
 	type feature struct {

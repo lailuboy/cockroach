@@ -120,7 +120,7 @@ func TestRangeLookupWithOpenTransaction(t *testing.T) {
 func setupMultipleRanges(ctx context.Context, db *client.DB, splitAt ...string) error {
 	// Split the keyspace at the given keys.
 	for _, key := range splitAt {
-		if err := db.AdminSplit(ctx, key /* spanKey */, key /* splitKey */); err != nil {
+		if err := db.AdminSplit(ctx, key /* spanKey */, key /* splitKey */, true /* manual */); err != nil {
 			return err
 		}
 	}
@@ -207,7 +207,7 @@ func checkResumeSpanScanResults(
 		rowLen := len(res.Rows)
 		// Check that satisfied scans don't have resume spans.
 		if _, satisfied := expSatisfied[i]; satisfied {
-			if res.ResumeSpan.Key != nil || res.ResumeSpan.EndKey != nil {
+			if res.ResumeSpan != nil {
 				t.Fatalf("%s: satisfied scan %d (%s) has ResumeSpan: %v",
 					errInfo(), i, spans[i], res.ResumeSpan)
 			}
@@ -281,7 +281,7 @@ func checkResumeSpanReverseScanResults(
 		rowLen := len(res.Rows)
 		// Check that satisfied scans don't have resume spans.
 		if _, satisfied := expSatisfied[i]; satisfied {
-			if res.ResumeSpan.Key != nil || res.ResumeSpan.EndKey != nil {
+			if res.ResumeSpan != nil {
 				t.Fatalf("%s: satisfied scan %d has ResumeSpan: %v", errInfo(), i, res.ResumeSpan)
 			}
 			continue
@@ -514,7 +514,7 @@ func TestMultiRangeBoundedBatchScan(t *testing.T) {
 				if bound < maxExpCount {
 					newB := &client.Batch{}
 					for _, res := range b.Results {
-						if res.ResumeSpan.Key != nil {
+						if res.ResumeSpan != nil {
 							if !reverse {
 								newB.Scan(res.ResumeSpan.Key, res.ResumeSpan.EndKey)
 							} else {
@@ -528,7 +528,7 @@ func TestMultiRangeBoundedBatchScan(t *testing.T) {
 					// Add the results to the previous results.
 					j := 0
 					for i, res := range b.Results {
-						if res.ResumeSpan.Key != nil {
+						if res.ResumeSpan != nil {
 							b.Results[i].Rows = append(b.Results[i].Rows, newB.Results[j].Rows...)
 							b.Results[i].ResumeSpan = newB.Results[j].ResumeSpan
 							j++
@@ -640,7 +640,7 @@ func checkResumeSpanDelRangeResults(
 		if rowLen > 0 {
 			// The key can be empty once the entire span has been deleted.
 			if rowLen == len(expResults[i]) {
-				if res.ResumeSpan.Key == nil && res.ResumeSpan.EndKey == nil {
+				if res.ResumeSpan == nil {
 					// Done.
 					continue
 				}
@@ -1001,7 +1001,8 @@ func TestMultiRangeScanReverseScanInconsistent(t *testing.T) {
 				ds := kv.NewDistSender(
 					kv.DistSenderConfig{
 						AmbientCtx: log.AmbientContext{Tracer: s.ClusterSettings().Tracer},
-						Clock:      clock, RPCContext: s.RPCContext(),
+						Clock:      clock,
+						RPCContext: s.RPCContext(),
 						NodeDialer: nodedialer.New(s.RPCContext(), gossip.AddressResolver(s.(*server.TestServer).Gossip())),
 					},
 					s.(*server.TestServer).Gossip(),
@@ -1047,7 +1048,7 @@ func TestParallelSender(t *testing.T) {
 	// Split into multiple ranges.
 	splitKeys := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
 	for _, key := range splitKeys {
-		if err := db.AdminSplit(context.TODO(), key, key); err != nil {
+		if err := db.AdminSplit(context.TODO(), key, key, true /* manual */); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1092,7 +1093,7 @@ func initReverseScanTestEnv(s serverutils.TestServerInterface, t *testing.T) *cl
 	// ["", "b"),["b", "e") ,["e", "g") and ["g", "\xff\xff").
 	for _, key := range []string{"b", "e", "g"} {
 		// Split the keyspace at the given key.
-		if err := db.AdminSplit(context.TODO(), key, key); err != nil {
+		if err := db.AdminSplit(context.TODO(), key, key, true /* manual */); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1505,10 +1506,10 @@ func TestStopAtRangeBoundary(t *testing.T) {
 
 				// Update remaining for the next iteration; remove satisfied scans.
 				for batchIdx, res := range b.Results {
-					if res.ResumeSpan.Key == nil && res.ResumeSpan.EndKey == nil {
+					if res.ResumeSpan == nil {
 						delete(remaining, batchToOrig[batchIdx])
 					} else {
-						remaining[batchToOrig[batchIdx]] = res.ResumeSpan
+						remaining[batchToOrig[batchIdx]] = *res.ResumeSpan
 					}
 				}
 			}
@@ -1531,7 +1532,7 @@ func TestBatchPutWithConcurrentSplit(t *testing.T) {
 	// Split first using the default client and scan to make sure that
 	// the range descriptor cache reflects the split.
 	for _, key := range []string{"b", "f"} {
-		if err := db.AdminSplit(context.TODO(), key, key); err != nil {
+		if err := db.AdminSplit(context.TODO(), key, key, true /* manual */); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1546,7 +1547,8 @@ func TestBatchPutWithConcurrentSplit(t *testing.T) {
 	ds := kv.NewDistSender(
 		kv.DistSenderConfig{
 			AmbientCtx: log.AmbientContext{Tracer: s.ClusterSettings().Tracer},
-			Clock:      s.Clock(), RPCContext: s.RPCContext(),
+			Clock:      s.Clock(),
+			RPCContext: s.RPCContext(),
 			NodeDialer: nodedialer.New(s.RPCContext(), gossip.AddressResolver(s.(*server.TestServer).Gossip())),
 		}, s.(*server.TestServer).Gossip(),
 	)
@@ -1584,7 +1586,7 @@ func TestReverseScanWithSplitAndMerge(t *testing.T) {
 
 	// Case 1: An encounter with a range split.
 	// Split the range ["b", "e") at "c".
-	if err := db.AdminSplit(context.TODO(), "c", "c"); err != nil {
+	if err := db.AdminSplit(context.TODO(), "c", "c", true /* manual */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1816,14 +1818,13 @@ func TestAsyncAbortPoisons(t *testing.T) {
 	// Add a testing request filter which pauses a get request for the
 	// key until after the signal channel is closed.
 	var storeKnobs storage.StoreTestingKnobs
-	keyA := roachpb.Key("a")
-	var expectPoison int64
+	keyA, keyB := roachpb.Key("a"), roachpb.Key("b")
 	commitCh := make(chan error, 1)
 	storeKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
 		for _, req := range ba.Requests {
 			switch r := req.GetInner().(type) {
 			case *roachpb.EndTransactionRequest:
-				if r.Key.Equal(keyA) && atomic.LoadInt64(&expectPoison) == 1 {
+				if r.Key.Equal(keyA) {
 					if r.Poison {
 						close(commitCh)
 					} else {
@@ -1855,12 +1856,17 @@ func TestAsyncAbortPoisons(t *testing.T) {
 		if err := txn.SetUserPriority(roachpb.MaxUserPriority); err != nil {
 			return err
 		}
+		// Write to keyB first to locate this txn's record on a different key
+		// than the initial txn's record. This allows the request filter to
+		// trivially ignore this transaction.
+		if err := txn.Put(ctx, keyB, []byte("value2")); err != nil {
+			return err
+		}
 		return txn.Put(ctx, keyA, []byte("value2"))
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	atomic.StoreInt64(&expectPoison, 1)
 	expErr := regexp.QuoteMeta("TransactionAbortedError(ABORT_REASON_ABORT_SPAN)")
 	if _, err := txn.Get(ctx, keyA); !testutils.IsError(err, expErr) {
 		t.Fatalf("expected %s, got: %v", expErr, err)
@@ -1919,7 +1925,7 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				if atomic.AddInt32(&count, 1) > 1 {
 					return nil
 				}
-				err := roachpb.NewTransactionRetryError(reason)
+				err := roachpb.NewTransactionRetryError(reason, "filter err")
 				return roachpb.NewErrorWithTxn(err, fArgs.Hdr.Txn)
 			}
 			return nil
@@ -2081,35 +2087,6 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			filter: newRetryFilter(roachpb.Key([]byte("a")), roachpb.RETRY_SERIALIZABLE),
 			// Expect a transaction coord retry, which should succeed.
 			txnCoordRetry: true,
-		},
-		{
-			// If there are suitable retry conditions but we've exhausted the limit
-			// for tracking refresh spans, we'll exit with an error before getting
-			// to the end transaction.
-			name: "forwarded timestamp with too many refreshes",
-			afterTxnStart: func(ctx context.Context, db *client.DB) error {
-				_, err := db.Get(ctx, "a") // set ts cache
-				return err
-			},
-			retryable: func(ctx context.Context, txn *client.Txn) error {
-				// Advance timestamp for retry.
-				if err := txn.Put(ctx, "a", "put"); err != nil {
-					return err
-				}
-				// Scan sufficient times to exceed the limit on refresh spans. This
-				// will propagate a failure because our timestamp has been pushed.
-				keybase := strings.Repeat("a", 1024)
-				maxRefreshBytes := kv.MaxTxnRefreshSpansBytes.Get(&s.ClusterSettings().SV)
-				scanToExceed := int(maxRefreshBytes) / len(keybase)
-				for i := 0; i < scanToExceed; i++ {
-					key := roachpb.Key(fmt.Sprintf("%s%10d", keybase, i))
-					if _, err := txn.Scan(ctx, key, key.Next(), 0); err != nil {
-						return err
-					}
-				}
-				return nil
-			},
-			expFailure: "transaction is too large to complete; try splitting into pieces",
 		},
 		{
 			// If we've exhausted the limit for tracking refresh spans but we
@@ -2460,8 +2437,12 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				b := txn.NewBatch()
 				b.Put("a", "put")
 				b.Put("c", "put")
-				return txn.CommitInBatch(ctx, b) // both puts will succeed, no retry
+				return txn.CommitInBatch(ctx, b)
 			},
+			// Parallel commits do not support the canForwardSerializableTimestamp
+			// optimization. That's ok because we need to removed that optimization
+			// anyway. See #36431.
+			txnCoordRetry: true,
 		},
 		{
 			name: "multi-range batch with forwarded timestamp and cput",
@@ -2489,7 +2470,7 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				return err
 			},
 			retryable: func(ctx context.Context, txn *client.Txn) error {
-				if _, err := txn.Get(ctx, "b"); err != nil { // Get triggers txn coord retry
+				if _, err := txn.Get(ctx, "b"); err != nil { // Get triggers retry
 					return err
 				}
 				b := txn.NewBatch()
@@ -2497,7 +2478,9 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				b.Put("c", "put")
 				return txn.CommitInBatch(ctx, b) // both puts will succeed, et will retry from get
 			},
-			txnCoordRetry: true,
+			// Client-side retry required as this will be a mixed success due
+			// to parallel commits.
+			clientRetry: true,
 		},
 		{
 			name: "multi-range batch with forwarded timestamp and cput and delete range",
@@ -2525,8 +2508,12 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				b := txn.NewBatch()
 				b.Put("a", "put")
 				b.Put("c", "put")
-				return txn.CommitInBatch(ctx, b) // both puts will succeed, no retry
+				return txn.CommitInBatch(ctx, b) // both puts will succeed, et will retry
 			},
+			// Parallel commits do not support the canForwardSerializableTimestamp
+			// optimization. That's ok because we need to removed that optimization
+			// anyway. See #36431.
+			txnCoordRetry: true,
 		},
 		{
 			name: "multi-range batch with write too old and failed cput",
@@ -2639,8 +2626,10 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				b.CPut("c", "cput", "value")
 				return txn.CommitInBatch(ctx, b)
 			},
-			filter:        newUncertaintyFilter(roachpb.Key([]byte("c"))),
-			txnCoordRetry: true, // will succeed because no mixed success
+			filter: newUncertaintyFilter(roachpb.Key([]byte("c"))),
+			// Client-side retry required as this will be a mixed success due
+			// to parallel commits.
+			clientRetry: true,
 		},
 		{
 			name: "multi-range batch with uncertainty interval error and get conflict",
@@ -2676,7 +2665,7 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				return txn.CommitInBatch(ctx, b)
 			},
 			filter:      newUncertaintyFilter(roachpb.Key([]byte("c"))),
-			clientRetry: true, // client-side retry required as this will be an mixed success
+			clientRetry: true, // client-side retry required as this will be a mixed success
 		},
 		{
 			name: "multi-range scan with uncertainty interval error",
@@ -2694,6 +2683,58 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			},
 			filter:      newUncertaintyFilter(roachpb.Key([]byte("c"))),
 			clientRetry: true, // can't restart because of mixed success and write batch
+		},
+		{
+			name: "missing pipelined write caught on chain",
+			retryable: func(ctx context.Context, txn *client.Txn) error {
+				if err := txn.Put(ctx, "a", "put"); err != nil {
+					return err
+				}
+				// Simulate a failed intent write by resolving the intent
+				// directly. This should be picked up by the transaction's
+				// QueryIntent when chaining on to the pipelined write to
+				// key "a".
+				var ba roachpb.BatchRequest
+				ba.Add(&roachpb.ResolveIntentRequest{
+					RequestHeader: roachpb.RequestHeader{
+						Key: roachpb.Key("a"),
+					},
+					IntentTxn: txn.Serialize().TxnMeta,
+					Status:    roachpb.ABORTED,
+				})
+				if _, pErr := txn.DB().NonTransactionalSender().Send(ctx, ba); pErr != nil {
+					return pErr.GoError()
+				}
+				_, err := txn.Get(ctx, "a")
+				return err
+			},
+			// The missing intent write results in a RETRY_ASYNC_WRITE_FAILURE error.
+			clientRetry: true,
+		},
+		{
+			name: "missing pipelined write caught on commit",
+			retryable: func(ctx context.Context, txn *client.Txn) error {
+				if err := txn.Put(ctx, "a", "put"); err != nil {
+					return err
+				}
+				// Simulate a failed intent write by resolving the intent
+				// directly. This should be picked up by the transaction's
+				// pre-commit QueryIntent for the pipelined write to key "a".
+				var ba roachpb.BatchRequest
+				ba.Add(&roachpb.ResolveIntentRequest{
+					RequestHeader: roachpb.RequestHeader{
+						Key: roachpb.Key("a"),
+					},
+					IntentTxn: txn.Serialize().TxnMeta,
+					Status:    roachpb.ABORTED,
+				})
+				if _, pErr := txn.DB().NonTransactionalSender().Send(ctx, ba); pErr != nil {
+					return pErr.GoError()
+				}
+				return nil // commit
+			},
+			// The missing intent write results in a RETRY_ASYNC_WRITE_FAILURE error.
+			clientRetry: true,
 		},
 	}
 

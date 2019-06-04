@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/workloadccl"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	workloadcli "github.com/cockroachdb/cockroach/pkg/workload/cli"
 	"github.com/pkg/errors"
@@ -51,7 +52,7 @@ func config() workloadccl.FixtureConfig {
 	if len(*gcsBillingProjectOverride) > 0 {
 		config.BillingProject = *gcsBillingProjectOverride
 	}
-	config.CSVServerURL = *fixturesMakeCSVServerURL
+	config.CSVServerURL = *fixturesMakeImportCSVServerURL
 	return config
 }
 
@@ -66,7 +67,7 @@ var fixturesListCmd = workloadcli.SetCmdDefaults(&cobra.Command{
 })
 var fixturesMakeCmd = workloadcli.SetCmdDefaults(&cobra.Command{
 	Use:   `make`,
-	Short: `regenerate and store a fixture on GCS`,
+	Short: `IMPORT a fixture and then store a BACKUP of it on GCS`,
 })
 var fixturesLoadCmd = workloadcli.SetCmdDefaults(&cobra.Command{
 	Use:   `load`,
@@ -81,7 +82,10 @@ var fixturesURLCmd = workloadcli.SetCmdDefaults(&cobra.Command{
 	Short: `generate the GCS URL for a fixture`,
 })
 
-var fixturesMakeCSVServerURL = fixturesMakeCmd.PersistentFlags().String(
+var fixturesLoadImportShared = pflag.NewFlagSet(`load/import`, pflag.ContinueOnError)
+var fixturesMakeImportShared = pflag.NewFlagSet(`load/import`, pflag.ContinueOnError)
+
+var fixturesMakeImportCSVServerURL = fixturesMakeImportShared.String(
 	`csv-server`, ``,
 	`Skip saving CSVs to cloud storage, instead get them from a 'csv-server' running at this url`)
 
@@ -93,8 +97,6 @@ var fixturesMakeFilesPerNode = fixturesMakeCmd.PersistentFlags().Int(
 	`files-per-node`, 1,
 	`number of file URLs to generate per node when using csv-server`)
 
-var fixturesLoadImportShared = pflag.NewFlagSet(`load/import`, pflag.ContinueOnError)
-
 var fixturesImportDirectIngestionTable = fixturesImportCmd.PersistentFlags().Bool(
 	`experimental-direct-ingestion`, false,
 	`Use the faster, but limited and still quite experimental, IMPORT without a distributed sort`)
@@ -105,6 +107,9 @@ var fixturesImportFilesPerNode = fixturesImportCmd.PersistentFlags().Int(
 
 var fixturesRunChecks = fixturesLoadImportShared.Bool(
 	`checks`, true, `Run validity checks on the loaded fixture`)
+
+var fixturesImportInjectStats = fixturesImportCmd.PersistentFlags().Bool(
+	`inject-stats`, true, `Inject pre-calculated statistics if they are available`)
 
 var gcsBucketOverride, gcsPrefixOverride, gcsBillingProjectOverride *string
 
@@ -157,6 +162,7 @@ func init() {
 				Args: cobra.RangeArgs(0, 1),
 			})
 			genMakeCmd.Flags().AddFlagSet(genFlags)
+			genMakeCmd.Flags().AddFlagSet(fixturesMakeImportShared)
 			genMakeCmd.Run = workloadcli.CmdHelper(gen, fixturesMake)
 			fixturesMakeCmd.AddCommand(genMakeCmd)
 
@@ -175,6 +181,7 @@ func init() {
 			})
 			genImportCmd.Flags().AddFlagSet(genFlags)
 			genImportCmd.Flags().AddFlagSet(fixturesLoadImportShared)
+			genImportCmd.Flags().AddFlagSet(fixturesMakeImportShared)
 			genImportCmd.Run = workloadcli.CmdHelper(gen, fixturesImport)
 			fixturesImportCmd.AddCommand(genImportCmd)
 
@@ -288,9 +295,16 @@ func fixturesLoad(gen workload.Generator, urls []string, dbName string) error {
 	if err != nil {
 		return errors.Wrap(err, `finding fixture`)
 	}
-	if err := workloadccl.RestoreFixture(ctx, sqlDB, fixture, dbName); err != nil {
+
+	start := timeutil.Now()
+	log.Infof(ctx, "starting load of %d tables", len(gen.Tables()))
+	bytes, err := workloadccl.RestoreFixture(ctx, sqlDB, fixture, dbName)
+	if err != nil {
 		return errors.Wrap(err, `restoring fixture`)
 	}
+	elapsed := timeutil.Since(start)
+	log.Infof(ctx, "loaded %s in %d tables (took %s, %s)",
+		humanizeutil.IBytes(bytes), len(gen.Tables()), elapsed, humanizeutil.DataRate(bytes, elapsed))
 
 	if hooks, ok := gen.(workload.Hookser); *fixturesRunChecks && ok {
 		if consistencyCheckFn := hooks.Hooks().CheckConsistency; consistencyCheckFn != nil {
@@ -314,13 +328,22 @@ func fixturesImport(gen workload.Generator, urls []string, dbName string) error 
 		return err
 	}
 
+	log.Infof(ctx, "starting import of %d tables", len(gen.Tables()))
+	start := timeutil.Now()
 	directIngestion := *fixturesImportDirectIngestionTable
 	filesPerNode := *fixturesImportFilesPerNode
-	bytes, err := workloadccl.ImportFixture(ctx, sqlDB, gen, dbName, directIngestion, filesPerNode)
+	injectStats := *fixturesImportInjectStats
+	noSkipPostLoad := false
+	csvServer := *fixturesMakeImportCSVServerURL
+	bytes, err := workloadccl.ImportFixture(
+		ctx, sqlDB, gen, dbName, directIngestion, filesPerNode, injectStats, noSkipPostLoad, csvServer,
+	)
 	if err != nil {
 		return errors.Wrap(err, `importing fixture`)
 	}
-	log.Infof(ctx, "imported %s bytes in %d tables", humanizeutil.IBytes(bytes), len(gen.Tables()))
+	elapsed := timeutil.Since(start)
+	log.Infof(ctx, "imported %s in %d tables (took %s, %s)",
+		humanizeutil.IBytes(bytes), len(gen.Tables()), elapsed, humanizeutil.DataRate(bytes, elapsed))
 
 	if hooks, ok := gen.(workload.Hookser); *fixturesRunChecks && ok {
 		if consistencyCheckFn := hooks.Hooks().CheckConsistency; consistencyCheckFn != nil {

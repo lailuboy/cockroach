@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -246,6 +247,9 @@ type zigzagJoiner struct {
 	// TODO(andrei): get rid of this field and move the actions it gates into the
 	// Start() method.
 	started bool
+
+	// returnedMeta contains all the metadata that zigzag joiner has emitted.
+	returnedMeta []distsqlpb.ProducerMetadata
 }
 
 // Batch size is a parameter which determines how many rows should be fetched
@@ -256,6 +260,7 @@ const zigzagJoinerBatchSize = 5
 
 var _ Processor = &zigzagJoiner{}
 var _ RowSource = &zigzagJoiner{}
+var _ distsqlpb.MetadataSource = &zigzagJoiner{}
 
 const zigzagJoinerProcName = "zigzagJoiner"
 
@@ -296,6 +301,7 @@ func newZigzagJoiner(
 
 	z.numTables = len(spec.Tables)
 	z.infos = make([]*zigzagJoinerInfo, z.numTables)
+	z.returnedMeta = make([]distsqlpb.ProducerMetadata, 0, 1)
 
 	for i := range z.infos {
 		z.infos[i] = &zigzagJoinerInfo{}
@@ -356,14 +362,15 @@ type zigzagJoinerInfo struct {
 	alloc      *sqlbase.DatumAlloc
 	table      *sqlbase.TableDescriptor
 	index      *sqlbase.IndexDescriptor
-	indexTypes []sqlbase.ColumnType
+	indexTypes []types.T
 	indexDirs  []sqlbase.IndexDescriptor_Direction
 
 	// Stores one batch of matches at a time. When all the rows are collected
 	// the cartesian product of the containers will be emitted.
 	container sqlbase.EncDatumRowContainer
 
-	eqColumnIDs columns
+	// eqColumns is the ordinal positions of the equality columns.
+	eqColumns columns
 
 	// Prefix of the index key that has fixed values.
 	fixedValues sqlbase.EncDatumRow
@@ -389,7 +396,7 @@ func (z *zigzagJoiner) setupInfo(spec *distsqlpb.ZigzagJoinerSpec, side int, col
 
 	info.alloc = &sqlbase.DatumAlloc{}
 	info.table = &spec.Tables[side]
-	info.eqColumnIDs = spec.EqColumns[side].Columns
+	info.eqColumns = spec.EqColumns[side].Columns
 	indexID := spec.IndexIds[side]
 	if indexID == 0 {
 		info.index = &info.table.PrimaryIndex
@@ -399,12 +406,10 @@ func (z *zigzagJoiner) setupInfo(spec *distsqlpb.ZigzagJoinerSpec, side int, col
 
 	var columnIDs []sqlbase.ColumnID
 	columnIDs, info.indexDirs = info.index.FullColumnIDs()
-	info.indexTypes = make([]sqlbase.ColumnType, len(columnIDs))
-	indexCols := make([]uint32, len(columnIDs))
+	info.indexTypes = make([]types.T, len(columnIDs))
 	columnTypes := info.table.ColumnTypes()
 	colIdxMap := info.table.ColumnIdxMap()
 	for i, columnID := range columnIDs {
-		indexCols[i] = uint32(columnID)
 		info.indexTypes[i] = columnTypes[colIdxMap[columnID]]
 	}
 
@@ -418,11 +423,11 @@ func (z *zigzagJoiner) setupInfo(spec *distsqlpb.ZigzagJoinerSpec, side int, col
 
 	// Add the fixed columns.
 	for i := 0; i < len(info.fixedValues); i++ {
-		neededCols.Add(int(indexCols[i]) - 1)
+		neededCols.Add(colIdxMap[columnIDs[i]])
 	}
 
 	// Add the equality columns.
-	for _, col := range info.eqColumnIDs {
+	for _, col := range info.eqColumns {
 		neededCols.Add(int(col))
 	}
 
@@ -466,17 +471,20 @@ func (z *zigzagJoiner) close() {
 // terminated, either due to being indicated by the consumer, or because the
 // processor ran out of rows or encountered an error. It is ok for err to be
 // nil indicating that we're done producing rows even though no error occurred.
-func (z *zigzagJoiner) producerMeta(err error) *ProducerMetadata {
-	var meta *ProducerMetadata
+func (z *zigzagJoiner) producerMeta(err error) *distsqlpb.ProducerMetadata {
+	var meta *distsqlpb.ProducerMetadata
 	if !z.closed {
 		if err != nil {
-			meta = &ProducerMetadata{Err: err}
+			meta = &distsqlpb.ProducerMetadata{Err: err}
 		} else if trace := getTraceData(z.Ctx); trace != nil {
-			meta = &ProducerMetadata{TraceData: trace}
+			meta = &distsqlpb.ProducerMetadata{TraceData: trace}
 		}
 		// We need to close as soon as we send producer metadata as we're done
 		// sending rows. The consumer is allowed to not call ConsumerDone().
 		z.close()
+	}
+	if meta != nil {
+		z.returnedMeta = append(z.returnedMeta, *meta)
 	}
 	return meta
 }
@@ -502,7 +510,7 @@ func (z *zigzagJoiner) fetchRowFromSide(
 	// Keep fetching until a row is found that does not have null in an equality
 	// column.
 	hasNull := func(row sqlbase.EncDatumRow) bool {
-		for _, c := range z.infos[side].eqColumnIDs {
+		for _, c := range z.infos[side].eqColumns {
 			if row[c].IsNull() {
 				return true
 			}
@@ -524,12 +532,12 @@ func (z *zigzagJoiner) fetchRowFromSide(
 // Return the datums from the equality columns from a given non-empty row
 // from the specified side.
 func (z *zigzagJoiner) extractEqDatums(row sqlbase.EncDatumRow, side int) sqlbase.EncDatumRow {
-	eqColIDs := z.infos[side].eqColumnIDs
-	eqCols := make(sqlbase.EncDatumRow, len(eqColIDs))
-	for i, id := range eqColIDs {
-		eqCols[i] = row[id]
+	eqCols := z.infos[side].eqColumns
+	eqDatums := make(sqlbase.EncDatumRow, len(eqCols))
+	for i, col := range eqCols {
+		eqDatums[i] = row[col]
 	}
-	return eqCols
+	return eqDatums
 }
 
 // Generates a Key for an inverted index from the passed datums and side
@@ -616,29 +624,30 @@ func (z *zigzagJoiner) produceSpanFromBaseRow() (roachpb.Span, error) {
 }
 
 // Returns the column types of the equality columns.
-func (zi *zigzagJoinerInfo) eqColTypes() []sqlbase.ColumnType {
-	eqColIDs := zi.eqColumnIDs
-	eqColTypes := make([]sqlbase.ColumnType, 0, len(eqColIDs))
-	for _, id := range eqColIDs {
-		eqColTypes = append(eqColTypes, zi.table.ColumnTypes()[id])
+func (zi *zigzagJoinerInfo) eqColTypes() []types.T {
+	eqColTypes := make([]types.T, len(zi.eqColumns))
+	colTypes := zi.table.ColumnTypes()
+	for i := range eqColTypes {
+		eqColTypes[i] = colTypes[zi.eqColumns[i]]
 	}
 	return eqColTypes
 }
 
 // Returns the ordering of the equality columns.
 func (zi *zigzagJoinerInfo) eqOrdering() (sqlbase.ColumnOrdering, error) {
-	ordering := make(sqlbase.ColumnOrdering, len(zi.eqColumnIDs))
-	for i, colID := range zi.eqColumnIDs {
+	ordering := make(sqlbase.ColumnOrdering, len(zi.eqColumns))
+	for i := range zi.eqColumns {
+		colID := zi.table.Columns[zi.eqColumns[i]].ID
 		// Search the index columns, then the primary keys to find an ordering for
 		// the current column, 'colID'.
 		var direction encoding.Direction
 		var err error
-		if idx := findColumnID(zi.index.ColumnIDs, sqlbase.ColumnID(colID+1)); idx != -1 {
+		if idx := findColumnID(zi.index.ColumnIDs, colID); idx != -1 {
 			direction, err = zi.index.ColumnDirections[idx].ToEncodingDirection()
 			if err != nil {
 				return nil, err
 			}
-		} else if idx := findColumnID(zi.table.PrimaryIndex.ColumnIDs, sqlbase.ColumnID(colID+1)); idx != -1 {
+		} else if idx := findColumnID(zi.table.PrimaryIndex.ColumnIDs, colID); idx != -1 {
 			direction, err = zi.table.PrimaryIndex.ColumnDirections[idx].ToEncodingDirection()
 			if err != nil {
 				return nil, err
@@ -719,10 +728,10 @@ func (z *zigzagJoiner) emitFromContainers() (sqlbase.EncDatumRow, error) {
 // at a time.
 func (z *zigzagJoiner) nextRow(
 	ctx context.Context, txn *client.Txn,
-) (sqlbase.EncDatumRow, *ProducerMetadata) {
+) (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	for {
 		if err := z.cancelChecker.Check(); err != nil {
-			return nil, &ProducerMetadata{Err: err}
+			return nil, &distsqlpb.ProducerMetadata{Err: err}
 		}
 
 		// Check if there are any rows built up in the containers that need to be
@@ -888,7 +897,7 @@ func (z *zigzagJoiner) collectAllMatches(
 }
 
 // Next is part of the RowSource interface.
-func (z *zigzagJoiner) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (z *zigzagJoiner) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	txn := z.flowCtx.txn
 
 	if !z.started {
@@ -925,6 +934,9 @@ func (z *zigzagJoiner) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 	for {
 		row, meta := z.nextRow(z.Ctx, txn)
 		if z.closed || meta != nil {
+			if meta != nil {
+				z.returnedMeta = append(z.returnedMeta, *meta)
+			}
 			return nil, meta
 		}
 		if row == nil {
@@ -938,11 +950,20 @@ func (z *zigzagJoiner) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 		}
 		return outRow, nil
 	}
-	return nil, z.DrainHelper()
+	meta := z.DrainHelper()
+	if meta != nil {
+		z.returnedMeta = append(z.returnedMeta, *meta)
+	}
+	return nil, meta
 }
 
 // ConsumerClosed is part of the RowSource interface.
 func (z *zigzagJoiner) ConsumerClosed() {
 	// The consumer is done, Next() will not be called again.
 	z.close()
+}
+
+// DrainMeta is part of the MetadataSource interface.
+func (z *zigzagJoiner) DrainMeta(_ context.Context) []distsqlpb.ProducerMetadata {
+	return z.returnedMeta
 }

@@ -21,11 +21,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
 )
@@ -60,7 +55,7 @@ func registerSchemaChangeKV(r *registry) {
 				// TODO(dan): Ideally, the test would fail if this queryload failed,
 				// but we can't put it in monitor as-is because the test deadlocks.
 				go func() {
-					const cmd = `./workload run kv --tolerate-errors --min-block-bytes=8 --max-block-bytes=128 --db=test`
+					const cmd = `./workload run kv --tolerate-errors --min-block-bytes=8 --max-block-bytes=127 --db=test`
 					l, err := t.l.ChildLogger(fmt.Sprintf(`kv-%d`, node))
 					if err != nil {
 						t.Fatal(err)
@@ -294,18 +289,18 @@ func findIndexProblem(
 }
 
 func registerSchemaChangeIndexTPCC1000(r *registry) {
-	r.Add(makeIndexAddTpccTest(5, 1000, time.Hour*2))
+	r.Add(makeIndexAddTpccTest(makeClusterSpec(5, cpu(16)), 1000, time.Hour*2))
 }
 
 func registerSchemaChangeIndexTPCC100(r *registry) {
-	r.Add(makeIndexAddTpccTest(5, 100, time.Minute*15))
+	r.Add(makeIndexAddTpccTest(makeClusterSpec(5), 100, time.Minute*15))
 }
 
-func makeIndexAddTpccTest(numNodes, warehouses int, length time.Duration) testSpec {
+func makeIndexAddTpccTest(spec clusterSpec, warehouses int, length time.Duration) testSpec {
 	return testSpec{
 		Name:    fmt.Sprintf("schemachange/index/tpcc/w=%d", warehouses),
-		Cluster: makeClusterSpec(numNodes),
-		Timeout: length * 2,
+		Cluster: spec,
+		Timeout: length * 3,
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runTPCC(ctx, t, c, tpccOptions{
 				Warehouses: warehouses,
@@ -324,111 +319,86 @@ func makeIndexAddTpccTest(numNodes, warehouses int, length time.Duration) testSp
 	}
 }
 
-func registerSchemaChangeCancelIndexTPCC1000(r *registry) {
-	r.Add(makeIndexAddRollbackTpccTest(5, 1000, time.Minute*90))
+func registerSchemaChangeBulkIngest(r *registry) {
+	r.Add(makeSchemaChangeBulkIngestTest(5, 100000000, time.Minute*20))
 }
 
-// Creates an index and job, returning the job ID and a notify channel for
-// when the schema change completes or rolls back.
-func createIndexAddJob(
-	ctx context.Context, c *cluster, prefix string,
-) (int64, <-chan error, error) {
-	conn := c.Conn(ctx, 1)
-	defer conn.Close()
-	oldJobID, err := jobutils.QueryRecentJobID(conn, 0)
-	if err != nil {
-		return 0, nil, err
-	}
-
-	// CREATE INDEX in a separate goroutine because it takes a lot of time.
-	notifyCommit := make(chan error)
-	go func() {
-		newConn := c.Conn(ctx, 1)
-		defer newConn.Close()
-		_, err := newConn.Exec(`CREATE INDEX foo ON tpcc.order (o_carrier_id);`)
-		notifyCommit <- err
-	}()
-
-	// Find the job id for the CREATE INDEX.
-	var jobID int64
-	for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
-		jobID, err = jobutils.QueryRecentJobID(conn, 0)
-		if err != nil {
-			return 0, nil, err
-		}
-		if jobID != oldJobID {
-			break
-		}
-	}
-
-	c.l.Printf("%s: created index add job %d\n", prefix, jobID)
-
-	return jobID, notifyCommit, nil
-}
-
-func makeIndexAddRollbackTpccTest(numNodes, warehouses int, length time.Duration) testSpec {
+func makeSchemaChangeBulkIngestTest(numNodes, numRows int, length time.Duration) testSpec {
 	return testSpec{
-		Name:    fmt.Sprintf("schemachange/indexrollback/tpcc/w=%d", warehouses),
+		Name:    "schemachange/bulkingest",
 		Cluster: makeClusterSpec(numNodes),
 		Timeout: length * 2,
+		// `fixtures import` (with the experimental-workload paths) is not supported in 2.1
+		MinVersion: "v19.1.0",
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			runTPCC(ctx, t, c, tpccOptions{
-				Warehouses: warehouses,
-				Extra:      "--wait=false --tolerate-errors",
-				During: func(ctx context.Context) error {
-					gcTTL := 10 * time.Minute
-					prefix := "indexrollback"
+			// Configure column a to have sequential ascending values, and columns b and c to be constant.
+			// The payload column will be randomized and thus uncorrelated with the primary key (a, b, c).
+			aNum := numRows
+			if c.isLocal() {
+				aNum = 100000
+			}
+			bNum := 1
+			cNum := 1
+			payloadBytes := 4
 
-					createID, notifyCommit, err := createIndexAddJob(ctx, c, prefix)
-					if err != nil {
-						return err
-					}
+			crdbNodes := c.Range(1, c.nodes-1)
+			workloadNode := c.Node(c.nodes)
 
-					conn := c.Conn(ctx, 1)
-					defer conn.Close()
+			c.Put(ctx, cockroach, "./cockroach")
+			c.Put(ctx, workload, "./workload", workloadNode)
+			// TODO (lucy): Remove flag once the faster import is enabled by default
+			c.Start(ctx, t, crdbNodes, startArgs("--env=COCKROACH_IMPORT_WORKLOAD_FASTER=true"))
 
-					if _, err := conn.Exec("ALTER INDEX tpcc.order@foo CONFIGURE ZONE USING gc.ttlseconds = $1", int64(gcTTL.Seconds())); err != nil {
-						return err
-					}
+			// Don't add another index when importing.
+			cmdWrite := fmt.Sprintf(
+				// For fixtures import, use the version built into the cockroach binary
+				// so the tpcc workload-versions match on release branches.
+				"./cockroach workload fixtures import bulkingest {pgurl:1} --a %d --b %d --c %d --payload-bytes %d --index-b-c-a=false",
+				aNum, bNum, cNum, payloadBytes,
+			)
 
-					retryOpts := retry.Options{InitialBackoff: 10 * time.Second, MaxBackoff: time.Minute}
-					if err := jobutils.WaitForFractionalProgress(
-						ctx,
-						conn,
-						createID,
-						0.12,
-						retryOpts,
-					); err != nil {
-						return err
-					}
+			c.Run(ctx, workloadNode, cmdWrite)
 
-					if _, err := conn.Exec(`CANCEL JOB $1`, createID); err != nil {
-						return err
-					}
-					c.l.Printf("%s: canceled job %d\n", prefix, createID)
+			m := newMonitor(ctx, c, crdbNodes)
 
-					if err := <-notifyCommit; !testutils.IsError(err, "job canceled") {
-						c.l.Printf("%s: canceled job %d, got: %+v\n", prefix, createID, err)
-						return errors.Errorf("expected 'job canceled' error, but got %+v", err)
-					}
-
-					rollbackID, err := jobutils.QueryRecentJobID(conn, 0)
-					if err != nil {
-						return err
-					} else if rollbackID == createID {
-						return errors.Errorf("no rollback job created")
-					}
-
-					c.l.Printf("%s: rollback for %d began: %d\n", prefix, createID, rollbackID)
-
-					backoff := 30 * time.Second
-					retryOpts = retry.Options{InitialBackoff: backoff, MaxBackoff: backoff, Multiplier: 1, MaxRetries: int(length / backoff)}
-					return jobutils.WaitForStatus(ctx, conn, rollbackID, jobs.StatusSucceeded, retryOpts)
-				},
-				Duration: length,
+			indexDuration := length
+			if c.isLocal() {
+				indexDuration = time.Second * 30
+			}
+			cmdWriteAndRead := fmt.Sprintf(
+				"./workload run bulkingest --duration %s {pgurl:1-%d} --a %d --b %d --c %d --payload-bytes %d",
+				indexDuration.String(), c.nodes-1, aNum, bNum, cNum, payloadBytes,
+			)
+			m.Go(func(ctx context.Context) error {
+				c.Run(ctx, workloadNode, cmdWriteAndRead)
+				return nil
 			})
+
+			m.Go(func(ctx context.Context) error {
+				db := c.Conn(ctx, 1)
+				defer db.Close()
+
+				if !c.isLocal() {
+					// Wait for the load generator to run for a few minutes before creating the index.
+					sleepInterval := time.Minute * 5
+					maxSleep := length / 2
+					if sleepInterval > maxSleep {
+						sleepInterval = maxSleep
+					}
+					time.Sleep(sleepInterval)
+				}
+
+				c.l.Printf("Creating index")
+				before := timeutil.Now()
+				if _, err := db.Exec(`CREATE INDEX payload_a ON bulkingest.bulkingest (payload, a)`); err != nil {
+					t.Fatal(err)
+				}
+				c.l.Printf("CREATE INDEX took %v\n", timeutil.Since(before))
+				return nil
+			})
+
+			m.Wait()
 		},
-		MinVersion: "v2.2.0",
 	}
 }
 

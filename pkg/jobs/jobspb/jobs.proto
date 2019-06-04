@@ -75,6 +75,7 @@ message ImportDetails {
     sqlbase.TableDescriptor desc = 1;
     string name = 18;
     int64 seq_val = 19;
+    bool is_new = 20;
     reserved 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17;
   }
   repeated Table tables = 1 [(gogoproto.nullable) = false];
@@ -209,13 +210,15 @@ message CreateStatsDetails {
       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ColumnID"
     ];
   }
-  string name = 1 [
-    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/tree.Name"
-  ];
+  string name = 1;
   sqlbase.TableDescriptor table = 2 [(gogoproto.nullable) = false];
   repeated ColList column_lists = 3 [(gogoproto.nullable) = false];
   string statement = 4;
   util.hlc.Timestamp as_of = 5;
+  double max_fraction_idle = 7;
+
+  // Fully qualified table name.
+  string fq_table_name = 6 [(gogoproto.customname) = "FQTableName"];
 }
 
 message CreateStatsProgress {
@@ -224,6 +227,8 @@ message CreateStatsProgress {
 
 message Payload {
   string description = 1;
+  // If empty, the description is assumed to be the statement.
+  string statement = 16;
   string username = 2;
   // For consistency with the SQL timestamp type, which has microsecond
   // precision, we avoid the timestamp.Timestamp WKT, which has nanosecond
@@ -278,4 +283,5 @@ enum Type {
   IMPORT = 4 [(gogoproto.enumvalue_customname) = "TypeImport"];
   CHANGEFEED = 5 [(gogoproto.enumvalue_customname) = "TypeChangefeed"];
   CREATE_STATS = 6 [(gogoproto.enumvalue_customname) = "TypeCreateStats"];
+  AUTO_CREATE_STATS = 7 [(gogoproto.enumvalue_customname) = "TypeAutoCreateStats"];
 }

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"strings"
 
 	"github.com/pkg/errors"
 )
@@ -28,7 +29,7 @@ import (
 const sshPublicKeyFile = "${HOME}/.ssh/id_rsa.pub"
 
 // sshKeyExists checks to see if there is a an SSH key with the given name in the given region.
-func sshKeyExists(keyName string, region string) (bool, error) {
+func (p *Provider) sshKeyExists(keyName string, region string) (bool, error) {
 	var data struct {
 		KeyPairs []struct {
 			KeyName string
@@ -38,7 +39,7 @@ func sshKeyExists(keyName string, region string) (bool, error) {
 		"ec2", "describe-key-pairs",
 		"--region", region,
 	}
-	err := runJSONCommand(args, &data)
+	err := p.runJSONCommand(args, &data)
 	if err != nil {
 		return false, err
 	}
@@ -52,7 +53,7 @@ func sshKeyExists(keyName string, region string) (bool, error) {
 
 // sshKeyImport takes the user's local, public SSH key and imports it into the ec2 region so that
 // we can create new hosts with it.
-func sshKeyImport(keyName string, region string) error {
+func (p *Provider) sshKeyImport(keyName string, region string) error {
 	keyBytes, err := ioutil.ReadFile(os.ExpandEnv(sshPublicKeyFile))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -71,7 +72,13 @@ func sshKeyImport(keyName string, region string) error {
 		"--key-name", keyName,
 		"--public-key-material", string(keyBytes),
 	}
-	return runJSONCommand(args, &data)
+	err = p.runJSONCommand(args, &data)
+	// If two roachprod instances run at the same time with the same key, they may
+	// race to upload the key pair.
+	if err == nil || strings.Contains(err.Error(), "InvalidKeyPair.Duplicate") {
+		return nil
+	}
+	return err
 }
 
 // sshKeyName computes the name of the ec2 ssh key that we'll store the local user's public key in

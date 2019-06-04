@@ -25,9 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -41,10 +41,12 @@ func TestMaybeRefreshStats(t *testing.T) {
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.NewTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
-	AutomaticStatisticsClusterMode.Override(&evalCtx.Settings.SV, false)
+	AutomaticStatisticsClusterMode.Override(&st.SV, false)
+	AutomaticStatisticsMinStaleRows.Override(&st.SV, 5)
 
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	sqlRun.Exec(t,
@@ -56,7 +58,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
 	descA := sqlbase.GetTableDescriptor(s.DB(), "t", "a")
 	cache := NewTableStatisticsCache(10 /* cacheSize */, s.Gossip(), kvDB, executor)
-	refresher := MakeRefresher(executor, cache, time.Microsecond /* asOfTime */)
+	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	// There should not be any stats yet.
 	if err := checkStatsCount(ctx, cache, descA.ID, 0 /* expected */); err != nil {
@@ -111,10 +113,11 @@ func TestAverageRefreshTime(t *testing.T) {
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.NewTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
-	AutomaticStatisticsClusterMode.Override(&evalCtx.Settings.SV, false)
+	AutomaticStatisticsClusterMode.Override(&st.SV, false)
 
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	sqlRun.Exec(t,
@@ -125,7 +128,7 @@ func TestAverageRefreshTime(t *testing.T) {
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
 	tableID := sqlbase.GetTableDescriptor(s.DB(), "t", "a").ID
 	cache := NewTableStatisticsCache(10 /* cacheSize */, s.Gossip(), kvDB, executor)
-	refresher := MakeRefresher(executor, cache, time.Microsecond /* asOfTime */)
+	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	checkAverageRefreshTime := func(expected time.Duration) error {
 		cache.InvalidateTableStats(ctx, tableID)
@@ -341,12 +344,12 @@ func TestAutoStatsReadOnlyTables(t *testing.T) {
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
 	cache := NewTableStatisticsCache(10 /* cacheSize */, s.Gossip(), kvDB, executor)
-	refresher := MakeRefresher(executor, cache, time.Microsecond /* asOfTime */)
+	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	AutomaticStatisticsClusterMode.Override(&st.SV, true)
 
 	if err := refresher.Start(
-		ctx, &st.SV, s.Stopper(), time.Millisecond, /* refreshInterval */
+		ctx, s.Stopper(), time.Millisecond, /* refreshInterval */
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -366,12 +369,13 @@ func TestNoRetryOnFailure(t *testing.T) {
 	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.NewTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
 	cache := NewTableStatisticsCache(10 /* cacheSize */, s.Gossip(), kvDB, executor)
-	r := MakeRefresher(executor, cache, time.Microsecond /* asOfTime */)
+	r := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	// Try to refresh stats on a table that doesn't exist.
 	r.maybeRefreshStats(
@@ -387,16 +391,20 @@ func TestNoRetryOnFailure(t *testing.T) {
 func TestMutationsChannel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.NewTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
-	AutomaticStatisticsClusterMode.Override(&evalCtx.Settings.SV, true)
-	r := Refresher{mutations: make(chan mutation, refreshChanBufferLen)}
+	AutomaticStatisticsClusterMode.Override(&st.SV, true)
+	r := Refresher{
+		st:        st,
+		mutations: make(chan mutation, refreshChanBufferLen),
+	}
 
 	// Test that the mutations channel doesn't block even when we add 10 more
 	// items than can fit in the buffer.
 	for i := 0; i < refreshChanBufferLen+10; i++ {
-		r.NotifyMutation(&evalCtx.Settings.SV, sqlbase.ID(53), 5 /* rowsAffected */)
+		r.NotifyMutation(sqlbase.ID(53), 5 /* rowsAffected */)
 	}
 
 	if expected, actual := refreshChanBufferLen, len(r.mutations); expected != actual {

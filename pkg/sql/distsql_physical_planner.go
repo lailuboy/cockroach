@@ -30,13 +30,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlplan/replicaoracle"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -220,8 +221,7 @@ func (v *distSQLExprCheckVisitor) VisitPre(expr tree.Expr) (recurse bool, newExp
 		v.err = newQueryNotSupportedError("OID expressions are not supported by distsql")
 		return false, expr
 	case *tree.CastExpr:
-		switch t.Type.(type) {
-		case *coltypes.TOid:
+		if t.Type.Family() == types.OidFamily {
 			v.err = newQueryNotSupportedErrorf("cast to %s is not supported by distsql", t.Type)
 			return false, expr
 		}
@@ -297,8 +297,8 @@ var setNotSupportedError = newQueryNotSupportedError("SET / SET CLUSTER SETTING 
 // mustWrapNode returns true if a node has no DistSQL-processor equivalent.
 // This must be kept in sync with createPlanForNode.
 // TODO(jordan): refactor these to use the observer pattern to avoid duplication.
-func (dsp *DistSQLPlanner) mustWrapNode(node planNode) bool {
-	switch node.(type) {
+func (dsp *DistSQLPlanner) mustWrapNode(planCtx *PlanningCtx, node planNode) bool {
+	switch n := node.(type) {
 	case *scanNode:
 	case *indexJoinNode:
 	case *lookupJoinNode:
@@ -311,11 +311,18 @@ func (dsp *DistSQLPlanner) mustWrapNode(node planNode) bool {
 	case *limitNode:
 	case *distinctNode:
 	case *unionNode:
-	case *valuesNode:
 	case *virtualTableNode:
 	case *projectSetNode:
 	case *unaryNode:
+	case *windowNode:
 	case *zeroNode:
+	case *valuesNode:
+		// This is unfortunately duplicated by createPlanForNode, and must be kept
+		// in sync with its implementation.
+		if !n.specifiedInQuery || planCtx.isLocal || planCtx.noEvalSubqueries {
+			return true
+		}
+		return false
 	default:
 		return true
 	}
@@ -658,10 +665,12 @@ func (h *distSQLNodeHealth) check(ctx context.Context, nodeID roachpb.NodeID) er
 	{
 		live, err := h.isLive(nodeID)
 		if err == nil && !live {
-			err = errors.New("node is not live")
+			err = pgerror.Newf(pgerror.CodeCannotConnectNowError,
+				"node n%d is not live", log.Safe(nodeID))
 		}
 		if err != nil {
-			return errors.Wrapf(err, "not using n%d due to liveness", nodeID)
+			return pgerror.Wrapf(err, pgerror.CodeCannotConnectNowError,
+				"not using n%d due to liveness", log.Safe(nodeID))
 		}
 	}
 
@@ -1136,21 +1145,21 @@ func (dsp *DistSQLPlanner) createTableReaders(
 		p.SetMergeOrdering(dsp.convertOrdering(n.props, scanNodeToTableOrdinalMap))
 	}
 
-	var types []sqlbase.ColumnType
+	var typs []types.T
 	if returnMutations {
-		types = make([]sqlbase.ColumnType, 0, len(n.desc.Columns)+len(n.desc.MutationColumns()))
+		typs = make([]types.T, 0, len(n.desc.Columns)+len(n.desc.MutationColumns()))
 	} else {
-		types = make([]sqlbase.ColumnType, 0, len(n.desc.Columns))
+		typs = make([]types.T, 0, len(n.desc.Columns))
 	}
 	for i := range n.desc.Columns {
-		types = append(types, n.desc.Columns[i].Type)
+		typs = append(typs, n.desc.Columns[i].Type)
 	}
 	if returnMutations {
 		for _, col := range n.desc.MutationColumns() {
-			types = append(types, col.Type)
+			typs = append(typs, col.Type)
 		}
 	}
-	p.SetLastStagePost(post, types)
+	p.SetLastStagePost(post, typs)
 
 	var outCols []uint32
 	if overrideResultColumns == nil {
@@ -1203,11 +1212,11 @@ func (dsp *DistSQLPlanner) selectRenders(
 		}
 	}
 
-	types, err := getTypesForPlanResult(n, planToStreamColMap)
+	typs, err := getTypesForPlanResult(n, planToStreamColMap)
 	if err != nil {
 		return err
 	}
-	err = p.AddRendering(renders, planCtx, p.PlanToStreamColMap, types)
+	err = p.AddRendering(renders, planCtx, p.PlanToStreamColMap, typs)
 	if err != nil {
 		return err
 	}
@@ -1282,7 +1291,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 	planCtx *PlanningCtx, p *PhysicalPlan, n *groupNode,
 ) error {
 	aggregations := make([]distsqlpb.AggregatorSpec_Aggregation, len(n.funcs))
-	aggregationsColumnTypes := make([][]sqlbase.ColumnType, len(n.funcs))
+	aggregationsColumnTypes := make([][]types.T, len(n.funcs))
 	for i, fholder := range n.funcs {
 		// Convert the aggregate function to the enum value with the same string
 		// representation.
@@ -1301,14 +1310,14 @@ func (dsp *DistSQLPlanner) addAggregators(
 			aggregations[i].FilterColIdx = &col
 		}
 		aggregations[i].Arguments = make([]distsqlpb.Expression, len(fholder.arguments))
-		aggregationsColumnTypes[i] = make([]sqlbase.ColumnType, len(fholder.arguments))
+		aggregationsColumnTypes[i] = make([]types.T, len(fholder.arguments))
 		for j, argument := range fholder.arguments {
 			var err error
 			aggregations[i].Arguments[j], err = distsqlplan.MakeExpression(argument, planCtx, nil)
 			if err != nil {
 				return err
 			}
-			aggregationsColumnTypes[i][j], err = sqlbase.DatumTypeToColumnType(argument.ResolvedType())
+			aggregationsColumnTypes[i][j] = *argument.ResolvedType()
 			if err != nil {
 				return err
 			}
@@ -1326,11 +1335,11 @@ func (dsp *DistSQLPlanner) addAggregators(
 	for i, idx := range n.groupCols {
 		groupCols[i] = uint32(p.PlanToStreamColMap[idx])
 	}
-	orderedGroupCols := make([]uint32, len(n.orderedGroupCols))
+	orderedGroupCols := make([]uint32, len(n.groupColOrdering))
 	var orderedGroupColSet util.FastIntSet
-	for i, idx := range n.orderedGroupCols {
-		orderedGroupCols[i] = uint32(p.PlanToStreamColMap[idx])
-		orderedGroupColSet.Add(idx)
+	for i, c := range n.groupColOrdering {
+		orderedGroupCols[i] = uint32(p.PlanToStreamColMap[c.ColIdx])
+		orderedGroupColSet.Add(c.ColIdx)
 	}
 
 	// We either have a local stage on each stream followed by a final stage, or
@@ -1458,7 +1467,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 		// aggregations but do not initialize any aggregations
 		// since we can de-duplicate equivalent local and final aggregations.
 		localAggs := make([]distsqlpb.AggregatorSpec_Aggregation, 0, nLocalAgg+len(groupCols))
-		intermediateTypes := make([]sqlbase.ColumnType, 0, nLocalAgg+len(groupCols))
+		intermediateTypes := make([]types.T, 0, nLocalAgg+len(groupCols))
 		finalAggs := make([]distsqlpb.AggregatorSpec_Aggregation, 0, nFinalAgg)
 		// finalIdxMap maps the index i of the final aggregation (with
 		// respect to the i-th final aggregation out of all final
@@ -1469,9 +1478,9 @@ func (dsp *DistSQLPlanner) addAggregators(
 		// helps type-check the indexed variables passed into
 		// FinalRendering for some aggregations.
 		// This has a 1-1 mapping to finalAggs
-		var finalPreRenderTypes []sqlbase.ColumnType
+		var finalPreRenderTypes []*types.T
 		if needRender {
-			finalPreRenderTypes = make([]sqlbase.ColumnType, 0, nFinalAgg)
+			finalPreRenderTypes = make([]*types.T, 0, nFinalAgg)
 		}
 
 		// Each aggregation can have multiple aggregations in the
@@ -1526,7 +1535,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 
 					// Keep track of the new local
 					// aggregation's output type.
-					argTypes := make([]sqlbase.ColumnType, len(e.ColIdx))
+					argTypes := make([]types.T, len(e.ColIdx))
 					for j, c := range e.ColIdx {
 						argTypes[j] = inputTypes[c]
 					}
@@ -1534,7 +1543,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 					if err != nil {
 						return err
 					}
-					intermediateTypes = append(intermediateTypes, outputType)
+					intermediateTypes = append(intermediateTypes, *outputType)
 				}
 			}
 
@@ -1575,7 +1584,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 					finalAggs = append(finalAggs, finalAgg)
 
 					if needRender {
-						argTypes := make([]sqlbase.ColumnType, len(finalInfo.LocalIdxs))
+						argTypes := make([]types.T, len(finalInfo.LocalIdxs))
 						for i := range finalInfo.LocalIdxs {
 							// Map the corresponding local
 							// aggregation output types for
@@ -1627,12 +1636,22 @@ func (dsp *DistSQLPlanner) addAggregators(
 			}
 		}
 
-		// Create the merge ordering for the local stage.
-		groupColProps := planPhysicalProps(n.plan)
-		groupColProps = groupColProps.project(n.groupCols)
-		ordCols := make([]distsqlpb.Ordering_Column, len(groupColProps.ordering))
-		for i, o := range groupColProps.ordering {
-			ordCols[i].ColIdx = finalGroupCols[o.ColIdx]
+		// Create the merge ordering for the local stage (this will be maintained
+		// for results going into the final stage).
+		ordCols := make([]distsqlpb.Ordering_Column, len(n.groupColOrdering))
+		for i, o := range n.groupColOrdering {
+			// Find the group column.
+			found := false
+			for j, col := range n.groupCols {
+				if col == o.ColIdx {
+					ordCols[i].ColIdx = finalGroupCols[j]
+					found = true
+					break
+				}
+			}
+			if !found {
+				return pgerror.AssertionFailedf("group column ordering contains non-grouping column %d", o.ColIdx)
+			}
 			if o.Direction == encoding.Descending {
 				ordCols[i].Direction = distsqlpb.Ordering_Column_DESC
 			} else {
@@ -1664,9 +1683,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 		if needRender {
 			// Build rendering expressions.
 			renderExprs := make([]distsqlpb.Expression, len(aggregations))
-			h := tree.MakeTypesOnlyIndexedVarHelper(
-				sqlbase.ColumnTypesToDatumTypes(finalPreRenderTypes),
-			)
+			h := tree.MakeTypesOnlyIndexedVarHelper(finalPreRenderTypes)
 			// finalIdx is an index inside finalAggs. It is used to
 			// keep track of the finalAggs results that correspond
 			// to each aggregation.
@@ -1728,9 +1745,9 @@ func (dsp *DistSQLPlanner) addAggregators(
 
 	// Set up the final stage.
 
-	finalOutTypes := make([]sqlbase.ColumnType, len(aggregations))
+	finalOutTypes := make([]types.T, len(aggregations))
 	for i, agg := range aggregations {
-		argTypes := make([]sqlbase.ColumnType, len(agg.ColIdx)+len(agg.Arguments))
+		argTypes := make([]types.T, len(agg.ColIdx)+len(agg.Arguments))
 		for j, c := range agg.ColIdx {
 			argTypes[j] = inputTypes[c]
 		}
@@ -1738,10 +1755,11 @@ func (dsp *DistSQLPlanner) addAggregators(
 			argTypes[len(agg.ColIdx)+j] = argumentColumnType
 		}
 		var err error
-		_, finalOutTypes[i], err = distsqlrun.GetAggregateInfo(agg.Func, argTypes...)
+		_, returnTyp, err := distsqlrun.GetAggregateInfo(agg.Func, argTypes...)
 		if err != nil {
 			return err
 		}
+		finalOutTypes[i] = *returnTyp
 	}
 
 	// Update p.PlanToStreamColMap; we will have a simple 1-to-1 mapping of
@@ -1920,7 +1938,7 @@ func (dsp *DistSQLPlanner) createPlanForLookupJoin(
 	post := distsqlpb.PostProcessSpec{Projection: true}
 
 	post.OutputColumns = make([]uint32, numOutCols)
-	types := make([]sqlbase.ColumnType, numOutCols)
+	types := make([]types.T, numOutCols)
 
 	for i := 0; i < numLeftCols; i++ {
 		types[i] = plan.ResultTypes[i]
@@ -2025,7 +2043,7 @@ func (dsp *DistSQLPlanner) createPlanForZigzagJoin(
 	numOutCols := len(n.columns)
 
 	post.OutputColumns = make([]uint32, numOutCols)
-	types := make([]sqlbase.ColumnType, numOutCols)
+	types := make([]types.T, numOutCols)
 	planToStreamColMap := makePlanToStreamColMap(numOutCols)
 	colOffset := 0
 	i := 0
@@ -2099,17 +2117,13 @@ func (dsp *DistSQLPlanner) createPlanForZigzagJoin(
 // getTypesForPlanResult returns the types of the elements in the result streams
 // of a plan that corresponds to a given planNode. If planToStreamColMap is nil,
 // a 1-1 mapping is assumed.
-func getTypesForPlanResult(node planNode, planToStreamColMap []int) ([]sqlbase.ColumnType, error) {
+func getTypesForPlanResult(node planNode, planToStreamColMap []int) ([]types.T, error) {
 	nodeColumns := planColumns(node)
 	if planToStreamColMap == nil {
 		// No remapping.
-		types := make([]sqlbase.ColumnType, len(nodeColumns))
+		types := make([]types.T, len(nodeColumns))
 		for i := range nodeColumns {
-			colTyp, err := sqlbase.DatumTypeToColumnType(nodeColumns[i].Typ)
-			if err != nil {
-				return nil, err
-			}
-			types[i] = colTyp
+			types[i] = *nodeColumns[i].Typ
 		}
 		return types, nil
 	}
@@ -2119,14 +2133,10 @@ func getTypesForPlanResult(node planNode, planToStreamColMap []int) ([]sqlbase.C
 			numCols = streamCol + 1
 		}
 	}
-	types := make([]sqlbase.ColumnType, numCols)
+	types := make([]types.T, numCols)
 	for nodeCol, streamCol := range planToStreamColMap {
 		if streamCol != -1 {
-			colTyp, err := sqlbase.DatumTypeToColumnType(nodeColumns[nodeCol].Typ)
-			if err != nil {
-				return nil, err
-			}
-			types[streamCol] = colTyp
+			types[streamCol] = *nodeColumns[nodeCol].Typ
 		}
 	}
 	return types, nil
@@ -2202,7 +2212,7 @@ func (dsp *DistSQLPlanner) createPlanForJoin(
 
 	// Set up the output columns.
 	if numEq := len(n.pred.leftEqualityIndices); numEq != 0 {
-		nodes = findJoinProcessorNodes(leftRouters, rightRouters, p.Processors, true /* includeRight */)
+		nodes = findJoinProcessorNodes(leftRouters, rightRouters, p.Processors)
 
 		if planMergeJoins.Get(&dsp.st.SV) && len(n.mergeJoinOrdering) > 0 {
 			// TODO(radu): we currently only use merge joins when we have an ordering on
@@ -2370,6 +2380,9 @@ func (dsp *DistSQLPlanner) createPlanForNode(
 		// the subqueries with their results yet, which again means that we can't
 		// plan a DistSQL values node, which requires that all expressions be
 		// evaluatable.
+		//
+		// NB: If you change this conditional, you must also change it in
+		// checkSupportForNode!
 		if !n.specifiedInQuery || planCtx.isLocal || planCtx.noEvalSubqueries {
 			plan, err = dsp.wrapPlan(planCtx, n)
 		} else {
@@ -2390,10 +2403,6 @@ func (dsp *DistSQLPlanner) createPlanForNode(
 
 	default:
 		// Can't handle a node? We wrap it and continue on our way.
-		// TODO(jordan): this should only wrap the node itself, not all of its
-		// children as well. To deal with this the wrapper should use the
-		// planNode walker to retrieve all of the children of the current plan,
-		// and recurse with createPlanForNode on all of those children.
 		plan, err = dsp.wrapPlan(planCtx, n)
 	}
 
@@ -2457,7 +2466,7 @@ func (dsp *DistSQLPlanner) wrapPlan(planCtx *PlanningCtx, n planNode) (PhysicalP
 			// Continue walking until we find a node that has a DistSQL
 			// representation - that's when we'll quit the wrapping process and hand
 			// control of planning back to the DistSQL physical planner.
-			if !dsp.mustWrapNode(plan) {
+			if !dsp.mustWrapNode(planCtx, plan) {
 				firstNotWrapped = plan
 				p, err = dsp.createPlanForNode(planCtx, plan)
 				if err != nil {
@@ -2547,7 +2556,7 @@ func (dsp *DistSQLPlanner) wrapPlan(planCtx *PlanningCtx, n planNode) (PhysicalP
 // located on the gateway node and initialized with given numRows
 // and rawBytes that need to be precomputed beforehand.
 func (dsp *DistSQLPlanner) createValuesPlan(
-	resultTypes []sqlbase.ColumnType, numRows int, rawBytes [][]byte,
+	resultTypes []types.T, numRows int, rawBytes [][]byte,
 ) (PhysicalPlan, error) {
 	numColumns := len(resultTypes)
 	s := distsqlpb.ValuesCoreSpec{
@@ -2612,7 +2621,7 @@ func (dsp *DistSQLPlanner) createPlanForValues(
 		datums := n.Values()
 		for j := range n.columns {
 			var err error
-			datum := sqlbase.DatumToEncDatum(types[j], datums[j])
+			datum := sqlbase.DatumToEncDatum(&types[j], datums[j])
 			buf, err = datum.Encode(&types[j], &a, sqlbase.DatumEncoding_VALUE, buf)
 			if err != nil {
 				return PhysicalPlan{}, err
@@ -2711,7 +2720,7 @@ func createProjectSetSpec(
 ) (*distsqlpb.ProjectSetSpec, error) {
 	spec := distsqlpb.ProjectSetSpec{
 		Exprs:            make([]distsqlpb.Expression, len(n.exprs)),
-		GeneratedColumns: make([]sqlbase.ColumnType, len(n.columns)-n.numColsInSource),
+		GeneratedColumns: make([]types.T, len(n.columns)-n.numColsInSource),
 		NumColsPerGen:    make([]uint32, len(n.exprs)),
 	}
 	for i, expr := range n.exprs {
@@ -2722,11 +2731,7 @@ func createProjectSetSpec(
 		}
 	}
 	for i, col := range n.columns[n.numColsInSource:] {
-		columnType, err := sqlbase.DatumTypeToColumnType(col.Typ)
-		if err != nil {
-			return nil, err
-		}
-		spec.GeneratedColumns[i] = columnType
+		spec.GeneratedColumns[i] = *col.Typ
 	}
 	for i, n := range n.numColsPerGen {
 		spec.NumColsPerGen[i] = uint32(n)
@@ -2931,7 +2936,7 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 		newOrdering := computeMergeJoinOrdering(leftProps, rightProps, planCols, planCols)
 		mergeOrdering = distsqlpb.ConvertToMappedSpecOrdering(newOrdering, p.PlanToStreamColMap)
 
-		var childResultTypes [2][]sqlbase.ColumnType
+		var childResultTypes [2][]types.T
 		for side, plan := range childPhysicalPlans {
 			childResultTypes[side], err = getTypesForPlanResult(
 				childLogicalPlans[side], plan.PlanToStreamColMap,
@@ -3008,7 +3013,7 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 		joinType := distsqlSetOpJoinType(n.unionType)
 
 		// Nodes where we will run the join processors.
-		nodes := findJoinProcessorNodes(leftRouters, rightRouters, p.Processors, true /* includeRight */)
+		nodes := findJoinProcessorNodes(leftRouters, rightRouters, p.Processors)
 
 		// Set up the equality columns.
 		eqCols := streamCols
@@ -3086,14 +3091,11 @@ func (dsp *DistSQLPlanner) createPlanForWindow(
 	// Each iteration of this loop adds a new stage of windowers. The steps taken:
 	// 1. find a set of unprocessed window functions that have the same PARTITION BY
 	//    clause. All of these will be computed using the single stage of windowers.
-	// 2. a) populate output types of the current stage of windowers. All columns
-	//       that are arguments to a window function in the set will be replaced by
-	//       a single output column; all columns that are not arguments to any
-	//       window function in the set are simply passed through.
+	// 2. a) populate output types of the current stage of windowers. All input
+	//       columns are being passed through, and windower will append output
+	//       columns for each window function processed at the stage.
 	//    b) create specs for all window functions in the set.
-	// 3. windowers' input schema is probably different from the output one, so we
-	//    are adjusting indices of the columns accordingly.
-	// 4. decide whether to put windowers on a single or on multiple nodes.
+	// 3. decide whether to put windowers on a single or on multiple nodes.
 	//    a) if we're putting windowers on multiple nodes, we'll put them onto
 	//       every node that participated in the previous stage. We leverage hash
 	//       routers to partition the data based on PARTITION BY clause of window
@@ -3101,63 +3103,21 @@ func (dsp *DistSQLPlanner) createPlanForWindow(
 	for numWindowFuncProcessed < len(n.funcs) {
 		samePartitionFuncs, partitionIdxs := windowPlanState.findUnprocessedWindowFnsWithSamePartition()
 		numWindowFuncProcessed += len(samePartitionFuncs)
-		for _, f := range samePartitionFuncs {
-			// The output of window function f will be put at f.argIdxStart'th column.
-			// If it is not possible - for example, when two window functions have the
-			// same argIdxStart, the function that appears later in n.funcs will put
-			// its result at argIdxStart + 1 - later call to adjustColumnIndices will
-			// take care of it.
-			windowPlanState.infos[f.funcIdx].outputColIdx = f.argIdxStart
-		}
-
 		windowerSpec := distsqlpb.WindowerSpec{
 			PartitionBy: partitionIdxs,
 			WindowFns:   make([]distsqlpb.WindowerSpec_WindowFn, len(samePartitionFuncs)),
 		}
 
-		// Populating output types of this stage since windowers will likely change
-		// them from its input types. Let's go through an example query
-		// `SELECT lead(a, b, c) OVER (), avg(d) OVER, rank() OVER() FROM t`.
-		// 1. 'lead' takes in three arguments which are in columns [0; 3). After we
-		//    compute it, we'll put the result in column 0 (in-place of 'a') and
-		//    not output columns 1 and 2.
-		// 2. 'avg' takes in a single argument in column 3. We compute it and put
-		//    the result in column 1 since previous window functions have produced
-		//    only a single column so far.
-		// 3. 'row_number' takes no arguments. We compute it and put the result
-		//    in column 2.
-		newResultTypes := make([]sqlbase.ColumnType, 0, len(plan.ResultTypes))
-		// inputColIdx is the index of the column that should be processed next
-		// among input columns to the current stage.
-		inputColIdx := 0
+		newResultTypes := make([]types.T, len(plan.ResultTypes)+len(samePartitionFuncs))
+		copy(newResultTypes, plan.ResultTypes)
 		for windowFnSpecIdx, windowFn := range samePartitionFuncs {
-			// All window functions are sorted by their argIdxStart, so we copy all
-			// columns up to windowFn.argIdxStart (all window functions in
-			// samePartitionFuncs after windowFn have their arguments in later
-			// columns).
-			newResultTypes = append(newResultTypes, plan.ResultTypes[inputColIdx:windowFn.argIdxStart]...)
-
 			windowFnSpec, outputType, err := windowPlanState.createWindowFnSpec(windowFn)
 			if err != nil {
 				return PhysicalPlan{}, err
 			}
-
-			// Windower processor does not pass through ("consumes") all arguments of
-			// windowFn and puts the result of computation at windowFn.argIdxStart.
-			newResultTypes = append(newResultTypes, outputType)
-			inputColIdx = windowFn.argIdxStart + windowFn.argCount
-
+			newResultTypes[windowFn.outputColIdx] = *outputType
 			windowerSpec.WindowFns[windowFnSpecIdx] = windowFnSpec
 		}
-		// We keep all the columns after the last window function
-		// that is being processed in the current stage.
-		newResultTypes = append(newResultTypes, plan.ResultTypes[inputColIdx:]...)
-
-		// We need to adjust indices since windower's output schema might not be
-		// equal to its input schema, and we need to maintain outputColIdx of
-		// processed window functions and argIdxStart of unprocessed window
-		// functions to point at the correct columns.
-		windowPlanState.adjustColumnIndices(samePartitionFuncs)
 
 		// Check if the previous stage is all on one node.
 		prevStageNode := plan.Processors[plan.ResultRouters[0]].Node
@@ -3168,13 +3128,15 @@ func (dsp *DistSQLPlanner) createPlanForWindow(
 			}
 		}
 
-		if len(partitionIdxs) == 0 || len(plan.ResultRouters) == 1 {
-			// No PARTITION BY or we have a single stream. Use a single windower.
+		// Get all nodes from the previous stage.
+		nodes := getNodesOfRouters(plan.ResultRouters, plan.Processors)
+		if len(partitionIdxs) == 0 || len(nodes) == 1 {
+			// No PARTITION BY or we have a single node. Use a single windower.
 			// If the previous stage was all on a single node, put the windower
 			// there. Otherwise, bring the results back on this node.
 			node := dsp.nodeDesc.NodeID
-			if prevStageNode != 0 {
-				node = prevStageNode
+			if len(nodes) == 1 {
+				node = nodes[0]
 			}
 			plan.AddSingleGroupStage(
 				node,
@@ -3195,17 +3157,11 @@ func (dsp *DistSQLPlanner) createPlanForWindow(
 			}
 			stageID := plan.NewStageID()
 
-			// Get all nodes from the previous stage.
-			nodes := findJoinProcessorNodes(plan.ResultRouters, nil /* rightRouter */, plan.Processors, false /* includeRight */)
-			if len(nodes) != len(plan.ResultRouters) {
-				panic("unexpected number of nodes")
-			}
-
 			// We put a windower on each node and we connect it
 			// with all hash routers from the previous stage in
 			// a such way that each node has its designated
 			// SourceRouterSlot - namely, position in which
-			// a node appear in nodes.
+			// a node appears in nodes.
 			prevStageRouters := plan.ResultRouters
 			plan.ResultRouters = make([]distsqlplan.ProcessorIdx, 0, len(nodes))
 			for bucket, nodeID := range nodes {
@@ -3226,9 +3182,9 @@ func (dsp *DistSQLPlanner) createPlanForWindow(
 				}
 				pIdx := plan.AddProcessor(proc)
 
-				for router := 0; router < len(nodes); router++ {
+				for _, router := range prevStageRouters {
 					plan.Streams = append(plan.Streams, distsqlplan.Stream{
-						SourceProcessor:  prevStageRouters[router],
+						SourceProcessor:  router,
 						SourceRouterSlot: bucket,
 						DestProcessor:    pIdx,
 						DestInput:        0,
@@ -3241,25 +3197,20 @@ func (dsp *DistSQLPlanner) createPlanForWindow(
 		}
 	}
 
-	// We probably added/removed columns throughout all the stages of windowers,
-	// so we need to update PlanToStreamColMap. We need to update the map before
-	// possibly adding rendering because it is used there.
+	// We definitely added columns throughout all the stages of windowers, so we
+	// need to update PlanToStreamColMap. We need to update the map before adding
+	// rendering or projection because it is used there.
 	plan.PlanToStreamColMap = identityMap(plan.PlanToStreamColMap, len(plan.ResultTypes))
 
-	// After all window functions are computed, we might need to add rendering.
-	if renderingAdded, err := windowPlanState.addRenderingIfNecessary(); err != nil {
+	// windowers do not guarantee maintaining the order at the moment, so we
+	// reset MergeOrdering. There shouldn't be an ordering here, but we reset it
+	// defensively (see #35179).
+	plan.SetMergeOrdering(distsqlpb.Ordering{})
+
+	// After all window functions are computed, we need to add rendering or
+	// projection.
+	if err := windowPlanState.addRenderingOrProjection(); err != nil {
 		return PhysicalPlan{}, err
-	} else if !renderingAdded && windowPlanState.n.numOverClausesColumns != 0 {
-		// We have added some columns used in OVER clauses of window functions, so
-		// we need to project them out. They were appended at the end, so the
-		// projection simply "discards" the last numOverClausesColumns. If
-		// rendering was added, then it took care of these extra columns, so we
-		// don't need to do anything in that case.
-		columns := make([]uint32, len(plan.ResultTypes)-windowPlanState.n.numOverClausesColumns)
-		for col := 0; col < len(columns); col++ {
-			columns[col] = uint32(col)
-		}
-		plan.AddProjection(columns)
 	}
 
 	if len(plan.ResultTypes) != len(plan.PlanToStreamColMap) {

@@ -22,8 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 type showFingerprintsNode struct {
@@ -56,8 +56,8 @@ func (p *planner) ShowFingerprints(
 ) (planNode, error) {
 	// We avoid the cache so that we can observe the fingerprints without
 	// taking a lease, like other SHOW commands.
-	tableDesc, err := p.ResolveUncachedTableDescriptor(
-		ctx, &n.Table, true /*required*/, requireTableDesc)
+	tableDesc, err := p.ResolveUncachedTableDescriptorEx(
+		ctx, n.Table, true /*required*/, ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -101,8 +101,8 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 		// TODO(dan): This is known to be a flawed way to fingerprint. Any datum
 		// with the same string representation is fingerprinted the same, even
 		// if they're different types.
-		switch col.Type.SemanticType {
-		case sqlbase.ColumnType_BYTES:
+		switch col.Type.Family() {
+		case types.BytesFamily:
 			cols = append(cols, fmt.Sprintf("%s:::bytes", tree.NameStringP(&col.Name)))
 		default:
 			cols = append(cols, fmt.Sprintf("%s::string::bytes", tree.NameStringP(&col.Name)))
@@ -159,7 +159,7 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	}
 
 	if len(fingerprintCols) != 1 {
-		return false, pgerror.NewAssertionErrorf(
+		return false, pgerror.AssertionFailedf(
 			"unexpected number of columns returned: 1 vs %d",
 			len(fingerprintCols))
 	}

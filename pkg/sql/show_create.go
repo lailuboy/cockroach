@@ -25,23 +25,9 @@ import (
 	"github.com/pkg/errors"
 )
 
-// ShowCreate implements the SHOW CREATE statement.
-// Privileges: Any privilege on object.
-func (p *planner) ShowCreate(ctx context.Context, n *tree.ShowCreate) (planNode, error) {
-	// The condition "database_name IS NULL" ensures that virtual tables are included.
-	const showCreateQuery = `
-     SELECT %[3]s AS table_name,
-            create_statement
-       FROM %[4]s.crdb_internal.create_statements
-      WHERE (database_name IS NULL OR database_name = %[1]s)
-        AND schema_name = %[5]s
-        AND descriptor_name = %[2]s
-`
-	return p.showTableDetails(ctx, "SHOW CREATE", &n.Name, showCreateQuery)
-}
-
-// ShowCreateView returns a valid SQL representation of the CREATE
-// VIEW statement used to create the given view.
+// ShowCreateView returns a valid SQL representation of the CREATE VIEW
+// statement used to create the given view. It is used in the implementation of
+// the crdb_internal.create_statements virtual table.
 func ShowCreateView(
 	ctx context.Context, tn *tree.Name, desc *sqlbase.TableDescriptor,
 ) (string, error) {
@@ -92,7 +78,6 @@ func printForeignKeyConstraint(
 	} else {
 		refNames = []string{"???"}
 		fkTableName = tree.MakeTableName(tree.Name(""), tree.Name(fmt.Sprintf("[%d as ref]", fk.Table)))
-		fkTableName.ExplicitSchema = false
 		fkTableName.ExplicitSchema = false
 	}
 	buf.WriteString("FOREIGN KEY (")
@@ -163,7 +148,9 @@ func ShowCreateTable(
 	f.FormatNode(tn)
 	f.WriteString(" (")
 	primaryKeyIsOnVisibleColumn := false
-	for i, col := range desc.VisibleColumns() {
+	visibleCols := desc.VisibleColumns()
+	for i := range visibleCols {
+		col := &visibleCols[i]
 		if i != 0 {
 			f.WriteString(",")
 		}
@@ -184,6 +171,7 @@ func ShowCreateTable(
 	allIdx := append(desc.Indexes, desc.PrimaryIndex)
 	for i := range allIdx {
 		idx := &allIdx[i]
+		// TODO (lucy): Possibly include FKs being validated here
 		if fk := &idx.ForeignKey; fk.IsSet() && !ignoreFKs {
 			f.WriteString(",\n\tCONSTRAINT ")
 			f.FormatNameP(&fk.Name)
@@ -223,7 +211,7 @@ func ShowCreateTable(
 		f.WriteString(")")
 	}
 
-	for _, e := range desc.Checks {
+	for _, e := range desc.AllActiveAndInactiveChecks() {
 		f.WriteString(",\n\t")
 		if len(e.Name) > 0 {
 			f.WriteString("CONSTRAINT ")

@@ -280,10 +280,7 @@ func doExpandPlan(
 
 		groupColProps := planPhysicalProps(n.plan)
 		groupColProps = groupColProps.project(n.groupCols)
-		n.orderedGroupCols = make([]int, len(groupColProps.ordering))
-		for i, o := range groupColProps.ordering {
-			n.orderedGroupCols[i] = o.ColIdx
-		}
+		n.groupColOrdering = groupColProps.ordering
 
 	case *windowNode:
 		n.plan, err = doExpandPlan(ctx, p, noParams, n.plan)
@@ -334,6 +331,9 @@ func doExpandPlan(
 	case *splitNode:
 		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
 
+	case *unsplitNode:
+		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
+
 	case *relocateNode:
 		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
 
@@ -348,6 +348,9 @@ func doExpandPlan(
 
 	case *projectSetNode:
 		n.source, err = doExpandPlan(ctx, p, noParams, n.source)
+
+	case *errorIfRowsNode:
+		n.plan, err = doExpandPlan(ctx, p, noParams, n.plan)
 
 	case *valuesNode:
 	case *virtualTableNode:
@@ -389,7 +392,6 @@ func doExpandPlan(
 	case *setVarNode:
 	case *setClusterSettingNode:
 	case *setZoneConfigNode:
-	case *showZoneConfigNode:
 	case *showFingerprintsNode:
 	case *showTraceNode:
 	case *scatterNode:
@@ -851,6 +853,9 @@ func (p *planner) simplifyOrderings(plan planNode, usefulOrdering sqlbase.Column
 	case *splitNode:
 		n.rows = p.simplifyOrderings(n.rows, nil)
 
+	case *unsplitNode:
+		n.rows = p.simplifyOrderings(n.rows, nil)
+
 	case *relocateNode:
 		n.rows = p.simplifyOrderings(n.rows, nil)
 
@@ -862,6 +867,12 @@ func (p *planner) simplifyOrderings(plan planNode, usefulOrdering sqlbase.Column
 
 	case *controlJobsNode:
 		n.rows = p.simplifyOrderings(n.rows, nil)
+
+	case *errorIfRowsNode:
+		n.plan = p.simplifyOrderings(n.plan, nil)
+
+	case *bufferNode:
+		n.plan = p.simplifyOrderings(n.plan, usefulOrdering)
 
 	case *valuesNode:
 	case *virtualTableNode:
@@ -897,9 +908,9 @@ func (p *planner) simplifyOrderings(plan planNode, usefulOrdering sqlbase.Column
 	case *setVarNode:
 	case *setClusterSettingNode:
 	case *setZoneConfigNode:
-	case *showZoneConfigNode:
 	case *showFingerprintsNode:
 	case *showTraceNode:
+	case *scanBufferNode:
 	case *scatterNode:
 
 	default:

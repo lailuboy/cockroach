@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 	"reflect"
 	"runtime"
 	"sync"
@@ -27,7 +28,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -48,6 +49,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 )
@@ -276,7 +279,7 @@ func TestReplicateRange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := repl.ChangeReplicas(
+	if _, err := repl.ChangeReplicas(
 		context.Background(),
 		roachpb.ADD_REPLICA,
 		roachpb.ReplicationTarget{
@@ -366,7 +369,7 @@ func TestRestoreReplicas(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := firstRng.ChangeReplicas(
+	if _, err := firstRng.ChangeReplicas(
 		context.Background(),
 		roachpb.ADD_REPLICA,
 		roachpb.ReplicationTarget{
@@ -421,12 +424,12 @@ func TestRestoreReplicas(t *testing.T) {
 			t.Fatal(err)
 		}
 		desc := repl.Desc()
-		if len(desc.Replicas) != 2 {
-			t.Fatalf("store %d: expected 2 replicas, found %d", i, len(desc.Replicas))
+		if len(desc.InternalReplicas) != 2 {
+			t.Fatalf("store %d: expected 2 replicas, found %d", i, len(desc.InternalReplicas))
 		}
-		if desc.Replicas[0].NodeID != mtc.stores[0].Ident.NodeID {
+		if desc.InternalReplicas[0].NodeID != mtc.stores[0].Ident.NodeID {
 			t.Errorf("store %d: expected replica[0].NodeID == %d, was %d",
-				i, mtc.stores[0].Ident.NodeID, desc.Replicas[0].NodeID)
+				i, mtc.stores[0].Ident.NodeID, desc.InternalReplicas[0].NodeID)
 		}
 	}
 }
@@ -460,7 +463,7 @@ func TestFailedReplicaChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := repl.ChangeReplicas(
+	if _, err := repl.ChangeReplicas(
 		context.Background(),
 		roachpb.ADD_REPLICA,
 		roachpb.ReplicationTarget{
@@ -476,7 +479,7 @@ func TestFailedReplicaChange(t *testing.T) {
 
 	// After the aborted transaction, r.Desc was not updated.
 	// TODO(bdarnell): expose and inspect raft's internal state.
-	if replicas := repl.Desc().Replicas; len(replicas) != 1 {
+	if replicas := repl.Desc().InternalReplicas; len(replicas) != 1 {
 		t.Fatalf("expected 1 replica, found %v", replicas)
 	}
 
@@ -488,7 +491,7 @@ func TestFailedReplicaChange(t *testing.T) {
 	// are pushable by making the transaction abandoned.
 	mtc.manualClock.Increment(10 * base.DefaultHeartbeatInterval.Nanoseconds())
 
-	if err := repl.ChangeReplicas(
+	if _, err := repl.ChangeReplicas(
 		context.Background(),
 		roachpb.ADD_REPLICA,
 		roachpb.ReplicationTarget{
@@ -510,7 +513,7 @@ func TestFailedReplicaChange(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if replicas := rang.Desc().Replicas; len(replicas) <= 1 {
+			if replicas := rang.Desc().InternalReplicas; len(replicas) <= 1 {
 				return errors.Errorf("expected > 1 replicas; got %v", replicas)
 			}
 		}
@@ -561,7 +564,7 @@ func TestReplicateAfterTruncation(t *testing.T) {
 	}
 
 	// Now add the second replica.
-	if err := repl.ChangeReplicas(
+	if _, err := repl.ChangeReplicas(
 		context.Background(),
 		roachpb.ADD_REPLICA,
 		roachpb.ReplicationTarget{
@@ -629,10 +632,9 @@ func TestRaftLogSizeAfterTruncation(t *testing.T) {
 		startWithSingleRange: true,
 	}
 	defer mtc.Stop()
-	mtc.Start(t, 3)
+	mtc.Start(t, 1)
 
 	const rangeID = 1
-	mtc.replicateRange(rangeID, 1, 2)
 
 	repl, err := mtc.stores[0].GetReplica(rangeID)
 	if err != nil {
@@ -646,32 +648,36 @@ func TestRaftLogSizeAfterTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mtc.waitForValues(key, []int64{5, 5, 5})
-
 	index, err := repl.GetLastIndex()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	assertEqualRaftLogSize := func() error {
-		var expectedSize int64
-		for i, s := range mtc.stores {
-			repl, err := s.GetReplica(rangeID)
-			if err != nil {
-				t.Fatal(err)
-			}
+	// Verifies the recomputed log size against what we track in `r.mu.raftLogSize`.
+	assertCorrectRaftLogSize := func() error {
+		// Recompute under raft lock so that the log doesn't change while we
+		// compute its size.
+		repl.RaftLock()
+		realSize, err := storage.ComputeRaftLogSize(
+			context.Background(), repl.RangeID, repl.Engine(), repl.SideloadedRaftMuLocked(),
+		)
+		size, _ := repl.GetRaftLogSize()
+		repl.RaftUnlock()
 
-			size := repl.GetRaftLogSize()
-			if i == 0 {
-				expectedSize = size
-			} else if expectedSize != size {
-				return fmt.Errorf("%s: expected raftLogSize %d, but found %d", repl, expectedSize, size)
-			}
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// If the size isn't trusted, it won't have to match (and in fact
+		// likely won't). In this test, this is because the upreplication
+		// elides old Raft log entries in the snapshot it uses.
+		if size != realSize {
+			return fmt.Errorf("%s: raft log claims size %d, but is in fact %d", repl, size, realSize)
 		}
 		return nil
 	}
 
-	testutils.SucceedsSoon(t, assertEqualRaftLogSize)
+	assert.NoError(t, assertCorrectRaftLogSize())
 
 	truncArgs := truncateLogArgs(index+1, 1)
 	if _, err := client.SendWrapped(
@@ -679,7 +685,10 @@ func TestRaftLogSizeAfterTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	testutils.SucceedsSoon(t, assertEqualRaftLogSize)
+	// Note that if there were multiple nodes, the Raft log sizes would not
+	// be correct for the followers as they would have received a shorter
+	// Raft log than the leader.
+	assert.NoError(t, assertCorrectRaftLogSize())
 }
 
 // TestSnapshotAfterTruncation tests that Raft will properly send a
@@ -843,6 +852,189 @@ func TestSnapshotAfterTruncation(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestSnapshotAfterTruncationWithUncommittedTail is similar in spirit to
+// TestSnapshotAfterTruncation/differentTerm. However, it differs in that we
+// take care to ensure that the partitioned Replica has a long uncommitted tail
+// of Raft entries that is not entirely overwritten by the snapshot it receives
+// after the partition heals. If the recipient of the snapshot did not purge its
+// Raft entry cache when receiving the snapshot, it could get stuck repeatedly
+// rejecting attempts to catch it up. This serves as a regression test for the
+// bug seen in #37056.
+func TestSnapshotAfterTruncationWithUncommittedTail(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	mtc := &multiTestContext{
+		// This test was written before the multiTestContext started creating many
+		// system ranges at startup, and hasn't been update to take that into
+		// account.
+		startWithSingleRange: true,
+	}
+	defer mtc.Stop()
+	mtc.Start(t, 3)
+
+	key := roachpb.Key("a")
+	incA := int64(5)
+	incB := int64(7)
+	incC := int64(9)
+	incAB := incA + incB
+	incABC := incAB + incC
+
+	// Set up a key to replicate across the cluster. We're going to modify this
+	// key and truncate the raft logs from that command after partitioning one
+	// of the nodes to check that it gets the new value after it reconnects.
+	// We're then going to continue modifying this key to make sure that the
+	// temporarily partitioned node can continue to receive updates.
+	incArgs := incrementArgs(key, incA)
+	if _, pErr := client.SendWrapped(ctx, mtc.stores[0].TestSender(), incArgs); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	mtc.replicateRange(1, 1, 2)
+	mtc.waitForValues(key, []int64{incA, incA, incA})
+
+	// We partition the original leader from the other two replicas. This allows
+	// us to build up a large uncommitted Raft log on the partitioned node.
+	const partStore = 0
+	partRepl, err := mtc.stores[partStore].GetReplica(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partReplDesc, err := partRepl.GetReplicaDescriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	partReplSender := mtc.stores[partStore].TestSender()
+
+	// Partition the original leader from its followers. We do this by installing
+	// unreliableRaftHandler listeners on all three Stores. The handler on the
+	// partitioned store filters out all messages while the handler on the other
+	// two stores only filters out messages from the partitioned store. The
+	// configuration looks like:
+	//
+	//           [0]
+	//          x  x
+	//         /    \
+	//        x      x
+	//      [1]<---->[2]
+	//
+	for _, s := range []int{0, 1, 2} {
+		h := &unreliableRaftHandler{rangeID: 1, RaftMessageHandler: mtc.stores[s]}
+		if s != partStore {
+			// Only filter messages from the partitioned store on the other
+			// two stores.
+			h.dropReq = func(req *storage.RaftMessageRequest) bool {
+				return req.FromReplica.StoreID == partRepl.StoreID()
+			}
+			h.dropHB = func(hb *storage.RaftHeartbeat) bool {
+				return hb.FromReplicaID == partReplDesc.ReplicaID
+			}
+		}
+		mtc.transport.Listen(mtc.stores[s].Ident.StoreID, h)
+	}
+
+	// Perform a series of writes on the partitioned replica. The writes will
+	// not succeed before their context is canceled, but they will be appended
+	// to the partitioned replica's Raft log because it is currently the Raft
+	// leader.
+	g := ctxgroup.WithContext(ctx)
+	for i := 0; i < 32; i++ {
+		otherKey := roachpb.Key(fmt.Sprintf("other-%d", i))
+		g.GoCtx(func(ctx context.Context) error {
+			cCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+			defer cancel()
+			incArgsOther := incrementArgs(otherKey, 1)
+			if _, pErr := client.SendWrapped(cCtx, partReplSender, incArgsOther); pErr == nil {
+				return errors.New("unexpected success")
+			} else if !testutils.IsPError(pErr, "context deadline exceeded") {
+				return pErr.GoError()
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Transfer the lease to one of the followers and perform a write. The
+	// partition ensures that this will require a Raft leadership change.
+	const newLeaderStore = partStore + 1
+	newLeaderRepl, err := mtc.stores[newLeaderStore].GetReplica(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newLeaderReplSender := mtc.stores[newLeaderStore].TestSender()
+
+	incArgs = incrementArgs(key, incB)
+	testutils.SucceedsSoon(t, func() error {
+		mtc.advanceClock(ctx)
+		_, pErr := client.SendWrapped(ctx, newLeaderReplSender, incArgs)
+		if _, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); ok {
+			return pErr.GoError()
+		} else if pErr != nil {
+			t.Fatal(pErr)
+		}
+		return nil
+	})
+	mtc.waitForValues(key, []int64{incA, incAB, incAB})
+
+	index, err := newLeaderRepl.GetLastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Truncate the log at index+1 (log entries < N are removed, so this
+	// includes the increment).
+	truncArgs := truncateLogArgs(index+1, 1)
+	testutils.SucceedsSoon(t, func() error {
+		_, pErr := client.SendWrapped(ctx, newLeaderReplSender, truncArgs)
+		if _, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); ok {
+			return pErr.GoError()
+		} else if pErr != nil {
+			t.Fatal(pErr)
+		}
+		return nil
+	})
+
+	snapsMetric := mtc.stores[partStore].Metrics().RangeSnapshotsNormalApplied
+	snapsBefore := snapsMetric.Count()
+
+	// Remove the partition. Snapshot should follow.
+	for _, s := range []int{0, 1, 2} {
+		mtc.transport.Listen(mtc.stores[s].Ident.StoreID, &unreliableRaftHandler{
+			rangeID:            1,
+			RaftMessageHandler: mtc.stores[s],
+			dropReq: func(req *storage.RaftMessageRequest) bool {
+				// Make sure that even going forward no MsgApp for what we just truncated can
+				// make it through. The Raft transport is asynchronous so this is necessary
+				// to make the test pass reliably.
+				// NB: the Index on the message is the log index that _precedes_ any of the
+				// entries in the MsgApp, so filter where msg.Index < index, not <= index.
+				return req.Message.Type == raftpb.MsgApp && req.Message.Index < index
+			},
+			dropHB:   func(*storage.RaftHeartbeat) bool { return false },
+			dropResp: func(*storage.RaftMessageResponse) bool { return false },
+		})
+	}
+
+	// The partitioned replica should catch up after a snapshot.
+	testutils.SucceedsSoon(t, func() error {
+		snapsAfter := snapsMetric.Count()
+		if !(snapsAfter > snapsBefore) {
+			return errors.New("expected at least 1 snapshot to catch the partitioned replica up")
+		}
+		return nil
+	})
+	mtc.waitForValues(key, []int64{incAB, incAB, incAB})
+
+	// Perform another write. The partitioned replica should be able to receive
+	// replicated updates.
+	incArgs = incrementArgs(key, incC)
+	if _, pErr := client.SendWrapped(ctx, mtc.distSenders[0], incArgs); pErr != nil {
+		t.Fatal(pErr)
+	}
+	mtc.waitForValues(key, []int64{incABC, incABC, incABC})
 }
 
 type fakeSnapshotStream struct {
@@ -1021,7 +1213,7 @@ func TestReplicateAfterRemoveAndSplit(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		return rep2.ChangeReplicas(
+		_, err = rep2.ChangeReplicas(
 			context.Background(),
 			roachpb.ADD_REPLICA,
 			roachpb.ReplicationTarget{
@@ -1032,6 +1224,7 @@ func TestReplicateAfterRemoveAndSplit(t *testing.T) {
 			storagepb.ReasonRangeUnderReplicated,
 			"",
 		)
+		return err
 	}
 
 	if err := replicateRHS(); !testutils.IsError(err, storage.IntersectingSnapshotMsg) {
@@ -1293,7 +1486,7 @@ func TestLogGrowthWhenRefreshingPendingCommands(t *testing.T) {
 		}
 
 		// Determine the current raft log size.
-		initLogSize := leaderRepl.GetRaftLogSize()
+		initLogSize, _ := leaderRepl.GetRaftLogSize()
 
 		// While a majority nodes are down, write some data.
 		putRes := make(chan *roachpb.Error)
@@ -1324,7 +1517,7 @@ func TestLogGrowthWhenRefreshingPendingCommands(t *testing.T) {
 				// etc.). The important thing here is that the log doesn't grow
 				// forever.
 				logSizeLimit := int64(2 * sc.RaftMaxUncommittedEntriesSize)
-				curlogSize := leaderRepl.GetRaftLogSize()
+				curlogSize, _ := leaderRepl.GetRaftLogSize()
 				logSize := curlogSize - initLogSize
 				logSizeStr := humanizeutil.IBytes(logSize)
 				// Note that logSize could be negative if something got truncated.
@@ -1388,7 +1581,7 @@ func TestStoreRangeUpReplicate(t *testing.T) {
 			if n := s.ReservationCount(); n != 0 {
 				return errors.Errorf("expected 0 reservations, but found %d", n)
 			}
-			if len(r.Desc().Replicas) != 3 {
+			if len(r.Desc().InternalReplicas) != 3 {
 				// This fails even after the preemptive snapshot has arrived and
 				// only goes through once the replica has properly caught up to
 				// the fully replicated descriptor.
@@ -1486,7 +1679,7 @@ func TestChangeReplicasDescriptorInvariant(t *testing.T) {
 	}
 
 	addReplica := func(storeNum int, desc *roachpb.RangeDescriptor) error {
-		return repl.ChangeReplicas(
+		_, err := repl.ChangeReplicas(
 			context.Background(),
 			roachpb.ADD_REPLICA,
 			roachpb.ReplicationTarget{
@@ -1497,6 +1690,7 @@ func TestChangeReplicasDescriptorInvariant(t *testing.T) {
 			storagepb.ReasonRangeUnderReplicated,
 			"",
 		)
+		return err
 	}
 
 	// Retain the descriptor for the range at this point.
@@ -1843,7 +2037,7 @@ func testReplicaAddRemove(t *testing.T, addFirst bool) {
 
 	desc := mtc.stores[0].LookupReplica(roachpb.RKeyMin).Desc()
 	replicaIDsByStore := map[roachpb.StoreID]roachpb.ReplicaID{}
-	for _, rep := range desc.Replicas {
+	for _, rep := range desc.InternalReplicas {
 		replicaIDsByStore[rep.StoreID] = rep.ReplicaID
 	}
 	expected := map[roachpb.StoreID]roachpb.ReplicaID{1: 1, 4: 2, 3: 4}
@@ -2559,7 +2753,7 @@ func TestRemovePlaceholderRace(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		for _, action := range []roachpb.ReplicaChangeType{roachpb.REMOVE_REPLICA, roachpb.ADD_REPLICA} {
 			for {
-				if err := repl.ChangeReplicas(
+				if _, err := repl.ChangeReplicas(
 					ctx,
 					action,
 					roachpb.ReplicationTarget{
@@ -2662,7 +2856,7 @@ func TestReplicaGCRace(t *testing.T) {
 	// Add the victim replica. Note that it will receive a snapshot and raft log
 	// replays, but will not process the configuration change containing the new
 	// range descriptor, preventing it from learning of the new NextReplicaID.
-	if err := repl.ChangeReplicas(
+	if _, err := repl.ChangeReplicas(
 		ctx,
 		roachpb.ADD_REPLICA,
 		roachpb.ReplicationTarget{
@@ -2720,7 +2914,7 @@ func TestReplicaGCRace(t *testing.T) {
 	})
 
 	// Remove the victim replica and manually GC it.
-	if err := repl.ChangeReplicas(
+	if _, err := repl.ChangeReplicas(
 		ctx,
 		roachpb.REMOVE_REPLICA,
 		roachpb.ReplicationTarget{
@@ -2802,7 +2996,7 @@ func TestStoreRangeMoveDecommissioning(t *testing.T) {
 	replica := mtc.stores[0].LookupReplica(roachpb.RKeyMin)
 	mtc.replicateRange(replica.RangeID, 1, 2)
 
-	origReplicas := getRangeMetadata(roachpb.RKeyMin, mtc, t).Replicas
+	origReplicas := getRangeMetadata(roachpb.RKeyMin, mtc, t).InternalReplicas
 
 	ctx := context.Background()
 	decommingNodeIdx := 2
@@ -2821,7 +3015,7 @@ func TestStoreRangeMoveDecommissioning(t *testing.T) {
 		}
 		// Wait for a replacement replica for the decommissioning node to be added
 		// and the replica on the decommissioning node to be removed.
-		curReplicas := getRangeMetadata(roachpb.RKeyMin, mtc, t).Replicas
+		curReplicas := getRangeMetadata(roachpb.RKeyMin, mtc, t).InternalReplicas
 		if len(curReplicas) != 5 {
 			return errors.Errorf("expected 5 replicas, got %v", curReplicas)
 		}
@@ -2832,139 +3026,6 @@ func TestStoreRangeMoveDecommissioning(t *testing.T) {
 			if r.NodeID == decommingNodeID {
 				return errors.Errorf("expected replica to be moved off node %d, but got replicas %v",
 					decommingNodeID, curReplicas)
-			}
-		}
-		return nil
-	})
-}
-
-// TestStoreRangeRemoveDead verifies that if a store becomes dead, the
-// ReplicateQueue will notice and remove any replicas on it.
-func TestStoreRangeRemoveDead(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	sc := storage.TestStoreConfig(nil)
-	sc.TestingKnobs.DisableReplicaRebalancing = true
-	mtc := &multiTestContext{
-		storeConfig: &sc,
-		// This test needs to verify full replication, but as written the check
-		// only works if there's only one range initially.
-		startWithSingleRange: true,
-	}
-
-	storage.TimeUntilStoreDead.Override(&sc.Settings.SV, storage.TestTimeUntilStoreDead)
-	// Disable declined and failed reservations. Their default values are on
-	// the order of seconds whereas we'll only advance the manual clock used
-	// in this test very slowly, leading to timeouts otherwise.
-	storage.DeclinedReservationsTimeout.Override(&sc.Settings.SV, time.Nanosecond)
-	storage.FailedReservationsTimeout.Override(&sc.Settings.SV, time.Nanosecond)
-
-	ctx := context.Background()
-	zone := config.DefaultSystemZoneConfig()
-	mtc.Start(t, int(*zone.NumReplicas+1))
-	defer mtc.Stop()
-
-	var nonDeadStores []*storage.Store
-	var deadStore *storage.Store
-	for i, s := range mtc.stores {
-		if i == 1 {
-			deadStore = s
-
-			continue
-		}
-		nonDeadStores = append(nonDeadStores, s)
-	}
-
-	var dead int32 // atomically
-
-	// Create a goroutine to gossip store capacity info periodically.
-	stopper := mtc.stoppers[0]
-	stopper.RunWorker(ctx, func(ctx context.Context) {
-		tickerDur := storage.TestTimeUntilStoreDead / 2
-		ticker := time.NewTicker(tickerDur)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				mtc.manualClock.Increment(int64(tickerDur))
-				storeIsDead := atomic.LoadInt32(&dead) == 1
-				// Keep gossiping the stores, excepting the dead store.
-				n := len(nonDeadStores)
-				if !storeIsDead {
-					// Until the deadStore dies, don't gossip one of the other
-					// stores to force some replicas on deadStore.
-					n--
-					if err := deadStore.GossipStore(ctx, false /* useCached */); err != nil {
-						panic(err)
-					}
-				}
-				for _, s := range nonDeadStores[:n] {
-					if err := s.GossipStore(ctx, false /* useCached */); err != nil {
-						panic(err)
-					}
-				}
-
-			case <-stopper.ShouldQuiesce():
-				return
-			}
-		}
-	})
-	stopper.RunWorker(ctx, func(ctx context.Context) {
-		tickerDur := storage.TestTimeUntilStoreDead / 2
-		ticker := time.NewTicker(tickerDur)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				// Force the repair queues on all alive stores to run.
-				for _, s := range nonDeadStores {
-					if err := s.ForceReplicationScanAndProcess(); err != nil {
-						panic(err)
-					}
-				}
-			case <-stopper.ShouldQuiesce():
-				return
-			}
-		}
-	})
-
-	// Wait for up-replication, including at least one replica on s2 (deadStore).
-	testutils.SucceedsSoon(t, func() error {
-		// NB: this only checks the first range, so it'll give false positives
-		// if there's more than one (see the note at the beginning of the test).
-		replicas := getRangeMetadata(roachpb.RKeyMin, mtc, t).Replicas
-		var found bool
-		for _, replica := range replicas {
-			if replica.StoreID == deadStore.StoreID() {
-				found = true
-			}
-		}
-		if len(replicas) != int(*zone.NumReplicas) {
-			return errors.Errorf("expected %d replicas; have %+v", *zone.NumReplicas, replicas)
-		}
-		if !found {
-			return errors.Errorf("no replica found on s%d", deadStore.StoreID())
-		}
-		return nil
-	})
-
-	// Stop a store which will be rebalanced away from. We can't use the very first
-	// one since getRangeMetadata is hard-coded to query that one, so we'll use the
-	// one after that.
-	atomic.StoreInt32(&dead, 1)
-	mtc.stopStore(1)
-	// The mtc asks us to restart this store before stopping the mtc.
-	defer mtc.restartStoreWithoutHeartbeat(1)
-
-	testutils.SucceedsSoon(t, func() error {
-		replicas := getRangeMetadata(roachpb.RKeyMin, mtc, t).Replicas
-		if len(replicas) != int(*zone.NumReplicas) {
-			return errors.Errorf("expected %d replicas; have %+v", zone.NumReplicas, replicas)
-		}
-		for _, r := range replicas {
-			if r.StoreID == deadStore.StoreID() /* 2 */ {
-				return errors.Errorf("expected store %d to be replaced; have %+v", r.StoreID, replicas)
 			}
 		}
 		return nil
@@ -3556,8 +3617,8 @@ func TestRemoveRangeWithoutGC(t *testing.T) {
 			return err
 		}
 		desc := rep.Desc()
-		if len(desc.Replicas) != 1 {
-			return errors.Errorf("range has %d replicas", len(desc.Replicas))
+		if len(desc.InternalReplicas) != 1 {
+			return errors.Errorf("range has %d replicas", len(desc.InternalReplicas))
 		}
 		return nil
 	})
@@ -3727,7 +3788,7 @@ func TestFailedPreemptiveSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	const expErr = "snapshot failed: failed to resolve n3: unknown peer 3"
-	if err := rep.ChangeReplicas(
+	if _, err := rep.ChangeReplicas(
 		context.Background(),
 		roachpb.ADD_REPLICA,
 		roachpb.ReplicationTarget{NodeID: 3, StoreID: 3},
@@ -3986,7 +4047,7 @@ func TestFailedConfChange(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if l := len(repl.Desc().Replicas); l != 2 {
+		if l := len(repl.Desc().InternalReplicas); l != 2 {
 			return errors.Errorf("store %d: expected 2 replicas in descriptor, found %d in %s",
 				i, l, repl.Desc())
 		}
@@ -4045,7 +4106,7 @@ func TestStoreRangeRemovalCompactionSuggestion(t *testing.T) {
 	ctx := repl.AnnotateCtx(context.Background())
 
 	deleteStore := mtc.stores[2]
-	if err := repl.ChangeReplicas(
+	if _, err := repl.ChangeReplicas(
 		ctx,
 		roachpb.REMOVE_REPLICA,
 		roachpb.ReplicationTarget{
@@ -4330,4 +4391,60 @@ func TestStoreWaitForReplicaInit(t *testing.T) {
 			t.Fatalf("expected %q error, but got %v", exp, err)
 		}
 	}
+}
+
+// TestTracingDoesNotRaceWithCancelation ensures that the tracing underneath
+// raft does not race with tracing operations which might occur concurrently
+// due to a request cancelation. When this bug existed this test only
+// uncovered it when run under stress.
+func TestTracingDoesNotRaceWithCancelation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	sc := storage.TestStoreConfig(nil)
+	sc.TestingKnobs.TraceAllRaftEvents = true
+	sc.TestingKnobs.DisableSplitQueue = true
+	sc.TestingKnobs.DisableMergeQueue = true
+	mtc := &multiTestContext{
+		storeConfig: &sc,
+		clock:       hlc.NewClock(hlc.UnixNano, time.Millisecond),
+	}
+	mtc.Start(t, 3)
+	defer mtc.Stop()
+
+	db := mtc.Store(0).DB()
+	ctx := context.Background()
+	// Make the transport flaky for the range in question to encourage proposals
+	// to be sent more times and ultimately traced more.
+	ri, err := getRangeInfo(ctx, db, roachpb.Key("foo"))
+	require.Nil(t, err)
+
+	for i := 0; i < 3; i++ {
+		mtc.transport.Listen(mtc.stores[i].Ident.StoreID, &unreliableRaftHandler{
+			rangeID:            ri.Desc.RangeID,
+			RaftMessageHandler: mtc.stores[i],
+			dropReq: func(req *storage.RaftMessageRequest) bool {
+				return rand.Intn(2) == 0
+			},
+		})
+	}
+	val := []byte("asdf")
+	var wg sync.WaitGroup
+	put := func(i int) func() {
+		wg.Add(1)
+		return func() {
+			defer wg.Done()
+			totalDelay := 1 * time.Millisecond
+			delay := time.Duration(rand.Intn(int(totalDelay)))
+			startDelay := totalDelay - delay
+			time.Sleep(startDelay)
+			ctx, cancel := context.WithTimeout(context.Background(), delay)
+			defer cancel()
+			_ = db.Put(ctx, roachpb.Key(fmt.Sprintf("foo%d", i)), val)
+		}
+	}
+	const N = 256
+	for i := 0; i < N; i++ {
+		go put(i)()
+	}
+	wg.Wait()
 }

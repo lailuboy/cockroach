@@ -64,7 +64,7 @@ func newMergeJoiner(
 	rightEqCols := make([]uint32, 0, len(spec.RightOrdering.Columns))
 	for i, c := range spec.LeftOrdering.Columns {
 		if spec.RightOrdering.Columns[i].Direction != c.Direction {
-			return nil, errors.New("Unmatched column orderings")
+			return nil, errors.New("unmatched column orderings")
 		}
 		leftEqCols = append(leftEqCols, c.ColIdx)
 		rightEqCols = append(rightEqCols, spec.RightOrdering.Columns[i].ColIdx)
@@ -86,7 +86,7 @@ func newMergeJoiner(
 		spec.Type, spec.OnExpr, leftEqCols, rightEqCols, 0, post, output,
 		ProcStateOpts{
 			InputsToDrain: []RowSource{leftSource, rightSource},
-			TrailingMetaCallback: func(context.Context) []ProducerMetadata {
+			TrailingMetaCallback: func(context.Context) []distsqlpb.ProducerMetadata {
 				m.close()
 				return nil
 			},
@@ -122,7 +122,7 @@ func (m *mergeJoiner) Start(ctx context.Context) context.Context {
 }
 
 // Next is part of the Processor interface.
-func (m *mergeJoiner) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (m *mergeJoiner) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	for m.State == StateRunning {
 		row, meta := m.nextRow()
 		if meta != nil {
@@ -143,7 +143,7 @@ func (m *mergeJoiner) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 	return nil, m.DrainHelper()
 }
 
-func (m *mergeJoiner) nextRow() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (m *mergeJoiner) nextRow() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	// The loops below form a restartable state machine that iterates over a
 	// batch of rows from the left and right side of the join. The state machine
 	// returns a result for every row that should be output.
@@ -158,7 +158,7 @@ func (m *mergeJoiner) nextRow() (sqlbase.EncDatumRow, *ProducerMetadata) {
 				m.rightIdx++
 				renderedRow, err := m.render(lrow, m.rightRows[ridx])
 				if err != nil {
-					return nil, &ProducerMetadata{Err: err}
+					return nil, &distsqlpb.ProducerMetadata{Err: err}
 				}
 				if renderedRow != nil {
 					m.matchedRightCount++
@@ -180,7 +180,7 @@ func (m *mergeJoiner) nextRow() (sqlbase.EncDatumRow, *ProducerMetadata) {
 			// Perform the cancellation check. We don't perform this on every row,
 			// but once for every iteration through the right-side batch.
 			if err := m.cancelChecker.Check(); err != nil {
-				return nil, &ProducerMetadata{Err: err}
+				return nil, &distsqlpb.ProducerMetadata{Err: err}
 			}
 
 			// We've exhausted the right-side batch. Adjust the indexes for the next
@@ -222,7 +222,7 @@ func (m *mergeJoiner) nextRow() (sqlbase.EncDatumRow, *ProducerMetadata) {
 		}
 
 		// Retrieve the next batch of rows to process.
-		var meta *ProducerMetadata
+		var meta *distsqlpb.ProducerMetadata
 		// TODO(paul): Investigate (with benchmarks) whether or not it's
 		// worthwhile to only buffer one row from the right stream per batch
 		// for semi-joins.

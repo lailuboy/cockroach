@@ -45,7 +45,7 @@ type typeDef struct {
 	//   FiltersExpr
 	//   ScanLimit
 	//   *tree.Subquery
-	//   types.T
+	//   *types.T
 	//
 	name string
 
@@ -57,7 +57,7 @@ type typeDef struct {
 	//   memo.FiltersExpr
 	//   memo.ScanLimit
 	//   *tree.Subquery
-	//   types.T
+	//   *types.T
 	//
 	fullName string
 
@@ -166,8 +166,7 @@ func newMetadata(compiled *lang.CompiledExpr, pkg string) *metadata {
 		"bool":           {fullName: "bool", passByVal: true},
 		"int":            {fullName: "int", passByVal: true},
 		"string":         {fullName: "string", passByVal: true},
-		"DatumType":      {fullName: "types.T", isPointer: true},
-		"ColType":        {fullName: "coltypes.T", isPointer: true},
+		"Type":           {fullName: "*types.T", isPointer: true},
 		"Datum":          {fullName: "tree.Datum", isPointer: true},
 		"TypedExpr":      {fullName: "tree.TypedExpr", isPointer: true},
 		"Subquery":       {fullName: "*tree.Subquery", isPointer: true, usePointerIntern: true},
@@ -175,8 +174,11 @@ func newMetadata(compiled *lang.CompiledExpr, pkg string) *metadata {
 		"Constraint":     {fullName: "*constraint.Constraint", isPointer: true, usePointerIntern: true},
 		"FuncProps":      {fullName: "*tree.FunctionProperties", isPointer: true, usePointerIntern: true},
 		"FuncOverload":   {fullName: "*tree.Overload", isPointer: true, usePointerIntern: true},
+		"WindowFrame":    {fullName: "*tree.WindowFrame", isPointer: true},
 		"PhysProps":      {fullName: "*physical.Required", isPointer: true},
+		"Presentation":   {fullName: "physical.Presentation", passByVal: true},
 		"RelProps":       {fullName: "props.Relational"},
+		"RelPropsPtr":    {fullName: "*props.Relational", isPointer: true, usePointerIntern: true},
 		"ScalarProps":    {fullName: "props.Scalar"},
 	}
 

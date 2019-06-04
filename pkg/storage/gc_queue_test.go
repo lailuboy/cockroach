@@ -621,14 +621,14 @@ func TestGCQueueTransactionTable(t *testing.T) {
 			newStatus: roachpb.PENDING,
 		},
 		// Old and pending, but still heartbeat (so no Push attempted; it
-		// would succeed).
+		// would not succeed).
 		"b": {
 			status:    roachpb.PENDING,
 			orig:      1, // immaterial
 			hb:        gcExpiration + 1,
 			newStatus: roachpb.PENDING,
 		},
-		// Old, pending and abandoned. Should push and abort it
+		// Old, pending, and abandoned. Should push and abort it
 		// successfully, and GC it, along with resolving the intent. The
 		// AbortSpan is also cleaned up.
 		"c": {
@@ -638,8 +638,32 @@ func TestGCQueueTransactionTable(t *testing.T) {
 			expResolve: true,
 			expAbortGC: true,
 		},
-		// Old and aborted, should delete.
+		// Staging and fresh, so no action.
 		"d": {
+			status:    roachpb.STAGING,
+			orig:      gcExpiration + 1,
+			newStatus: roachpb.STAGING,
+		},
+		// Old and staging, but still heartbeat (so no Push attempted; it
+		// would not succeed).
+		"e": {
+			status:    roachpb.STAGING,
+			orig:      1, // immaterial
+			hb:        gcExpiration + 1,
+			newStatus: roachpb.STAGING,
+		},
+		// Old, staging, and abandoned. Should push it and hit an indeterminate
+		// commit error. Should successfully recover the transaction and GC it,
+		// along with resolving the intent.
+		"f": {
+			status:     roachpb.STAGING,
+			orig:       gcExpiration - 1,
+			newStatus:  -1,
+			expResolve: true,
+			expAbortGC: true,
+		},
+		// Old and aborted, should delete.
+		"g": {
 			status:     roachpb.ABORTED,
 			orig:       gcExpiration - 1,
 			newStatus:  -1,
@@ -647,14 +671,14 @@ func TestGCQueueTransactionTable(t *testing.T) {
 			expAbortGC: true,
 		},
 		// Committed and fresh, so no action.
-		"e": {
+		"h": {
 			status:    roachpb.COMMITTED,
 			orig:      gcExpiration + 1,
 			newStatus: roachpb.COMMITTED,
 		},
 		// Committed and old. It has an intent (like all tests here), which is
 		// resolvable and hence we can GC.
-		"f": {
+		"i": {
 			status:     roachpb.COMMITTED,
 			orig:       gcExpiration - 1,
 			newStatus:  -1,
@@ -663,7 +687,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 		},
 		// Same as the previous one, but we've rigged things so that the intent
 		// resolution here will fail and consequently no GC is expected.
-		"g": {
+		"j": {
 			status:      roachpb.COMMITTED,
 			orig:        gcExpiration - 1,
 			newStatus:   roachpb.COMMITTED,
@@ -683,16 +707,19 @@ func TestGCQueueTransactionTable(t *testing.T) {
 		func(filterArgs storagebase.FilterArgs) *roachpb.Error {
 			if resArgs, ok := filterArgs.Req.(*roachpb.ResolveIntentRequest); ok {
 				id := string(resArgs.IntentTxn.Key)
-				var spans []roachpb.Span
-				val, ok := resolved.Load(id)
-				if ok {
-					spans = val.([]roachpb.Span)
+				// Only count finalizing intent resolution attempts in `resolved`.
+				if resArgs.Status != roachpb.PENDING {
+					var spans []roachpb.Span
+					val, ok := resolved.Load(id)
+					if ok {
+						spans = val.([]roachpb.Span)
+					}
+					spans = append(spans, roachpb.Span{
+						Key:    resArgs.Key,
+						EndKey: resArgs.EndKey,
+					})
+					resolved.Store(id, spans)
 				}
-				spans = append(spans, roachpb.Span{
-					Key:    resArgs.Key,
-					EndKey: resArgs.EndKey,
-				})
-				resolved.Store(id, spans)
 				// We've special cased one test case. Note that the intent is still
 				// counted in `resolved`.
 				if testCases[id].failResolve {
@@ -715,7 +742,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 		txnClock := hlc.NewClock(hlc.NewManualClock(test.orig).UnixNano, time.Nanosecond)
 		txn := newTransaction("txn1", baseKey, 1, txnClock)
 		txn.Status = test.status
-		txn.Intents = testIntents
+		txn.IntentSpans = testIntents
 		if test.hb > 0 {
 			txn.LastHeartbeat = hlc.Timestamp{WallTime: test.hb}
 		}

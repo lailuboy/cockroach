@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -164,7 +165,7 @@ func (txn *Txn) ID() uuid.UUID {
 }
 
 // Epoch exports the txn's epoch.
-func (txn *Txn) Epoch() uint32 {
+func (txn *Txn) Epoch() enginepb.TxnEpoch {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 	return txn.mu.sender.Epoch()
@@ -201,7 +202,7 @@ func (txn *Txn) SetUserPriority(userPriority roachpb.UserPriority) error {
 
 // InternalSetPriority sets the transaction priority. It is intended for
 // internal (testing) use only.
-func (txn *Txn) InternalSetPriority(priority int32) {
+func (txn *Txn) InternalSetPriority(priority enginepb.TxnPriority) {
 	txn.mu.Lock()
 	// The negative user priority is translated on the server into a positive,
 	// non-randomized, priority for the transaction.
@@ -558,7 +559,8 @@ func (txn *Txn) UpdateDeadlineMaybe(ctx context.Context, deadline hlc.Timestamp)
 			log.Fatalf(ctx, "deadline below txn.OrigTimestamp() is nonsensical; "+
 				"txn has would have no change to commit. Deadline: %s", deadline)
 		}
-		txn.mu.deadline = &deadline
+		txn.mu.deadline = new(hlc.Timestamp)
+		*txn.mu.deadline = deadline
 		return true
 	}
 	return false
@@ -606,16 +608,17 @@ func (txn *Txn) rollback(ctx context.Context) *roachpb.Error {
 		var ba roachpb.BatchRequest
 		ba.Add(endTxnReq(false /* commit */, nil /* deadline */, false /* systemConfigTrigger */))
 		_ = contextutil.RunWithTimeout(ctx, "async txn rollback", 3*time.Second, func(ctx context.Context) error {
-			_, pErr := txn.Send(ctx, ba)
-			if statusErr, ok := pErr.GetDetail().(*roachpb.TransactionStatusError); ok &&
-				statusErr.Reason == roachpb.TransactionStatusError_REASON_TXN_COMMITTED {
-				// A common cause of these async rollbacks failing is when they're
-				// triggered by a ctx canceled while a commit is in-flight (and it's too
-				// late for it to be canceled), and so the rollback finds the txn to be
-				// already committed. We don't spam the logs with those.
-				log.VEventf(ctx, 2, "async rollback failed: %s", pErr)
-			} else {
-				log.Infof(ctx, "async rollback failed: %s", pErr)
+			if _, pErr := txn.Send(ctx, ba); pErr != nil {
+				if statusErr, ok := pErr.GetDetail().(*roachpb.TransactionStatusError); ok &&
+					statusErr.Reason == roachpb.TransactionStatusError_REASON_TXN_COMMITTED {
+					// A common cause of these async rollbacks failing is when they're
+					// triggered by a ctx canceled while a commit is in-flight (and it's too
+					// late for it to be canceled), and so the rollback finds the txn to be
+					// already committed. We don't spam the logs with those.
+					log.VEventf(ctx, 2, "async rollback failed: %s", pErr)
+				} else {
+					log.Infof(ctx, "async rollback failed: %s", pErr)
+				}
 			}
 			return nil
 		})

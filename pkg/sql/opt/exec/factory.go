@@ -15,11 +15,14 @@
 package exec
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
@@ -91,6 +94,40 @@ type Factory interface {
 		n Node, exprs tree.TypedExprs, colNames []string, reqOrdering OutputOrdering,
 	) (Node, error)
 
+	// ConstructApplyJoin returns a node that runs an apply join between an input
+	// node (the left side of the join) and a RelExpr that has outer columns (the
+	// right side of the join) by replacing the outer columns of the right side
+	// RelExpr with data from each row of the left side of the join according to
+	// the data in leftBoundColMap. The apply join can be any kind of join except
+	// for right outer and full outer.
+	//
+	// leftBoundColMap is a map from opt.ColumnID to opt.ColumnOrdinal that maps
+	// a column bound by the left side of the apply join to the column ordinal
+	// in the left side that contains the binding.
+	//
+	// memo, rightProps, and right are the memo, required physical properties, and
+	// RelExpr of the right side of the join that will be repeatedly modified,
+	// re-planned and executed for every row from the left side.
+	//
+	// fakeRight is a pre-planned node that is the right side of the join with
+	// all outer columns replaced by NULL. The physical properties of this node
+	// (its output columns, their order and types) are used to pre-determine the
+	// runtime indexes and types for the right side of the apply join, since all
+	// re-plannings of the right hand side will be pinned to output the exact
+	// same output columns in the same order.
+	//
+	// onCond is the join condition.
+	ConstructApplyJoin(
+		joinType sqlbase.JoinType,
+		left Node,
+		leftBoundColMap opt.ColMap,
+		memo *memo.Memo,
+		rightProps *physical.Required,
+		fakeRight Node,
+		right memo.RelExpr,
+		onCond tree.TypedExpr,
+	) (Node, error)
+
 	// ConstructHashJoin returns a node that runs a hash-join between the results
 	// of two input nodes.
 	//
@@ -125,11 +162,11 @@ type Factory interface {
 	//
 	// If the input is guaranteed to have an ordering on grouping columns, a
 	// "streaming" aggregation is performed (i.e. aggregation happens separately
-	// for each distinct set of values on the orderedGroupCols).
+	// for each distinct set of values on the set of columns in the ordering).
 	ConstructGroupBy(
 		input Node,
 		groupCols []ColumnOrdinal,
-		orderedGroupCols ColumnOrdinalSet,
+		groupColOrdering sqlbase.ColumnOrdering,
 		aggregations []AggInfo,
 		reqOrdering OutputOrdering,
 	) (Node, error)
@@ -221,12 +258,20 @@ type Factory interface {
 		n Node, exprs tree.TypedExprs, zipCols sqlbase.ResultColumns, numColsPerGen []int,
 	) (Node, error)
 
+	// ConstructWindow returns a node that executes a window function over the
+	// given node.
+	ConstructWindow(input Node, window WindowInfo) (Node, error)
+
 	// RenameColumns modifies the column names of a node.
 	RenameColumns(input Node, colNames []string) (Node, error)
 
 	// ConstructPlan creates a plan enclosing the given plan and (optionally)
 	// subqueries.
 	ConstructPlan(root Node, subqueries []Subquery) (Plan, error)
+
+	// ConstructExplain returns a node that implements EXPLAIN (OPT), showing
+	// information about the given plan.
+	ConstructExplainOpt(plan string, envOpts ExplainEnvData) (Node, error)
 
 	// ConstructExplain returns a node that implements EXPLAIN, showing
 	// information about the given plan.
@@ -339,6 +384,10 @@ type Factory interface {
 	// ConstructSequenceSelect creates a node that implements a scan of a sequence
 	// as a data source.
 	ConstructSequenceSelect(sequence cat.Sequence) (Node, error)
+
+	// ConstructSaveTable wraps the input into a node that passes through all the
+	// rows, but also creates a table and inserts all the rows into it.
+	ConstructSaveTable(input Node, table *cat.DataSourceName, colNames []string) (Node, error)
 }
 
 // OutputOrdering indicates the required output ordering on a Node that is being
@@ -400,7 +449,7 @@ type AggInfo struct {
 	FuncName   string
 	Builtin    *tree.Overload
 	Distinct   bool
-	ResultType types.T
+	ResultType *types.T
 	ArgCols    []ColumnOrdinal
 
 	// ConstArgs is the list of any constant arguments to the aggregate,
@@ -410,4 +459,36 @@ type AggInfo struct {
 	// Filter is the index of the column, if any, which should be used as the
 	// FILTER condition for the aggregate. If there is no filter, Filter is -1.
 	Filter ColumnOrdinal
+}
+
+// WindowInfo represents the information about a window function that must be
+// passed through to the execution engine.
+type WindowInfo struct {
+	// Cols is the set of columns that are returned from the windowing operator.
+	Cols sqlbase.ResultColumns
+
+	// Exprs is the list of window function expressions.
+	Exprs []*tree.FuncExpr
+
+	// OutputIdxs are the indexes that the various window functions being computed
+	// should put their output in.
+	OutputIdxs []int
+
+	// ArgIdxs is the list of column ordinals each function takes as arguments,
+	// in the same order as Exprs.
+	ArgIdxs [][]ColumnOrdinal
+
+	// Partition is the set of input columns to partition on.
+	Partition []ColumnOrdinal
+
+	// Ordering is the set of input columns to order on.
+	Ordering sqlbase.ColumnOrdering
+}
+
+// ExplainEnvData represents the data that's going to be displayed in EXPLAIN (env).
+type ExplainEnvData struct {
+	ShowEnv   bool
+	Tables    []tree.TableName
+	Sequences []tree.TableName
+	Views     []tree.TableName
 }

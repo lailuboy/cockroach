@@ -54,6 +54,14 @@ type VM struct {
 	VPC         string `json:"vpc"`
 	MachineType string `json:"machine_type"`
 	Zone        string `json:"zone"`
+	// Project represents the project to which this vm belongs, if the VM is in a
+	// cloud that supports project (i.e. GCE). Empty otherwise.
+	Project string `json:"project"`
+}
+
+// Name generates the name for the i'th node in a cluster.
+func Name(cluster string, idx int) string {
+	return fmt.Sprintf("%s-%0.4d", cluster, idx)
 }
 
 // Error values for VM.Error
@@ -84,7 +92,7 @@ func (vm *VM) Locality() string {
 	return fmt.Sprintf("cloud=%s,region=%s,zone=%s", vm.Provider, region, vm.Zone)
 }
 
-// List TODO(peter): document
+// List represents a list of VMs.
 type List []VM
 
 func (vl List) Len() int           { return len(vl) }
@@ -122,6 +130,17 @@ type CreateOpts struct {
 	}
 }
 
+// MultipleProjectsOption is used to specify whether a command accepts multiple
+// values for the --gce-project flag.
+type MultipleProjectsOption bool
+
+const (
+	// SingleProject means that a single project is accepted.
+	SingleProject MultipleProjectsOption = false
+	// AcceptMultipleProjects means that multiple projects are supported.
+	AcceptMultipleProjects = true
+)
+
 // ProviderFlags is a hook point for Providers to supply additional,
 // provider-specific flags to various roachprod commands. In general, the flags
 // should be prefixed with the provider's name to prevent collision between
@@ -135,7 +154,7 @@ type ProviderFlags interface {
 	ConfigureCreateFlags(*pflag.FlagSet)
 	// Configures a FlagSet with any options relevant to cluster manipulation
 	// commands (`create`, `destroy`, `list`, `sync` and `gc`).
-	ConfigureClusterFlags(*pflag.FlagSet)
+	ConfigureClusterFlags(*pflag.FlagSet, MultipleProjectsOption)
 }
 
 // A Provider is a source of virtual machines running on some hosting platform.
@@ -152,6 +171,14 @@ type Provider interface {
 	List() (List, error)
 	// The name of the Provider, which will also surface in the top-level Providers map.
 	Name() string
+
+	// Active returns true if the provider is properly installed and capable of
+	// operating, false if it's just a stub. This allows one to test whether a
+	// particular provider is functioning properly by doin, for example,
+	// Providers[gce.ProviderName].Active. Note that just looking at
+	// Providers[gce.ProviderName] != nil doesn't work because
+	// Providers[gce.ProviderName] can be a stub.
+	Active() bool
 }
 
 // Providers contains all known Provider instances. This is initialized by subpackage init() functions.
@@ -261,4 +288,27 @@ func ProvidersSequential(named []string, action func(Provider) error) error {
 		}
 	}
 	return nil
+}
+
+// ZonePlacement allocates zones to numNodes in an equally sized groups in the
+// same order as zones. If numNodes is not divisible by len(zones) the remainder
+// is allocated in a round-robin fashion and placed at the end of the returned
+// slice. The returned slice has a length of numNodes where each value is in
+// [0, numZones).
+//
+// For example:
+//
+//   ZonePlacement(3, 8) = []int{0, 0, 1, 1, 2, 2, 0, 1}
+//
+func ZonePlacement(numZones, numNodes int) (nodeZones []int) {
+	numPerZone := numNodes / numZones
+	extraStartIndex := numPerZone * numZones
+	nodeZones = make([]int, numNodes)
+	for i := 0; i < numNodes; i++ {
+		nodeZones[i] = i / numPerZone
+		if i >= extraStartIndex {
+			nodeZones[i] = i % numZones
+		}
+	}
+	return nodeZones
 }

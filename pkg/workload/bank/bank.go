@@ -17,16 +17,18 @@ package bank
 import (
 	"context"
 	gosql "database/sql"
-	"encoding/hex"
 	"fmt"
-	"math/rand"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
+	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
+	"golang.org/x/exp/rand"
 )
 
 const (
@@ -47,7 +49,7 @@ type bank struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
 
-	seed                       int64
+	seed                       uint64
 	rows, payloadBytes, ranges int
 }
 
@@ -63,7 +65,7 @@ var bankMeta = workload.Meta{
 	New: func() workload.Generator {
 		g := &bank{}
 		g.flags.FlagSet = pflag.NewFlagSet(`bank`, pflag.ContinueOnError)
-		g.flags.Int64Var(&g.seed, `seed`, 1, `Key hash seed.`)
+		g.flags.Uint64Var(&g.seed, `seed`, 1, `Key hash seed.`)
 		g.flags.IntVar(&g.rows, `rows`, defaultRows, `Initial number of accounts in bank table.`)
 		g.flags.IntVar(&g.payloadBytes, `payload-bytes`, defaultPayloadBytes, `Size of the payload field in each initial row.`)
 		g.flags.IntVar(&g.ranges, `ranges`, defaultRanges, `Initial number of ranges in bank table.`)
@@ -112,26 +114,34 @@ func (b *bank) Hooks() workload.Hooks {
 	}
 }
 
+var bankColTypes = []types.T{
+	types.Int64,
+	types.Int64,
+	types.Bytes,
+}
+
 // Tables implements the Generator interface.
 func (b *bank) Tables() []workload.Table {
 	table := workload.Table{
 		Name:   `bank`,
 		Schema: bankSchema,
-		InitialRows: workload.Tuples(
-			b.rows,
-			func(rowIdx int) []interface{} {
-				rng := rand.New(rand.NewSource(b.seed + int64(rowIdx)))
+		InitialRows: workload.BatchedTuples{
+			NumBatches: b.rows,
+			NumTotal:   b.rows,
+			FillBatch: func(rowIdx int, cb coldata.Batch, a *bufalloc.ByteAllocator) {
+				rng := rand.NewSource(b.seed + uint64(rowIdx))
+				var payload []byte
+				*a, payload = a.Alloc(b.payloadBytes, 0 /* extraCap */)
 				const initialPrefix = `initial-`
-				bytes := hex.EncodeToString(randutil.RandBytes(rng, b.payloadBytes/2))
-				// Minus 2 for the single quotes
-				bytes = bytes[:b.payloadBytes-len(initialPrefix)-2]
-				return []interface{}{
-					rowIdx,                // id
-					0,                     // balance
-					initialPrefix + bytes, // payload
-				}
+				copy(payload[:len(initialPrefix)], []byte(initialPrefix))
+				randStringLetters(rng, payload[len(initialPrefix):])
+
+				cb.Reset(bankColTypes, 1)
+				cb.ColVec(0).Int64()[0] = int64(rowIdx) // id
+				cb.ColVec(1).Int64()[0] = 0             // balance
+				cb.ColVec(2).Bytes()[0] = payload       // payload
 			},
-		),
+		},
 		Splits: workload.Tuples(
 			b.ranges-1,
 			func(splitIdx int) []interface{} {
@@ -145,7 +155,7 @@ func (b *bank) Tables() []workload.Table {
 }
 
 // Ops implements the Opser interface.
-func (b *bank) Ops(urls []string, reg *workload.HistogramRegistry) (workload.QueryLoad, error) {
+func (b *bank) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(b, b.connFlags.DBOverride, urls)
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -188,4 +198,27 @@ func (b *bank) Ops(urls []string, reg *workload.HistogramRegistry) (workload.Que
 		ql.WorkerFns = append(ql.WorkerFns, workerFn)
 	}
 	return ql, nil
+}
+
+// NOTE: The following is intentionally duplicated with the ones in
+// workload/tpcc/generate.go. They're a very hot path in restoring a fixture and
+// hardcoding the consts seems to trigger some compiler optimizations that don't
+// happen if those things are params. Don't modify these without consulting
+// BenchmarkRandStringFast.
+
+func randStringLetters(rng rand.Source, buf []byte) {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	const lettersLen = uint64(len(letters))
+	const lettersCharsPerRand = uint64(11) // floor(log(math.MaxUint64)/log(lettersLen))
+
+	var r, charsLeft uint64
+	for i := 0; i < len(buf); i++ {
+		if charsLeft == 0 {
+			r = rng.Uint64()
+			charsLeft = lettersCharsPerRand
+		}
+		buf[i] = letters[r%lettersLen]
+		r = r / lettersLen
+		charsLeft--
+	}
 }

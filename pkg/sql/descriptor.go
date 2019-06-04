@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
 )
 
 //
@@ -36,10 +35,10 @@ import (
 //
 
 var (
-	errEmptyDatabaseName = pgerror.NewError(pgerror.CodeSyntaxError, "empty database name")
-	errNoDatabase        = pgerror.NewError(pgerror.CodeInvalidNameError, "no database specified")
-	errNoTable           = pgerror.NewError(pgerror.CodeInvalidNameError, "no table specified")
-	errNoMatch           = pgerror.NewError(pgerror.CodeUndefinedObjectError, "no object matched")
+	errEmptyDatabaseName = pgerror.New(pgerror.CodeSyntaxError, "empty database name")
+	errNoDatabase        = pgerror.New(pgerror.CodeInvalidNameError, "no database specified")
+	errNoTable           = pgerror.New(pgerror.CodeInvalidNameError, "no table specified")
+	errNoMatch           = pgerror.New(pgerror.CodeUndefinedObjectError, "no object matched")
 )
 
 // GenerateUniqueDescID returns the next available Descriptor ID and increments
@@ -49,7 +48,7 @@ func GenerateUniqueDescID(ctx context.Context, db *client.DB) (sqlbase.ID, error
 	// Increment unique descriptor counter.
 	newVal, err := client.IncrementValRetryable(ctx, db, keys.DescIDGenerator, 1)
 	if err != nil {
-		return 0, err
+		return sqlbase.InvalidID, err
 	}
 	return sqlbase.ID(newVal - 1), nil
 }
@@ -63,7 +62,7 @@ func GenerateUniqueDescID(ctx context.Context, db *client.DB) (sqlbase.ID, error
 func (p *planner) createDatabase(
 	ctx context.Context, desc *sqlbase.DatabaseDescriptor, ifNotExists bool,
 ) (bool, error) {
-	plainKey := databaseKey{desc.Name}
+	plainKey := sqlbase.NewDatabaseKey(desc.Name)
 	idKey := plainKey.Key()
 
 	if exists, err := descExists(ctx, p.txn, idKey); err == nil && exists {
@@ -141,32 +140,21 @@ func (p *planner) createDescriptorWithID(
 	return nil
 }
 
-// getDescriptor looks up the descriptor for `plainKey`, validates it,
-// and unmarshals it into `descriptor`.
-//
-// If `plainKey` doesn't exist, returns false and nil error.
-// In most cases you'll want to use wrappers: `getDatabaseDesc` or
-// `getTableDesc`.
-func getDescriptor(
-	ctx context.Context,
-	txn *client.Txn,
-	plainKey sqlbase.DescriptorKey,
-	descriptor sqlbase.DescriptorProto,
-) (bool, error) {
+// getDescriptorID looks up the ID for plainKey.
+// InvalidID is returned if the name cannot be resolved.
+func getDescriptorID(
+	ctx context.Context, txn *client.Txn, plainKey sqlbase.DescriptorKey,
+) (sqlbase.ID, error) {
 	key := plainKey.Key()
 	log.Eventf(ctx, "looking up descriptor ID for name key %q", key)
 	gr, err := txn.Get(ctx, key)
 	if err != nil {
-		return false, err
+		return sqlbase.InvalidID, err
 	}
 	if !gr.Exists() {
-		return false, nil
+		return sqlbase.InvalidID, nil
 	}
-
-	if err := getDescriptorByID(ctx, txn, sqlbase.ID(gr.ValueInt()), descriptor); err != nil {
-		return false, err
-	}
-	return true, nil
+	return sqlbase.ID(gr.ValueInt()), nil
 }
 
 // getDescriptorByID looks up the descriptor for `id`, validates it,
@@ -188,7 +176,8 @@ func getDescriptorByID(
 	case *sqlbase.TableDescriptor:
 		table := desc.GetTable()
 		if table == nil {
-			return errors.Errorf("%q is not a table", desc.String())
+			return pgerror.Newf(pgerror.CodeWrongObjectTypeError,
+				"%q is not a table", desc.String())
 		}
 		table.MaybeFillInDescriptor()
 
@@ -199,7 +188,8 @@ func getDescriptorByID(
 	case *sqlbase.DatabaseDescriptor:
 		database := desc.GetDatabase()
 		if database == nil {
-			return errors.Errorf("%q is not a database", desc.String())
+			return pgerror.Newf(pgerror.CodeWrongObjectTypeError,
+				"%q is not a database", desc.String())
 		}
 
 		if err := database.Validate(); err != nil {
@@ -231,7 +221,7 @@ func GetAllDescriptors(ctx context.Context, txn *client.Txn) ([]sqlbase.Descript
 		case *sqlbase.Descriptor_Database:
 			descs[i] = desc.GetDatabase()
 		default:
-			return nil, errors.Errorf("Descriptor.Union has unexpected type %T", t)
+			return nil, pgerror.AssertionFailedf("Descriptor.Union has unexpected type %T", t)
 		}
 	}
 	return descs, nil

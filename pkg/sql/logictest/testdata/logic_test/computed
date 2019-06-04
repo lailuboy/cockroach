@@ -1,4 +1,4 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata
+# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata
 
 statement ok
 CREATE TABLE with_no_column_refs (
@@ -95,7 +95,7 @@ a            INT8       true         3:::INT8        ·                      {} 
 b            INT8       true         7:::INT8        ·                      {}         false
 c            INT8       true         NULL            a                      {}         false
 d            INT8       true         NULL            a + b                  {}         false
-rowid        INT        false        unique_rowid()  ·                      {primary}  true
+rowid        INT8       false        unique_rowid()  ·                      {primary}  true
 
 statement error cannot write directly to computed column "c"
 INSERT INTO x (c) VALUES (1)
@@ -350,6 +350,16 @@ CREATE TABLE y (
   a INT,
   r INT AS (1) STORED REFERENCES x
 )
+
+# Regression test for #36036.
+statement ok
+CREATE TABLE tt (i INT8 AS (1) STORED)
+
+statement error variable sub-expressions are not allowed in computed column
+ALTER TABLE tt ADD COLUMN c STRING AS ((SELECT NULL)) STORED
+
+statement error computed columns cannot reference other computed columns
+ALTER TABLE tt ADD COLUMN c INT8 AS (i) STORED
 
 # Composite FK.
 
@@ -674,7 +684,7 @@ SELECT * FROM x ORDER BY a
 6 12 10
 
 # Verify a bad statement fails.
-statement error could not parse "a" as type int
+statement error unsupported binary operator: <int> \+ <string> \(desired <int>\)
 ALTER TABLE x ADD COLUMN d INT AS (a + 'a') STORED
 
 statement error could not parse "a" as type int
@@ -744,5 +754,21 @@ CREATE TABLE x (
   b INT AS (a+1) STORED
 )
 
-query error value type decimal doesn't match type INT8 of column "a"
+query error value type decimal doesn't match type int of column "a"
 INSERT INTO x VALUES(1.4)
+
+# Regression test for #34901: verify that builtins can be used in computed
+# column expressions without a "memory budget exceeded" error while backfilling
+statement ok
+CREATE TABLE t34901 (x STRING)
+
+statement ok
+INSERT INTO t34901 VALUES ('a')
+
+statement ok
+ALTER TABLE t34901 ADD COLUMN y STRING AS (concat(x, 'b')) STORED
+
+query TT
+SELECT * FROM t34901
+----
+a  ab

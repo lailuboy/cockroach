@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
@@ -81,6 +80,10 @@ type commandResult struct {
 	// oids is a map from result column index to its Oid, similar to formatCodes
 	// (except oids must always be set).
 	oids []oid.Oid
+
+	// bufferingDisabled is conditionally set during planning of certain
+	// statements.
+	bufferingDisabled bool
 }
 
 func (c *conn) makeCommandResult(
@@ -129,10 +132,9 @@ func (r *commandResult) Close(t sql.TransactionStatusIndicator) {
 		r.typ == commandComplete &&
 		r.stmtType == tree.Rows {
 
-		r.err = pgerror.UnimplementedWithIssueErrorf(4035,
+		r.err = pgerror.UnimplementedWithIssuef(4035,
 			"execute row count limits not supported: %d of %d",
 			r.limit, r.rowsAffected)
-		telemetry.RecordError(r.err)
 		r.conn.bufferErr(r.err)
 	}
 
@@ -210,8 +212,18 @@ func (r *commandResult) AddRow(ctx context.Context, row tree.Datums) error {
 	r.rowsAffected++
 
 	r.conn.bufferRow(ctx, row, r.formatCodes, r.conv, r.oids)
-	_ /* flushed */, err := r.conn.maybeFlush(r.pos)
+	var err error
+	if r.bufferingDisabled {
+		err = r.conn.Flush(r.pos)
+	} else {
+		_ /* flushed */, err = r.conn.maybeFlush(r.pos)
+	}
 	return err
+}
+
+// DisableBuffering is part of the CommandResult interface.
+func (r *commandResult) DisableBuffering() {
+	r.bufferingDisabled = true
 }
 
 // SetColumns is part of the CommandResult interface.
@@ -222,7 +234,7 @@ func (r *commandResult) SetColumns(ctx context.Context, cols sqlbase.ResultColum
 	}
 	r.oids = make([]oid.Oid, len(cols))
 	for i, col := range cols {
-		r.oids[i] = col.Typ.Oid()
+		r.oids[i] = mapResultOid(col.Typ.Oid())
 	}
 }
 

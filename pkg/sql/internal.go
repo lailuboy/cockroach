@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
@@ -35,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
 )
 
 var _ sqlutil.InternalExecutor = &InternalExecutor{}
@@ -205,6 +203,7 @@ func (ie *internalExecutorImpl) initConnEx(
 	wg.Add(1)
 	go func() {
 		if err := ex.run(ctx, ie.mon, mon.BoundAccount{} /*reserved*/, nil /* cancel */); err != nil {
+			ex.recordError(ctx, err)
 			errCallback(err)
 		}
 		closeMode := normalClose
@@ -461,7 +460,7 @@ func (ie *internalExecutorImpl) execInternal(
 	case internalExecRootSession:
 		sargs.SessionDefaults = map[string]string{
 			"database":         "system",
-			"application_name": InternalAppNamePrefix + "internal-" + opName,
+			"application_name": sqlbase.InternalAppNamePrefix + "-" + opName,
 		}
 	}
 
@@ -470,10 +469,10 @@ func (ie *internalExecutorImpl) execInternal(
 		// case we need to leave the error intact so that it can be retried at a
 		// higher level.
 		if retErr != nil && !errIsRetriable(retErr) {
-			retErr = errors.Wrap(retErr, opName)
+			retErr = pgerror.Wrapf(retErr, pgerror.CodeDataExceptionError, opName)
 		}
 		if retRes.err != nil && !errIsRetriable(retRes.err) {
-			retRes.err = errors.Wrap(retRes.err, opName)
+			retRes.err = pgerror.Wrapf(retRes.err, pgerror.CodeDataExceptionError, opName)
 		}
 	}()
 
@@ -508,7 +507,7 @@ func (ie *internalExecutorImpl) execInternal(
 				return
 			}
 		}
-		resCh <- result{err: pgerror.NewAssertionErrorf("missing result for pos: %d and no previous error", resPos)}
+		resCh <- result{err: pgerror.AssertionFailedf("missing result for pos: %d and no previous error", resPos)}
 	}
 	errCallback := func(err error) {
 		if resultsReceived {
@@ -527,7 +526,7 @@ func (ie *internalExecutorImpl) execInternal(
 	typeHints := make(tree.PlaceholderTypes, len(datums))
 	for i, d := range datums {
 		// Arg numbers start from 1.
-		typeHints[types.PlaceholderIdx(i)] = d.ResolvedType()
+		typeHints[tree.PlaceholderIdx(i)] = d.ResolvedType()
 	}
 	if len(qargs) == 0 {
 		resPos = 0

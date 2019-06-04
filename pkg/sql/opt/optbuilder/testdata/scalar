@@ -740,7 +740,7 @@ concat [type=int[]]
  ├── array: [type=int[]]
  │    ├── const: 1 [type=int]
  │    └── const: 2 [type=int]
- └── cast: INT2 [type=int]
+ └── cast: INT2 [type=int2]
       └── null [type=unknown]
 
 build-scalar
@@ -756,12 +756,12 @@ concat [type=oid[]]
 build-scalar
 ARRAY['"foo"'::jsonb]
 ----
-error: arrays of jsonb not allowed
+error: unimplemented: arrays of jsonb not allowed
 
 build-scalar
 ARRAY['"foo"'::json]
 ----
-error: arrays of jsonb not allowed
+error: unimplemented: arrays of jsonb not allowed
 
 opt
 SELECT -((-9223372036854775808):::int)
@@ -907,7 +907,7 @@ project
 build
 SELECT ARRAY(VALUES ('{}'::JSONB))
 ----
-error: arrays of jsonb not allowed
+error (0A000): unimplemented: arrays of jsonb not allowed
 
 build
 SELECT ARRAY(SELECT 1, 2)
@@ -1003,7 +1003,7 @@ build-scalar
 ----
 any-scalar: eq [type=bool]
  ├── const: 1 [type=int]
- └── tuple [type=tuple{}]
+ └── tuple [type=tuple]
 
 build
 SELECT 1 > ALL ARRAY['foo']
@@ -1117,12 +1117,12 @@ project
 build
 SELECT ARRAY(SELECT (y, 2) FROM u ORDER BY x) FROM v
 ----
-error: can't execute a correlated ARRAY(...) over tuple{int[], int}
+error (0A000): unimplemented: can't execute a correlated ARRAY(...) over tuple{int[], int}
 
 build
 SELECT ARRAY(SELECT y FROM u ORDER BY x) FROM v
 ----
-error: can't execute a correlated ARRAY(...) over int[]
+error (0A000): unimplemented: can't execute a correlated ARRAY(...) over int[]
 
 build-scalar
 ISERROR(1/0)

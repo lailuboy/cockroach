@@ -29,44 +29,42 @@ SELECT * FROM (SELECT * FROM a WITH ORDINALITY) WHERE ordinality > 0 AND ordinal
 ----
 select
  ├── columns: x:1(int!null) y:2(int) ordinality:3(int!null)
- ├── stats: [rows=444.444444, distinct(1)=444.444444, null(1)=0, distinct(3)=444.444444, null(3)=0]
+ ├── stats: [rows=10, distinct(1)=10, null(1)=0, distinct(3)=10, null(3)=0]
  ├── key: (1)
  ├── fd: (1)-->(2,3), (3)-->(1,2)
- ├── row-number
+ ├── ordinality
  │    ├── columns: x:1(int!null) y:2(int) ordinality:3(int!null)
- │    ├── stats: [rows=4000, distinct(1)=5000, null(1)=0, distinct(3)=4000, null(3)=0]
+ │    ├── stats: [rows=4000, distinct(1)=4000, null(1)=0, distinct(3)=4000, null(3)=0]
  │    ├── key: (1)
  │    ├── fd: (1)-->(2,3), (3)-->(1,2)
  │    └── scan a
  │         ├── columns: x:1(int!null) y:2(int)
- │         ├── stats: [rows=4000, distinct(1)=5000, null(1)=0]
+ │         ├── stats: [rows=4000, distinct(1)=4000, null(1)=0]
  │         ├── key: (1)
  │         └── fd: (1)-->(2)
  └── filters
-      ├── ordinality > 0 [type=bool, outer=(3), constraints=(/3: [/1 - ]; tight)]
-      └── ordinality <= 10 [type=bool, outer=(3), constraints=(/3: (/NULL - /10]; tight)]
+      └── (ordinality > 0) AND (ordinality <= 10) [type=bool, outer=(3), constraints=(/3: [/1 - /10]; tight)]
 
 norm
 SELECT * FROM (SELECT * FROM a WITH ORDINALITY) WHERE y > 0 AND y <= 10
 ----
 select
  ├── columns: x:1(int!null) y:2(int!null) ordinality:3(int!null)
- ├── stats: [rows=444.444444, distinct(1)=444.444444, null(1)=0, distinct(2)=276.821541, null(2)=0, distinct(3)=444.444444, null(3)=0]
+ ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=10, null(2)=0, distinct(3)=100, null(3)=0]
  ├── key: (1)
  ├── fd: (1)-->(2,3), (3)-->(1,2)
- ├── row-number
+ ├── ordinality
  │    ├── columns: x:1(int!null) y:2(int) ordinality:3(int!null)
- │    ├── stats: [rows=4000, distinct(1)=5000, null(1)=0, distinct(2)=400, null(2)=0, distinct(3)=4000, null(3)=0]
+ │    ├── stats: [rows=4000, distinct(1)=4000, null(1)=0, distinct(2)=400, null(2)=0, distinct(3)=4000, null(3)=0]
  │    ├── key: (1)
  │    ├── fd: (1)-->(2,3), (3)-->(1,2)
  │    └── scan a
  │         ├── columns: x:1(int!null) y:2(int)
- │         ├── stats: [rows=4000, distinct(1)=5000, null(1)=0, distinct(2)=400, null(2)=0]
+ │         ├── stats: [rows=4000, distinct(1)=4000, null(1)=0, distinct(2)=400, null(2)=0]
  │         ├── key: (1)
  │         └── fd: (1)-->(2)
  └── filters
-      ├── y > 0 [type=bool, outer=(2), constraints=(/2: [/1 - ]; tight)]
-      └── y <= 10 [type=bool, outer=(2), constraints=(/2: (/NULL - /10]; tight)]
+      └── (y > 0) AND (y <= 10) [type=bool, outer=(2), constraints=(/2: [/1 - /10]; tight)]
 
 norm
 SELECT 1 x FROM a WITH ORDINALITY
@@ -75,7 +73,7 @@ project
  ├── columns: x:4(int!null)
  ├── stats: [rows=4000]
  ├── fd: ()-->(4)
- ├── row-number
+ ├── ordinality
  │    ├── columns: ordinality:3(int!null)
  │    ├── stats: [rows=4000]
  │    ├── key: (3)
@@ -89,25 +87,24 @@ SELECT x FROM (SELECT * FROM a WITH ORDINALITY) WHERE ordinality > 0 AND ordinal
 ----
 project
  ├── columns: x:1(int!null)
- ├── stats: [rows=444.444444]
+ ├── stats: [rows=10]
  ├── key: (1)
  └── select
       ├── columns: x:1(int!null) ordinality:3(int!null)
-      ├── stats: [rows=444.444444, distinct(1)=444.444444, null(1)=0, distinct(3)=444.444444, null(3)=0]
+      ├── stats: [rows=10, distinct(1)=10, null(1)=0, distinct(3)=10, null(3)=0]
       ├── key: (1)
       ├── fd: (1)-->(3), (3)-->(1)
-      ├── row-number
+      ├── ordinality
       │    ├── columns: x:1(int!null) ordinality:3(int!null)
-      │    ├── stats: [rows=4000, distinct(1)=5000, null(1)=0, distinct(3)=4000, null(3)=0]
+      │    ├── stats: [rows=4000, distinct(1)=4000, null(1)=0, distinct(3)=4000, null(3)=0]
       │    ├── key: (1)
       │    ├── fd: (1)-->(3), (3)-->(1)
       │    └── scan a
       │         ├── columns: x:1(int!null)
-      │         ├── stats: [rows=4000, distinct(1)=5000, null(1)=0]
+      │         ├── stats: [rows=4000, distinct(1)=4000, null(1)=0]
       │         └── key: (1)
       └── filters
-           ├── ordinality > 0 [type=bool, outer=(3), constraints=(/3: [/1 - ]; tight)]
-           └── ordinality <= 10 [type=bool, outer=(3), constraints=(/3: (/NULL - /10]; tight)]
+           └── (ordinality > 0) AND (ordinality <= 10) [type=bool, outer=(3), constraints=(/3: [/1 - /10]; tight)]
 
 
 norm
@@ -119,14 +116,14 @@ select
  ├── stats: [rows=1, distinct(1)=1, null(1)=0, distinct(3)=1, null(3)=0]
  ├── key: ()
  ├── fd: ()-->(1-3)
- ├── row-number
+ ├── ordinality
  │    ├── columns: x:1(int!null) y:2(int) ordinality:3(int!null)
- │    ├── stats: [rows=4000, distinct(1)=5000, null(1)=0, distinct(3)=4000, null(3)=0]
+ │    ├── stats: [rows=4000, distinct(1)=4000, null(1)=0, distinct(3)=4000, null(3)=0]
  │    ├── key: (1)
  │    ├── fd: (1)-->(2,3), (3)-->(1,2)
  │    └── scan a
  │         ├── columns: x:1(int!null) y:2(int)
- │         ├── stats: [rows=4000, distinct(1)=5000, null(1)=0]
+ │         ├── stats: [rows=4000, distinct(1)=4000, null(1)=0]
  │         ├── key: (1)
  │         └── fd: (1)-->(2)
  └── filters
@@ -144,7 +141,7 @@ distinct-on
       ├── columns: ordinality:3(int!null)
       ├── stats: [rows=4000, distinct(3)=4000, null(3)=0]
       ├── key: (3)
-      └── row-number
+      └── ordinality
            ├── columns: x:1(int!null) y:2(int) ordinality:3(int!null)
            ├── stats: [rows=4000, distinct(3)=4000, null(3)=0]
            ├── key: (1)

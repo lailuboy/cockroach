@@ -147,6 +147,7 @@ func (kv *kvNative) done() {
 // kvSQL is a SQL-based implementation of the KV interface.
 type kvSQL struct {
 	db     *gosql.DB
+	buf    bytes.Buffer
 	doneFn func()
 }
 
@@ -167,45 +168,45 @@ func newKVSQL(b *testing.B) kvInterface {
 
 func (kv *kvSQL) Insert(rows, run int) error {
 	firstRow := rows * run
-	var buf bytes.Buffer
-	buf.WriteString(`INSERT INTO bench.kv VALUES `)
+	defer kv.buf.Reset()
+	kv.buf.WriteString(`INSERT INTO bench.kv VALUES `)
 	for i := 0; i < rows; i++ {
 		if i > 0 {
-			buf.WriteString(", ")
+			kv.buf.WriteString(", ")
 		}
-		fmt.Fprintf(&buf, "('%08d', %d)", i+firstRow, i)
+		fmt.Fprintf(&kv.buf, "('%08d', %d)", i+firstRow, i)
 	}
-	_, err := kv.db.Exec(buf.String())
+	_, err := kv.db.Exec(kv.buf.String())
 	return err
 }
 
 func (kv *kvSQL) Update(rows, run int) error {
 	perm := rand.Perm(rows)
-	var buf bytes.Buffer
-	buf.WriteString(`UPDATE bench.kv SET v = v + 1 WHERE k IN (`)
+	defer kv.buf.Reset()
+	kv.buf.WriteString(`UPDATE bench.kv SET v = v + 1 WHERE k IN (`)
 	for j := 0; j < rows; j++ {
 		if j > 0 {
-			buf.WriteString(", ")
+			kv.buf.WriteString(", ")
 		}
-		fmt.Fprintf(&buf, `'%08d'`, perm[j])
+		fmt.Fprintf(&kv.buf, `'%08d'`, perm[j])
 	}
-	buf.WriteString(`)`)
-	_, err := kv.db.Exec(buf.String())
+	kv.buf.WriteString(`)`)
+	_, err := kv.db.Exec(kv.buf.String())
 	return err
 }
 
 func (kv *kvSQL) Delete(rows, run int) error {
 	firstRow := rows * run
-	var buf bytes.Buffer
-	buf.WriteString(`DELETE FROM bench.kv WHERE k IN (`)
+	defer kv.buf.Reset()
+	kv.buf.WriteString(`DELETE FROM bench.kv WHERE k IN (`)
 	for j := 0; j < rows; j++ {
 		if j > 0 {
-			buf.WriteString(", ")
+			kv.buf.WriteString(", ")
 		}
-		fmt.Fprintf(&buf, `'%08d'`, j+firstRow)
+		fmt.Fprintf(&kv.buf, `'%08d'`, j+firstRow)
 	}
-	buf.WriteString(`)`)
-	_, err := kv.db.Exec(buf.String())
+	kv.buf.WriteString(`)`)
+	_, err := kv.db.Exec(kv.buf.String())
 	return err
 }
 
@@ -245,15 +246,15 @@ CREATE TABLE IF NOT EXISTS bench.kv (
 	if !initData {
 		return nil
 	}
-	var buf bytes.Buffer
-	buf.WriteString(`INSERT INTO bench.kv VALUES `)
+	defer kv.buf.Reset()
+	kv.buf.WriteString(`INSERT INTO bench.kv VALUES `)
 	for i := 0; i < rows; i++ {
 		if i > 0 {
-			buf.WriteString(", ")
+			kv.buf.WriteString(", ")
 		}
-		fmt.Fprintf(&buf, "('%08d', %d)", i, i)
+		fmt.Fprintf(&kv.buf, "('%08d', %d)", i, i)
 	}
-	_, err := kv.db.Exec(buf.String())
+	_, err := kv.db.Exec(kv.buf.String())
 	return err
 }
 
@@ -269,14 +270,14 @@ func BenchmarkKV(b *testing.B) {
 		kvInterface.Scan,
 	} {
 		opName := runtime.FuncForPC(reflect.ValueOf(opFn).Pointer()).Name()
-		opName = strings.TrimPrefix(opName, "github.com/cockroachdb/cockroach/pkg/sql_test.kvInterface.")
+		opName = strings.TrimPrefix(opName, "github.com/cockroachdb/cockroach/pkg/sql/tests_test.kvInterface.")
 		b.Run(opName, func(b *testing.B) {
 			for _, kvFn := range []func(*testing.B) kvInterface{
 				newKVNative,
 				newKVSQL,
 			} {
 				kvTyp := runtime.FuncForPC(reflect.ValueOf(kvFn).Pointer()).Name()
-				kvTyp = strings.TrimPrefix(kvTyp, "github.com/cockroachdb/cockroach/pkg/sql_test.newKV")
+				kvTyp = strings.TrimPrefix(kvTyp, "github.com/cockroachdb/cockroach/pkg/sql/tests_test.newKV")
 				b.Run(kvTyp, func(b *testing.B) {
 					for _, rows := range []int{1, 10, 100, 1000, 10000} {
 						b.Run(fmt.Sprintf("rows=%d", rows), func(b *testing.B) {

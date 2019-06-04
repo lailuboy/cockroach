@@ -23,8 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // buildUpdate builds a memo group for an UpdateOp expression. First, an input
@@ -68,12 +67,13 @@ import (
 // become a physical property required of the Update operator).
 func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope) {
 	if upd.OrderBy != nil && upd.Limit == nil {
-		panic(builderError{errors.New("UPDATE statement requires LIMIT when ORDER BY is used")})
+		panic(pgerror.Newf(pgerror.CodeSyntaxError,
+			"UPDATE statement requires LIMIT when ORDER BY is used"))
 	}
 
 	// UX friendliness safeguard.
 	if upd.Where == nil && b.evalCtx.SessionData.SafeUpdates {
-		panic(builderError{pgerror.NewDangerousStatementErrorf("UPDATE without WHERE clause")})
+		panic(pgerror.DangerousStatementf("UPDATE without WHERE clause"))
 	}
 
 	if upd.With != nil {
@@ -133,7 +133,7 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 // exactly as many columns as are expected by the named SET columns.
 func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 	if len(mb.targetColList) != 0 {
-		panic("addTargetColsForUpdate cannot be called more than once")
+		panic(pgerror.AssertionFailedf("addTargetColsForUpdate cannot be called more than once"))
 	}
 
 	for _, expr := range exprs {
@@ -148,7 +148,7 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 				// Use the data types of the target columns to resolve expressions
 				// with ambiguous types (e.g. should 1 be interpreted as an INT or
 				// as a FLOAT).
-				desiredTypes := make([]types.T, len(expr.Names))
+				desiredTypes := make([]*types.T, len(expr.Names))
 				targetIdx := len(mb.targetColList) - len(expr.Names)
 				for i := range desiredTypes {
 					desiredTypes[i] = mb.md.ColumnMeta(mb.targetColList[targetIdx+i]).Type
@@ -161,11 +161,13 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 				n = len(t.Exprs)
 			}
 			if n < 0 {
-				panic(builderError{errors.Errorf("unsupported tuple assignment: %T", expr.Expr)})
+				panic(unimplementedWithIssueDetailf(35713, fmt.Sprintf("%T", expr.Expr),
+					"source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression; not supported: %T", expr.Expr))
 			}
 			if len(expr.Names) != n {
-				panic(builderError{fmt.Errorf("number of columns (%d) does not match number of values (%d)",
-					len(expr.Names), n)})
+				panic(pgerror.Newf(pgerror.CodeSyntaxError,
+					"number of columns (%d) does not match number of values (%d)",
+					len(expr.Names), n))
 			}
 		}
 	}
@@ -190,8 +192,6 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 // input. A final Project operator is built if any single-column or tuple SET
 // expressions are present.
 func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
-	mb.updateColList = make(opt.ColList, mb.tab.DeletableColumnCount())
-
 	// SET expressions should reject aggregates, generators, etc.
 	scalarProps := &mb.b.semaCtx.Properties
 	defer scalarProps.Restore(*scalarProps)
@@ -205,13 +205,13 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 	projectionsScope := mb.outScope.replace()
 	projectionsScope.appendColumnsFromScope(mb.outScope)
 
-	checkCol := func(sourceCol *scopeColumn, targetColID opt.ColumnID) {
+	checkCol := func(sourceCol *scopeColumn, scopeOrd scopeOrdinal, targetColID opt.ColumnID) {
 		// Type check the input expression against the corresponding table column.
 		ord := mb.tabID.ColumnOrdinal(targetColID)
 		checkDatumTypeFitsColumnType(mb.tab.Column(ord), sourceCol.typ)
 
-		// Add new column ID to the list of columns to update.
-		mb.updateColList[ord] = sourceCol.id
+		// Add ordinal of new scope column to the list of columns to update.
+		mb.updateOrds[ord] = scopeOrd
 
 		// Rename the column to match the target column being updated.
 		sourceCol.name = mb.tab.Column(ord).ColName()
@@ -227,9 +227,10 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 		desiredType := mb.md.ColumnMeta(targetColID).Type
 		texpr := inScope.resolveType(expr, desiredType)
 		scopeCol := mb.b.addColumn(projectionsScope, "" /* alias */, texpr)
+		scopeColOrd := scopeOrdinal(len(projectionsScope.cols) - 1)
 		mb.b.buildScalar(texpr, inScope, projectionsScope, scopeCol, nil)
 
-		checkCol(scopeCol, targetColID)
+		checkCol(scopeCol, scopeColOrd, targetColID)
 	}
 
 	n := 0
@@ -244,7 +245,8 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 
 				// Type check and rename columns.
 				for i := range subqueryScope.cols {
-					checkCol(&subqueryScope.cols[i], mb.targetColList[n])
+					scopeColOrd := scopeOrdinal(len(projectionsScope.cols) + i)
+					checkCol(&subqueryScope.cols[i], scopeColOrd, mb.targetColList[n])
 					n++
 				}
 
@@ -281,6 +283,15 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 
 	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
 	mb.outScope = projectionsScope
+
+	// Possibly round DECIMAL-related columns that were updated. Do this
+	// before evaluating computed expressions, since those may depend on the
+	// inserted columns.
+	mb.roundDecimalValues(mb.updateOrds, false /* roundComputedCols */)
+
+	// Add additional columns for computed expressions that may depend on any
+	// updated columns.
+	mb.addComputedColsForUpdate()
 }
 
 // addComputedColsForUpdate wraps an Update input expression with a Project
@@ -300,9 +311,12 @@ func (mb *mutationBuilder) addComputedColsForUpdate() {
 	mb.disambiguateColumns()
 
 	mb.addSynthesizedCols(
-		mb.updateColList,
+		mb.updateOrds,
 		func(tabCol cat.Column) bool { return tabCol.IsComputed() },
 	)
+
+	// Possibly round DECIMAL-related computed columns.
+	mb.roundDecimalValues(mb.updateOrds, true /* roundComputedCols */)
 }
 
 // buildUpdate constructs an Update operator, possibly wrapped by a Project

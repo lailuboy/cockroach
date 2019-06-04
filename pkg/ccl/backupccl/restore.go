@@ -16,7 +16,6 @@ import (
 	"sort"
 	"sync/atomic"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/gossipccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/intervalccl"
@@ -29,11 +28,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
@@ -68,12 +68,13 @@ func loadBackupDescs(
 	for i, uri := range uris {
 		desc, err := ReadBackupDescriptorFromURI(ctx, uri, settings)
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to read backup descriptor")
+			return nil, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+				"failed to read backup descriptor")
 		}
 		backupDescs[i] = desc
 	}
 	if len(backupDescs) == 0 {
-		return nil, errors.Errorf("no backups found")
+		return nil, pgerror.Newf(pgerror.CodeDataExceptionError, "no backups found")
 	}
 	return backupDescs, nil
 }
@@ -164,7 +165,8 @@ func selectTargets(
 func rewriteViewQueryDBNames(table *sqlbase.TableDescriptor, newDB string) error {
 	stmt, err := parser.ParseOne(table.ViewQuery)
 	if err != nil {
-		return errors.Wrapf(err, "failed to parse underlying query from view %q", table.Name)
+		return pgerror.Wrapf(err, pgerror.CodeSyntaxError,
+			"failed to parse underlying query from view %q", table.Name)
 	}
 	// Re-format to change all DB names to `newDB`.
 	f := tree.NewFmtCtx(tree.FmtParsable)
@@ -241,7 +243,8 @@ func allocateTableRewrites(
 		}
 
 		// Check that referenced sequences exist.
-		for _, col := range table.Columns {
+		for i := range table.Columns {
+			col := &table.Columns[i]
 			for _, seqID := range col.UsesSequenceIds {
 				if _, ok := tablesByID[seqID]; !ok {
 					if _, ok := opts[restoreOptSkipMissingSequences]; !ok {
@@ -316,7 +319,8 @@ func allocateTableRewrites(
 				{
 					parentDB, err := sqlbase.GetDatabaseDescFromID(ctx, txn, parentID)
 					if err != nil {
-						return errors.Wrapf(err, "failed to lookup parent DB %d", parentID)
+						return pgerror.NewAssertionErrorWithWrappedErrf(err,
+							"failed to lookup parent DB %d", log.Safe(parentID))
 					}
 
 					if err := p.CheckPrivilege(ctx, parentDB, privilege.CREATE); err != nil {
@@ -488,8 +492,9 @@ func RewriteTableDescs(
 		}
 
 		// Rewrite sequence references in column descriptors.
-		for idx, col := range table.Columns {
+		for idx := range table.Columns {
 			var newSeqRefs []sqlbase.ID
+			col := &table.Columns[idx]
 			for _, seqID := range col.UsesSequenceIds {
 				if rewrite, ok := tableRewrites[seqID]; ok {
 					newSeqRefs = append(newSeqRefs, rewrite.TableID)
@@ -504,7 +509,6 @@ func RewriteTableDescs(
 				}
 			}
 			col.UsesSequenceIds = newSeqRefs
-			table.Columns[idx] = col
 		}
 
 		// since this is a "new" table in eyes of new cluster, any leftover change
@@ -789,13 +793,25 @@ func splitAndScatter(
 			// TODO(dan): Really, this should be splitting the Key of the first
 			// entry in the _next_ chunk.
 			log.VEventf(restoreCtx, 1, "presplitting chunk %d of %d", idx, len(importSpanChunks))
-			if err := db.AdminSplit(ctx, chunkKey, chunkKey); err != nil {
+			if err := db.AdminSplit(ctx, chunkKey, chunkKey, false /* manual */); err != nil {
 				return err
 			}
 
 			log.VEventf(restoreCtx, 1, "scattering chunk %d of %d", idx, len(importSpanChunks))
 			scatterReq := &roachpb.AdminScatterRequest{
-				RequestHeader: roachpb.RequestHeaderFromSpan(roachpb.Span{Key: chunkKey, EndKey: chunkKey.Next()}),
+				RequestHeader: roachpb.RequestHeaderFromSpan(roachpb.Span{
+					Key:    chunkKey,
+					EndKey: chunkKey.Next(),
+				}),
+				// TODO(dan): This is a bit of a hack, but it seems to be an effective
+				// one (see the PR that added it for graphs). As of the commit that
+				// added this, scatter is not very good at actually balancing leases.
+				// This is likely for two reasons: 1) there's almost certainly some
+				// regression in scatter's behavior, it used to work much better and 2)
+				// scatter has to operate by balancing leases for all ranges in a
+				// cluster, but in RESTORE, we really just want it to be balancing the
+				// span being restored into.
+				RandomizeLeases: true,
 			}
 			if _, pErr := client.SendWrapped(ctx, db.NonTransactionalSender(), scatterReq); pErr != nil {
 				// TODO(dan): Unfortunately, Scatter is still too unreliable to
@@ -833,7 +849,7 @@ func splitAndScatter(
 					// TODO(dan): Really, this should be splitting the Key of
 					// the _next_ entry.
 					log.VEventf(restoreCtx, 1, "presplitting %d of %d", idx, len(importSpans))
-					if err := db.AdminSplit(ctx, newSpanKey, newSpanKey); err != nil {
+					if err := db.AdminSplit(ctx, newSpanKey, newSpanKey, false /* manual */); err != nil {
 						return err
 					}
 
@@ -890,13 +906,14 @@ func WriteTableDescs(
 			b.CPut(sqlbase.MakeDescMetadataKey(desc.ID), sqlbase.WrapDescriptor(desc), nil)
 			b.CPut(sqlbase.MakeNameMetadataKey(keys.RootNamespaceID, desc.Name), desc.ID, nil)
 		}
-		for _, table := range tables {
-			if wrote, ok := wroteDBs[table.ParentID]; ok {
-				table.Privileges = wrote.GetPrivileges()
+		for i := range tables {
+			if wrote, ok := wroteDBs[tables[i].ParentID]; ok {
+				tables[i].Privileges = wrote.GetPrivileges()
 			} else {
-				parentDB, err := sqlbase.GetDatabaseDescFromID(ctx, txn, table.ParentID)
+				parentDB, err := sqlbase.GetDatabaseDescFromID(ctx, txn, tables[i].ParentID)
 				if err != nil {
-					return errors.Wrapf(err, "failed to lookup parent DB %d", table.ParentID)
+					return pgerror.NewAssertionErrorWithWrappedErrf(err,
+						"failed to lookup parent DB %d", log.Safe(tables[i].ParentID))
 				}
 				// TODO(mberhault): CheckPrivilege wants a planner.
 				if err := sql.CheckPrivilegeForUser(ctx, user, parentDB, privilege.CREATE); err != nil {
@@ -904,33 +921,35 @@ func WriteTableDescs(
 				}
 				// Default is to copy privs from restoring parent db, like CREATE TABLE.
 				// TODO(dt): Make this more configurable.
-				table.Privileges = parentDB.GetPrivileges()
+				tables[i].Privileges = parentDB.GetPrivileges()
 			}
-			b.CPut(table.GetDescMetadataKey(), sqlbase.WrapDescriptor(table), nil)
-			b.CPut(table.GetNameMetadataKey(), table.ID, nil)
+			b.CPut(tables[i].GetDescMetadataKey(), sqlbase.WrapDescriptor(tables[i]), nil)
+			b.CPut(tables[i].GetNameMetadataKey(), tables[i].ID, nil)
 		}
 		for _, kv := range extra {
 			b.InitPut(kv.Key, &kv.Value, false)
 		}
 		if err := txn.Run(ctx, b); err != nil {
 			if _, ok := errors.Cause(err).(*roachpb.ConditionFailedError); ok {
-				return errors.New("table already exists")
+				return pgerror.Newf(pgerror.CodeDuplicateObjectError, "table already exists")
 			}
 			return err
 		}
 
 		for _, table := range tables {
 			if err := table.Validate(ctx, txn, settings); err != nil {
-				return errors.Wrapf(err, "validate table %d", table.ID)
+				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+					"validate table %d", log.Safe(table.ID))
 			}
 		}
 		return nil
 	}()
-	return errors.Wrap(err, "restoring table desc and namespace entries")
+	return pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+		"restoring table desc and namespace entries")
 }
 
 func restoreJobDescription(
-	restore *tree.Restore, from []string, opts map[string]string,
+	p sql.PlanHookState, restore *tree.Restore, from []string, opts map[string]string,
 ) (string, error) {
 	r := &tree.Restore{
 		AsOf:    restore.AsOf,
@@ -947,7 +966,8 @@ func restoreJobDescription(
 		r.From[i] = tree.NewDString(sf)
 	}
 
-	return tree.AsStringWithFlags(r, tree.FmtAlwaysQualifyTableNames), nil
+	ann := p.ExtendedEvalContext().Annotations
+	return tree.AsStringWithFQNames(r, ann), nil
 }
 
 // rewriteBackupSpanKey rewrites a backup span start key for the purposes of
@@ -972,18 +992,21 @@ func restoreJobDescription(
 func rewriteBackupSpanKey(kr *storageccl.KeyRewriter, key roachpb.Key) (roachpb.Key, error) {
 	newKey, rewritten, err := kr.RewriteKey(append([]byte(nil), key...))
 	if err != nil {
-		return nil, errors.Wrapf(err, "could not rewrite span start key: %s", key)
+		return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+			"could not rewrite span start key: %s", key)
 	}
 	if !rewritten && bytes.Equal(newKey, key) {
 		// if nothing was changed, we didn't match the top-level key at all.
-		return nil, errors.Errorf("no rewrite for span start key: %s", key)
+		return nil, pgerror.AssertionFailedf(
+			"no rewrite for span start key: %s", key)
 	}
 	// Modify all spans that begin at the primary index to instead begin at the
 	// start of the table. That is, change a span start key from /Table/51/1 to
 	// /Table/51. Otherwise a permanently empty span at /Table/51-/Table/51/1
 	// will be created.
 	if b, id, idx, err := sqlbase.DecodeTableIDIndexID(newKey); err != nil {
-		return nil, errors.Wrapf(err, "could not rewrite span start key: %s", key)
+		return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+			"could not rewrite span start key: %s", key)
 	} else if idx == 1 && len(b) == 0 {
 		newKey = keys.MakeTablePrefix(uint32(id))
 	}
@@ -1054,7 +1077,7 @@ func restore(
 		}
 		disableCtx, cancel := context.WithCancel(restoreCtx)
 		defer cancel()
-		gossipccl.DisableMerges(disableCtx, gossip, tableIDs)
+		gossip.DisableMerges(disableCtx, tableIDs)
 	}
 
 	// Get TableRekeys to use when importing raw data.
@@ -1062,7 +1085,8 @@ func restore(
 	for i := range tables {
 		newDescBytes, err := protoutil.Marshal(sqlbase.WrapDescriptor(tables[i]))
 		if err != nil {
-			return mu.res, nil, nil, errors.Wrap(err, "marshaling descriptor")
+			return mu.res, nil, nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+				"marshaling descriptor")
 		}
 		rekeys = append(rekeys, roachpb.ImportRequest_TableRekey{
 			OldID:   uint32(oldTableIDs[i]),
@@ -1079,7 +1103,8 @@ func restore(
 	highWaterMark := job.Progress().Details.(*jobspb.Progress_Restore).Restore.HighWater
 	importSpans, _, err := makeImportSpans(spans, backupDescs, highWaterMark, errOnMissingRange)
 	if err != nil {
-		return mu.res, nil, nil, errors.Wrapf(err, "making import requests for %d backups", len(backupDescs))
+		return mu.res, nil, nil, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+			"making import requests for %d backups", len(backupDescs))
 	}
 
 	for i := range importSpans {
@@ -1087,11 +1112,8 @@ func restore(
 	}
 	mu.requestsCompleted = make([]bool, len(importSpans))
 
-	progressLogger := jobs.ProgressLogger{
-		Job:           job,
-		TotalChunks:   len(importSpans),
-		StartFraction: job.FractionCompleted(),
-		ProgressedFn: func(progressedCtx context.Context, details jobspb.ProgressDetails) {
+	progressLogger := jobs.NewChunkProgressLogger(job, len(importSpans), job.FractionCompleted(),
+		func(progressedCtx context.Context, details jobspb.ProgressDetails) {
 			switch d := details.(type) {
 			case *jobspb.Progress_Restore:
 				mu.Lock()
@@ -1102,8 +1124,7 @@ func restore(
 			default:
 				log.Errorf(progressedCtx, "job payload had unexpected type %T", d)
 			}
-		},
-	}
+		})
 
 	// We're already limiting these on the server-side, but sending all the
 	// Import requests at once would fill up distsender/grpc/something and cause
@@ -1183,7 +1204,8 @@ func restore(
 
 				importRes, pErr := client.SendWrapped(ctx, db.NonTransactionalSender(), importRequest)
 				if pErr != nil {
-					return errors.Wrapf(pErr.GoError(), "importing span %v", importRequest.DataSpan)
+					return pgerror.Wrapf(pErr.GoError(), pgerror.CodeDataExceptionError,
+						"importing span %v", importRequest.DataSpan)
 
 				}
 
@@ -1193,7 +1215,7 @@ func restore(
 				// Assert that we're actually marking the correct span done. See #23977.
 				if !importSpans[idx].Key.Equal(importRequest.DataSpan.Key) {
 					mu.Unlock()
-					return errors.Errorf(
+					return pgerror.Newf(pgerror.CodeDataExceptionError,
 						"request %d for span %v (to %v) does not match import span for same idx: %v",
 						idx, importRequest.DataSpan, newSpanKey, importSpans[idx],
 					)
@@ -1216,7 +1238,8 @@ func restore(
 		// This leaves the data that did get imported in case the user wants to
 		// retry.
 		// TODO(dan): Build tooling to allow a user to restart a failed restore.
-		return mu.res, nil, nil, errors.Wrapf(err, "importing %d ranges", len(importSpans))
+		return mu.res, nil, nil, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+			"importing %d ranges", len(importSpans))
 	}
 
 	return mu.res, databases, tables, nil
@@ -1236,20 +1259,20 @@ var RestoreHeader = sqlbase.ResultColumns{
 // restorePlanHook implements sql.PlanHookFn.
 func restorePlanHook(
 	_ context.Context, stmt tree.Statement, p sql.PlanHookState,
-) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, error) {
+) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, bool, error) {
 	restoreStmt, ok := stmt.(*tree.Restore)
 	if !ok {
-		return nil, nil, nil, nil
+		return nil, nil, nil, false, nil
 	}
 
 	fromFn, err := p.TypeAsStringArray(restoreStmt.From, "RESTORE")
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 
 	optsFn, err := p.TypeAsStringOpts(restoreStmt.Options, restoreOptionExpectValues)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
@@ -1306,7 +1329,7 @@ func restorePlanHook(
 		}
 		return doRestorePlan(ctx, restoreStmt, p, from, endTime, opts, resultsCh)
 	}
-	return fn, RestoreHeader, nil, nil
+	return fn, RestoreHeader, nil, false, nil
 }
 
 func doRestorePlan(
@@ -1363,7 +1386,7 @@ func doRestorePlan(
 	if err != nil {
 		return err
 	}
-	description, err := restoreJobDescription(restoreStmt, from, opts)
+	description, err := restoreJobDescription(p, restoreStmt, from, opts)
 	if err != nil {
 		return err
 	}
@@ -1422,6 +1445,7 @@ func loadBackupSQLDescs(
 }
 
 type restoreResumer struct {
+	job            *jobs.Job
 	settings       *cluster.Settings
 	res            roachpb.BulkOpSummary
 	databases      []*sqlbase.DatabaseDescriptor
@@ -1429,10 +1453,11 @@ type restoreResumer struct {
 	statsRefresher *stats.Refresher
 }
 
+// Resume is part of the jobs.Resumer interface.
 func (r *restoreResumer) Resume(
-	ctx context.Context, job *jobs.Job, phs interface{}, resultsCh chan<- tree.Datums,
+	ctx context.Context, phs interface{}, resultsCh chan<- tree.Datums,
 ) error {
-	details := job.Details().(jobspb.RestoreDetails)
+	details := r.job.Details().(jobspb.RestoreDetails)
 	p := phs.(sql.PlanHookState)
 
 	backupDescs, sqlDescs, err := loadBackupSQLDescs(ctx, details, r.settings)
@@ -1449,7 +1474,7 @@ func (r *restoreResumer) Resume(
 		sqlDescs,
 		details.TableRewrites,
 		details.OverrideDB,
-		job,
+		r.job,
 		resultsCh,
 	)
 	r.res = res
@@ -1459,12 +1484,12 @@ func (r *restoreResumer) Resume(
 	return err
 }
 
-// OnFailOrCancel removes KV data that has been committed from a restore that
-// has failed or been canceled. It does this by adding the table descriptors
-// in DROP state, which causes the schema change stuff to delete the keys
-// in the background.
-func (r *restoreResumer) OnFailOrCancel(ctx context.Context, txn *client.Txn, job *jobs.Job) error {
-	details := job.Details().(jobspb.RestoreDetails)
+// OnFailOrCancel is part of the jobs.Resumer interface. Removes KV data that
+// has been committed from a restore that has failed or been canceled. It does
+// this by adding the table descriptors in DROP state, which causes the schema
+// change stuff to delete the keys in the background.
+func (r *restoreResumer) OnFailOrCancel(ctx context.Context, txn *client.Txn) error {
+	details := r.job.Details().(jobspb.RestoreDetails)
 
 	// Needed to trigger the schema change manager.
 	if err := txn.SetSystemConfigTrigger(); err != nil {
@@ -1478,32 +1503,31 @@ func (r *restoreResumer) OnFailOrCancel(ctx context.Context, txn *client.Txn, jo
 	return txn.Run(ctx, b)
 }
 
-func (r *restoreResumer) OnSuccess(ctx context.Context, txn *client.Txn, job *jobs.Job) error {
+// OnSuccess is part of the jobs.Resumer interface.
+func (r *restoreResumer) OnSuccess(ctx context.Context, txn *client.Txn) error {
 	log.Event(ctx, "making tables live")
 
 	// Write the new TableDescriptors and flip the namespace entries over to
 	// them. After this call, any queries on a table will be served by the newly
 	// restored data.
-	if err := WriteTableDescs(ctx, txn, r.databases, r.tables, job.Payload().Username, r.settings, nil); err != nil {
-		return errors.Wrapf(err, "restoring %d TableDescriptors", len(r.tables))
+	if err := WriteTableDescs(ctx, txn, r.databases, r.tables, r.job.Payload().Username, r.settings, nil); err != nil {
+		return pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+			"restoring %d TableDescriptors", len(r.tables))
 	}
 
 	// Initiate a run of CREATE STATISTICS. We don't know the actual number of
 	// rows affected per table, so we use a large number because we want to make
 	// sure that stats always get created/refreshed here.
 	for i := range r.tables {
-		r.statsRefresher.NotifyMutation(
-			&r.settings.SV,
-			r.tables[i].ID,
-			math.MaxInt32, /* rowsAffected */
-		)
+		r.statsRefresher.NotifyMutation(r.tables[i].ID, math.MaxInt32 /* rowsAffected */)
 	}
 
 	return nil
 }
 
+// OnTerminal is part of the jobs.Resumer interface.
 func (r *restoreResumer) OnTerminal(
-	ctx context.Context, job *jobs.Job, status jobs.Status, resultsCh chan<- tree.Datums,
+	ctx context.Context, status jobs.Status, resultsCh chan<- tree.Datums,
 ) {
 	if status == jobs.StatusSucceeded {
 		// TODO(benesch): emit periodic progress updates.
@@ -1512,7 +1536,7 @@ func (r *restoreResumer) OnTerminal(
 		// the current coordinator's counts.
 
 		resultsCh <- tree.Datums{
-			tree.NewDInt(tree.DInt(*job.ID())),
+			tree.NewDInt(tree.DInt(*r.job.ID())),
 			tree.NewDString(string(jobs.StatusSucceeded)),
 			tree.NewDFloat(tree.DFloat(1.0)),
 			tree.NewDInt(tree.DInt(r.res.Rows)),
@@ -1525,17 +1549,15 @@ func (r *restoreResumer) OnTerminal(
 
 var _ jobs.Resumer = &restoreResumer{}
 
-func restoreResumeHook(typ jobspb.Type, settings *cluster.Settings) jobs.Resumer {
-	if typ != jobspb.TypeRestore {
-		return nil
-	}
-
-	return &restoreResumer{
-		settings: settings,
-	}
-}
-
 func init() {
 	sql.AddPlanHook(restorePlanHook)
-	jobs.AddResumeHook(restoreResumeHook)
+	jobs.RegisterConstructor(
+		jobspb.TypeRestore,
+		func(job *jobs.Job, settings *cluster.Settings) jobs.Resumer {
+			return &restoreResumer{
+				job:      job,
+				settings: settings,
+			}
+		},
+	)
 }

@@ -183,7 +183,7 @@ EXPLAIN SELECT * FROM t x JOIN t y USING(b) WHERE x.b < '3'
 ----
 render                     ·               ·
  └── render                ·               ·
-      └── join             ·               ·
+      └── merge-join       ·               ·
            │               type            inner
            │               equality        (b) = (b)
            │               mergeJoinOrder  +"(b=b)"
@@ -736,8 +736,8 @@ sort                 ·            ·
  └── group           ·            ·
       │              aggregate 0  resource_key
       │              aggregate 1  count(resource_key)
-      │              group by     @1
-      │              ordered      @1
+      │              group by     resource_key
+      │              ordered      +resource_key
       └── render     ·            ·
            └── scan  ·            ·
 ·                    table        favorites@favorites_glob_fav_idx
@@ -1022,11 +1022,12 @@ index-join  ·      ·
 query TTT
 EXPLAIN SELECT * FROM noncover WHERE c > 0 AND d = 8
 ----
-index-join  ·      ·
- │          table  noncover@primary
- └── scan   ·      ·
-·           table  noncover@c
-·           spans  /1-
+index-join  ·       ·
+ │          table   noncover@primary
+ │          filter  d = 8
+ └── scan   ·       ·
+·           table   noncover@c
+·           spans   /1-
 
 # The following testcases verify that when we have a small limit, we prefer an
 # order-matching index.

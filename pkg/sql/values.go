@@ -21,19 +21,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 type valuesNode struct {
 	columns sqlbase.ResultColumns
 	tuples  [][]tree.TypedExpr
-	// isConst is set if the valuesNode only contains constant expressions (no
-	// subqueries). In this case, rows will be evaluated during the first call
-	// to planNode.Start and memoized for future consumption. A valuesNode with
-	// isConst = true can serve its values multiple times. See valuesNode.Reset.
-	isConst bool
 
 	// specifiedInQuery is set if the valuesNode represents a literal
 	// relational expression that was present in the original SQL text,
@@ -46,11 +40,10 @@ type valuesNode struct {
 
 // Values implements the VALUES clause.
 func (p *planner) Values(
-	ctx context.Context, origN tree.Statement, desiredTypes []types.T,
+	ctx context.Context, origN tree.Statement, desiredTypes []*types.T,
 ) (planNode, error) {
 	v := &valuesNode{
 		specifiedInQuery: true,
-		isConst:          true,
 	}
 
 	// If we have names, extract them.
@@ -61,7 +54,7 @@ func (p *planner) Values(
 	case *tree.ValuesClause:
 		n = t
 	default:
-		return nil, pgerror.NewAssertionErrorf("unhandled case in values: %T %v", origN, origN)
+		return nil, pgerror.AssertionFailedf("unhandled case in values: %T %v", origN, origN)
 	}
 
 	if len(n.Rows) == 0 {
@@ -74,8 +67,6 @@ func (p *planner) Values(
 	tupleBuf := make([]tree.TypedExpr, len(n.Rows)*numCols)
 
 	v.columns = make(sqlbase.ResultColumns, 0, numCols)
-
-	lastKnownSubqueryIndex := len(p.curPlan.subqueryPlans)
 
 	// We need to save and restore the previous value of the field in
 	// semaCtx in case we are recursively called within a subquery
@@ -109,10 +100,10 @@ func (p *planner) Values(
 			typ := typedExpr.ResolvedType()
 			if num == 0 {
 				v.columns = append(v.columns, sqlbase.ResultColumn{Name: "column" + strconv.Itoa(i+1), Typ: typ})
-			} else if v.columns[i].Typ == types.Unknown {
+			} else if v.columns[i].Typ.Family() == types.UnknownFamily {
 				v.columns[i].Typ = typ
-			} else if typ != types.Unknown && !typ.Equivalent(v.columns[i].Typ) {
-				return nil, pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
+			} else if typ.Family() != types.UnknownFamily && !typ.Equivalent(v.columns[i].Typ) {
+				return nil, pgerror.Newf(pgerror.CodeDatatypeMismatchError,
 					"VALUES types %s and %s cannot be matched", typ, v.columns[i].Typ)
 			}
 
@@ -120,20 +111,12 @@ func (p *planner) Values(
 		}
 		v.tuples = append(v.tuples, tupleRow)
 	}
-
-	// TODO(nvanbenschoten): if v.isConst, we should be able to evaluate n.rows
-	// ahead of time. This requires changing the contract for planNode.Close such
-	// that it must always be called unless an error is returned from a planNode
-	// constructor. This would simplify the Close contract, but would make some
-	// code (like in planner.SelectClause) more messy.
-	v.isConst = (len(p.curPlan.subqueryPlans) == lastKnownSubqueryIndex)
 	return v, nil
 }
 
 func (p *planner) newContainerValuesNode(columns sqlbase.ResultColumns, capacity int) *valuesNode {
 	return &valuesNode{
 		columns: columns,
-		isConst: true,
 		valuesRun: valuesRun{
 			rows: rowcontainer.NewRowContainer(
 				p.EvalContext().Mon.MakeBoundAccount(), sqlbase.ColTypeInfoFromResCols(columns), capacity,
@@ -150,9 +133,8 @@ type valuesRun struct {
 
 func (n *valuesNode) startExec(params runParams) error {
 	if n.rows != nil {
-		if !n.isConst {
-			log.Fatalf(params.ctx, "valuesNode evaluated twice")
-		}
+		// n.rows was already created in newContainerValuesNode.
+		// Nothing to do here.
 		return nil
 	}
 
@@ -187,16 +169,6 @@ func (n *valuesNode) startExec(params runParams) error {
 	return nil
 }
 
-// Reset resets the valuesNode processing state without requiring recomputation
-// of the values tuples if the valuesNode is processed again. Reset can only
-// be called if valuesNode.isConst.
-func (n *valuesNode) Reset(ctx context.Context) {
-	if !n.isConst {
-		log.Fatalf(ctx, "valuesNode.Reset can only be called on constant valuesNodes")
-	}
-	n.nextRow = 0
-}
-
 func (n *valuesNode) Next(runParams) (bool, error) {
 	if n.nextRow >= n.rows.Len() {
 		return false, nil
@@ -217,7 +189,7 @@ func (n *valuesNode) Close(ctx context.Context) {
 }
 
 func newValuesListLenErr(exp, got int) error {
-	return pgerror.NewErrorf(
+	return pgerror.Newf(
 		pgerror.CodeSyntaxError,
 		"VALUES lists must all be the same length, expected %d columns, found %d",
 		exp, got)

@@ -202,10 +202,15 @@ type Writer interface {
 	// and committing a batch whose Repr() equals repr. If sync is true, the
 	// batch is synchronously written to disk. It is an error to specify
 	// sync=true if the Writer is a Batch.
+	//
+	// It is safe to modify the contents of the arguments after ApplyBatchRepr
+	// returns.
 	ApplyBatchRepr(repr []byte, sync bool) error
-	// Clear removes the item from the db with the given key.
-	// Note that clear actually removes entries from the storage
-	// engine, rather than inserting tombstones.
+	// Clear removes the item from the db with the given key. Note that clear
+	// actually removes entries from the storage engine, rather than inserting
+	// tombstones.
+	//
+	// It is safe to modify the contents of the arguments after Clear returns.
 	Clear(key MVCCKey) error
 	// SingleClear removes the most recent write to the item from the db with
 	// the given key. Whether older version of the item will come back to life
@@ -214,16 +219,25 @@ type Writer interface {
 	// for details on the SingleDelete operation that this method invokes. Note
 	// that clear actually removes entries from the storage engine, rather than
 	// inserting tombstones.
+	//
+	// It is safe to modify the contents of the arguments after SingleClear
+	// returns.
 	SingleClear(key MVCCKey) error
 	// ClearRange removes a set of entries, from start (inclusive) to end
 	// (exclusive). Similar to Clear, this method actually removes entries from
 	// the storage engine.
+	//
+	// It is safe to modify the contents of the arguments after ClearRange
+	// returns.
 	ClearRange(start, end MVCCKey) error
 	// ClearIterRange removes a set of entries, from start (inclusive) to end
 	// (exclusive). Similar to Clear and ClearRange, this method actually removes
 	// entries from the storage engine. Unlike ClearRange, the entries to remove
 	// are determined by iterating over iter and per-key tombstones are
 	// generated.
+	//
+	// It is safe to modify the contents of the arguments after ClearIterRange
+	// returns.
 	ClearIterRange(iter Iterator, start, end MVCCKey) error
 	// Merge is a high-performance write operation used for values which are
 	// accumulated over several writes. Multiple values can be merged
@@ -237,12 +251,19 @@ type Writer interface {
 	// (stored as byte slices with a special tag on the roachpb.Value) are
 	// combined with specialized logic beyond that of simple byte slices.
 	//
-	// The logic for merges is written in db.cc in order to be compatible with RocksDB.
+	// The logic for merges is written in db.cc in order to be compatible with
+	// RocksDB.
+	//
+	// It is safe to modify the contents of the arguments after Merge returns.
 	Merge(key MVCCKey, value []byte) error
 	// Put sets the given key to the value provided.
+	//
+	// It is safe to modify the contents of the arguments after Put returns.
 	Put(key MVCCKey, value []byte) error
 	// LogData adds the specified data to the RocksDB WAL. The data is
 	// uninterpreted by RocksDB (i.e. not added to the memtable or sstables).
+	//
+	// It is safe to modify the contents of the arguments after LogData returns.
 	LogData(data []byte) error
 	// LogLogicalOp logs the specified logical mvcc operation with the provided
 	// details to the writer, if it has logical op logging enabled. For most
@@ -268,6 +289,9 @@ type Engine interface {
 	Flush() error
 	// GetStats retrieves stats from the engine.
 	GetStats() (*Stats, error)
+	// GetEnvStats retrieves stats about the engine's environment
+	// For RocksDB, this includes details of at-rest encryption.
+	GetEnvStats() (*EnvStats, error)
 	// GetAuxiliaryDir returns a path under which files can be stored
 	// persistently, and from which data can be ingested by the engine.
 	//
@@ -304,6 +328,10 @@ type Engine interface {
 	// case of hard-links) when allowFileModifications true. See additional
 	// comments in db.cc's IngestExternalFile explaining modification behavior.
 	IngestExternalFiles(ctx context.Context, paths []string, skipWritingSeqNo, allowFileModifications bool) error
+	// PreIngestDelay offers an engine the chance to backpressure ingestions.
+	// When called, it may choose to block if the engine determines that it is in
+	// or approaching a state where further ingestions may risk its health.
+	PreIngestDelay(ctx context.Context)
 	// ApproximateDiskBytes returns an approximation of the on-disk size for the given key span.
 	ApproximateDiskBytes(from, to roachpb.Key) (uint64, error)
 	// CompactRange ensures that the specified range of key value pairs is
@@ -326,6 +354,10 @@ type Engine interface {
 	// the engine implementation. For RocksDB, this means using the Env responsible for the file
 	// which may handle extra logic (eg: copy encryption settings for EncryptedEnv).
 	LinkFile(oldname, newname string) error
+	// CreateCheckpoint creates a checkpoint of the engine in the given directory,
+	// which must not exist. The directory should be on the same file system so
+	// that hard links can be used.
+	CreateCheckpoint(dir string) error
 }
 
 // MapProvidingEngine is an Engine that also provides facilities for making a
@@ -401,6 +433,7 @@ type Stats struct {
 	Compactions                    int64
 	TableReadersMemEstimate        int64
 	PendingCompactionBytesEstimate int64
+	L0FileCount                    int64
 }
 
 // EnvStats is a set of RocksDB env stats, including encryption status.
@@ -413,6 +446,9 @@ type EnvStats struct {
 	ActiveKeyFiles uint64
 	// ActiveKeyBytes is the size of files using the active data key.
 	ActiveKeyBytes uint64
+	// EncryptionType is an enum describing the active encryption algorithm.
+	// See: ccl/storageccl/engineccl/enginepbccl/key_registry.proto
+	EncryptionType int32
 	// EncryptionStatus is a serialized enginepbccl/stats.proto::EncryptionStatus protobuf.
 	EncryptionStatus []byte
 }

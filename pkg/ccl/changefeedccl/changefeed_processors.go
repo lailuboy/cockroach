@@ -10,6 +10,7 @@ package changefeedccl
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"time"
 
@@ -19,14 +20,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/storage/closedts"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
 )
 
 type changeAggregator struct {
@@ -90,7 +93,7 @@ func newChangeAggregatorProcessor(
 		output,
 		memMonitor,
 		distsqlrun.ProcStateOpts{
-			TrailingMetaCallback: func(context.Context) []distsqlrun.ProducerMetadata {
+			TrailingMetaCallback: func(context.Context) []distsqlpb.ProducerMetadata {
 				ca.close()
 				return nil
 			},
@@ -107,7 +110,7 @@ func newChangeAggregatorProcessor(
 	return ca, nil
 }
 
-func (ca *changeAggregator) OutputTypes() []sqlbase.ColumnType {
+func (ca *changeAggregator) OutputTypes() []types.T {
 	return changefeedResultTypes
 }
 
@@ -123,6 +126,7 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 	if ca.sink, err = getSink(
 		ca.spec.Feed.SinkURI, nodeID, ca.spec.Feed.Opts, ca.spec.Feed.Targets, ca.flowCtx.Settings,
 	); err != nil {
+		err = MarkRetryableError(err)
 		// Early abort in the case that there is an error creating the sink.
 		ca.MoveToDraining(err)
 		ca.cancel()
@@ -149,13 +153,23 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 	// dependency cycles.
 	metrics := ca.flowCtx.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
 	ca.sink = makeMetricsSink(metrics, ca.sink)
+	ca.sink = &errorWrapperSink{wrapped: ca.sink}
+
+	var knobs TestingKnobs
+	if cfKnobs, ok := ca.flowCtx.TestingKnobs().Changefeed.(*TestingKnobs); ok {
+		knobs = *cfKnobs
+	}
 
 	// It seems like we should also be able to use `ca.ProcessorBase.MemMonitor`
 	// for the poller, but there is a race between the flow's MemoryMonitor
 	// getting Stopped and `changeAggregator.Close`, which causes panics. Not sure
 	// what to do about this yet.
+	pollerMemMonCapacity := memBufferDefaultCapacity
+	if knobs.MemBufferCapacity != 0 {
+		pollerMemMonCapacity = knobs.MemBufferCapacity
+	}
 	pollerMemMon := mon.MakeMonitorInheritWithLimit("poller", math.MaxInt64, ca.ProcessorBase.MemMonitor)
-	pollerMemMon.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	pollerMemMon.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(pollerMemMonCapacity))
 	ca.pollerMemMon = &pollerMemMon
 
 	buf := makeBuffer()
@@ -166,10 +180,6 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 	)
 	rowsFn := kvsToRows(leaseMgr, ca.spec.Feed, buf.Get)
 
-	var knobs TestingKnobs
-	if cfKnobs, ok := ca.flowCtx.TestingKnobs().Changefeed.(*TestingKnobs); ok {
-		knobs = *cfKnobs
-	}
 	ca.tickFn = emitEntries(
 		ca.flowCtx.Settings, ca.spec.Feed, spans, ca.encoder, ca.sink, rowsFn, knobs, metrics)
 
@@ -177,8 +187,8 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 	// but only the first one is ever used.
 	ca.errCh = make(chan error, 2)
 
+	ca.pollerDoneCh = make(chan struct{})
 	if err := ca.flowCtx.Stopper().RunAsyncTask(ctx, "changefeed-poller", func(ctx context.Context) {
-		ca.pollerDoneCh = make(chan struct{})
 		defer close(ca.pollerDoneCh)
 		var err error
 		if PushEnabled.Get(&ca.flowCtx.Settings.SV) {
@@ -192,6 +202,10 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 		ca.errCh <- err
 		ca.cancel()
 	}); err != nil {
+		// If err != nil then the RunAsyncTask closure never ran, which means we
+		// need to manually close ca.pollerDoneCh so `(*changeAggregator).close`
+		// doesn't hang.
+		close(ca.pollerDoneCh)
 		ca.errCh <- err
 		ca.cancel()
 	}
@@ -228,7 +242,7 @@ func (ca *changeAggregator) close() {
 }
 
 // Next is part of the RowSource interface.
-func (ca *changeAggregator) Next() (sqlbase.EncDatumRow, *distsqlrun.ProducerMetadata) {
+func (ca *changeAggregator) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	for ca.State == distsqlrun.StateRunning {
 		if !ca.changedRowBuf.IsEmpty() {
 			return ca.changedRowBuf.Pop(), nil
@@ -323,6 +337,10 @@ type changeFrontier struct {
 	// jobProgressedFn, if non-nil, is called to checkpoint the changefeed's
 	// progress in the corresponding system job entry.
 	jobProgressedFn func(context.Context, jobs.HighWaterProgressedFn) error
+	// highWaterAtStart is the greater of the job high-water and the timestamp the
+	// CHANGEFEED statement was run at. It's used in an assertion that we never
+	// regress the job high-water.
+	highWaterAtStart hlc.Timestamp
 	// passthroughBuf, in some but not all flows, contains changed row data to
 	// pass through unchanged to the gateway node.
 	passthroughBuf encDatumRowBuffer
@@ -333,7 +351,7 @@ type changeFrontier struct {
 	// metrics are monitoring counters shared between all changefeeds.
 	metrics *Metrics
 	// metricsID is used as the unique id of this changefeed in the
-	// metrics.MinHighWater map.
+	// metrics.MaxBehindNanos map.
 	metricsID int
 }
 
@@ -364,7 +382,7 @@ func newChangeFrontierProcessor(
 		output,
 		memMonitor,
 		distsqlrun.ProcStateOpts{
-			TrailingMetaCallback: func(context.Context) []distsqlrun.ProducerMetadata {
+			TrailingMetaCallback: func(context.Context) []distsqlpb.ProducerMetadata {
 				cf.close()
 				return nil
 			},
@@ -394,7 +412,7 @@ func newChangeFrontierProcessor(
 	return cf, nil
 }
 
-func (cf *changeFrontier) OutputTypes() []sqlbase.ColumnType {
+func (cf *changeFrontier) OutputTypes() []types.T {
 	return changefeedResultTypes
 }
 
@@ -411,6 +429,7 @@ func (cf *changeFrontier) Start(ctx context.Context) context.Context {
 	if cf.sink, err = getSink(
 		cf.spec.Feed.SinkURI, nodeID, cf.spec.Feed.Opts, cf.spec.Feed.Targets, cf.flowCtx.Settings,
 	); err != nil {
+		err = MarkRetryableError(err)
 		cf.MoveToDraining(err)
 		return ctx
 	}
@@ -424,7 +443,9 @@ func (cf *changeFrontier) Start(ctx context.Context) context.Context {
 	// dependency cycles.
 	cf.metrics = cf.flowCtx.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
 	cf.sink = makeMetricsSink(cf.metrics, cf.sink)
+	cf.sink = &errorWrapperSink{wrapped: cf.sink}
 
+	cf.highWaterAtStart = cf.spec.Feed.StatementTime
 	if cf.spec.JobID != 0 {
 		job, err := cf.flowCtx.JobRegistry.LoadJob(ctx, cf.spec.JobID)
 		if err != nil {
@@ -432,24 +453,27 @@ func (cf *changeFrontier) Start(ctx context.Context) context.Context {
 			return ctx
 		}
 		cf.jobProgressedFn = job.HighWaterProgressed
+
+		p := job.Progress()
+		if ts := p.GetHighWater(); ts != nil {
+			cf.highWaterAtStart.Forward(*ts)
+		}
 	}
 
 	cf.metrics.mu.Lock()
 	cf.metricsID = cf.metrics.mu.id
 	cf.metrics.mu.id++
 	cf.metrics.mu.Unlock()
+	// TODO(dan): It's very important that we de-register from the metric because
+	// if we orphan an entry in there, our monitoring will lie (say the changefeed
+	// is behind when it may not be). We call this in `close` but that doesn't
+	// always get called when the processor is shut down (especially during crdb
+	// chaos), so here's something that maybe will work some of the times that
+	// close doesn't. This is all very hacky. The real answer is to fix whatever
+	// bugs currently exist in processor shutdown.
 	go func() {
-		// Delete this feed from the MinHighwater metric so it's no longer
-		// considered by the gauge.
-		//
-		// TODO(dan): Ideally this would be done in something like `close` but
-		// there's nothing that's guaranteed to be called when a processor shuts
-		// down.
 		<-ctx.Done()
-		cf.metrics.mu.Lock()
-		delete(cf.metrics.mu.resolved, cf.metricsID)
-		cf.metricsID = -1
-		cf.metrics.mu.Unlock()
+		cf.closeMetrics()
 	}()
 
 	return ctx
@@ -457,6 +481,9 @@ func (cf *changeFrontier) Start(ctx context.Context) context.Context {
 
 func (cf *changeFrontier) close() {
 	if cf.InternalClose() {
+		if cf.metrics != nil {
+			cf.closeMetrics()
+		}
 		if cf.sink != nil {
 			if err := cf.sink.Close(); err != nil {
 				log.Warningf(cf.Ctx, `error closing sink. goroutines may have leaked: %v`, err)
@@ -467,8 +494,19 @@ func (cf *changeFrontier) close() {
 	}
 }
 
+// closeMetrics de-registers from the progress registry that powers
+// `changefeed.max_behind_nanos`. This method is idempotent.
+func (cf *changeFrontier) closeMetrics() {
+	// Delete this feed from the MaxBehindNanos metric so it's no longer
+	// considered by the gauge.
+	cf.metrics.mu.Lock()
+	delete(cf.metrics.mu.resolved, cf.metricsID)
+	cf.metricsID = -1
+	cf.metrics.mu.Unlock()
+}
+
 // Next is part of the RowSource interface.
-func (cf *changeFrontier) Next() (sqlbase.EncDatumRow, *distsqlrun.ProducerMetadata) {
+func (cf *changeFrontier) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	for cf.State == distsqlrun.StateRunning {
 		if !cf.passthroughBuf.IsEmpty() {
 			return cf.passthroughBuf.Pop(), nil
@@ -511,11 +549,26 @@ func (cf *changeFrontier) noteResolvedSpan(d sqlbase.EncDatum) error {
 	}
 	raw, ok := d.Datum.(*tree.DBytes)
 	if !ok {
-		return errors.Errorf(`unexpected datum type %T: %s`, d.Datum, d.Datum)
+		return pgerror.AssertionFailedf(`unexpected datum type %T: %s`, d.Datum, d.Datum)
 	}
 	var resolved jobspb.ResolvedSpan
 	if err := protoutil.Unmarshal([]byte(*raw), &resolved); err != nil {
-		return errors.Wrapf(err, `unmarshalling resolved span: %x`, raw)
+		return pgerror.NewAssertionErrorWithWrappedErrf(err,
+			`unmarshalling resolved span: %x`, raw)
+	}
+
+	// Inserting a timestamp less than the one the changefeed flow started at
+	// could potentially regress the job progress. This is not expected, but it
+	// was a bug at one point, so assert to prevent regressions.
+	//
+	// TODO(dan): This is much more naturally expressed as an assert inside the
+	// job progress update closure, but it currently doesn't pass along the info
+	// we'd need to do it that way.
+	if !resolved.Timestamp.IsEmpty() && resolved.Timestamp.Less(cf.highWaterAtStart) {
+		log.ReportOrPanic(cf.Ctx, &cf.flowCtx.Settings.SV,
+			`got a span level timestamp %s for %s that is less than the initial high-water %s`,
+			log.Safe(resolved.Timestamp), resolved.Span, log.Safe(cf.highWaterAtStart))
+		return nil
 	}
 
 	frontierChanged := cf.sf.Forward(resolved.Span, resolved.Timestamp)
@@ -540,29 +593,31 @@ func (cf *changeFrontier) noteResolvedSpan(d sqlbase.EncDatum) error {
 		}
 	}
 
-	// Potentially log the most behind span in the frontier for debugging.
-	slownessThreshold := 10 * changefeedPollInterval.Get(&cf.flowCtx.Settings.SV)
+	// Potentially log the most behind span in the frontier for debugging. These
+	// two cluster setting values represent the target responsiveness of poller
+	// and range feed. The cluster setting for switching between poller and
+	// rangefeed is only checked at changefeed start/resume, so instead of
+	// switching on it here, just add them. Also add 1 second in case both these
+	// settings are set really low (as they are in unit tests).
+	pollInterval := changefeedPollInterval.Get(&cf.flowCtx.Settings.SV)
+	closedtsInterval := closedts.TargetDuration.Get(&cf.flowCtx.Settings.SV)
+	slownessThreshold := time.Second + 10*(pollInterval+closedtsInterval)
 	frontier := cf.sf.Frontier()
 	now := timeutil.Now()
 	if resolvedBehind := now.Sub(frontier.GoTime()); resolvedBehind > slownessThreshold {
+		description := `sinkless feed`
+		if cf.spec.JobID != 0 {
+			description = fmt.Sprintf("job %d", cf.spec.JobID)
+		}
 		if frontierChanged {
-			if cf.spec.JobID != 0 {
-				log.Infof(cf.Ctx, "job %d new resolved timestamp %s is behind by %s",
-					cf.spec.JobID, frontier, resolvedBehind)
-			} else {
-				log.Infof(cf.Ctx, "sinkless feed new resolved timestamp %s is behind by %s",
-					frontier, resolvedBehind)
-			}
+			log.Infof(cf.Ctx, "%s new resolved timestamp %s is behind by %s",
+				description, frontier, resolvedBehind)
 		}
 		const slowSpanMaxFrequency = 10 * time.Second
 		if now.Sub(cf.lastSlowSpanLog) > slowSpanMaxFrequency {
 			cf.lastSlowSpanLog = now
 			s := cf.sf.peekFrontierSpan()
-			if cf.spec.JobID != 0 {
-				log.Infof(cf.Ctx, "job %d span %s is behind by %s", cf.spec.JobID, s, resolvedBehind)
-			} else {
-				log.Infof(cf.Ctx, "sinkless feed span %s is behind by %s", s, resolvedBehind)
-			}
+			log.Infof(cf.Ctx, "%s span %s is behind by %s", description, s, resolvedBehind)
 		}
 	}
 

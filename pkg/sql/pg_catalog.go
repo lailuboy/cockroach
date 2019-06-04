@@ -21,16 +21,16 @@ import (
 	"fmt"
 	"hash"
 	"hash/fnv"
-	"reflect"
 	"strings"
 	"unicode"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/lib/pq/oid"
 	"github.com/pkg/errors"
 	"golang.org/x/text/collate"
@@ -232,6 +232,8 @@ var pgCatalog = virtualSchema{
 // See: https://www.postgresql.org/docs/9.5/static/catalog-pg-am.html and
 // https://www.postgresql.org/docs/9.6/static/catalog-pg-am.html.
 var pgCatalogAmTable = virtualSchemaTable{
+	comment: `index access methods (incomplete)
+https://www.postgresql.org/docs/9.5/catalog-pg-am.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_am (
 	oid OID,
@@ -309,8 +311,9 @@ CREATE TABLE pg_catalog.pg_am (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-attrdef.html.
 var pgCatalogAttrDefTable = virtualSchemaTable{
+	comment: `column default values
+https://www.postgresql.org/docs/9.5/catalog-pg-attrdef.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_attrdef (
 	oid OID,
@@ -343,8 +346,9 @@ CREATE TABLE pg_catalog.pg_attrdef (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-attribute.html.
 var pgCatalogAttributeTable = virtualSchemaTable{
+	comment: `table columns (incomplete - see also information_schema.columns)
+https://www.postgresql.org/docs/9.5/catalog-pg-attribute.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_attribute (
 	attrelid OID,
@@ -374,20 +378,37 @@ CREATE TABLE pg_catalog.pg_attribute (
 		return forEachTableDesc(ctx, p, dbContext, virtualMany, func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 			// addColumn adds adds either a table or a index column to the pg_attribute table.
 			addColumn := func(column *sqlbase.ColumnDescriptor, attRelID tree.Datum, colID sqlbase.ColumnID) error {
-				colTyp := column.Type.ToDatumType()
+				colTyp := &column.Type
+				attTypMod := int32(-1)
+				if width := colTyp.Width(); width != 0 {
+					switch colTyp.Family() {
+					case types.StringFamily:
+						// Postgres adds 4 to the attypmod for bounded string types, the
+						// var header size.
+						attTypMod = width + 4
+					case types.BitFamily:
+						attTypMod = width
+					case types.DecimalFamily:
+						// attTypMod is calculated by putting the precision in the upper
+						// bits and the scale in the lower bits of a 32-bit int, and adding
+						// 4 (the var header size). We mock this for clients' sake. See
+						// numeric.c.
+						attTypMod = ((colTyp.Precision() << 16) | width) + 4
+					}
+				}
 				return addRow(
-					attRelID,                       // attrelid
-					tree.NewDName(column.Name),     // attname
-					typOid(colTyp),                 // atttypid
-					zeroVal,                        // attstattarget
-					typLen(colTyp),                 // attlen
-					tree.NewDInt(tree.DInt(colID)), // attnum
-					zeroVal,                        // attndims
-					negOneVal,                      // attcacheoff
-					negOneVal,                      // atttypmod
-					tree.DNull,                     // attbyval (see pg_type.typbyval)
-					tree.DNull,                     // attstorage
-					tree.DNull,                     // attalign
+					attRelID,                           // attrelid
+					tree.NewDName(column.Name),         // attname
+					typOid(colTyp),                     // atttypid
+					zeroVal,                            // attstattarget
+					typLen(colTyp),                     // attlen
+					tree.NewDInt(tree.DInt(colID)),     // attnum
+					zeroVal,                            // attndims
+					negOneVal,                          // attcacheoff
+					tree.NewDInt(tree.DInt(attTypMod)), // atttypmod
+					tree.DNull,                         // attbyval (see pg_type.typbyval)
+					tree.DNull,                         // attstorage
+					tree.DNull,                         // attalign
 					tree.MakeDBool(tree.DBool(!column.Nullable)),          // attnotnull
 					tree.MakeDBool(tree.DBool(column.DefaultExpr != nil)), // atthasdef
 					tree.DBoolFalse,    // attisdropped
@@ -421,8 +442,9 @@ CREATE TABLE pg_catalog.pg_attribute (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-auth-members.html.
 var pgCatalogAuthMembersTable = virtualSchemaTable{
+	comment: `role membership
+https://www.postgresql.org/docs/9.5/catalog-pg-auth-members.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_auth_members (
 	roleid OID,
@@ -453,8 +475,9 @@ var (
 	relPersistencePermanent = tree.NewDString("p")
 )
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-class.html.
 var pgCatalogClassTable = virtualSchemaTable{
+	comment: `tables and relation-like objects (incomplete - see also information_schema.tables/sequences/views)
+https://www.postgresql.org/docs/9.5/catalog-pg-class.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_class (
 	oid OID,
@@ -572,8 +595,9 @@ CREATE TABLE pg_catalog.pg_class (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-collation.html.
 var pgCatalogCollationTable = virtualSchemaTable{
+	comment: `available collations (incomplete)
+https://www.postgresql.org/docs/9.5/catalog-pg-collation.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_collation (
   oid OID,
@@ -646,8 +670,9 @@ var (
 	}
 )
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-constraint.html.
 var pgCatalogConstraintTable = virtualSchemaTable{
+	comment: `table constraints (incomplete - see also information_schema.table_constraints)
+https://www.postgresql.org/docs/9.5/catalog-pg-constraint.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_constraint (
 	oid OID,
@@ -742,7 +767,7 @@ CREATE TABLE pg_catalog.pg_constraint (
 					}
 					columnIDs := con.Index.ColumnIDs
 					if int(con.FK.SharedPrefixLen) > len(columnIDs) {
-						return pgerror.NewAssertionErrorf(
+						return pgerror.AssertionFailedf(
 							"foreign key %q's SharedPrefixLen (%d) is greater than the columns in the index (%d)",
 							con.FK.Name,
 							con.FK.SharedPrefixLen,
@@ -854,8 +879,9 @@ func colIDArrayToVector(arr []sqlbase.ColumnID) (tree.Datum, error) {
 	return tree.NewDIntVectorFromDArray(tree.MustBeDArray(dArr)), nil
 }
 
-// See https://www.postgresql.org/docs/9.6/static/catalog-pg-database.html.
 var pgCatalogDatabaseTable = virtualSchemaTable{
+	comment: `available databases (incomplete)
+https://www.postgresql.org/docs/9.5/catalog-pg-database.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_database (
 	oid OID,
@@ -913,8 +939,6 @@ var (
 	pgClassTableName       = tree.MakeTableNameWithSchema("", tree.Name(pgCatalogName), tree.Name("pg_class"))
 )
 
-// See https://www.postgresql.org/docs/9.6/static/catalog-pg-depend.html.
-//
 // pg_depend is a fairly complex table that details many different kinds of
 // relationships between database objects. We do not implement the vast
 // majority of this table, as it is mainly used by pgjdbc to address a
@@ -924,6 +948,8 @@ var (
 // provide those rows in pg_depend that track the dependency of foreign key
 // constraints on their supporting index entries in pg_class.
 var pgCatalogDependTable = virtualSchemaTable{
+	comment: `dependency relationships (incomplete)
+https://www.postgresql.org/docs/9.5/catalog-pg-depend.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_depend (
   classid OID,
@@ -987,8 +1013,26 @@ CREATE TABLE pg_catalog.pg_depend (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-description.html.
+// getComments returns all comments in the database. A comment is represented
+// as a datum row, containing object id, sub id (column id in the case of
+// columns), comment text, and comment type (keys.FooCommentType).
+func getComments(ctx context.Context, p *planner) ([]tree.Datums, error) {
+	return p.extendedEvalCtx.ExecCfg.InternalExecutor.Query(
+		ctx,
+		"select-comments",
+		p.EvalContext().Txn,
+		`SELECT COALESCE(pc.object_id, sc.object_id) AS object_id,
+              COALESCE(pc.sub_id, sc.sub_id) AS sub_id,
+              COALESCE(pc.comment, sc.comment) AS comment,
+              COALESCE(pc.type, sc.type) AS type
+         FROM (SELECT * FROM system.comments) AS sc
+    FULL JOIN (SELECT * FROM crdb_internal.predefined_comments) AS pc
+           ON (pc.object_id = sc.object_id AND pc.sub_id = sc.sub_id AND pc.type = sc.type)`)
+}
+
 var pgCatalogDescriptionTable = virtualSchemaTable{
+	comment: `object comments
+https://www.postgresql.org/docs/9.5/catalog-pg-description.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_description (
 	objoid OID,
@@ -1001,75 +1045,74 @@ CREATE TABLE pg_catalog.pg_description (
 		p *planner,
 		dbContext *DatabaseDescriptor,
 		addRow func(...tree.Datum) error) error {
-		comments, err := p.extendedEvalCtx.ExecCfg.InternalExecutor.Query(
-			ctx,
-			"select-comments",
-			p.EvalContext().Txn,
-			"SELECT object_id, sub_id, comment FROM system.comments")
+
+		// This is less efficient than it has to be - if we see performance problems
+		// here, we can push the filter into the query that getComments runs,
+		// instead of filtering client-side below.
+		comments, err := getComments(ctx, p)
 		if err != nil {
 			return err
 		}
-
-		commentMap := make(map[tree.DInt]tree.Datums)
 		for _, comment := range comments {
-			id := *comment[0].(*tree.DInt)
-			commentMap[id] = comment
-		}
-
-		err = forEachTableDescWithTableLookup(
-			ctx,
-			p,
-			dbContext,
-			hideVirtual,
-			func(
-				db *sqlbase.DatabaseDescriptor,
-				scName string,
-				table *sqlbase.TableDescriptor,
-				tableLookup tableLookupFn) error {
-				if comment, ok := commentMap[tree.DInt(table.ID)]; ok {
-					return addRow(
-						defaultOid(table.ID),
-						oidZero,
-						comment[1],
-						comment[2])
-				}
-
-				return nil
-			})
-		if err != nil {
-			return err
-		}
-
-		return forEachDatabaseDesc(ctx, p, nil /*all databases*/, func(db *sqlbase.DatabaseDescriptor) error {
-			if comment, ok := commentMap[tree.DInt(db.ID)]; ok {
-				return addRow(
-					defaultOid(db.ID),
-					oidZero,
-					comment[1],
-					comment[2])
+			commentType := tree.MustBeDInt(comment[3])
+			classOid := oidZero
+			switch commentType {
+			case keys.DatabaseCommentType:
+				// Database comments are exported in pg_shdescription.
+				continue
+			case keys.TableCommentType, keys.ColumnCommentType:
+				classOid = tree.NewDOid(sqlbase.PgCatalogClassTableID)
 			}
-
-			return nil
-		})
+			objID := sqlbase.ID(tree.MustBeDInt(comment[0]))
+			if err := addRow(
+				defaultOid(objID),
+				classOid,
+				comment[1],
+				comment[2]); err != nil {
+				return err
+			}
+		}
+		return nil
 	},
 }
 
-// See: https://www.postgresql.org/docs/current/static/catalog-pg-shdescription.html.
 var pgCatalogSharedDescriptionTable = virtualSchemaTable{
+	comment: `shared object comments
+https://www.postgresql.org/docs/9.5/catalog-pg-shdescription.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_shdescription (
 	objoid OID,
 	classoid OID,
 	description STRING
 )`,
-	populate: func(_ context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		// Comments on database objects are not currently supported.
+	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		// See comment above - could make this more efficient if necessary.
+		comments, err := getComments(ctx, p)
+		if err != nil {
+			return err
+		}
+		for _, comment := range comments {
+			commentType := tree.MustBeDInt(comment[3])
+			if commentType != keys.DatabaseCommentType {
+				// Only database comments are exported in this table.
+				continue
+			}
+			classOid := tree.NewDOid(sqlbase.PgCatalogDatabaseTableID)
+			objID := sqlbase.ID(tree.MustBeDInt(comment[0]))
+			if err := addRow(
+				defaultOid(objID),
+				classOid,
+				comment[2]); err != nil {
+				return err
+			}
+		}
 		return nil
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-enum.html.
 var pgCatalogEnumTable = virtualSchemaTable{
+	comment: `enum types and labels (empty - feature does not exist)
+https://www.postgresql.org/docs/9.5/catalog-pg-enum.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_enum (
   oid OID,
@@ -1083,10 +1126,12 @@ CREATE TABLE pg_catalog.pg_enum (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-extension.html.
 var pgCatalogExtensionTable = virtualSchemaTable{
+	comment: `installed extensions (empty - feature does not exist)
+https://www.postgresql.org/docs/9.5/catalog-pg-extension.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_extension (
+  oid OID,
   extname NAME,
   extowner OID,
   extnamespace OID,
@@ -1101,8 +1146,9 @@ CREATE TABLE pg_catalog.pg_extension (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-foreign-data-wrapper.html.
 var pgCatalogForeignDataWrapperTable = virtualSchemaTable{
+	comment: `foreign data wrappers (empty - feature does not exist)
+https://www.postgresql.org/docs/9.5/catalog-pg-foreign-data-wrapper.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_foreign_data_wrapper (
   oid OID,
@@ -1119,8 +1165,9 @@ CREATE TABLE pg_catalog.pg_foreign_data_wrapper (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-foreign-server.html.
 var pgCatalogForeignServerTable = virtualSchemaTable{
+	comment: `foreign servers (empty - feature does not exist)
+https://www.postgresql.org/docs/9.5/catalog-pg-foreign-server.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_foreign_server (
   oid OID,
@@ -1138,8 +1185,9 @@ CREATE TABLE pg_catalog.pg_foreign_server (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-foreign-table.html.
 var pgCatalogForeignTableTable = virtualSchemaTable{
+	comment: `foreign tables (empty  - feature does not exist)
+https://www.postgresql.org/docs/9.5/catalog-pg-foreign-table.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_foreign_table (
   ftrelid OID,
@@ -1172,8 +1220,9 @@ func makeZeroedIntVector(size int) (tree.Datum, error) {
 	return tree.NewDIntVectorFromDArray(intArray), nil
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-index.html.
 var pgCatalogIndexTable = virtualSchemaTable{
+	comment: `indexes (incomplete)
+https://www.postgresql.org/docs/9.5/catalog-pg-index.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_index (
     indexrelid OID,
@@ -1217,7 +1266,7 @@ CREATE TABLE pg_catalog.pg_index (
 						if err != nil {
 							return err
 						}
-						if err := collationOids.Append(typColl(col.Type.ToDatumType(), h)); err != nil {
+						if err := collationOids.Append(typColl(&col.Type, h)); err != nil {
 							return err
 						}
 					}
@@ -1258,11 +1307,11 @@ CREATE TABLE pg_catalog.pg_index (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/view-pg-indexes.html.
-//
-// Note that crdb_oid is an extension of the schema to much more easily map
-// index OIDs to the corresponding index definition.
 var pgCatalogIndexesTable = virtualSchemaTable{
+	comment: `index creation statements
+https://www.postgresql.org/docs/9.5/view-pg-indexes.html`,
+	// Note: crdb_oid is an extension of the schema to much more easily map
+	// index OIDs to the corresponding index definition.
 	schema: `
 CREATE TABLE pg_catalog.pg_indexes (
 	crdb_oid OID,
@@ -1354,8 +1403,9 @@ func indexDefFromDescriptor(
 	return indexDef.String(), nil
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-inherits.html.
 var pgCatalogInheritsTable = virtualSchemaTable{
+	comment: `table inheritance hierarchy (empty - feature does not exist)
+https://www.postgresql.org/docs/9.5/catalog-pg-inherits.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_inherits (
 	inhrelid OID,
@@ -1368,8 +1418,9 @@ CREATE TABLE pg_catalog.pg_inherits (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-language.html.
 var pgCatalogLanguageTable = virtualSchemaTable{
+	comment: `available languages (empty - feature does not exist)
+https://www.postgresql.org/docs/9.5/catalog-pg-language.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_language (
 	oid OID,
@@ -1388,8 +1439,9 @@ CREATE TABLE pg_catalog.pg_language (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-namespace.html.
 var pgCatalogNamespaceTable = virtualSchemaTable{
+	comment: `available namespaces (incomplete; namespaces and databases are congruent in CockroachDB)
+https://www.postgresql.org/docs/9.5/catalog-pg-namespace.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_namespace (
 	oid OID,
@@ -1421,8 +1473,9 @@ var (
 	_ = postfixKind
 )
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-operator.html.
 var pgCatalogOperatorTable = virtualSchemaTable{
+	comment: `operators (incomplete)
+https://www.postgresql.org/docs/9.5/catalog-pg-operator.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_operator (
 	oid OID,
@@ -1535,8 +1588,9 @@ var (
 	_ = proArgModeTable
 )
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-proc.html.
 var pgCatalogProcTable = virtualSchemaTable{
+	comment: `built-in functions (incomplete)
+https://www.postgresql.org/docs/9.5/catalog-pg-proc.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_proc (
 	oid OID,
@@ -1596,17 +1650,17 @@ CREATE TABLE pg_catalog.pg_proc (
 					isRetSet := false
 					if fixedRetType := builtin.FixedReturnType(); fixedRetType != nil {
 						var retOid oid.Oid
-						if t, ok := fixedRetType.(types.TTuple); ok && builtin.Generator != nil {
+						if fixedRetType.Family() == types.TupleFamily && builtin.Generator != nil {
 							isRetSet = true
 							// Functions returning tables with zero, or more than one
 							// columns are marked to return "anyelement"
 							// (e.g. `unnest`)
 							retOid = oid.T_anyelement
-							if len(t.Types) == 1 {
+							if len(fixedRetType.TupleContents()) == 1 {
 								// Functions returning tables with exactly one column
 								// are marked to return the type of that column
 								// (e.g. `generate_series`).
-								retOid = t.Types[0].Oid()
+								retOid = fixedRetType.TupleContents()[0].Oid()
 							}
 						} else {
 							retOid = fixedRetType.Oid()
@@ -1692,8 +1746,9 @@ CREATE TABLE pg_catalog.pg_proc (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-range.html.
 var pgCatalogRangeTable = virtualSchemaTable{
+	comment: `range types (empty - feature does not exist)
+https://www.postgresql.org/docs/9.5/catalog-pg-range.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_range (
 	rngtypid OID,
@@ -1711,8 +1766,9 @@ CREATE TABLE pg_catalog.pg_range (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-rewrite.html.
 var pgCatalogRewriteTable = virtualSchemaTable{
+	comment: `rewrite rules (empty - feature does not exist)
+https://www.postgresql.org/docs/9.5/catalog-pg-rewrite.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_rewrite (
 	oid OID,
@@ -1730,8 +1786,9 @@ CREATE TABLE pg_catalog.pg_rewrite (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/view-pg-roles.html.
 var pgCatalogRolesTable = virtualSchemaTable{
+	comment: `database roles
+https://www.postgresql.org/docs/9.5/view-pg-roles.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_roles (
 	oid OID,
@@ -1779,8 +1836,9 @@ CREATE TABLE pg_catalog.pg_roles (
 	},
 }
 
-// See: https://www.postgresql.org/docs/10/static/catalog-pg-sequence.html.
 var pgCatalogSequencesTable = virtualSchemaTable{
+	comment: `sequences (see also information_schema.sequences)
+https://www.postgresql.org/docs/9.5/catalog-pg-sequence.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_sequence (
 	seqrelid OID,
@@ -1818,8 +1876,9 @@ var (
 	settingsCtxUser = tree.NewDString("user")
 )
 
-// See: https://www.postgresql.org/docs/9.6/static/view-pg-settings.html.
 var pgCatalogSettingsTable = virtualSchemaTable{
+	comment: `session variables (incomplete)
+https://www.postgresql.org/docs/9.5/catalog-pg-settings.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_settings (
     name STRING,
@@ -1890,8 +1949,9 @@ CREATE TABLE pg_catalog.pg_settings (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/view-pg-tables.html.
 var pgCatalogTablesTable = virtualSchemaTable{
+	comment: `tables summary (see also information_schema.tables, pg_catalog.pg_class)
+https://www.postgresql.org/docs/9.5/view-pg-tables.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_tables (
 	schemaname NAME,
@@ -1926,8 +1986,9 @@ CREATE TABLE pg_catalog.pg_tables (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-tablespace.html.
 var pgCatalogTablespaceTable = virtualSchemaTable{
+	comment: `available tablespaces (incomplete; concept inapplicable to CockroachDB)
+https://www.postgresql.org/docs/9.5/catalog-pg-tablespace.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_tablespace (
 	oid OID,
@@ -1949,8 +2010,9 @@ CREATE TABLE pg_catalog.pg_tablespace (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-trigger.html.
 var pgCatalogTriggerTable = virtualSchemaTable{
+	comment: `triggers (empty - feature does not exist)
+https://www.postgresql.org/docs/9.5/catalog-pg-trigger.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_trigger (
 	oid OID,
@@ -2016,13 +2078,13 @@ var (
 	_ = typCategoryGeometric
 	_ = typCategoryRange
 	_ = typCategoryBitString
-	_ = typCategoryUnknown
 
 	typDelim = tree.NewDString(",")
 )
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-type.html.
 var pgCatalogTypeTable = virtualSchemaTable{
+	comment: `scalar types (incomplete)
+https://www.postgresql.org/docs/9.5/catalog-pg-type.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_type (
 	oid OID,
@@ -2068,30 +2130,31 @@ CREATE TABLE pg_catalog.pg_type (
 				typElem := oidZero
 				typArray := oidZero
 				builtinPrefix := builtins.PGIOBuiltinPrefix(typ)
-				if cat == typCategoryArray {
-					switch typ {
-					case types.IntVector:
-						// IntVector needs a special case because its a special snowflake
-						// type. It's just like an Int2Array, but it has its own OID. We
-						// can't just wrap our Int2Array type in an OID wrapper, though,
-						// because Int2Array is not an exported, first-class type - it's an
-						// input-only type that translates immediately to int8array. This
-						// would go away if we decided to export Int2Array as a real type.
+				if typ.Family() == types.ArrayFamily {
+					switch typ.Oid() {
+					case oid.T_int2vector:
+						// IntVector needs a special case because it's a special snowflake
+						// type that behaves in some ways like a scalar type and in others
+						// like an array type.
 						typElem = tree.NewDOid(tree.DInt(oid.T_int2))
-					case types.OidVector:
+						typArray = tree.NewDOid(tree.DInt(oid.T__int2vector))
+					case oid.T_oidvector:
 						// Same story as above for OidVector.
 						typElem = tree.NewDOid(tree.DInt(oid.T_oid))
+						typArray = tree.NewDOid(tree.DInt(oid.T__oidvector))
+					case oid.T_anyarray:
+						// AnyArray does not use a prefix or element type.
 					default:
 						builtinPrefix = "array_"
-						typElem = tree.NewDOid(tree.DInt(types.UnwrapType(typ).(types.TArray).Typ.Oid()))
+						typElem = tree.NewDOid(tree.DInt(typ.ArrayContents().Oid()))
 					}
 				} else {
-					typArray = tree.NewDOid(tree.DInt(types.TArray{Typ: typ}.Oid()))
+					typArray = tree.NewDOid(tree.DInt(types.MakeArray(typ).Oid()))
 				}
 				if cat == typCategoryPseudo {
 					typType = typTypePseudo
 				}
-				typname := strings.ToLower(oid.TypeName[o])
+				typname := typ.PGName()
 
 				if err := addRow(
 					tree.NewDOid(tree.DInt(o)), // oid
@@ -2137,8 +2200,9 @@ CREATE TABLE pg_catalog.pg_type (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/view-pg-user.html.
 var pgCatalogUserTable = virtualSchemaTable{
+	comment: `database users
+https://www.postgresql.org/docs/9.5/view-pg-user.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_user (
 	usename NAME,
@@ -2174,8 +2238,9 @@ CREATE TABLE pg_catalog.pg_user (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/catalog-pg-user-mapping.html.
 var pgCatalogUserMappingTable = virtualSchemaTable{
+	comment: `local to remote user mapping (empty - feature does not exist)
+https://www.postgresql.org/docs/9.5/catalog-pg-user-mapping.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_user_mapping (
 	oid OID,
@@ -2190,8 +2255,9 @@ CREATE TABLE pg_catalog.pg_user_mapping (
 	},
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/monitoring-stats.html#PG-STAT-ACTIVITY-VIEW
 var pgCatalogStatActivityTable = virtualSchemaTable{
+	comment: `backend access statistics (empty - monitoring works differently in CockroachDB)
+https://www.postgresql.org/docs/9.6/monitoring-stats.html#PG-STAT-ACTIVITY-VIEW`,
 	schema: `
 CREATE TABLE pg_catalog.pg_stat_activity (
 	datid OID,
@@ -2220,9 +2286,9 @@ CREATE TABLE pg_catalog.pg_stat_activity (
 	},
 }
 
-//
-// See https://www.postgresql.org/docs/current/static/catalog-pg-seclabel.html
 var pgCatalogSecurityLabelTable = virtualSchemaTable{
+	comment: `security labels (empty - feature does not exist)
+https://www.postgresql.org/docs/9.5/catalog-pg-seclabel.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_seclabel (
 	objoid OID,
@@ -2237,8 +2303,9 @@ CREATE TABLE pg_catalog.pg_seclabel (
 	},
 }
 
-// See https://www.postgresql.org/docs/current/static/catalog-pg-shseclabel.html
 var pgCatalogSharedSecurityLabelTable = virtualSchemaTable{
+	comment: `shared security labels (empty - feature not supported)
+https://www.postgresql.org/docs/9.5/catalog-pg-shseclabel.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_shseclabel (
 	objoid OID,
@@ -2255,18 +2322,18 @@ CREATE TABLE pg_catalog.pg_shseclabel (
 // typOid is the only OID generation approach that does not use oidHasher, because
 // object identifiers for types are not arbitrary, but instead need to be kept in
 // sync with Postgres.
-func typOid(typ types.T) tree.Datum {
+func typOid(typ *types.T) tree.Datum {
 	return tree.NewDOid(tree.DInt(typ.Oid()))
 }
 
-func typLen(typ types.T) *tree.DInt {
+func typLen(typ *types.T) *tree.DInt {
 	if sz, variable := tree.DatumTypeSize(typ); !variable {
 		return tree.NewDInt(tree.DInt(sz))
 	}
 	return negOneVal
 }
 
-func typByVal(typ types.T) tree.Datum {
+func typByVal(typ *types.T) tree.Datum {
 	_, variable := tree.DatumTypeSize(typ)
 	return tree.MakeDBool(tree.DBool(!variable))
 }
@@ -2274,51 +2341,57 @@ func typByVal(typ types.T) tree.Datum {
 // typColl returns the collation OID for a given type.
 // The default collation is en-US, which is equivalent to but spelled
 // differently than the default database collation, en_US.utf8.
-func typColl(typ types.T, h oidHasher) tree.Datum {
-	if typ.FamilyEqual(types.Any) {
+func typColl(typ *types.T, h oidHasher) tree.Datum {
+	switch typ.Family() {
+	case types.AnyFamily:
 		return oidZero
-	} else if typ.Equivalent(types.String) || typ.Equivalent(types.TArray{Typ: types.String}) {
+	case types.StringFamily:
 		return h.CollationOid(defaultCollationTag)
-	} else if typ.FamilyEqual(types.FamCollatedString) {
-		return h.CollationOid(typ.(types.TCollatedString).Locale)
+	case types.CollatedStringFamily:
+		return h.CollationOid(typ.Locale())
+	}
+
+	if typ.Equivalent(types.StringArray) {
+		return h.CollationOid(defaultCollationTag)
 	}
 	return oidZero
 }
 
 // This mapping should be kept sync with PG's categorization.
-var datumToTypeCategory = map[reflect.Type]*tree.DString{
-	reflect.TypeOf(types.Any):         typCategoryPseudo,
-	reflect.TypeOf(types.BitArray):    typCategoryBitString,
-	reflect.TypeOf(types.Bool):        typCategoryBoolean,
-	reflect.TypeOf(types.Bytes):       typCategoryUserDefined,
-	reflect.TypeOf(types.Date):        typCategoryDateTime,
-	reflect.TypeOf(types.Time):        typCategoryDateTime,
-	reflect.TypeOf(types.Float):       typCategoryNumeric,
-	reflect.TypeOf(types.Int):         typCategoryNumeric,
-	reflect.TypeOf(types.Interval):    typCategoryTimespan,
-	reflect.TypeOf(types.JSON):        typCategoryUserDefined,
-	reflect.TypeOf(types.Decimal):     typCategoryNumeric,
-	reflect.TypeOf(types.String):      typCategoryString,
-	reflect.TypeOf(types.Timestamp):   typCategoryDateTime,
-	reflect.TypeOf(types.TimestampTZ): typCategoryDateTime,
-	reflect.TypeOf(types.FamTuple):    typCategoryPseudo,
-	reflect.TypeOf(types.Oid):         typCategoryNumeric,
-	reflect.TypeOf(types.UUID):        typCategoryUserDefined,
-	reflect.TypeOf(types.INet):        typCategoryNetworkAddr,
+var datumToTypeCategory = map[types.Family]*tree.DString{
+	types.AnyFamily:         typCategoryPseudo,
+	types.BitFamily:         typCategoryBitString,
+	types.BoolFamily:        typCategoryBoolean,
+	types.BytesFamily:       typCategoryUserDefined,
+	types.DateFamily:        typCategoryDateTime,
+	types.TimeFamily:        typCategoryDateTime,
+	types.FloatFamily:       typCategoryNumeric,
+	types.IntFamily:         typCategoryNumeric,
+	types.IntervalFamily:    typCategoryTimespan,
+	types.JsonFamily:        typCategoryUserDefined,
+	types.DecimalFamily:     typCategoryNumeric,
+	types.StringFamily:      typCategoryString,
+	types.TimestampFamily:   typCategoryDateTime,
+	types.TimestampTZFamily: typCategoryDateTime,
+	types.ArrayFamily:       typCategoryArray,
+	types.TupleFamily:       typCategoryPseudo,
+	types.OidFamily:         typCategoryNumeric,
+	types.UuidFamily:        typCategoryUserDefined,
+	types.INetFamily:        typCategoryNetworkAddr,
+	types.UnknownFamily:     typCategoryUnknown,
 }
 
-func typCategory(typ types.T) tree.Datum {
-	if typ.FamilyEqual(types.FamArray) {
-		if typ == types.AnyArray {
-			return typCategoryPseudo
-		}
-		return typCategoryArray
+func typCategory(typ *types.T) tree.Datum {
+	// Special case ARRAY of ANY.
+	if typ.Family() == types.ArrayFamily && typ.ArrayContents().Family() == types.AnyFamily {
+		return typCategoryPseudo
 	}
-	return datumToTypeCategory[reflect.TypeOf(types.UnwrapType(typ))]
+	return datumToTypeCategory[typ.Family()]
 }
 
-// See: https://www.postgresql.org/docs/9.6/static/view-pg-views.html.
 var pgCatalogViewsTable = virtualSchemaTable{
+	comment: `view definitions (incomplete - see also information_schema.views)
+https://www.postgresql.org/docs/9.5/view-pg-views.html`,
 	schema: `
 CREATE TABLE pg_catalog.pg_views (
 	schemaname NAME,

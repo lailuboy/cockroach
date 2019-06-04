@@ -69,30 +69,49 @@ var _ engine.SimpleIterator = &MVCCIncrementalIterator{}
 
 // IterOptions bundles options for NewMVCCIncrementalIterator.
 type IterOptions struct {
-	StartTime  hlc.Timestamp
-	EndTime    hlc.Timestamp
-	UpperBound roachpb.Key
-	WithStats  bool
+	StartTime                           hlc.Timestamp
+	EndTime                             hlc.Timestamp
+	UpperBound                          roachpb.Key
+	WithStats                           bool
+	EnableTimeBoundIteratorOptimization bool
 }
 
 // NewMVCCIncrementalIterator creates an MVCCIncrementalIterator with the
 // specified engine and options.
 func NewMVCCIncrementalIterator(e engine.Reader, opts IterOptions) *MVCCIncrementalIterator {
+	io := engine.IterOptions{
+		UpperBound: opts.UpperBound,
+		WithStats:  opts.WithStats,
+	}
+
+	// Time-bound iterators only make sense to use if the start time is set.
+	var sanityIter engine.Iterator
+	if opts.EnableTimeBoundIteratorOptimization && !opts.StartTime.IsEmpty() {
+		// The call to startTime.Next() converts our exclusive start bound into the
+		// inclusive start bound that MinTimestampHint expects. This is strictly a
+		// performance optimization; omitting the call would still return correct
+		// results.
+		io.MinTimestampHint = opts.StartTime.Next()
+		io.MaxTimestampHint = opts.EndTime
+		// It is necessary for correctness that sanityIter be created before iter.
+		// This is because the provided Reader may not be a consistent snapshot, so
+		// the two could end up observing different information. The hack around
+		// sanityCheckMetadataKey only works properly if all possible discrepancies
+		// between the two iterators lead to intents and values falling outside of
+		// the timestamp range **from iter's perspective**. This allows us to simply
+		// ignore discrepancies that we notice in advance(). See #34819.
+		sanityIter = e.NewIterator(engine.IterOptions{
+			UpperBound: opts.UpperBound,
+		})
+	}
+
 	return &MVCCIncrementalIterator{
 		e:          e,
 		upperBound: opts.UpperBound,
-		iter: e.NewIterator(engine.IterOptions{
-			// The call to startTime.Next() converts our exclusive start bound into
-			// the inclusive start bound that MinTimestampHint expects. This is
-			// strictly a performance optimization; omitting the call would still
-			// return correct results.
-			MinTimestampHint: opts.StartTime.Next(),
-			MaxTimestampHint: opts.EndTime,
-			UpperBound:       opts.UpperBound,
-			WithStats:        opts.WithStats,
-		}),
-		startTime: opts.StartTime,
-		endTime:   opts.EndTime,
+		iter:       e.NewIterator(io),
+		startTime:  opts.StartTime,
+		endTime:    opts.EndTime,
+		sanityIter: sanityIter,
 	}
 }
 
@@ -215,9 +234,9 @@ func (i *MVCCIncrementalIterator) advance() {
 // in `advance` for a time-bound iterator bug.
 func (i *MVCCIncrementalIterator) sanityCheckMetadataKey() ([]byte, bool, error) {
 	if i.sanityIter == nil {
-		// The common case is that we'll won't need the sanityIter for a given
-		// MVCCIncrementalIterator, so create it lazily.
-		i.sanityIter = i.e.NewIterator(engine.IterOptions{UpperBound: i.upperBound})
+		// If sanityIter is not set, it's because we're not using time-bound
+		// iterator and we don't need the sanity check.
+		return i.iter.UnsafeValue(), true, nil
 	}
 	unsafeKey := i.iter.UnsafeKey()
 	i.sanityIter.Seek(unsafeKey)

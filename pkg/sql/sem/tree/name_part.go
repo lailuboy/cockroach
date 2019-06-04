@@ -50,11 +50,17 @@ func NameString(s string) string {
 	return ((*Name)(&s)).String()
 }
 
-// ErrNameString escapes an identifier stored a string to a SQL
+// ErrNameStringP escapes an identifier stored a string to a SQL
 // identifier suitable for printing in error messages, avoiding a heap
 // allocation.
-func ErrNameString(s *string) string {
+func ErrNameStringP(s *string) string {
 	return ErrString(((*Name)(s)))
+}
+
+// ErrNameString escapes an identifier stored a string to a SQL
+// identifier suitable for printing in error messages.
+func ErrNameString(s string) string {
+	return ErrString(((*Name)(&s)))
 }
 
 // Normalize normalizes to lowercase and Unicode Normalization Form C
@@ -215,14 +221,23 @@ type UnresolvedObjectName struct {
 	// however that Parts does not have a meaningful "length"; its actual length
 	// (the number of parts specified) is populated in NumParts above.
 	Parts [3]string
+
+	// UnresolvedObjectName cam be annotated with a *TableName.
+	AnnotatedNode
 }
+
+// UnresolvedObjectName implements TableExpr.
+func (*UnresolvedObjectName) tableExpr() {}
 
 // NewUnresolvedObjectName creates an unresolved object name, verifying that it
 // is well-formed.
-func NewUnresolvedObjectName(numParts int, parts [3]string) (*UnresolvedObjectName, error) {
+func NewUnresolvedObjectName(
+	numParts int, parts [3]string, annotationIdx AnnotationIdx,
+) (*UnresolvedObjectName, error) {
 	u := &UnresolvedObjectName{
-		NumParts: numParts,
-		Parts:    parts,
+		NumParts:      numParts,
+		Parts:         parts,
+		AnnotatedNode: AnnotatedNode{AnnIdx: annotationIdx},
 	}
 	if u.NumParts < 1 {
 		return nil, newInvTableNameError(u)
@@ -243,8 +258,36 @@ func NewUnresolvedObjectName(numParts int, parts [3]string) (*UnresolvedObjectNa
 	return u, nil
 }
 
+// Resolved returns the resolved name in the annotation for this node (or nil if
+// there isn't one).
+func (u *UnresolvedObjectName) Resolved(ann *Annotations) *TableName {
+	r := u.GetAnnotation(ann)
+	if r == nil {
+		return nil
+	}
+	return r.(*TableName)
+}
+
 // Format implements the NodeFormatter interface.
 func (u *UnresolvedObjectName) Format(ctx *FmtCtx) {
+	// If we want to format the corresponding resolved name, look it up in the
+	// annotation.
+	if ctx.HasFlags(FmtAlwaysQualifyTableNames) || ctx.tableNameFormatter != nil {
+		if ctx.tableNameFormatter != nil && ctx.ann == nil {
+			// TODO(radu): this is a temporary hack while we transition to using
+			// unresolved names everywhere. We will need to revisit and see if we need
+			// to switch to (or add) an UnresolvedObjectName formatter.
+			tn := u.ToTableName()
+			tn.Format(ctx)
+			return
+		}
+
+		if n := u.Resolved(ctx.ann); n != nil {
+			n.Format(ctx)
+			return
+		}
+	}
+
 	for i := u.NumParts; i > 0; i-- {
 		// The first part to print is the last item in u.Parts. It is also
 		// a potentially restricted name to disambiguate from keywords in

@@ -37,7 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -154,7 +153,7 @@ var schemas = [...]string{
 		s_remote_cnt integer,
 		s_data       varchar(50),
 		primary key (s_w_id, s_i_id),
-		index (s_i_id)
+		index stock_item_fk_idx (s_i_id)
 	)
 	`,
 	`
@@ -171,8 +170,8 @@ var schemas = [...]string{
 		ol_amount       decimal(6,2),
 		ol_dist_info    char(24),
 		primary key (ol_w_id, ol_d_id, ol_o_id DESC, ol_number),
-		index order_line_fk (ol_supply_w_id, ol_d_id),
-		foreign key (ol_supply_w_id, ol_d_id) references stock (s_w_id, s_i_id)
+		index order_line_fk (ol_supply_w_id, ol_i_id),
+		foreign key (ol_supply_w_id, ol_i_id) references stock (s_w_id, s_i_id)
 	)
 	`,
 	`
@@ -522,7 +521,7 @@ func (h *harness) prepareUsingAPI(tb testing.TB) {
 			tb.Fatalf("%v", err)
 		}
 
-		id := types.PlaceholderIdx(i)
+		id := tree.PlaceholderIdx(i)
 		typ, _ := h.semaCtx.Placeholders.ValueType(id)
 		texpr, err := sqlbase.SanitizeVarFreeExpr(
 			parg,
@@ -538,6 +537,7 @@ func (h *harness) prepareUsingAPI(tb testing.TB) {
 		h.semaCtx.Placeholders.Values[i] = texpr
 	}
 	h.evalCtx.Placeholders = &h.semaCtx.Placeholders
+	h.evalCtx.Annotations = &h.semaCtx.Annotations
 }
 
 func (h *harness) runUsingAPI(tb testing.TB, bmType BenchmarkType, usePrepared bool) {
@@ -576,7 +576,9 @@ func (h *harness) runUsingAPI(tb testing.TB, bmType BenchmarkType, usePrepared b
 	if usePrepared && !h.prepMemo.HasPlaceholders() {
 		execMemo = h.prepMemo
 	} else {
-		h.optimizer.Optimize()
+		if _, err := h.optimizer.Optimize(); err != nil {
+			panic(err)
+		}
 		execMemo = h.optimizer.Memo()
 	}
 

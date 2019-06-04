@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
 )
 
@@ -59,6 +60,7 @@ type registration struct {
 	span             roachpb.Span
 	catchupIter      engine.SimpleIterator
 	catchupTimestamp hlc.Timestamp
+	metrics          *Metrics
 
 	// Output.
 	stream Stream
@@ -89,12 +91,14 @@ func newRegistration(
 	startTS hlc.Timestamp,
 	catchupIter engine.SimpleIterator,
 	bufferSz int,
+	metrics *Metrics,
 	stream Stream,
 	errC chan<- *roachpb.Error,
 ) registration {
 	r := registration{
 		span:             span,
 		catchupIter:      catchupIter,
+		metrics:          metrics,
 		stream:           stream,
 		errC:             errC,
 		buf:              make(chan *roachpb.RangeFeedEvent, bufferSz),
@@ -206,9 +210,11 @@ func (r *registration) runCatchupScan() error {
 	if r.catchupIter == nil {
 		return nil
 	}
+	start := timeutil.Now()
 	defer func() {
 		r.catchupIter.Close()
 		r.catchupIter = nil
+		r.metrics.RangeFeedCatchupScanNanos.Inc(timeutil.Since(start).Nanoseconds())
 	}()
 
 	var a bufalloc.ByteAllocator
@@ -359,8 +365,11 @@ func (reg *registry) PublishToOverlapping(span roachpb.Span, event *roachpb.Rang
 		// timestamps equal to or greater than the value's timestamp.
 		minTS = t.Value.Timestamp
 	case *roachpb.RangeFeedCheckpoint:
-		// Always publish checkpoint notifications, regardless
-		// of a registration's starting timestamp.
+		// Always publish checkpoint notifications, regardless of a registration's
+		// starting timestamp.
+		//
+		// TODO(dan): It's unclear if this is the right contract, it's certainly
+		// surprising. Revisit this once RangeFeed has more users.
 		minTS = hlc.MaxTimestamp
 	default:
 		panic(fmt.Sprintf("unexpected RangeFeedEvent variant: %v", event))

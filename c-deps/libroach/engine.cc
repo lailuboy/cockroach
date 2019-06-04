@@ -203,6 +203,9 @@ DBStatus DBImpl::GetStats(DBStatsResult* stats) {
   rep->GetIntProperty("rocksdb.estimate-pending-compaction-bytes",
                       &pending_compaction_bytes_estimate);
 
+  std::string l0_file_count_str;
+  rep->GetProperty("rocksdb.num-files-at-level0", &l0_file_count_str);
+
   stats->block_cache_hits = (int64_t)s->getTickerCount(rocksdb::BLOCK_CACHE_HIT);
   stats->block_cache_misses = (int64_t)s->getTickerCount(rocksdb::BLOCK_CACHE_MISS);
   stats->block_cache_usage = (int64_t)block_cache->GetUsage();
@@ -216,6 +219,51 @@ DBStatus DBImpl::GetStats(DBStatsResult* stats) {
   stats->compactions = (int64_t)event_listener->GetCompactions();
   stats->table_readers_mem_estimate = table_readers_mem_estimate;
   stats->pending_compaction_bytes_estimate = pending_compaction_bytes_estimate;
+  stats->l0_file_count = std::atoi(l0_file_count_str.c_str());
+  return kSuccess;
+}
+
+// `GetTickersAndHistograms` retrieves maps of all RocksDB tickers and histograms.
+// It differs from `GetStats` by getting _every_ ticker and histogram, and by not
+// getting anything else (DB properties, for example).
+//
+// In addition to freeing the `DBString`s in the result, the caller is also
+// responsible for freeing `DBTickersAndHistogramsResult::tickers` and
+// `DBTickersAndHistogramsResult::histograms`.
+DBStatus DBImpl::GetTickersAndHistograms(DBTickersAndHistogramsResult* stats) {
+  const rocksdb::Options& opts = rep->GetOptions();
+  const std::shared_ptr<rocksdb::Statistics>& s = opts.statistics;
+  stats->tickers_len = rocksdb::TickersNameMap.size();
+  // We malloc the result so it can be deallocated by the caller using free().
+  stats->tickers = static_cast<TickerInfo*>(
+      malloc(stats->tickers_len * sizeof(TickerInfo)));
+  if (stats->tickers == nullptr) {
+    return FmtStatus("malloc failed");
+  }
+  for (size_t i = 0; i < stats->tickers_len; ++i) {
+    stats->tickers[i].name = ToDBString(rocksdb::TickersNameMap[i].second);
+    stats->tickers[i].value = s->getTickerCount(static_cast<uint32_t>(i));
+  }
+
+  stats->histograms_len = rocksdb::HistogramsNameMap.size();
+  // We malloc the result so it can be deallocated by the caller using free().
+  stats->histograms = static_cast<HistogramInfo*>(
+      malloc(stats->histograms_len * sizeof(HistogramInfo)));
+  if (stats->histograms == nullptr) {
+    return FmtStatus("malloc failed");
+  }
+  for (size_t i = 0; i < stats->histograms_len; ++i) {
+    stats->histograms[i].name = ToDBString(rocksdb::HistogramsNameMap[i].second);
+    rocksdb::HistogramData data;
+    s->histogramData(static_cast<uint32_t>(i), &data);
+    stats->histograms[i].mean = data.average;
+    stats->histograms[i].p50 = data.median;
+    stats->histograms[i].p95 = data.percentile95;
+    stats->histograms[i].p99 = data.percentile99;
+    stats->histograms[i].max = data.max;
+    stats->histograms[i].count = data.count;
+    stats->histograms[i].sum = data.sum;
+  }
   return kSuccess;
 }
 
@@ -229,12 +277,16 @@ DBStatus DBImpl::GetEnvStats(DBEnvStatsResult* stats) {
   // Always initialize the fields.
   stats->encryption_status = DBString();
   stats->total_files = stats->total_bytes = stats->active_key_files = stats->active_key_bytes = 0;
+  stats->encryption_type = 0;
 
   if (env_mgr->env_stats_handler == nullptr || env_mgr->file_registry == nullptr) {
     // We can't compute these if we don't have a file registry or stats handler.
     // This happens in OSS mode or when encryption has not been turned on.
     return kSuccess;
   }
+
+  // Get encryption algorithm.
+  stats->encryption_type = env_mgr->env_stats_handler->GetActiveStoreKeyType();
 
   // Get encryption status.
   std::string encryption_status;

@@ -18,6 +18,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -201,7 +202,7 @@ type TxnSender interface {
 	IsSerializablePushAndRefreshNotPossible() bool
 
 	// Epoch returns the txn's epoch.
-	Epoch() uint32
+	Epoch() enginepb.TxnEpoch
 
 	// SerializeTxn returns a clone of the transaction's current proto.
 	// This is a nuclear option; generally client code shouldn't deal with protos.
@@ -266,7 +267,7 @@ func NewMockTransactionalSender(
 	) (*roachpb.BatchResponse, *roachpb.Error),
 	txn *roachpb.Transaction,
 ) *MockTransactionalSender {
-	return &MockTransactionalSender{senderFunc: f, txn: txn.Clone()}
+	return &MockTransactionalSender{senderFunc: f, txn: *txn}
 }
 
 // Send is part of the TxnSender interface.
@@ -352,12 +353,11 @@ func (m *MockTransactionalSender) IsSerializablePushAndRefreshNotPossible() bool
 }
 
 // Epoch is part of the TxnSender interface.
-func (m *MockTransactionalSender) Epoch() uint32 { panic("unimplemented") }
+func (m *MockTransactionalSender) Epoch() enginepb.TxnEpoch { panic("unimplemented") }
 
 // SerializeTxn is part of the TxnSender interface.
 func (m *MockTransactionalSender) SerializeTxn() *roachpb.Transaction {
-	cp := m.txn.Clone()
-	return &cp
+	return m.txn.Clone()
 }
 
 // UpdateStateOnRemoteRetryableErr is part of the TxnSender interface.

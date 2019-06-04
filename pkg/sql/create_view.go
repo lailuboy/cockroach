@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -111,7 +110,7 @@ func (p *planner) CreateView(ctx context.Context, n *tree.CreateView) (planNode,
 
 func (n *createViewNode) startExec(params runParams) error {
 	viewName := n.n.Name.Table()
-	tKey := tableKey{parentID: n.dbDesc.ID, name: viewName}
+	tKey := sqlbase.NewTableKey(n.dbDesc.ID, viewName)
 	key := tKey.Key()
 	if exists, err := descExists(params.ctx, params.p.txn, key); err == nil && exists {
 		// TODO(a-robinson): Support CREATE OR REPLACE commands.
@@ -216,11 +215,7 @@ func (n *createViewNode) makeViewTableDesc(
 		params.p.txn.CommitTimestamp(), privileges)
 	desc.ViewQuery = tree.AsStringWithFlags(n.n.AsSource, tree.FmtParsable)
 	for i, colRes := range resultColumns {
-		colType, err := coltypes.DatumTypeToColumnType(colRes.Typ)
-		if err != nil {
-			return desc, err
-		}
-		columnTableDef := tree.ColumnTableDef{Name: tree.Name(colRes.Name), Type: colType}
+		columnTableDef := tree.ColumnTableDef{Name: tree.Name(colRes.Name), Type: colRes.Typ}
 		if len(columnNames) > i {
 			columnTableDef.Name = columnNames[i]
 		}
@@ -230,7 +225,7 @@ func (n *createViewNode) makeViewTableDesc(
 		if err != nil {
 			return desc, err
 		}
-		desc.AddColumn(*col)
+		desc.AddColumn(col)
 	}
 	// AllocateIDs mutates its receiver. `return desc, desc.AllocateIDs()`
 	// happens to work in gc, but does not work in gccgo.
@@ -255,11 +250,7 @@ func MakeViewTableDesc(
 	desc.ViewQuery = tree.AsStringWithFlags(n.AsSource, tree.FmtParsable)
 
 	for i, colRes := range resultColumns {
-		colType, err := coltypes.DatumTypeToColumnType(colRes.Typ)
-		if err != nil {
-			return desc, err
-		}
-		columnTableDef := tree.ColumnTableDef{Name: tree.Name(colRes.Name), Type: colType}
+		columnTableDef := tree.ColumnTableDef{Name: tree.Name(colRes.Name), Type: colRes.Typ}
 		if len(n.ColumnNames) > i {
 			columnTableDef.Name = n.ColumnNames[i]
 		}
@@ -269,7 +260,7 @@ func MakeViewTableDesc(
 		if err != nil {
 			return desc, err
 		}
-		desc.AddColumn(*col)
+		desc.AddColumn(col)
 	}
 	// AllocateIDs mutates its receiver. `return desc, desc.AllocateIDs()`
 	// happens to work in gc, but does not work in gccgo.

@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -98,14 +99,14 @@ func (m *outbox) setFlowCtx(flowCtx *FlowCtx) {
 	m.flowCtx = flowCtx
 }
 
-func (m *outbox) init(types []sqlbase.ColumnType) {
-	if types == nil {
+func (m *outbox) init(typs []types.T) {
+	if typs == nil {
 		// We check for nil to detect uninitialized cases; but we support 0-length
 		// rows.
-		types = make([]sqlbase.ColumnType, 0)
+		typs = make([]types.T, 0)
 	}
-	m.RowChannel.InitWithNumSenders(types, 1)
-	m.encoder.init(types)
+	m.RowChannel.InitWithNumSenders(typs, 1)
+	m.encoder.init(typs)
 }
 
 // addRow encodes a row into rowBuf. If enough rows were accumulated, flush() is
@@ -117,7 +118,7 @@ func (m *outbox) init(types []sqlbase.ColumnType) {
 // too, or it might be an encoding error, in which case we've forwarded it on
 // the stream.
 func (m *outbox) addRow(
-	ctx context.Context, row sqlbase.EncDatumRow, meta *ProducerMetadata,
+	ctx context.Context, row sqlbase.EncDatumRow, meta *distsqlpb.ProducerMetadata,
 ) error {
 	mustFlush := false
 	var encodingErr error
@@ -129,7 +130,7 @@ func (m *outbox) addRow(
 	} else {
 		encodingErr = m.encoder.AddRow(row)
 		if encodingErr != nil {
-			m.encoder.AddMetadata(ProducerMetadata{Err: encodingErr})
+			m.encoder.AddMetadata(distsqlpb.ProducerMetadata{Err: encodingErr})
 			mustFlush = true
 		}
 	}
@@ -280,7 +281,7 @@ func (m *outbox) mainLoop(ctx context.Context) error {
 					tracing.FinishSpan(span)
 					spanFinished = true
 					if trace := getTraceData(ctx); trace != nil {
-						err := m.addRow(ctx, nil, &ProducerMetadata{TraceData: trace})
+						err := m.addRow(ctx, nil, &distsqlpb.ProducerMetadata{TraceData: trace})
 						if err != nil {
 							return err
 						}

@@ -85,8 +85,8 @@ const (
 	ParseModeMDY
 )
 
-// ParseDate converts a string into a time value.
-func ParseDate(now time.Time, mode ParseMode, s string) (time.Time, error) {
+// ParseDate converts a string into Date.
+func ParseDate(now time.Time, mode ParseMode, s string) (Date, error) {
 	fe := fieldExtract{
 		now:      now,
 		mode:     mode,
@@ -98,9 +98,9 @@ func ParseDate(now time.Time, mode ParseMode, s string) (time.Time, error) {
 	}
 
 	if err := fe.Extract(s); err != nil {
-		return TimeEpoch, parseError(err, "date", s)
+		return Date{}, parseError(err, "date", s)
 	}
-	return fe.MakeDate(), nil
+	return fe.MakeDate()
 }
 
 // ParseTime converts a string into a time value on the epoch day.
@@ -147,17 +147,17 @@ func ParseTimestamp(now time.Time, mode ParseMode, s string) (time.Time, error) 
 
 // badFieldPrefixError constructs a CodeInvalidDatetimeFormatError pgerror.
 func badFieldPrefixError(field field, prefix rune) error {
-	return inputErrorf("unexpected separator '%v' for field %s", prefix, field.Pretty())
+	return inputErrorf("unexpected separator '%s' for field %s", string(prefix), field.Pretty())
 }
 
 // inputErrorf returns a CodeInvalidDatetimeFormatError pgerror.
 func inputErrorf(format string, args ...interface{}) error {
-	return pgerror.NewErrorf(pgerror.CodeInvalidDatetimeFormatError, format, args...)
+	return pgerror.Newf(pgerror.CodeInvalidDatetimeFormatError, format, args...)
 }
 
 // outOfRangeError returns a CodeDatetimeFieldOverflowError pgerror.
 func outOfRangeError(field string, val int) error {
-	return pgerror.NewErrorf(pgerror.CodeDatetimeFieldOverflowError,
+	return pgerror.Newf(pgerror.CodeDatetimeFieldOverflowError,
 		"field %s value %d is out of range", field, val)
 }
 
@@ -168,6 +168,6 @@ func parseError(err error, kind string, s string) error {
 		err.Message += " as type " + kind
 		return err
 	}
-	return pgerror.NewErrorf(pgerror.CodeInvalidDatetimeFormatError,
+	return pgerror.Newf(pgerror.CodeInvalidDatetimeFormatError,
 		`could not parse "%s" as type %s`, s, kind)
 }

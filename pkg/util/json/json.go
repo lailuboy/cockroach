@@ -75,6 +75,8 @@ type JSON interface {
 	// one per path through the receiver.
 	encodeInvertedIndexKeys(b []byte) ([][]byte, error)
 
+	numInvertedIndexEntries() (int, error)
+
 	// allPaths returns a slice of new JSON documents, each a path to a leaf
 	// through the receiver. Note that leaves include the empty object and array
 	// in addition to scalars.
@@ -489,7 +491,7 @@ func (j jsonObject) Compare(other JSON) (int, error) {
 	return 0, nil
 }
 
-var errTrailingCharacters = pgerror.NewError(pgerror.CodeInvalidTextRepresentationError, "trailing characters after JSON document")
+var errTrailingCharacters = pgerror.New(pgerror.CodeInvalidTextRepresentationError, "trailing characters after JSON document")
 
 func (jsonNull) Format(buf *bytes.Buffer) { buf.WriteString("null") }
 
@@ -499,7 +501,22 @@ func (jsonTrue) Format(buf *bytes.Buffer) { buf.WriteString("true") }
 
 func (j jsonNumber) Format(buf *bytes.Buffer) {
 	dec := apd.Decimal(j)
+	// Make sure non-finite values are encoded as valid strings by
+	// quoting them. Unfortunately, since this is JSON, there's no
+	// defined way to express the three special numeric values (+inf,
+	// -inf, nan) except as a string. This means that the decoding
+	// side can't tell whether the field should be a float or a
+	// string. Testing for exact types is thus tricky. As of this
+	// comment, our current tests for this behavior happen it the SQL
+	// package, not here in the JSON package.
+	nonfinite := dec.Form != apd.Finite
+	if nonfinite {
+		buf.WriteByte('"')
+	}
 	buf.WriteString(dec.String())
+	if nonfinite {
+		buf.WriteByte('"')
+	}
 }
 
 func (j jsonString) Format(buf *bytes.Buffer) {
@@ -654,7 +671,7 @@ func ParseJSON(s string) (JSON, error) {
 	decoder.UseNumber()
 	err := decoder.Decode(&result)
 	if err != nil {
-		return nil, pgerror.NewErrorf(pgerror.CodeInvalidTextRepresentationError, "error decoding JSON: %s", err.Error())
+		return nil, pgerror.Newf(pgerror.CodeInvalidTextRepresentationError, "error decoding JSON: %s", err.Error())
 	}
 	if decoder.More() {
 		return nil, errTrailingCharacters
@@ -748,23 +765,63 @@ func (j jsonObject) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 // array are encoded identically in the inverted index, the total number of
 // distinct index entries may be less than the total number of paths.
 func NumInvertedIndexEntries(j JSON) (int, error) {
-	// TODO (lucy): Figure out how to avoid allocating every path
-	keys, err := EncodeInvertedIndexKeys(make([]byte, 0), j)
-	if err != nil {
-		return 0, err
-	}
+	return j.numInvertedIndexEntries()
+}
 
-	// Count distinct keys
-	sort.Slice(keys, func(i int, j int) bool {
-		return bytes.Compare(keys[i], keys[j]) < 0
-	})
-	n := 0
-	for i := 0; i < len(keys); i++ {
-		if i == 0 || bytes.Compare(keys[i-1], keys[i]) < 0 {
-			n++
+func (j jsonNull) numInvertedIndexEntries() (int, error) {
+	return 1, nil
+}
+func (jsonTrue) numInvertedIndexEntries() (int, error) {
+	return 1, nil
+}
+func (jsonFalse) numInvertedIndexEntries() (int, error) {
+	return 1, nil
+}
+func (j jsonString) numInvertedIndexEntries() (int, error) {
+	return 1, nil
+}
+func (j jsonNumber) numInvertedIndexEntries() (int, error) {
+	return 1, nil
+}
+func (j jsonArray) numInvertedIndexEntries() (int, error) {
+	switch len(j) {
+	case 0:
+		return 1, nil
+	case 1:
+		return j[0].numInvertedIndexEntries()
+	default:
+		keys, err := j.encodeInvertedIndexKeys(make([]byte, 0))
+		if err != nil {
+			return 0, err
 		}
+
+		// Count distinct keys
+		sort.Slice(keys, func(i int, j int) bool {
+			return bytes.Compare(keys[i], keys[j]) < 0
+		})
+		n := 0
+		for i := 0; i < len(keys); i++ {
+			if i == 0 || bytes.Compare(keys[i-1], keys[i]) < 0 {
+				n++
+			}
+		}
+		return n, nil
 	}
-	return n, nil
+}
+
+func (j jsonObject) numInvertedIndexEntries() (int, error) {
+	if len(j) == 0 {
+		return 1, nil
+	}
+	count := 0
+	for _, kv := range j {
+		n, err := kv.v.numInvertedIndexEntries()
+		if err != nil {
+			return 0, err
+		}
+		count += n
+	}
+	return count, nil
 }
 
 // AllPaths returns a slice of new JSON documents, each a path to a leaf
@@ -949,7 +1006,7 @@ func MakeJSON(d interface{}) (JSON, error) {
 		// random JSON generator.
 		return v, nil
 	}
-	return nil, pgerror.NewError("invalid value %s passed to MakeJSON", d.(fmt.Stringer).String())
+	return nil, pgerror.New("invalid value %s passed to MakeJSON", d.(fmt.Stringer).String())
 }
 
 // This value was determined through some rough experimental results as a good
@@ -1024,7 +1081,7 @@ func FetchPath(j JSON, path []string) (JSON, error) {
 	return j, nil
 }
 
-var errCannotSetPathInScalar = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "cannot set path in scalar")
+var errCannotSetPathInScalar = pgerror.New(pgerror.CodeInvalidParameterValueError, "cannot set path in scalar")
 
 // setValKeyOrIdx sets a key or index within a JSON object or array. If the
 // provided value is neither an object or array the value is returned
@@ -1116,7 +1173,7 @@ func deepSet(j JSON, path []string, to JSON, createMissing bool) (JSON, error) {
 	}
 }
 
-var errCannotReplaceExistingKey = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "cannot replace existing key")
+var errCannotReplaceExistingKey = pgerror.New(pgerror.CodeInvalidParameterValueError, "cannot replace existing key")
 
 func insertValKeyOrIdx(j JSON, key string, newVal JSON, insertAfter bool) (JSON, error) {
 	switch v := j.(type) {
@@ -1225,8 +1282,8 @@ func (jsonFalse) FetchValKeyOrIdx(string) (JSON, error)  { return nil, nil }
 func (jsonString) FetchValKeyOrIdx(string) (JSON, error) { return nil, nil }
 func (jsonNumber) FetchValKeyOrIdx(string) (JSON, error) { return nil, nil }
 
-var errCannotDeleteFromScalar = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "cannot delete from scalar")
-var errCannotDeleteFromObject = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "cannot delete from object using integer index")
+var errCannotDeleteFromScalar = pgerror.New(pgerror.CodeInvalidParameterValueError, "cannot delete from scalar")
+var errCannotDeleteFromObject = pgerror.New(pgerror.CodeInvalidParameterValueError, "cannot delete from object using integer index")
 
 func (j jsonObject) SetKey(key string, to JSON, createMissing bool) (jsonObject, error) {
 	result := make(jsonObject, 0, len(j)+1)
@@ -1336,7 +1393,7 @@ func (jsonFalse) RemoveIndex(int) (JSON, bool, error)  { return nil, false, errC
 func (jsonString) RemoveIndex(int) (JSON, bool, error) { return nil, false, errCannotDeleteFromScalar }
 func (jsonNumber) RemoveIndex(int) (JSON, bool, error) { return nil, false, errCannotDeleteFromScalar }
 
-var errInvalidConcat = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "invalid concatenation of jsonb objects")
+var errInvalidConcat = pgerror.New(pgerror.CodeInvalidParameterValueError, "invalid concatenation of jsonb objects")
 
 func scalarConcat(left, other JSON) (JSON, error) {
 	switch other.Type() {
@@ -1642,7 +1699,7 @@ func Pretty(j JSON) (string, error) {
 	return string(res), err
 }
 
-var errCannotDeletePathInScalar = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "cannot delete path in scalar")
+var errCannotDeletePathInScalar = pgerror.New(pgerror.CodeInvalidParameterValueError, "cannot delete path in scalar")
 
 func (j jsonArray) RemovePath(path []string) (JSON, bool, error)  { return j.doRemovePath(path) }
 func (j jsonObject) RemovePath(path []string) (JSON, bool, error) { return j.doRemovePath(path) }
@@ -1671,7 +1728,7 @@ func (j jsonArray) doRemovePath(path []string) (JSON, bool, error) {
 	idx, err := strconv.Atoi(path[0])
 	if err != nil {
 		// TODO(yuzefovich): give the position of the path element to match psql.
-		return j, false, pgerror.NewErrorf(
+		return j, false, pgerror.Newf(
 			pgerror.CodeInvalidTextRepresentationError,
 			"a path element is not an integer: %s",
 			path[0])

@@ -695,6 +695,10 @@ type MVCCGetOptions struct {
 func MVCCGet(
 	ctx context.Context, eng Reader, key roachpb.Key, timestamp hlc.Timestamp, opts MVCCGetOptions,
 ) (*roachpb.Value, *roachpb.Intent, error) {
+	if timestamp.WallTime < 0 {
+		return nil, nil, errors.Errorf("cannot write to %q at timestamp %s", key, timestamp)
+	}
+
 	iter := eng.NewIterator(IterOptions{Prefix: true})
 	value, intent, err := iter.MVCCGet(key, timestamp, opts)
 	iter.Close()
@@ -808,6 +812,10 @@ func mvccGetInternal(
 	if !consistent && txn != nil {
 		return nil, nil, safeValue, errors.Errorf(
 			"cannot allow inconsistent reads within a transaction")
+	}
+
+	if timestamp.WallTime < 0 {
+		return nil, nil, safeValue, errors.Errorf("cannot write to %q at timestamp %s", metaKey.Key, timestamp)
 	}
 
 	meta := &buf.meta
@@ -1002,7 +1010,7 @@ func (b *putBuffer) putMeta(
 // the Timestamp field on the value results in an error.
 //
 // Note that, when writing transactionally, the txn's timestamps
-// dictate the timestamp of the operation, and the timestamp paramater is
+// dictate the timestamp of the operation, and the timestamp parameter is
 // confusing and redundant. See the comment on mvccPutInternal for details.
 //
 // If the timestamp is specified as hlc.Timestamp{}, the value is
@@ -1281,6 +1289,10 @@ func mvccPutInternal(
 		return emptyKeyError()
 	}
 
+	if timestamp.WallTime < 0 {
+		return errors.Errorf("cannot write to %q at timestamp %s", key, timestamp)
+	}
+
 	metaKey := MakeMVCCMetadataKey(key)
 	ok, origMetaKeySize, origMetaValSize, err := mvccGetMetadata(iter, metaKey, &buf.meta)
 	if err != nil {
@@ -1338,6 +1350,7 @@ func mvccPutInternal(
 		}
 		writeTimestamp = txn.Timestamp
 	}
+
 	timestamp = hlc.Timestamp{} // prevent accidental use below
 
 	// Determine what the logical operation is. Are we writing an intent
@@ -1872,7 +1885,7 @@ func MVCCDeleteRange(
 	if txn != nil {
 		prevSeqTxn := txn.Clone()
 		prevSeqTxn.Sequence--
-		scanTxn = &prevSeqTxn
+		scanTxn = prevSeqTxn
 	}
 	kvs, resumeSpan, _, err := MVCCScan(
 		ctx, engine, key, endKey, max, scanTs, MVCCScanOptions{Txn: scanTxn})
@@ -2210,10 +2223,12 @@ func mvccResolveWriteIntent(
 	// For cases where there's no value corresponding to the key we're
 	// resolving, and this is a committed transaction, log a warning if
 	// the intent txn is epoch=0. For non-zero epoch transactions, this
-	// is a common occurrence for intents which were resolved by
-	// concurrent actors, and does not benefit from a warning.
+	// is a common occurrence for intents written only be earlier epochs
+	// which were resolved by concurrent actors, and does not benefit
+	// from a warning. See #9399 for details.
+	expVal := intent.Status == roachpb.COMMITTED && intent.Txn.Epoch == 0
 	if !ok {
-		if intent.Status == roachpb.COMMITTED && intent.Txn.Epoch == 0 {
+		if expVal {
 			log.Warningf(ctx, "unable to find value for %s (%+v)",
 				intent.Key, intent.Txn)
 		}
@@ -2224,11 +2239,11 @@ func mvccResolveWriteIntent(
 		if forRange {
 			return false, nil
 		}
-		if intent.Status == roachpb.COMMITTED {
+		if expVal {
 			// The intent is being committed. Verify that it was already committed by
 			// looking for a value at the transaction timestamp. Note that this check
-			// has false positives, but such false positives should be very rare. See
-			// #9399 for details.
+			// has false positives due to MVCC GC, but such false positives should be
+			// very rare.
 			//
 			// Note that we hit this code path relatively frequently when doing end
 			// transaction processing for locally resolved intents. In those cases,
@@ -2245,15 +2260,16 @@ func mvccResolveWriteIntent(
 				log.Warningf(ctx, "unable to find value for %s @ %s: %v ",
 					intent.Key, intent.Txn.Timestamp, err)
 			} else if v == nil {
-				// This should never happen as ok is true above.
+				// This can happen if the committed value was already GCed.
 				log.Warningf(ctx, "unable to find value for %s @ %s (%+v vs %+v)",
 					intent.Key, intent.Txn.Timestamp, meta, intent.Txn)
-			} else if v.Timestamp != intent.Txn.Timestamp && intent.Txn.Epoch == 0 {
-				// We only log here if the txn epoch is zero, as it's a
-				// common case for an intent written during an earlier
-				// epoch to have been resolved already by a concurrent
-				// reader or writer. Note that this warning can *still*
-				// be a false positive.
+			} else if v.Timestamp != intent.Txn.Timestamp {
+				// This should never happen. If we find a value when seeking
+				// to the intent's commit timestamp then that value should
+				// always have the correct timestamp. Finding a value without
+				// a matching timestamp rules out the possibility that our
+				// committed value was already GCed, because we now found a
+				// version with an even lower timestamp.
 				log.Warningf(ctx, "unable to find value for %s @ %s: %s (txn=%+v)",
 					intent.Key, intent.Txn.Timestamp, v.Timestamp, intent.Txn)
 			}
@@ -2299,7 +2315,7 @@ func mvccResolveWriteIntent(
 	// | restart      |            |
 	// | write@2      |            |
 	// |              | resolve@1  |
-	// ============================
+	// =============================
 	//
 	// In this case, if we required the epochs to match, we would not push the
 	// intent forward, and client B would upon retrying after its successful
@@ -2310,9 +2326,15 @@ func mvccResolveWriteIntent(
 	// used for resolving), but that costs latency.
 	// TODO(tschottdorf): various epoch-related scenarios here deserve more
 	// testing.
-	pushed := intent.Status == roachpb.PENDING &&
-		hlc.Timestamp(meta.Timestamp).Less(intent.Txn.Timestamp) &&
-		meta.Txn.Epoch >= intent.Txn.Epoch
+	inProgress := !intent.Status.IsFinalized() && meta.Txn.Epoch >= intent.Txn.Epoch
+	pushed := inProgress && hlc.Timestamp(meta.Timestamp).Less(intent.Txn.Timestamp)
+
+	// There's nothing to do if meta's epoch is greater than or equal txn's
+	// epoch and the state is still in progress but the intent was not pushed
+	// to a larger timestamp.
+	if inProgress && !pushed {
+		return false, nil
+	}
 
 	// If we're committing, or if the commit timestamp of the intent has been moved forward, and if
 	// the proposed epoch matches the existing epoch: update the meta.Txn. For commit, it's set to
@@ -2406,12 +2428,6 @@ func mvccResolveWriteIntent(
 	// - writer1 writes key0 at epoch 1
 	// - writer2 dispatches ResolveIntent to key0 (with epoch 0)
 	// - ResolveIntent with epoch 0 aborts intent from epoch 1.
-
-	// There's nothing to do if meta's epoch is greater than or equal txn's epoch
-	// and the state is still PENDING.
-	if intent.Status == roachpb.PENDING && meta.Txn.Epoch >= intent.Txn.Epoch {
-		return false, nil
-	}
 
 	// First clear the intent value.
 	latestKey := MVCCKey{Key: intent.Key, Timestamp: hlc.Timestamp(meta.Timestamp)}

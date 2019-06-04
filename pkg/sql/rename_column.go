@@ -25,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
-var errEmptyColumnName = pgerror.NewError(pgerror.CodeSyntaxError, "empty column name")
+var errEmptyColumnName = pgerror.New(pgerror.CodeSyntaxError, "empty column name")
 
 type renameColumnNode struct {
 	n         *tree.RenameColumn
@@ -38,7 +38,7 @@ type renameColumnNode struct {
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) RenameColumn(ctx context.Context, n *tree.RenameColumn) (planNode, error) {
 	// Check if table exists.
-	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, &n.Table, !n.IfExists, requireTableDesc)
+	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, &n.Table, !n.IfExists, ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -58,14 +58,32 @@ func (n *renameColumnNode) startExec(params runParams) error {
 	ctx := params.ctx
 	tableDesc := n.tableDesc
 
-	if n.n.NewName == "" {
-		return errEmptyColumnName
-	}
-
-	col, _, err := tableDesc.FindColumnByName(n.n.Name)
-	// n.n.IfExists only applies to table, no need to check here.
+	descChanged, err := params.p.renameColumn(params.ctx, tableDesc, &n.n.Name, &n.n.NewName)
 	if err != nil {
 		return err
+	}
+
+	if !descChanged {
+		return nil
+	}
+
+	if err := tableDesc.Validate(ctx, p.txn, p.EvalContext().Settings); err != nil {
+		return err
+	}
+
+	return p.writeSchemaChange(ctx, tableDesc, sqlbase.InvalidMutationID)
+}
+
+func (p *planner) renameColumn(
+	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor, oldName, newName *tree.Name,
+) (bool, error) {
+	if *newName == "" {
+		return false, errEmptyColumnName
+	}
+
+	col, _, err := tableDesc.FindColumnByName(*oldName)
+	if err != nil {
+		return false, err
 	}
 
 	for _, tableRef := range tableDesc.DependedOnBy {
@@ -76,34 +94,34 @@ func (n *renameColumnNode) startExec(params runParams) error {
 			}
 		}
 		if found {
-			return p.dependentViewRenameError(
-				ctx, "column", n.n.Name.String(), tableDesc.ParentID, tableRef.ID)
+			return false, p.dependentViewRenameError(
+				ctx, "column", oldName.String(), tableDesc.ParentID, tableRef.ID)
 		}
 	}
 
-	if n.n.Name == n.n.NewName {
+	if *oldName == *newName {
 		// Noop.
-		return nil
+		return false, nil
 	}
 
-	if _, _, err := tableDesc.FindColumnByName(n.n.NewName); err == nil {
-		return fmt.Errorf("column name %q already exists", string(n.n.NewName))
+	if _, _, err := tableDesc.FindColumnByName(*newName); err == nil {
+		return false, fmt.Errorf("column name %q already exists", tree.ErrString(newName))
 	}
 
-	preFn := func(expr tree.Expr) (err error, recurse bool, newExpr tree.Expr) {
+	preFn := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
 		if vBase, ok := expr.(tree.VarName); ok {
 			v, err := vBase.NormalizeVarName()
 			if err != nil {
-				return err, false, nil
+				return false, nil, err
 			}
 			if c, ok := v.(*tree.ColumnItem); ok {
-				if string(c.ColumnName) == string(n.n.Name) {
-					c.ColumnName = n.n.NewName
+				if string(c.ColumnName) == string(*oldName) {
+					c.ColumnName = *newName
 				}
 			}
-			return nil, false, v
+			return false, v, nil
 		}
-		return nil, true, expr
+		return true, expr, nil
 	}
 
 	renameIn := func(expression string) (string, error) {
@@ -121,11 +139,12 @@ func (n *renameColumnNode) startExec(params runParams) error {
 	}
 
 	// Rename the column in CHECK constraints.
+	// Renaming columns that are being referenced by checks that are being added is not allowed.
 	for i := range tableDesc.Checks {
 		var err error
 		tableDesc.Checks[i].Expr, err = renameIn(tableDesc.Checks[i].Expr)
 		if err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -134,20 +153,16 @@ func (n *renameColumnNode) startExec(params runParams) error {
 		if tableDesc.Columns[i].IsComputed() {
 			newExpr, err := renameIn(*tableDesc.Columns[i].ComputeExpr)
 			if err != nil {
-				return err
+				return false, err
 			}
 			tableDesc.Columns[i].ComputeExpr = &newExpr
 		}
 	}
 
 	// Rename the column in the indexes.
-	tableDesc.RenameColumnDescriptor(col, string(n.n.NewName))
+	tableDesc.RenameColumnDescriptor(col, string(*newName))
 
-	if err := tableDesc.Validate(ctx, p.txn, p.EvalContext().Settings); err != nil {
-		return err
-	}
-
-	return p.writeSchemaChange(ctx, tableDesc, sqlbase.InvalidMutationID)
+	return true, nil
 }
 
 func (n *renameColumnNode) Next(runParams) (bool, error) { return false, nil }

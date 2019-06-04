@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // NeededGroupingCols returns the columns needed by a grouping operator's
@@ -29,9 +29,9 @@ func (c *CustomFuncs) NeededGroupingCols(private *memo.GroupingPrivate) opt.ColS
 	return private.GroupingCols.Union(private.Ordering.ColSet())
 }
 
-// NeededRowNumberCols returns the columns needed by a RowNumber operator's
+// NeededOrdinalityCols returns the columns needed by a Ordinality operator's
 // requested ordering.
-func (c *CustomFuncs) NeededRowNumberCols(private *memo.RowNumberPrivate) opt.ColSet {
+func (c *CustomFuncs) NeededOrdinalityCols(private *memo.OrdinalityPrivate) opt.ColSet {
 	return private.Ordering.ColSet()
 }
 
@@ -77,6 +77,7 @@ func (c *CustomFuncs) NeededMutationCols(private *memo.MutationPrivate) opt.ColS
 func (c *CustomFuncs) NeededMutationFetchCols(
 	op opt.Operator, private *memo.MutationPrivate,
 ) opt.ColSet {
+
 	var cols opt.ColSet
 	tabMeta := c.mem.Metadata().TableMeta(private.Table)
 
@@ -97,6 +98,25 @@ func (c *CustomFuncs) NeededMutationFetchCols(
 			famCols := familyCols(tabMeta.Table.Family(i))
 			if famCols.Intersects(updateCols) {
 				cols.UnionWith(famCols)
+			}
+		}
+	}
+
+	// Retain any FetchCols that are needed for ReturnCols. If a RETURN column
+	// is needed, then:
+	//   1. For Delete, the corresponding FETCH column is always needed, since
+	//      it is always returned.
+	//   2. For Update, the corresponding FETCH column is needed when there is
+	//      no corresponding UPDATE column. In that case, the FETCH column always
+	//      becomes the RETURN column.
+	//   3. For Upsert, the corresponding FETCH column is needed when there is
+	//      no corresponding UPDATE column. In that case, either the INSERT or
+	//      FETCH column becomes the RETURN column, so both must be available
+	//      for the CASE expression.
+	for ord, col := range private.ReturnCols {
+		if col != 0 {
+			if op == opt.DeleteOp || len(private.UpdateCols) == 0 || private.UpdateCols[ord] == 0 {
+				cols.Add(int(tabMeta.MetaID.ColumnID(ord)))
 			}
 		}
 	}
@@ -139,13 +159,6 @@ func (c *CustomFuncs) NeededMutationFetchCols(
 		}
 
 	case opt.DeleteOp:
-		// Retain any FetchCols that are needed for ReturnCols.
-		for ord, col := range private.ReturnCols {
-			if col != 0 && len(private.FetchCols) != 0 && col == private.FetchCols[ord] {
-				cols.Add(int(tabMeta.MetaID.ColumnID(ord)))
-			}
-		}
-
 		// Add in all strict key columns from all indexes, since these are needed
 		// to compose the keys of rows to delete. Include mutation indexes, since
 		// it is necessary to delete rows even from indexes that are being added
@@ -296,24 +309,21 @@ func (c *CustomFuncs) pruneValuesCols(values *memo.ValuesExpr, neededCols opt.Co
 	newRows := make(memo.ScalarListExpr, len(values.Rows))
 	for irow, row := range values.Rows {
 		tuple := row.(*memo.TupleExpr)
-		typ := tuple.DataType().(types.TTuple)
+		typ := tuple.DataType()
 
+		newContents := make([]types.T, len(newCols))
 		newElems := make(memo.ScalarListExpr, len(newCols))
 		nelem := 0
 		for ielem, elem := range tuple.Elems {
 			if !neededCols.Contains(int(values.Cols[ielem])) {
 				continue
 			}
-			if ielem != nelem {
-				typ.Types[nelem] = typ.Types[ielem]
-			}
-
+			newContents[nelem] = typ.TupleContents()[ielem]
 			newElems[nelem] = elem
 			nelem++
 		}
-		typ.Types = typ.Types[:nelem]
 
-		newRows[irow] = c.f.ConstructTuple(newElems, typ)
+		newRows[irow] = c.f.ConstructTuple(newElems, types.MakeTuple(newContents))
 	}
 
 	return c.f.ConstructValues(newRows, &memo.ValuesPrivate{
@@ -338,11 +348,11 @@ func (c *CustomFuncs) PruneOrderingGroupBy(
 	return &new
 }
 
-// PruneOrderingRowNumber removes any columns referenced by the Ordering inside
-// a RowNumberPrivate which are not part of the neededCols set.
-func (c *CustomFuncs) PruneOrderingRowNumber(
-	private *memo.RowNumberPrivate, neededCols opt.ColSet,
-) *memo.RowNumberPrivate {
+// PruneOrderingOrdinality removes any columns referenced by the Ordering inside
+// a OrdinalityPrivate which are not part of the neededCols set.
+func (c *CustomFuncs) PruneOrderingOrdinality(
+	private *memo.OrdinalityPrivate, neededCols opt.ColSet,
+) *memo.OrdinalityPrivate {
 	if private.Ordering.SubsetOfCols(neededCols) {
 		return private
 	}
@@ -352,6 +362,42 @@ func (c *CustomFuncs) PruneOrderingRowNumber(
 	new.Ordering = new.Ordering.Copy()
 	new.Ordering.ProjectCols(neededCols)
 	return &new
+}
+
+// NeededWindowCols is the set of columns that the window function needs to
+// execute.
+func (c *CustomFuncs) NeededWindowCols(windows memo.WindowsExpr, p *memo.WindowPrivate) opt.ColSet {
+	var needed opt.ColSet
+	needed.UnionWith(p.Partition)
+	needed.UnionWith(p.Ordering.ColSet())
+	for i := range windows {
+		needed.UnionWith(windows[i].ScalarProps(c.mem).OuterCols)
+	}
+	return needed
+}
+
+// CanPruneWindows is true if the list of window functions contains a column
+// which is not included in needed, meaning that it can be pruned.
+func (c *CustomFuncs) CanPruneWindows(needed opt.ColSet, windows memo.WindowsExpr) bool {
+	for _, w := range windows {
+		if !needed.Contains(int(w.Col)) {
+			return true
+		}
+	}
+	return false
+}
+
+// PruneWindows restricts windows to only the columns which appear in needed.
+// If we eliminate all the window functions, EliminateWindow will trigger and
+// remove the expression entirely.
+func (c *CustomFuncs) PruneWindows(needed opt.ColSet, windows memo.WindowsExpr) memo.WindowsExpr {
+	result := make(memo.WindowsExpr, 0, len(windows))
+	for _, w := range windows {
+		if needed.Contains(int(w.Col)) {
+			result = append(result, w)
+		}
+	}
+	return result
 }
 
 // DerivePruneCols returns the subset of the given expression's output columns
@@ -423,14 +469,14 @@ func DerivePruneCols(e memo.RelExpr) opt.ColSet {
 		ordering := e.Private().(*physical.OrderingChoice).ColSet()
 		relProps.Rule.PruneCols = inputPruneCols.Difference(ordering)
 
-	case opt.RowNumberOp:
+	case opt.OrdinalityOp:
 		// Any pruneable input columns can potentially be pruned, as long as
 		// they're not used as an ordering column. The new row number column
 		// cannot be pruned without adding an additional Project operator, so
 		// don't add it to the set.
-		rowNum := e.(*memo.RowNumberExpr)
-		inputPruneCols := DerivePruneCols(rowNum.Input)
-		relProps.Rule.PruneCols = inputPruneCols.Difference(rowNum.Ordering.ColSet())
+		ord := e.(*memo.OrdinalityExpr)
+		inputPruneCols := DerivePruneCols(ord.Input)
+		relProps.Rule.PruneCols = inputPruneCols.Difference(ord.Ordering.ColSet())
 
 	case opt.IndexJoinOp, opt.LookupJoinOp, opt.MergeJoinOp:
 		// There is no need to prune columns projected by Index, Lookup or Merge
@@ -448,6 +494,16 @@ func DerivePruneCols(e memo.RelExpr) opt.ColSet {
 		relProps.Rule.PruneCols = DerivePruneCols(projectSet.Input).Copy()
 		usedCols := projectSet.Zip.OuterCols(e.Memo())
 		relProps.Rule.PruneCols.DifferenceWith(usedCols)
+
+	case opt.WindowOp:
+		win := e.(*memo.WindowExpr)
+		relProps.Rule.PruneCols = DerivePruneCols(win.Input).Copy()
+		relProps.Rule.PruneCols.DifferenceWith(win.Partition)
+		relProps.Rule.PruneCols.DifferenceWith(win.Ordering.ColSet())
+		for _, w := range win.Windows {
+			relProps.Rule.PruneCols.Add(int(w.Col))
+			relProps.Rule.PruneCols.DifferenceWith(w.ScalarProps(e.Memo()).OuterCols)
+		}
 
 	default:
 		// Don't allow any columns to be pruned, since that would trigger the

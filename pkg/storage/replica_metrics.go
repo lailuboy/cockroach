@@ -44,6 +44,7 @@ type ReplicaMetrics struct {
 	RangeCounter    bool
 	Unavailable     bool
 	Underreplicated bool
+	Overreplicated  bool
 	BehindCount     int64
 	LatchInfoLocal  storagepb.LatchManagerInfo
 	LatchInfoGlobal storagepb.LatchManagerInfo
@@ -119,7 +120,7 @@ func calcReplicaMetrics(
 	m.Quiescent = quiescent
 	m.Ticking = ticking
 
-	m.RangeCounter, m.Unavailable, m.Underreplicated =
+	m.RangeCounter, m.Unavailable, m.Underreplicated, m.Overreplicated =
 		calcRangeCounter(storeID, desc, livenessMap, *zone.NumReplicas, clusterNodes)
 
 	// The raft leader computes the number of raft entries that replicas are
@@ -158,8 +159,8 @@ func calcRangeCounter(
 	livenessMap IsLiveMap,
 	numReplicas int32,
 	clusterNodes int,
-) (rangeCounter, unavailable, underreplicated bool) {
-	for _, rd := range desc.Replicas {
+) (rangeCounter, unavailable, underreplicated, overreplicated bool) {
+	for _, rd := range desc.Replicas().Unwrap() {
 		if livenessMap[rd.NodeID].IsLive {
 			rangeCounter = rd.StoreID == storeID
 			break
@@ -169,11 +170,14 @@ func calcRangeCounter(
 	// unavailable ranges for each range based on the liveness table.
 	if rangeCounter {
 		liveReplicas := calcLiveReplicas(desc, livenessMap)
-		if liveReplicas < computeQuorum(len(desc.Replicas)) {
+		if liveReplicas < desc.Replicas().QuorumSize() {
 			unavailable = true
 		}
-		if GetNeededReplicas(numReplicas, clusterNodes) > liveReplicas {
+		needed := GetNeededReplicas(numReplicas, clusterNodes)
+		if needed > liveReplicas {
 			underreplicated = true
+		} else if needed < liveReplicas {
+			overreplicated = true
 		}
 	}
 	return
@@ -183,7 +187,7 @@ func calcRangeCounter(
 // determined by checking its node in the provided liveness map.
 func calcLiveReplicas(desc *roachpb.RangeDescriptor, livenessMap IsLiveMap) int {
 	var live int
-	for _, rd := range desc.Replicas {
+	for _, rd := range desc.Replicas().Unwrap() {
 		if livenessMap[rd.NodeID].IsLive {
 			live++
 		}
@@ -197,7 +201,7 @@ func calcBehindCount(
 	raftStatus *raft.Status, desc *roachpb.RangeDescriptor, livenessMap IsLiveMap,
 ) int64 {
 	var behindCount int64
-	for _, rd := range desc.Replicas {
+	for _, rd := range desc.Replicas().Unwrap() {
 		if progress, ok := raftStatus.Progress[uint64(rd.ReplicaID)]; ok {
 			if progress.Match > 0 &&
 				progress.Match < raftStatus.Commit {

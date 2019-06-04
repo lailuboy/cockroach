@@ -48,18 +48,17 @@ type ZipfGenerator struct {
 	theta float64
 	iMin  uint64
 	// internally computed values
-	alpha, zeta2 float64
-	verbose      bool
+	alpha, zeta2, halfPowTheta float64
+	verbose                    bool
 }
 
 // ZipfGeneratorMu holds variables which must be globally synced.
 type ZipfGeneratorMu struct {
-	mu       syncutil.Mutex
-	r        *rand.Rand
-	iMax     uint64
-	iMaxHead uint64
-	eta      float64
-	zetaN    float64
+	mu    syncutil.Mutex
+	r     *rand.Rand
+	iMax  uint64
+	eta   float64
+	zetaN float64
 }
 
 // NewZipfGenerator constructs a new ZipfGenerator with the given parameters.
@@ -94,12 +93,13 @@ func NewZipfGenerator(
 	var zetaN float64
 	zetaN, err = computeZetaFromScratch(iMax+1-iMin, theta)
 	if err != nil {
-		return nil, errors.Errorf("Could not compute zeta(2,%d): %s", iMax, err)
+		return nil, errors.Errorf("Could not compute zeta(%d,theta): %s", iMax, err)
 	}
 	z.alpha = 1.0 / (1.0 - theta)
 	z.zipfGenMu.eta = (1 - math.Pow(2.0/float64(z.zipfGenMu.iMax+1-z.iMin), 1.0-theta)) / (1.0 - zeta2/zetaN)
 	z.zipfGenMu.zetaN = zetaN
 	z.zeta2 = zeta2
+	z.halfPowTheta = 1.0 + math.Pow(0.5, z.theta)
 	return &z, nil
 }
 
@@ -139,7 +139,7 @@ func (z *ZipfGenerator) Uint64() uint64 {
 	var result uint64
 	if uz < 1.0 {
 		result = z.iMin
-	} else if uz < 1.0+math.Pow(0.5, z.theta) {
+	} else if uz < z.halfPowTheta {
 		result = z.iMin + 1
 	} else {
 		spread := float64(z.zipfGenMu.iMax + 1 - z.iMin)
@@ -152,32 +152,20 @@ func (z *ZipfGenerator) Uint64() uint64 {
 	return result
 }
 
-// IncrementIMax increments, iMax, and recompute the internal values that depend
-// on it. It throws an error if the recomputation failed.
-func (z *ZipfGenerator) IncrementIMax() error {
+// IncrementIMax increments iMax by count and recomputes the internal values
+// that depend on it. It throws an error if the recomputation failed.
+func (z *ZipfGenerator) IncrementIMax(count uint64) error {
 	z.zipfGenMu.mu.Lock()
 	zetaN, err := computeZetaIncrementally(
-		z.zipfGenMu.iMax, z.zipfGenMu.iMax+1, z.theta, z.zipfGenMu.zetaN)
+		z.zipfGenMu.iMax+1-z.iMin, z.zipfGenMu.iMax+count+1-z.iMin, z.theta, z.zipfGenMu.zetaN)
 	if err != nil {
 		z.zipfGenMu.mu.Unlock()
 		return errors.Errorf("Could not incrementally compute zeta: %s", err)
 	}
+	z.zipfGenMu.iMax += count
 	eta := (1 - math.Pow(2.0/float64(z.zipfGenMu.iMax+1-z.iMin), 1.0-z.theta)) / (1.0 - z.zeta2/zetaN)
 	z.zipfGenMu.eta = eta
 	z.zipfGenMu.zetaN = zetaN
-	z.zipfGenMu.iMax++
 	z.zipfGenMu.mu.Unlock()
 	return nil
-}
-
-// IMaxHead returns the current value of IMaxHead, and increments it after.
-func (z *ZipfGenerator) IMaxHead() uint64 {
-	z.zipfGenMu.mu.Lock()
-	if z.zipfGenMu.iMaxHead < z.zipfGenMu.iMax {
-		z.zipfGenMu.iMaxHead = z.zipfGenMu.iMax
-	}
-	iMaxHead := z.zipfGenMu.iMaxHead
-	z.zipfGenMu.iMaxHead++
-	z.zipfGenMu.mu.Unlock()
-	return iMaxHead
 }

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
 )
 
 // ChaosTimer configures a chaos schedule.
@@ -86,24 +87,44 @@ func (ch *Chaos) Runner(c *cluster, m *monitor) func(context.Context) error {
 
 			if ch.DrainAndQuit {
 				l.Printf("stopping and draining %v\n", target)
-				c.Stop(ctx, target, stopArgs("--sig=15"))
+				if err := c.StopE(ctx, target, stopArgs("--sig=15")); err != nil {
+					return errors.Wrapf(err, "could not stop node %s", target)
+				}
 			} else {
 				l.Printf("killing %v\n", target)
-				c.Stop(ctx, target)
+				if err := c.StopE(ctx, target); err != nil {
+					return errors.Wrapf(err, "could not stop node %s", target)
+				}
 			}
 
 			select {
 			case <-ch.Stopper:
+				// NB: the roachtest harness checks that at the end of the test,
+				// all nodes that have data also have a running process.
 				l.Printf("restarting %v (chaos is done)\n", target)
-				c.Start(ctx, c.t.(*test), target)
+				if err := c.StartE(ctx, target); err != nil {
+					return errors.Wrapf(err, "could not restart node %s", target)
+				}
 				return nil
 			case <-ctx.Done():
+				// NB: the roachtest harness checks that at the end of the test,
+				// all nodes that have data also have a running process.
+				l.Printf("restarting %v (chaos is done)\n", target)
+				// Use a one-off context to restart the node because ours is
+				// already canceled.
+				tCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := c.StartE(tCtx, target); err != nil {
+					return errors.Wrapf(err, "could not restart node %s", target)
+				}
 				return ctx.Err()
 			case <-time.After(downTime):
 			}
 			l.Printf("restarting %v after %s of downtime\n", target, downTime)
 			t.Reset(period)
-			c.Start(ctx, c.t.(*test), target)
+			if err := c.StartE(ctx, target); err != nil {
+				return errors.Wrapf(err, "could not restart node %s", target)
+			}
 		}
 	}
 }

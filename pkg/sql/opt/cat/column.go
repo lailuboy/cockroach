@@ -16,7 +16,7 @@ package cat
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // Column is an interface to a table column, exposing only the information
@@ -33,7 +33,24 @@ type Column interface {
 	ColName() tree.Name
 
 	// DatumType returns the data type of the column.
-	DatumType() types.T
+	DatumType() *types.T
+
+	// ColTypePrecision returns the precision of the column's SQL data type. This
+	// is only defined for the Decimal data type and represents the max number of
+	// decimal digits in the decimal (including fractional digits). If precision
+	// is 0, then the decimal has no max precision.
+	ColTypePrecision() int
+
+	// ColTypeWidth returns the width of the column's SQL data type. This has
+	// different meanings depending on the data type:
+	//
+	//   Decimal  : scale
+	//   Int      : # bits (16, 32, 64, etc)
+	//   Bit Array: # bits
+	//   String   : rune count
+	//
+	// TODO(andyk): Switch calling code to use DatumType.
+	ColTypeWidth() int
 
 	// ColTypeStr returns the SQL data type of the column, as a string. Note that
 	// this is sometimes different than DatumType().String(), since datum types

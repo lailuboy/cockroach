@@ -15,6 +15,9 @@
 package exec
 
 import (
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/pkg/errors"
@@ -84,7 +87,7 @@ type hashJoinerSourceSpec struct {
 
 // hashJoinEqOp performs a hash join on the input tables equality columns.
 // It requires that the output for every input batch in the probe phase fits
-// within ColBatchSize, otherwise the behavior is undefined. A join is performed
+// within col.BatchSize, otherwise the behavior is undefined. A join is performed
 // and there is no guarantee on the ordering of the output columns.
 //
 // Before the build phase, all equality and output columns from the build table
@@ -155,7 +158,7 @@ type hashJoinerSourceSpec struct {
 // 3. Now, head stores the keyID of the first match in the build table for every
 //    probe table key. ht.same is used to select all build key matches for each
 //    probe key, which are added to the resulting batch. Output batching is done
-//    to ensure that each batch is at most ColBatchSize.
+//    to ensure that each batch is at most col.BatchSize.
 //
 // In the case that an outer join on the probe table side is performed, every
 // single probe row is kept even if its groupID is 0. If a groupID of 0 is
@@ -229,17 +232,17 @@ func (hj *hashJoinEqOp) Init() {
 	hj.runningState = hjBuilding
 }
 
-func (hj *hashJoinEqOp) Next() ColBatch {
+func (hj *hashJoinEqOp) Next(ctx context.Context) coldata.Batch {
 	switch hj.runningState {
 	case hjBuilding:
-		hj.build()
-		return hj.Next()
+		hj.build(ctx)
+		return hj.Next(ctx)
 	case hjProbing:
-		hj.prober.exec()
+		hj.prober.exec(ctx)
 
 		if hj.prober.batch.Length() == 0 && hj.builder.spec.outer {
 			hj.initEmitting()
-			return hj.Next()
+			return hj.Next(ctx)
 		}
 
 		return hj.prober.batch
@@ -251,8 +254,8 @@ func (hj *hashJoinEqOp) Next() ColBatch {
 	}
 }
 
-func (hj *hashJoinEqOp) build() {
-	hj.builder.exec()
+func (hj *hashJoinEqOp) build(ctx context.Context) {
+	hj.builder.distinctExec(ctx)
 
 	if !hj.spec.buildDistinct {
 		hj.ht.same = make([]uint64, hj.ht.size+1)
@@ -272,14 +275,14 @@ func (hj *hashJoinEqOp) initEmitting() {
 	// Set all elements in the probe columns of the output batch to null.
 	for _, colIdx := range hj.prober.spec.outCols {
 		outCol := hj.prober.batch.ColVec(int(colIdx + hj.prober.probeColOffset))
-		outCol.SetNulls()
+		outCol.Nulls().SetNulls()
 	}
 }
 
 func (hj *hashJoinEqOp) emitUnmatched() {
 	nResults := uint16(0)
 
-	for nResults < ColBatchSize && hj.emittingUnmatchedState.rowIdx < hj.ht.size {
+	for nResults < coldata.BatchSize && hj.emittingUnmatchedState.rowIdx < hj.ht.size {
 		if !hj.prober.buildRowMatched[hj.emittingUnmatchedState.rowIdx] {
 			hj.prober.buildIdx[nResults] = hj.emittingUnmatchedState.rowIdx
 			nResults++
@@ -326,7 +329,7 @@ type hashTable struct {
 	// keys.
 	//
 	// same is a densely-packed list that stores the keyID of the next key in the
-	// hash table that has the same value as the current key. The head of the key
+	// hash table that has the same value as the current key. The headID of the key
 	// is the first key of that value found in the next linked list. This field
 	// will be lazily populated by the prober.
 	same []uint64
@@ -334,27 +337,57 @@ type hashTable struct {
 	// by the prober.
 	visited []bool
 
+	// head indicates whether each of the corresponding keys is the head of the
+	// linked list at same. This would allow us to eliminate keys that are not the
+	// head and thereby should not be traversed.
+	head []bool
+
 	// vals stores the union of the equality and output columns of the left
 	// table. A key tuple is defined as the elements in each row of vals that
 	// makes up the equality columns. The ID of a key at any index of vals is
 	// index + 1.
-	vals []ColVec
+	vals []coldata.Vec
 	// valTypes stores the corresponding types of the val columns.
 	valTypes []types.T
 	// valCols stores the union of the keyCols and outCols.
 	valCols []uint32
-
 	// keyCols stores the indices of vals which are key columns.
 	keyCols []uint32
 
 	// outCols stores the indices of vals which are output columns.
 	outCols []uint32
+	// outTypes stores the types of the output columns.
+	outTypes []types.T
 
 	// size returns the total number of keyCols the hashTable currently stores.
 	size uint64
 	// bucketSize returns the number of buckets the hashTable employs. This is
 	// equivalent to the size of first.
 	bucketSize uint64
+
+	// keyCols stores the equality columns on the probe table for a single batch.
+	keys []coldata.Vec
+	// buckets is used to store the computed hash value of each key in a single
+	// batch.
+	buckets []uint64
+
+	// groupID stores the keyID that maps to the joining rows of the build table.
+	// The ith element of groupID stores the keyID of the build table that
+	// corresponds to the ith key in the probe table.
+	groupID []uint64
+	// toCheck stores the indices of the eqCol rows that have yet to be found or
+	// rejected.
+	toCheck []uint16
+
+	// headID stores the first build table keyID that matched with the probe batch
+	// key at any given index.
+	headID []uint64
+
+	// differs stores whether the key at any index differs with the build table
+	// key.
+	differs []bool
+
+	cancelChecker CancelChecker
 }
 
 func makeHashTable(
@@ -375,7 +408,7 @@ func makeHashTable(
 	}
 
 	// Extract the important columns and discard the rest.
-	cols := make([]ColVec, 0, nCols)
+	cols := make([]coldata.Vec, 0, nCols)
 	nKeep := uint32(0)
 
 	keepTypes := make([]types.T, 0, nCols)
@@ -383,7 +416,7 @@ func makeHashTable(
 
 	for i := 0; i < nCols; i++ {
 		if keepCol[i] {
-			cols = append(cols, newMemColumn(sourceTypes[i], 0))
+			cols = append(cols, coldata.NewMemColumn(sourceTypes[i], 0))
 			keepTypes = append(keepTypes, sourceTypes[i])
 			keepCols = append(keepCols, uint32(i))
 
@@ -415,18 +448,26 @@ func makeHashTable(
 		vals:     cols,
 		valTypes: keepTypes,
 		valCols:  keepCols,
-
-		keyCols: keys,
-
-		outCols: outs,
+		keyCols:  keys,
+		outCols:  outs,
+		outTypes: outTypes,
 
 		bucketSize: bucketSize,
+
+		groupID: make([]uint64, coldata.BatchSize),
+		toCheck: make([]uint16, coldata.BatchSize),
+		differs: make([]bool, coldata.BatchSize),
+
+		headID: make([]uint64, coldata.BatchSize),
+
+		keys:    make([]coldata.Vec, len(eqCols)),
+		buckets: make([]uint64, coldata.BatchSize),
 	}
 }
 
 // loadBatch appends a new batch of keys and outputs to the existing keys and
 // output columns.
-func (ht *hashTable) loadBatch(batch ColBatch) {
+func (ht *hashTable) loadBatch(batch coldata.Batch) {
 	batchSize := batch.Length()
 	sel := batch.Selection()
 
@@ -446,11 +487,15 @@ func (ht *hashTable) loadBatch(batch ColBatch) {
 // key is a tuple of various types, rehash is used to apply a transformation on
 // the resulting hash value based on an element of the key of a specified type.
 //
-// The current integer tuple hashing heuristic is based off of Java's
-// Arrays.hashCode(int[]) and only supports int8, int16, int32, and int64
-// elements. float32 and float64 are hashed according to their respective 32-bit
-// and 64-bit integer representation. bool keys are hashed as a 1 for true and 0
-// for false. bytes are hashed as an array of int8 integers.
+// We currently use the same hash functions used by go's maps.
+// TODO(asubiotto): Once https://go-review.googlesource.com/c/go/+/155118/ is
+// in, we should use the public API.
+
+// rehash takes an element of a key (tuple representing a row of equality
+// column values) at a given column and computes a new hash by applying a
+// transformation to the existing hash. This function is generated by execgen,
+// so it doesn't appear in this file. Look at hashjoiner_tmpl.go for the source
+// code.
 //
 // initHash initializes the hash value of each key to its initial state for
 // rehashing purposes.
@@ -459,10 +504,6 @@ func (ht *hashTable) initHash(buckets []uint64, nKeys uint64) {
 		buckets[i] = 1
 	}
 }
-
-// rehash takes a element of a key (tuple representing a row of equality
-// column values) at a given column and computes a new hash by applying a
-// transformation to the existing hash. This function is generated by execgen.
 
 // finalizeHash takes each key's hash value and applies a final transformation
 // onto it so that it fits within the hashTable's bucket size.
@@ -478,25 +519,27 @@ func (ht *hashTable) finalizeHash(buckets []uint64, nKeys uint64) {
 
 // computeBuckets computes the hash value of each key and stores the result in
 // buckets.
-func (ht *hashTable) computeBuckets(buckets []uint64, keys []ColVec, nKeys uint64, sel []uint16) {
+func (ht *hashTable) computeBuckets(
+	ctx context.Context, buckets []uint64, keys []coldata.Vec, nKeys uint64, sel []uint16,
+) {
 	ht.initHash(buckets, nKeys)
 
 	for i, k := range ht.keyCols {
-		ht.rehash(buckets, i, ht.valTypes[k], keys[i], nKeys, sel)
+		ht.rehash(ctx, buckets, i, ht.valTypes[k], keys[i], nKeys, sel)
 	}
 
 	ht.finalizeHash(buckets, nKeys)
 }
 
-// insertKeys builds the hash map from the compute hash values.
-func (ht *hashTable) insertKeys(buckets []uint64) {
-	ht.next = make([]uint64, ht.size+1)
-
+// buildNextChains builds the hash map from the computed hash values.
+func (ht *hashTable) buildNextChains(ctx context.Context) {
 	for id := uint64(1); id <= ht.size; id++ {
+		ht.cancelChecker.check(ctx)
 		// keyID is stored into corresponding hash bucket at the front of the next
 		// chain.
-		ht.next[id] = ht.first[buckets[id-1]]
-		ht.first[buckets[id-1]] = id
+		hash := ht.next[id]
+		ht.next[id] = ht.first[hash]
+		ht.first[hash] = id
 	}
 }
 
@@ -526,11 +569,61 @@ func makeHashJoinBuilder(ht *hashTable, spec hashJoinerSourceSpec) *hashJoinBuil
 	}
 }
 
-// exec executes the entirety of the hash table build phase using the source as
-// the build relation. The source operator is entirely consumed in the process.
-func (builder *hashJoinBuilder) exec() {
+// exec executes distinctExec, and then eagerly populates the hashTable's same
+// array by probing the hashTable with every single input key.
+func (builder *hashJoinBuilder) exec(ctx context.Context) {
+	builder.distinctExec(ctx)
+
+	builder.ht.same = make([]uint64, builder.ht.size+1)
+	builder.ht.visited = make([]bool, builder.ht.size+1)
+	builder.ht.head = make([]bool, builder.ht.size+1)
+
+	// Since keyID = 0 is reserved for end of list, it can be marked as visited
+	// at the beginning.
+	builder.ht.visited[0] = true
+
+	nKeyCols := len(builder.spec.eqCols)
+	batchStart := uint64(0)
+	for batchStart < builder.ht.size {
+		batchEnd := batchStart + coldata.BatchSize
+		if batchEnd > builder.ht.size {
+			batchEnd = builder.ht.size
+		}
+
+		batchSize := uint16(batchEnd - batchStart)
+
+		for i := 0; i < nKeyCols; i++ {
+			builder.ht.keys[i] = builder.ht.vals[builder.ht.keyCols[i]].Slice(builder.ht.valTypes[builder.ht.keyCols[i]], batchStart, batchEnd)
+		}
+
+		builder.ht.lookupInitial(ctx, batchSize, nil)
+		nToCheck := batchSize
+
+		for nToCheck > 0 {
+			// Continue searching for the build table matching keys while the toCheck
+			// array is non-empty.
+			nToCheck = builder.ht.check(nToCheck, nil)
+			builder.ht.findNext(nToCheck)
+		}
+
+		// Reset each element of headID to 0 to indicate that the probe key has not
+		// been found in the build table. Also mark the corresponding indices as
+		// head of the linked list.
+		for i := uint16(0); i < batchSize; i++ {
+			builder.ht.head[builder.ht.headID[i]] = true
+			builder.ht.headID[i] = 0
+		}
+
+		batchStart = batchEnd
+	}
+}
+
+// distinctExec executes the entirety of the hash table build phase using the
+// source as the build relation. The source operator is entirely consumed in the
+// process.
+func (builder *hashJoinBuilder) distinctExec(ctx context.Context) {
 	for {
-		batch := builder.spec.source.Next()
+		batch := builder.spec.source.Next(ctx)
 
 		if batch.Length() == 0 {
 			break
@@ -539,16 +632,16 @@ func (builder *hashJoinBuilder) exec() {
 		builder.ht.loadBatch(batch)
 	}
 
-	// buckets is used to store the computed hash value of each key.
-	nKeys := len(builder.ht.keyCols)
-	keyCols := make([]ColVec, nKeys)
-	for i := 0; i < nKeys; i++ {
+	nKeyCols := len(builder.spec.eqCols)
+	keyCols := make([]coldata.Vec, nKeyCols)
+	for i := 0; i < nKeyCols; i++ {
 		keyCols[i] = builder.ht.vals[builder.ht.keyCols[i]]
 	}
 
-	buckets := make([]uint64, builder.ht.size)
-	builder.ht.computeBuckets(buckets, keyCols, builder.ht.size, nil)
-	builder.ht.insertKeys(buckets)
+	// builder.ht.next is used to store the computed hash value of each key.
+	builder.ht.next = make([]uint64, builder.ht.size+1)
+	builder.ht.computeBuckets(ctx, builder.ht.next[1:], keyCols, builder.ht.size, nil)
+	builder.ht.buildNextChains(ctx)
 }
 
 // hashJoinProber is used by the hashJoinEqOp during the probe phase. It
@@ -559,23 +652,7 @@ type hashJoinProber struct {
 
 	// batch stores the resulting output batch that is constructed and returned
 	// for every input batch during the probe phase.
-	batch ColBatch
-
-	// groupID stores the keyID that maps to the joining rows of the build table.
-	// The ith element of groupID stores the keyID of the build table that
-	// corresponds to the ith key in the probe table.
-	groupID []uint64
-	// toCheck stores the indices of the eqCol rows that have yet to be found or
-	// rejected.
-	toCheck []uint16
-
-	// head stores the first build table keyID that matched with the probe batch
-	// key at any given index.
-	head []uint64
-
-	// differs stores whether the key at any index differs with the build table
-	// key.
-	differs []bool
+	batch coldata.Batch
 
 	// buildIdx and probeIdx represents the matching row indices that are used to
 	// stitch together the join results. Since probing is done on a per-batch
@@ -603,12 +680,6 @@ type hashJoinProber struct {
 	buildColOffset uint32
 	probeColOffset uint32
 
-	// keyCols stores the equality columns on the probe table for a single batch.
-	keys []ColVec
-	// buckets is used to store the computed hash value of each key in a single
-	// batch.
-	buckets []uint64
-
 	// spec holds the specifications for the source operator used in the probe
 	// phase.
 	spec hashJoinerSourceSpec
@@ -624,7 +695,7 @@ type hashJoinProber struct {
 
 	// prevBatch, if not nil, indicates that the previous probe input batch has
 	// not been fully processed.
-	prevBatch ColBatch
+	prevBatch coldata.Batch
 }
 
 func makeHashJoinProber(
@@ -651,25 +722,16 @@ func makeHashJoinProber(
 
 	var probeRowUnmatched []bool
 	if probe.outer {
-		probeRowUnmatched = make([]bool, ColBatchSize)
+		probeRowUnmatched = make([]bool, coldata.BatchSize)
 	}
 
 	return &hashJoinProber{
 		ht: ht,
 
-		batch: NewMemBatch(outColTypes),
+		batch: coldata.NewMemBatch(outColTypes),
 
-		groupID: make([]uint64, ColBatchSize),
-		toCheck: make([]uint16, ColBatchSize),
-		differs: make([]bool, ColBatchSize),
-
-		head: make([]uint64, ColBatchSize),
-
-		buildIdx: make([]uint64, ColBatchSize),
-		probeIdx: make([]uint16, ColBatchSize),
-
-		keys:    make([]ColVec, len(probe.eqCols)),
-		buckets: make([]uint64, ColBatchSize),
+		buildIdx: make([]uint64, coldata.BatchSize),
+		probeIdx: make([]uint16, coldata.BatchSize),
 
 		spec:  probe,
 		build: build,
@@ -685,7 +747,7 @@ func makeHashJoinProber(
 }
 
 // exec is a general prober that works with non-distinct build table equality
-// columns. It returns a ColBatch with N + M columns where N is the number of
+// columns. It returns a Batch with N + M columns where N is the number of
 // left source columns and M is the number of right source columns. The first N
 // columns correspond to the respective left source columns, followed by the
 // right source columns as the last M elements. Even though all the columns are
@@ -696,7 +758,7 @@ func makeHashJoinProber(
 // buildDistinct is true if the build table equality columns are distinct. It
 // performs the same operation as the exec() function normally would while
 // taking a shortcut to improve speed.
-func (prober *hashJoinProber) exec() {
+func (prober *hashJoinProber) exec(ctx context.Context) {
 	prober.batch.SetLength(0)
 
 	if batch := prober.prevBatch; batch != nil {
@@ -711,7 +773,7 @@ func (prober *hashJoinProber) exec() {
 		prober.congregate(nResults, batch, batchSize)
 	} else {
 		for {
-			batch := prober.spec.source.Next()
+			batch := prober.spec.source.Next(ctx)
 			batchSize := batch.Length()
 
 			if batchSize == 0 {
@@ -719,25 +781,25 @@ func (prober *hashJoinProber) exec() {
 			}
 
 			for i, colIdx := range prober.spec.eqCols {
-				prober.keys[i] = batch.ColVec(int(colIdx))
+				prober.ht.keys[i] = batch.ColVec(int(colIdx))
 			}
 
 			sel := batch.Selection()
 
 			// Initialize groupID with the initial hash buckets and toCheck with all
 			// applicable indices.
-			prober.lookupInitial(batchSize, sel)
+			prober.ht.lookupInitial(ctx, batchSize, sel)
 			nToCheck := batchSize
 
 			var nResults uint16
 
 			if prober.buildDistinct {
-				// Continue searching along the hash table next chains for the corresponding
-				// buckets. If the key is found or end of next chain is reached, the key is
-				// removed from the toCheck array.
 				for nToCheck > 0 {
-					nToCheck = prober.distinctCheck(nToCheck, sel)
-					prober.findNext(nToCheck)
+					// Continue searching along the hash table next chains for the corresponding
+					// buckets. If the key is found or end of next chain is reached, the key is
+					// removed from the toCheck array.
+					nToCheck = prober.ht.distinctCheck(nToCheck, sel)
+					prober.ht.findNext(nToCheck)
 				}
 
 				nResults = prober.distinctCollect(batch, batchSize, sel)
@@ -745,8 +807,8 @@ func (prober *hashJoinProber) exec() {
 				for nToCheck > 0 {
 					// Continue searching for the build table matching keys while the toCheck
 					// array is non-empty.
-					nToCheck = prober.check(nToCheck, sel)
-					prober.findNext(nToCheck)
+					nToCheck = prober.ht.check(nToCheck, sel)
+					prober.ht.findNext(nToCheck)
 				}
 
 				nResults = prober.collect(batch, batchSize, sel)
@@ -764,72 +826,70 @@ func (prober *hashJoinProber) exec() {
 // lookupInitial finds the corresponding hash table buckets for the equality
 // column of the batch and stores the results in groupID. It also initializes
 // toCheck with all indices in the range [0, batchSize).
-func (prober *hashJoinProber) lookupInitial(batchSize uint16, sel []uint16) {
-	prober.ht.computeBuckets(prober.buckets, prober.keys, uint64(batchSize), sel)
+func (ht *hashTable) lookupInitial(ctx context.Context, batchSize uint16, sel []uint16) {
+	ht.computeBuckets(ctx, ht.buckets, ht.keys, uint64(batchSize), sel)
 	for i := uint16(0); i < batchSize; i++ {
-		prober.groupID[i] = prober.ht.first[prober.buckets[i]]
-		prober.toCheck[i] = i
+		ht.groupID[i] = ht.first[ht.buckets[i]]
+		ht.toCheck[i] = i
 	}
 }
 
 // findNext determines the id of the next key inside the groupID buckets for
 // each equality column key in toCheck.
-func (prober *hashJoinProber) findNext(nToCheck uint16) {
+func (ht *hashTable) findNext(nToCheck uint16) {
 	for i := uint16(0); i < nToCheck; i++ {
-		prober.groupID[prober.toCheck[i]] = prober.ht.next[prober.groupID[prober.toCheck[i]]]
+		ht.groupID[ht.toCheck[i]] = ht.next[ht.groupID[ht.toCheck[i]]]
 	}
 }
 
-// checkCols performs a column by columns checkCol on the key columns.
-func (prober *hashJoinProber) checkCols(nToCheck uint16, sel []uint16) {
-	for i, k := range prober.ht.keyCols {
-		prober.checkCol(prober.ht.valTypes[k], i, nToCheck, sel)
+// checkCols performs a column by column checkCol on the key columns.
+func (ht *hashTable) checkCols(nToCheck uint16, sel []uint16) {
+	for i, k := range ht.keyCols {
+		ht.checkCol(ht.valTypes[k], i, nToCheck, sel)
 	}
 }
 
-// check performs a equality check between the current key in the groupID bucket
+// check performs an equality check between the current key in the groupID bucket
 // and the probe key at that index. If there is a match, the hashTable's same
-// array is updated to lazily populate the a linked list of identical build
+// array is updated to lazily populate the linked list of identical build
 // table keys. The visited flag for corresponding build table key is also set. A
 // key is removed from toCheck if it has already been visited in a previous
 // probe, or the bucket has reached the end (key not found in build table). The
 // new length of toCheck is returned by this function.
-func (prober *hashJoinProber) check(nToCheck uint16, sel []uint16) uint16 {
-	prober.checkCols(nToCheck, sel)
-
+func (ht *hashTable) check(nToCheck uint16, sel []uint16) uint16 {
+	ht.checkCols(nToCheck, sel)
 	nDiffers := uint16(0)
 	for i := uint16(0); i < nToCheck; i++ {
-		if !prober.differs[prober.toCheck[i]] {
-			// If the current key matches with the probe key, we want to update head
+		if !ht.differs[ht.toCheck[i]] {
+			// If the current key matches with the probe key, we want to update headID
 			// with the current key if it has not been set yet.
-			keyID := prober.groupID[prober.toCheck[i]]
-
-			if prober.head[prober.toCheck[i]] == 0 {
-				prober.head[prober.toCheck[i]] = keyID
+			keyID := ht.groupID[ht.toCheck[i]]
+			if ht.headID[ht.toCheck[i]] == 0 {
+				ht.headID[ht.toCheck[i]] = keyID
 			}
-			headID := prober.head[prober.toCheck[i]]
+			firstID := ht.headID[ht.toCheck[i]]
 
-			if !prober.ht.visited[keyID] {
+			if !ht.visited[keyID] {
 				// We can then add this keyID into the same array at the end of the
 				// corresponding linked list and mark this ID as visited. Since there
 				// can be multiple keys that match this probe key, we want to mark
 				// differs at this position to be true. This way, the prober will
 				// continue probing for this key until it reaches the end of the next
 				// chain.
-				prober.differs[prober.toCheck[i]] = true
-				prober.ht.visited[keyID] = true
+				ht.differs[ht.toCheck[i]] = true
+				ht.visited[keyID] = true
 
-				if headID != keyID {
-					prober.ht.same[keyID] = prober.ht.same[headID]
-					prober.ht.same[headID] = keyID
+				if firstID != keyID {
+					ht.same[keyID] = ht.same[firstID]
+					ht.same[firstID] = keyID
 				}
 			}
 		}
 
-		if prober.differs[prober.toCheck[i]] {
+		if ht.differs[ht.toCheck[i]] {
 			// Continue probing in this next chain for the probe key.
-			prober.differs[prober.toCheck[i]] = false
-			prober.toCheck[nDiffers] = prober.toCheck[i]
+			ht.differs[ht.toCheck[i]] = false
+			ht.toCheck[nDiffers] = ht.toCheck[i]
 			nDiffers++
 		}
 	}
@@ -840,7 +900,7 @@ func (prober *hashJoinProber) check(nToCheck uint16, sel []uint16) uint16 {
 // congregate uses the probeIdx and buildidx pairs to stitch together the
 // resulting join rows and add them to the output batch with the left table
 // columns preceding the right table columns.
-func (prober *hashJoinProber) congregate(nResults uint16, batch ColBatch, batchSize uint16) {
+func (prober *hashJoinProber) congregate(nResults uint16, batch coldata.Batch, batchSize uint16) {
 	for i, colIdx := range prober.build.outCols {
 		outCol := prober.batch.ColVec(int(colIdx + prober.buildColOffset))
 		valCol := prober.ht.vals[prober.ht.outCols[i]]
@@ -885,15 +945,15 @@ func (prober *hashJoinProber) congregate(nResults uint16, batch ColBatch, batchS
 // toCheck. If the bucket has reached the end, the key is rejected. The toCheck
 // list is reconstructed to only hold the indices of the eqCol keys that have
 // not been found. The new length of toCheck is returned by this function.
-func (prober *hashJoinProber) distinctCheck(nToCheck uint16, sel []uint16) uint16 {
-	prober.checkCols(nToCheck, sel)
+func (ht *hashTable) distinctCheck(nToCheck uint16, sel []uint16) uint16 {
+	ht.checkCols(nToCheck, sel)
 
 	// Select the indices that differ and put them into toCheck.
 	nDiffers := uint16(0)
 	for i := uint16(0); i < nToCheck; i++ {
-		if prober.differs[prober.toCheck[i]] {
-			prober.differs[prober.toCheck[i]] = false
-			prober.toCheck[nDiffers] = prober.toCheck[i]
+		if ht.differs[ht.toCheck[i]] {
+			ht.differs[ht.toCheck[i]] = false
+			ht.toCheck[nDiffers] = ht.toCheck[i]
 			nDiffers++
 		}
 	}

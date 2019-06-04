@@ -26,6 +26,9 @@ package tree
 import (
 	"errors"
 	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // SelectStatement represents any SELECT statement.
@@ -265,6 +268,7 @@ type IndexID uint32
 //  - FORCE_INDEX=<index_name|index_id>
 //  - ASC / DESC
 //  - NO_INDEX_JOIN
+//  - IGNORE_FOREIGN_KEYS
 // It is used optionally after a table name in SELECT statements.
 type IndexFlags struct {
 	Index   UnrestrictedName
@@ -274,6 +278,10 @@ type IndexFlags struct {
 	Direction Direction
 	// NoIndexJoin cannot be specified together with an index.
 	NoIndexJoin bool
+	// IgnoreForeignKeys disables optimizations based on outbound foreign key
+	// references from this table. This is useful in particular for scrub queries
+	// used to verify the consistency of foreign key relations.
+	IgnoreForeignKeys bool
 }
 
 // ForceIndex returns true if a forced index was specified, either using a name
@@ -288,8 +296,12 @@ func (ih *IndexFlags) CombineWith(other *IndexFlags) error {
 	if ih.NoIndexJoin && other.NoIndexJoin {
 		return errors.New("NO_INDEX_JOIN specified multiple times")
 	}
+	if ih.IgnoreForeignKeys && other.IgnoreForeignKeys {
+		return errors.New("IGNORE_FOREIGN_KEYS specified multiple times")
+	}
 	result := *ih
 	result.NoIndexJoin = ih.NoIndexJoin || other.NoIndexJoin
+	result.IgnoreForeignKeys = ih.IgnoreForeignKeys || other.IgnoreForeignKeys
 
 	if other.Direction != 0 {
 		if ih.Direction != 0 {
@@ -327,18 +339,22 @@ func (ih *IndexFlags) Check() error {
 
 // Format implements the NodeFormatter interface.
 func (ih *IndexFlags) Format(ctx *FmtCtx) {
-	if !ih.NoIndexJoin && ih.Direction == 0 {
-		ctx.WriteByte('@')
+	ctx.WriteByte('@')
+	if !ih.NoIndexJoin && !ih.IgnoreForeignKeys && ih.Direction == 0 {
 		if ih.Index != "" {
 			ctx.FormatNode(&ih.Index)
 		} else {
 			ctx.Printf("[%d]", ih.IndexID)
 		}
 	} else {
-		if ih.Index == "" && ih.IndexID == 0 {
-			ctx.WriteString("@{NO_INDEX_JOIN}")
-		} else {
-			ctx.WriteString("@{FORCE_INDEX=")
+		ctx.WriteByte('{')
+		var sep func()
+		sep = func() {
+			sep = func() { ctx.WriteByte(',') }
+		}
+		if ih.Index != "" || ih.IndexID != 0 {
+			sep()
+			ctx.WriteString("FORCE_INDEX=")
 			if ih.Index != "" {
 				ctx.FormatNode(&ih.Index)
 			} else {
@@ -348,11 +364,17 @@ func (ih *IndexFlags) Format(ctx *FmtCtx) {
 			if ih.Direction != 0 {
 				ctx.Printf(",%s", ih.Direction)
 			}
-			if ih.NoIndexJoin {
-				ctx.WriteString(",NO_INDEX_JOIN")
-			}
-			ctx.WriteString("}")
 		}
+		if ih.NoIndexJoin {
+			sep()
+			ctx.WriteString("NO_INDEX_JOIN")
+		}
+
+		if ih.IgnoreForeignKeys {
+			sep()
+			ctx.WriteString("IGNORE_FOREIGN_KEYS")
+		}
+		ctx.WriteString("}")
 	}
 }
 
@@ -362,11 +384,15 @@ type AliasedTableExpr struct {
 	Expr       TableExpr
 	IndexFlags *IndexFlags
 	Ordinality bool
+	Lateral    bool
 	As         AliasClause
 }
 
 // Format implements the NodeFormatter interface.
 func (node *AliasedTableExpr) Format(ctx *FmtCtx) {
+	if node.Lateral {
+		ctx.WriteString("LATERAL ")
+	}
 	ctx.FormatNode(node.Expr)
 	if node.IndexFlags != nil {
 		ctx.FormatNode(node.IndexFlags)
@@ -795,7 +821,7 @@ func (node *WindowFrameBound) Format(ctx *FmtCtx) {
 	case UnboundedFollowing:
 		ctx.WriteString("UNBOUNDED FOLLOWING")
 	default:
-		panic(fmt.Sprintf("unhandled case: %d", node.BoundType))
+		panic(pgerror.AssertionFailedf("unhandled case: %d", log.Safe(node.BoundType)))
 	}
 }
 
@@ -809,7 +835,7 @@ func (node *WindowFrame) Format(ctx *FmtCtx) {
 	case GROUPS:
 		ctx.WriteString("GROUPS ")
 	default:
-		panic(fmt.Sprintf("unhandled case: %d", node.Mode))
+		panic(pgerror.AssertionFailedf("unhandled case: %d", log.Safe(node.Mode)))
 	}
 	if node.Bounds.EndBound != nil {
 		ctx.WriteString("BETWEEN ")

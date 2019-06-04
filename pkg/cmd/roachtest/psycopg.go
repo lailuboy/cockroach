@@ -23,14 +23,12 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
-
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 )
 
-var psycopgResultRegex = regexp.MustCompile(`(?P<name>.*) \((?P<class>.*)\) \.\.\. (?P<result>.*)`)
+var psycopgResultRegex = regexp.MustCompile(`(?P<name>.*) \((?P<class>.*)\) \.\.\. (?P<result>[^ ']*)(?: u?['"](?P<reason>.*)['"])?`)
+var psycopgReleaseTagRegex = regexp.MustCompile(`^(?P<major>\d+)(?:_(?P<minor>\d+)(?:_(?P<point>\d+)(?:_(?P<subpoint>\d+))?)?)?$`)
 
-// This test runs psycopg full test suite against an single cockroach node.
+// This test runs psycopg full test suite against a single cockroach node.
 
 func registerPsycopg(r *registry) {
 	runPsycopg := func(
@@ -47,70 +45,57 @@ func registerPsycopg(r *registry) {
 		c.Start(ctx, t, c.All())
 
 		t.Status("cloning psycopg and installing prerequisites")
-		opts := retry.Options{
-			InitialBackoff: 10 * time.Second,
-			Multiplier:     2,
-			MaxBackoff:     5 * time.Minute,
+		latestTag, err := repeatGetLatestTag(ctx, c, "psycopg", "psycopg2", psycopgReleaseTagRegex)
+		if err != nil {
+			t.Fatal(err)
 		}
-		for attempt, r := 0, retry.StartWithCtx(ctx, opts); r.Next(); {
-			if ctx.Err() != nil {
-				return
-			}
-			if c.t.Failed() {
-				return
-			}
-			attempt++
+		c.l.Printf("Latest Psycopg release is %s.", latestTag)
 
-			c.l.Printf("attempt %d - update dependencies", attempt)
-			if err := c.RunE(ctx, node, `sudo apt-get -q update`); err != nil {
-				continue
-			}
-			if err := c.RunE(
-				ctx, node, `sudo apt-get -qy install make python3 libpq-dev python-dev gcc`,
-			); err != nil {
-				continue
-			}
-
-			c.l.Printf("attempt %d - cloning psycopg", attempt)
-			if err := c.RunE(ctx, node, `rm -rf /mnt/data1/psycopg`); err != nil {
-				continue
-			}
-			if err := c.GitCloneE(
-				ctx,
-				"https://github.com/psycopg/psycopg2.git",
-				"/mnt/data1/psycopg",
-				"2_7_7",
-				node,
-			); err != nil {
-				continue
-			}
-
-			break
+		if err := repeatRunE(
+			ctx, c, node, "update apt-get", `sudo apt-get -qq update`,
+		); err != nil {
+			t.Fatal(err)
 		}
 
-		t.Status("building psycopg")
-		for attempt, r := 0, retry.StartWithCtx(ctx, opts); r.Next(); {
-			if ctx.Err() != nil {
-				return
-			}
-			if c.t.Failed() {
-				return
-			}
-			attempt++
-			c.l.Printf("attempt %d - building psycopg", attempt)
-			if err := c.RunE(
-				ctx, node, `cd /mnt/data1/psycopg/ && make`,
-			); err != nil {
-				continue
-			}
-			break
+		if err := repeatRunE(
+			ctx,
+			c,
+			node,
+			"install dependencies",
+			`sudo apt-get -qq install make python3 libpq-dev python-dev gcc python3-setuptools python-setuptools`,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := repeatRunE(
+			ctx, c, node, "remove old Psycopg", `sudo rm -rf /mnt/data1/psycopg`,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := repeatGitCloneE(
+			ctx,
+			c,
+			"https://github.com/psycopg/psycopg2.git",
+			"/mnt/data1/psycopg",
+			latestTag,
+			node,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		t.Status("building Psycopg")
+		if err := repeatRunE(
+			ctx, c, node, "building Psycopg", `cd /mnt/data1/psycopg/ && make`,
+		); err != nil {
+			t.Fatal(err)
 		}
 
 		version, err := fetchCockroachVersion(ctx, c, node[0])
 		if err != nil {
 			t.Fatal(err)
 		}
-		blacklistName, expectedFailureList, ignoredlistName, ignoredlist := getPsycopgBlacklistForVersion(version)
+		blacklistName, expectedFailureList, ignoredlistName, ignoredlist := psycopgBlacklists.getLists(version)
 		if expectedFailureList == nil {
 			t.Fatalf("No psycopg blacklist defined for cockroach version %s", version)
 		}
@@ -137,7 +122,7 @@ func registerPsycopg(r *registry) {
 
 		// Find all the failed and errored tests.
 
-		var failUnexpectedCount, failExpectedCount, ignoredCount int
+		var failUnexpectedCount, failExpectedCount, ignoredCount, skipCount, unexpectedSkipCount int
 		var passUnexpectedCount, passExpectedCount, notRunCount int
 		// Put all the results in a giant map of [testname]result
 		results := make(map[string]string)
@@ -155,6 +140,10 @@ func registerPsycopg(r *registry) {
 					groups[psycopgResultRegex.SubexpNames()[i]] = name
 				}
 				test := fmt.Sprintf("%s.%s", groups["class"], groups["name"])
+				var skipReason string
+				if groups["result"] == "skipped" {
+					skipReason = groups["reason"]
+				}
 				pass := groups["result"] == "ok"
 				allTests = append(allTests, test)
 
@@ -164,6 +153,12 @@ func registerPsycopg(r *registry) {
 				case expectedIgnored:
 					results[test] = fmt.Sprintf("--- SKIP: %s due to %s (expected)", test, ignoredIssue)
 					ignoredCount++
+				case len(skipReason) > 0 && expectedFailure:
+					results[test] = fmt.Sprintf("--- SKIP: %s due to %s (unexpected)", test, skipReason)
+					unexpectedSkipCount++
+				case len(skipReason) > 0:
+					results[test] = fmt.Sprintf("--- SKIP: %s due to %s (expected)", test, skipReason)
+					skipCount++
 				case pass && !expectedFailure:
 					results[test] = fmt.Sprintf("--- PASS: %s (expected)", test)
 					passExpectedCount++
@@ -212,6 +207,7 @@ func registerPsycopg(r *registry) {
 
 		var bResults strings.Builder
 		fmt.Fprintf(&bResults, "Tests run on Cockroach %s\n", version)
+		fmt.Fprintf(&bResults, "Tests run against Pyscopg %s\n", latestTag)
 		fmt.Fprintf(&bResults, "%d Total Tests Run\n",
 			passExpectedCount+passUnexpectedCount+failExpectedCount+failUnexpectedCount,
 		)
@@ -225,16 +221,19 @@ func registerPsycopg(r *registry) {
 		}
 		p("passed", passUnexpectedCount+passExpectedCount)
 		p("failed", failUnexpectedCount+failExpectedCount)
+		p("skipped", skipCount)
 		p("ignored", ignoredCount)
 		p("passed unexpectedly", passUnexpectedCount)
 		p("failed unexpectedly", failUnexpectedCount)
+		p("expected failed but skipped", unexpectedSkipCount)
 		p("expected failed but not run", notRunCount)
 
 		fmt.Fprintf(&bResults, "For a full summary look at the psycopg artifacts. \n")
 		t.l.Printf("%s\n", bResults.String())
 		t.l.Printf("------------------------\n")
 
-		if failUnexpectedCount > 0 || passUnexpectedCount > 0 || notRunCount > 0 {
+		if failUnexpectedCount > 0 || passUnexpectedCount > 0 ||
+			notRunCount > 0 || unexpectedSkipCount > 0 {
 			// Create a new psycopg_blacklist so we can easily update this test.
 			sort.Strings(currentFailures)
 			var b strings.Builder
@@ -258,8 +257,9 @@ func registerPsycopg(r *registry) {
 	}
 
 	r.Add(testSpec{
-		Name:    "psycopg",
-		Cluster: makeClusterSpec(1),
+		Name:       "psycopg",
+		Cluster:    makeClusterSpec(1),
+		MinVersion: "v2.2.0",
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runPsycopg(ctx, t, c)
 		},

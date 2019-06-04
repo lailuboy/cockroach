@@ -17,8 +17,8 @@ package sqlbase
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/pkg/errors"
 )
 
@@ -99,11 +99,30 @@ func (ep *DummyEvalPlanner) ResolveTableName(ctx context.Context, tn *tree.Table
 }
 
 // ParseType is part of the tree.EvalPlanner interface.
-func (ep *DummyEvalPlanner) ParseType(sql string) (coltypes.CastTargetType, error) {
+func (ep *DummyEvalPlanner) ParseType(sql string) (*types.T, error) {
 	return nil, errEvalPlanner
 }
 
 // EvalSubquery is part of the tree.EvalPlanner interface.
 func (ep *DummyEvalPlanner) EvalSubquery(expr *tree.Subquery) (tree.Datum, error) {
 	return nil, errEvalPlanner
+}
+
+// DummySessionAccessor implements the tree.EvalSessionAccessor interface by returning errors.
+type DummySessionAccessor struct{}
+
+var _ tree.EvalSessionAccessor = &DummySessionAccessor{}
+
+var errEvalSessionVar = errors.New("cannot backfill expressions that access session variables")
+
+// GetSessionVar is part of the tree.EvalSessionAccessor interface.
+func (ep *DummySessionAccessor) GetSessionVar(
+	_ context.Context, _ string, _ bool,
+) (bool, string, error) {
+	return false, "", errEvalSessionVar
+}
+
+// SetSessionVar is part of the tree.EvalSessionAccessor interface.
+func (ep *DummySessionAccessor) SetSessionVar(_ context.Context, _, _ string) error {
+	return errEvalSessionVar
 }

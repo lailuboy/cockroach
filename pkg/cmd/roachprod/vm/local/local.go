@@ -48,7 +48,7 @@ func (o *emptyFlags) ConfigureCreateFlags(flags *pflag.FlagSet) {
 }
 
 // ConfigureClusterFlags is part of ProviderFlags.  This implementation is a no-op.
-func (o *emptyFlags) ConfigureClusterFlags(*pflag.FlagSet) {
+func (o *emptyFlags) ConfigureClusterFlags(*pflag.FlagSet, vm.MultipleProjectsOption) {
 }
 
 // CleanSSH is part of the vm.Provider interface.  This implementation is a no-op.
@@ -134,4 +134,9 @@ func (p *Provider) List() (ret vm.List, _ error) {
 // Name returns the name of the Provider, which will also surface in VM.Provider
 func (p *Provider) Name() string {
 	return ProviderName
+}
+
+// Active is part of the vm.Provider interface.
+func (p *Provider) Active() bool {
+	return true
 }

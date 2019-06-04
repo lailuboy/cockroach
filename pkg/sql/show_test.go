@@ -32,7 +32,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -41,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/kr/pretty"
+	"github.com/pkg/errors"
 )
 
 func TestShowCreateTable(t *testing.T) {
@@ -632,7 +636,7 @@ func TestShowQueries(t *testing.T) {
 	// Now check the behavior on error.
 	tc.StopServer(1)
 
-	rows, err := conn1.Query(`SELECT node_id, query FROM [SHOW CLUSTER QUERIES]`)
+	rows, err := conn1.Query(`SELECT node_id, query FROM [SHOW ALL CLUSTER QUERIES]`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -677,7 +681,7 @@ func TestShowSessions(t *testing.T) {
 	var showSessions = fmt.Sprintf(`
 	select node_id, (now() - session_start)::float from
 		[show cluster sessions] where application_name not like '%s%%'
-	`, sql.InternalAppNamePrefix)
+	`, sqlbase.InternalAppNamePrefix)
 
 	rows, err := conn.Query(showSessions)
 	if err != nil {
@@ -743,7 +747,7 @@ func TestShowSessions(t *testing.T) {
 	// Now check the behavior on error.
 	tc.StopServer(1)
 
-	rows, err = conn.Query(`SELECT node_id, active_queries FROM [SHOW CLUSTER SESSIONS]`)
+	rows, err = conn.Query(`SELECT node_id, active_queries FROM [SHOW ALL CLUSTER SESSIONS]`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -990,6 +994,68 @@ func TestShowJobs(t *testing.T) {
 	}
 }
 
+func TestShowAutomaticJobs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	params, _ := tests.CreateTestServerParams()
+	s, rawSQLDB, _ := serverutils.StartServer(t, params)
+	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
+	defer s.Stopper().Stop(context.TODO())
+
+	// row represents a row returned from crdb_internal.jobs, but
+	// *not* a row in system.jobs.
+	type row struct {
+		id      int64
+		typ     string
+		status  string
+		details jobspb.Details
+	}
+
+	rows := []row{
+		{
+			id:      1,
+			typ:     "CREATE STATS",
+			status:  "running",
+			details: jobspb.CreateStatsDetails{Name: "my_stats"},
+		},
+		{
+			id:      2,
+			typ:     "AUTO CREATE STATS",
+			status:  "running",
+			details: jobspb.CreateStatsDetails{Name: "__auto__"},
+		},
+	}
+
+	for _, in := range rows {
+		// system.jobs is part proper SQL columns, part protobuf, so we can't use the
+		// row struct directly.
+		inPayload, err := protoutil.Marshal(&jobspb.Payload{
+			Details: jobspb.WrapPayloadDetails(in.details),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sqlDB.Exec(t,
+			`INSERT INTO system.jobs (id, status, payload) VALUES ($1, $2, $3)`,
+			in.id, in.status, inPayload,
+		)
+	}
+
+	var out row
+	sqlDB.QueryRow(t, `SELECT job_id, job_type FROM [SHOW JOBS]`).Scan(&out.id, &out.typ)
+	if out.id != 1 || out.typ != "CREATE STATS" {
+		t.Fatalf("Expected id:%d and type:%s but found id:%d and type:%s",
+			1, "CREATE STATS", out.id, out.typ)
+	}
+
+	sqlDB.QueryRow(t, `SELECT job_id, job_type FROM [SHOW AUTOMATIC JOBS]`).Scan(&out.id, &out.typ)
+	if out.id != 2 || out.typ != "AUTO CREATE STATS" {
+		t.Fatalf("Expected id:%d and type:%s but found id:%d and type:%s",
+			2, "AUTO CREATE STATS", out.id, out.typ)
+	}
+}
+
 func TestShowJobsWithError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -1109,4 +1175,124 @@ func TestShowJobsWithError(t *testing.T) {
 		t.Fatalf("%d: invalid row", rowNum)
 	}
 	rowNum++
+}
+
+func TestLintClusterSettingNames(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	params, _ := tests.CreateTestServerParams()
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	rows, err := sqlDB.Query(`SELECT variable, setting_type, description FROM [SHOW ALL CLUSTER SETTINGS]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var varName, sType, desc string
+		if err := rows.Scan(&varName, &sType, &desc); err != nil {
+			t.Fatal(err)
+		}
+
+		if strings.ToLower(varName) != varName {
+			t.Errorf("%s: variable name must be all lowercase", varName)
+		}
+
+		suffixSuggestions := map[string]string{
+			"_ttl":     ".ttl",
+			"_enabled": ".enabled",
+			"_timeout": ".timeout",
+		}
+
+		nameErr := func() error {
+			segments := strings.Split(varName, ".")
+			for _, segment := range segments {
+				if strings.TrimSpace(segment) != segment {
+					return errors.Errorf("%s: part %q has heading or trailing whitespace", varName, segment)
+				}
+				tokens, ok := parser.Tokens(segment)
+				if !ok {
+					return errors.Errorf("%s: part %q does not scan properly", varName, segment)
+				}
+				if len(tokens) == 0 || len(tokens) > 1 {
+					return errors.Errorf("%s: part %q has invalid structure", varName, segment)
+				}
+				if tokens[0].TokenID != parser.IDENT {
+					cat, ok := lex.KeywordsCategories[tokens[0].Str]
+					if !ok {
+						return errors.Errorf("%s: part %q has invalid structure", varName, segment)
+					}
+					if cat == "R" {
+						return errors.Errorf("%s: part %q is a reserved keyword", varName, segment)
+					}
+				}
+			}
+
+			for suffix, repl := range suffixSuggestions {
+				if strings.HasSuffix(varName, suffix) {
+					return errors.Errorf("%s: use %q instead of %q", varName, repl, suffix)
+				}
+			}
+
+			if sType == "b" && !strings.HasSuffix(varName, ".enabled") {
+				return errors.Errorf("%s: use .enabled for booleans", varName)
+			}
+
+			return nil
+		}()
+		if nameErr != nil {
+			var grandFathered = map[string]string{
+				"server.declined_reservation_timeout":                `server.declined_reservation_timeout: use ".timeout" instead of "_timeout"`,
+				"server.failed_reservation_timeout":                  `server.failed_reservation_timeout: use ".timeout" instead of "_timeout"`,
+				"server.web_session_timeout":                         `server.web_session_timeout: use ".timeout" instead of "_timeout"`,
+				"sql.distsql.flow_stream_timeout":                    `sql.distsql.flow_stream_timeout: use ".timeout" instead of "_timeout"`,
+				"debug.panic_on_failed_assertions":                   `debug.panic_on_failed_assertions: use .enabled for booleans`,
+				"diagnostics.reporting.send_crash_reports":           `diagnostics.reporting.send_crash_reports: use .enabled for booleans`,
+				"kv.closed_timestamp.follower_reads_enabled":         `kv.closed_timestamp.follower_reads_enabled: use ".enabled" instead of "_enabled"`,
+				"kv.raft_log.disable_synchronization_unsafe":         `kv.raft_log.disable_synchronization_unsafe: use .enabled for booleans`,
+				"kv.range_merge.queue_enabled":                       `kv.range_merge.queue_enabled: use ".enabled" instead of "_enabled"`,
+				"kv.range_split.by_load_enabled":                     `kv.range_split.by_load_enabled: use ".enabled" instead of "_enabled"`,
+				"kv.transaction.parallel_commits_enabled":            `kv.transaction.parallel_commits_enabled: use ".enabled" instead of "_enabled"`,
+				"kv.transaction.write_pipelining_enabled":            `kv.transaction.write_pipelining_enabled: use ".enabled" instead of "_enabled"`,
+				"server.clock.forward_jump_check_enabled":            `server.clock.forward_jump_check_enabled: use ".enabled" instead of "_enabled"`,
+				"sql.defaults.experimental_optimizer_mutations":      `sql.defaults.experimental_optimizer_mutations: use .enabled for booleans`,
+				"sql.distsql.distribute_index_joins":                 `sql.distsql.distribute_index_joins: use .enabled for booleans`,
+				"sql.distsql.temp_storage.joins":                     `sql.distsql.temp_storage.joins: use .enabled for booleans`,
+				"sql.distsql.temp_storage.sorts":                     `sql.distsql.temp_storage.sorts: use .enabled for booleans`,
+				"sql.metrics.statement_details.dump_to_logs":         `sql.metrics.statement_details.dump_to_logs: use .enabled for booleans`,
+				"sql.metrics.statement_details.sample_logical_plans": `sql.metrics.statement_details.sample_logical_plans: use .enabled for booleans`,
+				"sql.trace.log_statement_execute":                    `sql.trace.log_statement_execute: use .enabled for booleans`,
+				"trace.debug.enable":                                 `trace.debug.enable: use .enabled for booleans`,
+				// These two settings have been deprecated in favor of a new (better named) setting
+				// but the old name is still around to support migrations.
+				// TODO(knz): remove these cases when these settings are retired.
+				"timeseries.storage.10s_resolution_ttl": `timeseries.storage.10s_resolution_ttl: part "10s_resolution_ttl" has invalid structure`,
+				"timeseries.storage.30m_resolution_ttl": `timeseries.storage.30m_resolution_ttl: part "30m_resolution_ttl" has invalid structure`,
+			}
+			expectedErr, found := grandFathered[varName]
+			if !found || expectedErr != nameErr.Error() {
+				t.Error(nameErr)
+			}
+		}
+
+		if strings.TrimSpace(desc) != desc {
+			t.Errorf("%s: description %q has heading or trailing whitespace", varName, desc)
+		}
+
+		if len(desc) == 0 {
+			t.Errorf("%s: description is empty", varName)
+		}
+
+		if len(desc) > 0 {
+			if strings.ToLower(desc[0:1]) != desc[0:1] {
+				t.Errorf("%s: description %q must not start with capital", varName, desc)
+			}
+			if strings.Contains(desc, ". ") != (desc[len(desc)-1] == '.') {
+				t.Errorf("%s: description %q must end with period if and only if it contains a secondary sentence", varName, desc)
+			}
+		}
+	}
+
 }

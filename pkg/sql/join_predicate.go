@@ -17,8 +17,8 @@ package sql
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
@@ -220,7 +220,7 @@ func makePredicate(
 			// First, check if the comparison would even be valid.
 			_, found := tree.FindEqualComparisonFunction(uc.leftType, uc.rightType)
 			if !found {
-				return nil, pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
+				return nil, pgerror.Newf(pgerror.CodeDatatypeMismatchError,
 					"JOIN/USING types %s for left and %s for right cannot be matched for column %s",
 					uc.leftType, uc.rightType, uc.name,
 				)
@@ -251,7 +251,7 @@ func (p *joinPredicate) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Dat
 }
 
 // IndexedVarResolvedType implements the tree.IndexedVarContainer interface.
-func (p *joinPredicate) IndexedVarResolvedType(idx int) types.T {
+func (p *joinPredicate) IndexedVarResolvedType(idx int) *types.T {
 	if idx < p.numLeftCols {
 		return p.leftInfo.SourceColumns[idx].Typ
 	}
@@ -264,6 +264,23 @@ func (p *joinPredicate) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
 		return p.leftInfo.NodeFormatter(idx)
 	}
 	return p.rightInfo.NodeFormatter(idx - p.numLeftCols)
+}
+
+// eval for joinPredicate runs the on condition across the columns that do
+// not participate in the equality (the equality columns are checked
+// in the join algorithm already).
+// Returns true if there is no on condition or the on condition accepts the
+// row.
+func (p *joinPredicate) eval(ctx *tree.EvalContext, leftRow, rightRow tree.Datums) (bool, error) {
+	if p.onCond != nil {
+		copy(p.curRow[:len(leftRow)], leftRow)
+		copy(p.curRow[len(leftRow):], rightRow)
+		ctx.PushIVarContainer(p.iVarHelper.Container())
+		pred, err := sqlbase.RunFilter(p.onCond, ctx)
+		ctx.PopIVarContainer()
+		return pred, err
+	}
+	return true, nil
 }
 
 // getNeededColumns figures out the columns needed for the two
@@ -292,16 +309,23 @@ func (p *joinPredicate) getNeededColumns(neededJoined []bool) ([]bool, []bool) {
 	return leftNeeded, rightNeeded
 }
 
+// prepareRow prepares the output row by combining values from the
+// input data sources.
+func (p *joinPredicate) prepareRow(result, leftRow, rightRow tree.Datums) {
+	copy(result[:len(leftRow)], leftRow)
+	copy(result[len(leftRow):], rightRow)
+}
+
 // usingColumns captures the information about equality columns
 // from USING and NATURAL JOIN statements.
 type usingColumn struct {
 	name tree.Name
 	// Index and type of the column in the left source.
 	leftIdx  int
-	leftType types.T
+	leftType *types.T
 	// Index and type of the column in the right source.
 	rightIdx  int
-	rightType types.T
+	rightType *types.T
 }
 
 func makeUsingColumns(
@@ -316,7 +340,7 @@ func makeUsingColumns(
 	for _, syntaxColName := range usingColNames {
 		colName := string(syntaxColName)
 		if _, ok := seenNames[colName]; ok {
-			return nil, pgerror.NewErrorf(pgerror.CodeDuplicateColumnError,
+			return nil, pgerror.Newf(pgerror.CodeDuplicateColumnError,
 				"column %q appears more than once in USING clause", colName)
 		}
 		seenNames[colName] = struct{}{}
@@ -346,7 +370,7 @@ func makeUsingColumns(
 // is reported.
 func pickUsingColumn(
 	cols sqlbase.ResultColumns, colName string, context string,
-) (int, types.T, error) {
+) (int, *types.T, error) {
 	idx := invalidColIdx
 	for j, col := range cols {
 		if col.Hidden {
@@ -358,7 +382,7 @@ func pickUsingColumn(
 		}
 	}
 	if idx == invalidColIdx {
-		return idx, nil, pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
+		return idx, nil, pgerror.Newf(pgerror.CodeUndefinedColumnError,
 			"column \"%s\" specified in USING clause does not exist in %s table", colName, context)
 	}
 	return idx, cols[idx].Typ, nil

@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/cloudinfo"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -213,6 +214,8 @@ func fillHardwareInfo(ctx context.Context, n *diagnosticspb.NodeInfo) {
 	if l, err := load.AvgWithContext(ctx); err == nil {
 		n.Hardware.Loadavg15 = float32(l.Load15)
 	}
+
+	n.Hardware.Provider, n.Hardware.InstanceClass = cloudinfo.GetProviderInfo()
 }
 
 // checkForUpdates calls home to check for new versions for the current platform
@@ -304,7 +307,9 @@ func (s *Server) collectNodeInfo(ctx context.Context) diagnosticspb.NodeInfo {
 	return n
 }
 
-func (s *Server) getReportingInfo(ctx context.Context) *diagnosticspb.DiagnosticReport {
+func (s *Server) getReportingInfo(
+	ctx context.Context, reset telemetry.ResetCounters,
+) *diagnosticspb.DiagnosticReport {
 	info := diagnosticspb.DiagnosticReport{}
 	n := s.node.recorder.GenerateNodeStatus(ctx)
 	info.Node = s.collectNodeInfo(ctx)
@@ -332,6 +337,7 @@ func (s *Server) getReportingInfo(ctx context.Context) *diagnosticspb.Diagnostic
 		bytes := int64(r.Metrics["sysbytes"] + r.Metrics["intentbytes"] + r.Metrics["valbytes"] + r.Metrics["keybytes"])
 		info.Stores[i].Bytes = bytes
 		info.Node.Bytes += bytes
+		info.Stores[i].EncryptionAlgorithm = int64(r.Metrics["rocksdb.encryption.algorithm"])
 	}
 
 	schema, err := s.collectSchemaInfo(ctx)
@@ -341,7 +347,7 @@ func (s *Server) getReportingInfo(ctx context.Context) *diagnosticspb.Diagnostic
 	}
 	info.Schema = schema
 
-	info.FeatureUsage = telemetry.GetAndResetFeatureCounts(true /* quantize */)
+	info.FeatureUsage = telemetry.GetFeatureCounts(telemetry.Quantized, reset)
 
 	// Read the system.settings table to determine the settings for which we have
 	// explicitly set values -- the in-memory SV has the set and default values
@@ -443,7 +449,7 @@ func (s *Server) reportDiagnostics(ctx context.Context) {
 	ctx, span := s.AnnotateCtxWithSpan(ctx, "usageReport")
 	defer span.Finish()
 
-	report := s.getReportingInfo(ctx)
+	report := s.getReportingInfo(ctx, telemetry.ResetCounts)
 	b, err := protoutil.Marshal(report)
 	if err != nil {
 		log.Warning(ctx, err)

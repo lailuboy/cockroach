@@ -62,8 +62,11 @@ TESTCONFIG :=
 ## if they are provided.
 SUBTESTS :=
 
+## Test timeout to use for the linter.
+LINTTIMEOUT := 20m
+
 ## Test timeout to use for regular tests.
-TESTTIMEOUT := 8m
+TESTTIMEOUT := 12m
 
 ## Test timeout to use for race tests.
 RACETIMEOUT := 25m
@@ -302,14 +305,16 @@ bin/.bootstrap: $(GITHOOKS) Gopkg.lock | bin/.submodules-initialized
 		./vendor/github.com/golang/dep/cmd/dep \
 		./vendor/github.com/golang/lint/golint \
 		./vendor/github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway \
-		./vendor/github.com/jteeuwen/go-bindata/go-bindata \
+		./vendor/github.com/kevinburke/go-bindata/go-bindata \
 		./vendor/github.com/kisielk/errcheck \
 		./vendor/github.com/mattn/goveralls \
 		./vendor/github.com/mibk/dupl \
 		./vendor/github.com/wadey/gocovmerge \
 		./vendor/golang.org/x/perf/cmd/benchstat \
 		./vendor/golang.org/x/tools/cmd/goyacc \
-		./vendor/golang.org/x/tools/cmd/stringer
+		./vendor/golang.org/x/tools/cmd/stringer \
+		./vendor/golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow \
+		./vendor/honnef.co/go/tools/cmd/staticcheck
 	touch $@
 
 .SECONDARY: bin/.submodules-initialized
@@ -341,6 +346,8 @@ build/variables.mk: Makefile build/archive/contents/Makefile pkg/ui/Makefile bui
 	@sed -nE -e '/^	/d' -e 's/([^#]*)#.*/\1/' \
 	  -e 's/(^|^[^:]+:)[ ]*(export)?[ ]*([[:upper:]_]+)[ ]*[:?+]?=.*/  \3/p' $^ \
 	  | sort -u >> $@
+	# Special case for 'prefix' variable, which is required by Homebrew.
+	@echo '  prefix' >> $@
 	@echo 'endef' >> $@
 
 # The following section handles building our C/C++ dependencies. These are
@@ -451,7 +458,7 @@ C_LIBS_CCL = $(C_LIBS_COMMON) $(LIBCRYPTOPP) $(LIBROACHCCL)
 # We only include krb5 on linux, non-musl builds.
 ifeq "$(findstring linux-gnu,$(TARGET_TRIPLE))" "linux-gnu"
 C_LIBS_CCL += $(LIBKRB5)
-KRB_CPPFLAGS := -I$(KRB5_DIR)/include
+KRB_CPPFLAGS := $(KRB5_DIR)/include
 KRB_DIR := $(KRB5_DIR)/lib
 override TAGS += gss
 endif
@@ -491,7 +498,7 @@ $(CGO_FLAGS_FILES): Makefile
 	@echo >> $@
 	@echo 'package $(notdir $(@D))' >> $@
 	@echo >> $@
-	@echo '// #cgo CPPFLAGS: -I$(JEMALLOC_DIR)/include $(KRB_CPPFLAGS)' >> $@
+	@echo '// #cgo CPPFLAGS: $(addprefix -I,$(JEMALLOC_DIR)/include $(KRB_CPPFLAGS))' >> $@
 	@echo '// #cgo LDFLAGS: $(addprefix -L,$(CRYPTOPP_DIR) $(PROTOBUF_DIR) $(JEMALLOC_DIR)/lib $(SNAPPY_DIR) $(ROCKSDB_DIR) $(LIBROACH_DIR) $(KRB_DIR))' >> $@
 	@echo 'import "C"' >> $@
 
@@ -603,7 +610,8 @@ $(LIBROACH_DIR)/Makefile: $(C_DEPS_DIR)/libroach-rebuild | bin/.submodules-initi
 	mkdir -p $(LIBROACH_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/libroach-rebuild. See above for rationale.
-	cd $(LIBROACH_DIR) && cmake $(xcmake-flags) $(LIBROACH_SRC_DIR) -DCMAKE_BUILD_TYPE=Release \
+	cd $(LIBROACH_DIR) && cmake $(xcmake-flags) $(LIBROACH_SRC_DIR) \
+		-DCMAKE_BUILD_TYPE=$(if $(ENABLE_LIBROACH_ASSERTIONS),Debug,Release) \
 		-DPROTOBUF_LIB=$(LIBPROTOBUF) -DROCKSDB_LIB=$(LIBROCKSDB) \
 		-DJEMALLOC_LIB=$(LIBJEMALLOC) -DSNAPPY_LIB=$(LIBSNAPPY) \
 		-DCRYPTOPP_LIB=$(LIBCRYPTOPP)
@@ -735,16 +743,24 @@ DOCGEN_TARGETS := bin/.docgen_bnfs bin/.docgen_functions
 EXECGEN_TARGETS = \
   pkg/sql/exec/any_not_null_agg.eg.go \
   pkg/sql/exec/avg_agg.eg.go \
-  pkg/sql/exec/colvec.eg.go \
+  pkg/sql/exec/coldata/vec.eg.go \
+  pkg/sql/exec/const.eg.go \
   pkg/sql/exec/distinct.eg.go \
   pkg/sql/exec/hashjoiner.eg.go \
+  pkg/sql/exec/like_ops.eg.go \
   pkg/sql/exec/mergejoiner.eg.go \
+  pkg/sql/exec/min_max_agg.eg.go \
   pkg/sql/exec/projection_ops.eg.go \
   pkg/sql/exec/quicksort.eg.go \
   pkg/sql/exec/rowstovec.eg.go \
   pkg/sql/exec/selection_ops.eg.go \
   pkg/sql/exec/sort.eg.go \
-  pkg/sql/exec/sum_agg.eg.go
+  pkg/sql/exec/sum_agg.eg.go \
+  pkg/sql/exec/tuples_differ.eg.go \
+  pkg/sql/exec/vec_comparators.eg.go \
+  pkg/sql/exec/vecbuiltins/rank.eg.go \
+  pkg/sql/exec/vecbuiltins/row_number.eg.go \
+  pkg/sql/exec/zerocolumns.eg.go
 
 OPTGEN_TARGETS = \
 	pkg/sql/opt/memo/expr.og.go \
@@ -759,6 +775,7 @@ go-targets-ccl := \
 	bench benchshort \
 	check test testshort testslow testrace testraceslow testbuild \
 	stress stressrace \
+	roachprod-stress roachprod-stressrace \
 	generate \
 	lint lintshort
 
@@ -901,7 +918,7 @@ roachprod-stress roachprod-stressrace: bin/roachprod-stress
 	@if [ -z "$(CLUSTER)" ]; then \
 	  echo "ERROR: missing or empty CLUSTER"; \
 	else \
-	  bin/roachprod-stress $(CLUSTER) $(STRESSFLAGS) ./$(notdir $(PKG)).test \
+	  bin/roachprod-stress $(CLUSTER) $(STRESSFLAGS) ./$(notdir $(patsubst %/,%,$(PKG))).test \
 	    -test.run "$(TESTS)" $(filter-out -v,$(TESTFLAGS)) -test.v -test.timeout $(TESTTIMEOUT); \
 	fi
 
@@ -970,8 +987,10 @@ dupl: bin/.bootstrap
 
 .PHONY: generate
 generate: ## Regenerate generated code.
-generate: protobuf $(DOCGEN_TARGETS) $(EXECGEN_TARGETS) $(OPTGEN_TARGETS) $(SQLPARSER_TARGETS) $(SETTINGS_DOC_PAGE) bin/langgen
+generate: protobuf $(DOCGEN_TARGETS) $(EXECGEN_TARGETS) $(OPTGEN_TARGETS) $(SQLPARSER_TARGETS) $(SETTINGS_DOC_PAGE) bin/langgen bin/terraformgen
 	$(GO) generate $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
+
+lint lintshort: TESTTIMEOUT := $(LINTTIMEOUT)
 
 .PHONY: lint
 lint: override TAGS += lint
@@ -982,12 +1001,12 @@ lint: bin/returncheck
 	@# packages. In Go 1.10, only 'go vet' recompiles on demand. For details:
 	@# https://groups.google.com/forum/#!msg/golang-dev/qfa3mHN4ZPA/X2UzjNV1BAAJ.
 	$(xgo) build -i -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
-	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run 'Lint/$(TESTS)'
+	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -timeout $(TESTTIMEOUT) -run 'Lint/$(TESTS)'
 
 .PHONY: lintshort
 lintshort: override TAGS += lint
 lintshort: ## Run a fast subset of the style checkers and linters.
-	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -run 'TestLint/$(TESTS)'
+	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -timeout $(TESTTIMEOUT) -run 'TestLint/$(TESTS)'
 
 .PHONY: protobuf
 protobuf: $(PROTOBUF_TARGETS)
@@ -1098,7 +1117,7 @@ UI_JS_OSS := pkg/ui/src/js/protos.js
 UI_TS_OSS := pkg/ui/src/js/protos.d.ts
 UI_PROTOS_OSS := $(UI_JS_OSS) $(UI_TS_OSS)
 
-CPP_PROTOS := $(filter %/roachpb/metadata.proto %/roachpb/data.proto %/roachpb/internal.proto %/engine/enginepb/mvcc.proto %/engine/enginepb/mvcc3.proto %/engine/enginepb/file_registry.proto %/engine/enginepb/rocksdb.proto %/hlc/legacy_timestamp.proto %/hlc/timestamp.proto %/unresolved_addr.proto,$(GO_PROTOS))
+CPP_PROTOS := $(filter %/roachpb/metadata.proto %/roachpb/data.proto %/roachpb/internal.proto %/engine/enginepb/mvcc.proto %/engine/enginepb/mvcc3.proto %/engine/enginepb/file_registry.proto %/engine/enginepb/rocksdb.proto %/hlc/legacy_timestamp.proto %/hlc/timestamp.proto %/log/log.proto %/unresolved_addr.proto,$(GO_PROTOS))
 CPP_HEADERS := $(subst ./pkg,$(CPP_PROTO_ROOT),$(CPP_PROTOS:%.proto=%.pb.h))
 CPP_SOURCES := $(subst ./pkg,$(CPP_PROTO_ROOT),$(CPP_PROTOS:%.proto=%.pb.cc))
 
@@ -1321,24 +1340,26 @@ pkg/sql/parser/sql.go: pkg/sql/parser/gen/sql.go.tmp
 # Determine the types that will be migrated to union types by looking
 # at the accessors of sqlSymUnion. The first step in this pipeline
 # prints every return type of a sqlSymUnion accessor on a separate line.
-# The next step regular expression escapes these types. The third step
-# joins all of the lines into a single line with a '|' character to be
-# used as a regexp "or" meta-character. Finally, the last '|' character
-# is stripped from the string.
+# The next step regular expression escapes these types. The third
+# (prepending) and the fourth (appending) steps build regular expressions
+# for each of the types and store them in the file. (We make multiple
+# regular expressions because we ran into a limit of characters for a
+# single regex executed by sed.)
 # Then translate the original syntax file, with the types determined
 # above being replaced with the union type in their type declarations.
 .SECONDARY: pkg/sql/parser/gen/sql-gen.y
 pkg/sql/parser/gen/sql-gen.y: pkg/sql/parser/sql.y pkg/sql/parser/replace_help_rules.awk
 	mkdir -p pkg/sql/parser/gen
 	set -euo pipefail; \
-	TYPES=$$(awk '/func.*sqlSymUnion/ {print $$(NF - 1)}' pkg/sql/parser/sql.y | \
-	        sed -e 's/[]\/$$*.^|[]/\\&/g' | \
-	        tr '\n' '|' | \
-	        sed -E '$$s/.$$//'); \
-	sed -E "s_(type|token) <($$TYPES)>_\1 <union> /* <\2> */_" < pkg/sql/parser/sql.y | \
+	awk '/func.*sqlSymUnion/ {print $$(NF - 1)}' pkg/sql/parser/sql.y | \
+	sed -e 's/[]\/$$*.^|[]/\\&/g' | \
+	sed -e "s/^/s_(type|token) <(/" | \
+	awk '{print $$0")>_\\1 <union> /* <\\2> */_"}' > pkg/sql/parser/gen/types_regex.tmp; \
+	sed -E -f pkg/sql/parser/gen/types_regex.tmp < pkg/sql/parser/sql.y | \
 	awk -f pkg/sql/parser/replace_help_rules.awk | \
 	sed -Ee 's,//.*$$,,g;s,/[*]([^*]|[*][^/])*[*]/, ,g;s/ +$$//g' > $@.tmp || rm $@.tmp
 	mv -f $@.tmp $@
+	rm pkg/sql/parser/gen/types_regex.tmp
 
 pkg/sql/lex/reserved_keywords.go: pkg/sql/parser/sql.y pkg/sql/parser/reserved_keywords.awk
 	awk -f pkg/sql/parser/reserved_keywords.awk < $< > $@.tmp || rm $@.tmp
@@ -1385,13 +1406,21 @@ $(SETTINGS_DOC_PAGE): $(settings-doc-gen)
 
 pkg/sql/exec/any_not_null_agg.eg.go: pkg/sql/exec/any_not_null_agg_tmpl.go
 pkg/sql/exec/avg_agg.eg.go: pkg/sql/exec/avg_agg_tmpl.go
-pkg/sql/exec/colvec.eg.go: pkg/sql/exec/colvec_tmpl.go
+pkg/sql/exec/coldata/vec.eg.go: pkg/sql/exec/coldata/vec_tmpl.go
+pkg/sql/exec/const.eg.go: pkg/sql/exec/const_tmpl.go
 pkg/sql/exec/distinct.eg.go: pkg/sql/exec/distinct_tmpl.go
 pkg/sql/exec/hashjoiner.eg.go: pkg/sql/exec/hashjoiner_tmpl.go
 pkg/sql/exec/mergejoiner.eg.go: pkg/sql/exec/mergejoiner_tmpl.go
+pkg/sql/exec/min_max_agg.eg.go: pkg/sql/exec/min_max_agg_tmpl.go
 pkg/sql/exec/quicksort.eg.go: pkg/sql/exec/quicksort_tmpl.go
+pkg/sql/exec/rowstovec.eg.go: pkg/sql/exec/rowstovec_tmpl.go
 pkg/sql/exec/sort.eg.go: pkg/sql/exec/sort_tmpl.go
 pkg/sql/exec/sum_agg.eg.go: pkg/sql/exec/sum_agg_tmpl.go
+pkg/sql/exec/tuples_differ.eg.go: pkg/sql/exec/tuples_differ_tmpl.go
+pkg/sql/exec/vec_comparators.eg.go: pkg/sql/exec/vec_comparators_tmpl.go
+pkg/sql/exec/vecbuiltins/rank.eg.go: pkg/sql/exec/vecbuiltins/rank_tmpl.go
+pkg/sql/exec/vecbuiltins/row_number.eg.go: pkg/sql/exec/vecbuiltins/row_number_tmpl.go
+pkg/sql/exec/zerocolumns.eg.go: pkg/sql/exec/zerocolumns_tmpl.go
 
 $(EXECGEN_TARGETS): bin/execgen
 	@# Remove generated files with the old suffix to avoid conflicts.
@@ -1478,6 +1507,7 @@ bins = \
   bin/docgen \
   bin/execgen \
   bin/generate-binary \
+  bin/terraformgen \
   bin/github-post \
   bin/github-pull-request-make \
   bin/gossipsim \
@@ -1508,7 +1538,7 @@ optgen-package = ./pkg/sql/opt/optgen/cmd/optgen
 logictest-package = ./pkg/sql/logictest
 logictestccl-package = ./pkg/ccl/logictestccl
 logictestopt-package = ./pkg/sql/opt/exec/execbuilder
-
+terraformgen-package = ./pkg/cmd/roachprod/vm/aws/terraformgen
 logictest-bins := bin/logictest bin/logictestopt bin/logictestccl
 
 # Additional dependencies for binaries that depend on generated code.

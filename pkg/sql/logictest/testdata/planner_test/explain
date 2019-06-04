@@ -1,5 +1,8 @@
 # LogicTest: local
 
+statement ok
+SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false
+
 query TTT colnames
 EXPLAIN (PLAN) SELECT 1 FROM system.jobs WHERE FALSE
 ----
@@ -114,9 +117,9 @@ sort                   ·       ·
  │                     order   -"coalesce",-started
  └── render            ·       ·
       └── filter       ·       ·
-           │           filter  (finished IS NULL) OR (finished > (now() - '12:00:00'))
+           │           filter  ((job_type != 'AUTO CREATE STATS') OR (job_type IS NULL)) AND ((finished IS NULL) OR (finished > (now() - '12:00:00')))
            └── values  ·       ·
-·                      size    15 columns, 0 rows
+·                      size    16 columns, 0 rows
 
 statement ok
 CREATE INDEX a ON foo(x)
@@ -158,7 +161,7 @@ query TTT
 SELECT * FROM [EXPLAIN SHOW TABLES] WHERE field != 'size'
 ----
 sort                   ·       ·
- │                     order   +table_schema,+table_name
+ │                     order   +table_name
  └── render            ·       ·
       └── filter       ·       ·
            │           filter  table_schema = 'public'
@@ -167,24 +170,22 @@ sort                   ·       ·
 query TTT
 SELECT * FROM [EXPLAIN SHOW TABLES WITH COMMENT] WHERE field != 'size'
 ----
-sort                                  ·         ·
- │                                    order     +table_schema,+table_name
- └── render                           ·         ·
-      └── join                        ·         ·
-           │                          type      left outer
-           │                          equality  (table_id) = (object_id)
-           ├── filter                 ·         ·
-           │    │                     filter    ((state = 'PUBLIC') OR (state IS NULL)) AND ((database_name = 'test') OR (database_name IS NULL))
-           │    └── join              ·         ·
-           │         │                type      left outer
-           │         │                equality  (table_name, table_catalog) = (name, database_name)
-           │         ├── filter       ·         ·
-           │         │    │           filter    table_schema = 'public'
-           │         │    └── values  ·         ·
-           │         └── values       ·         ·
-           └── scan                   ·         ·
-·                                     table     comments@primary
-·                                     spans     ALL
+render                      ·         ·
+ └── hash-join              ·         ·
+      │                     type      left outer
+      │                     equality  (oid) = (objoid)
+      ├── hash-join         ·         ·
+      │    │                type      inner
+      │    │                equality  (relnamespace) = (oid)
+      │    ├── filter       ·         ·
+      │    │    │           filter    relkind IN ('r', 'v')
+      │    │    └── values  ·         ·
+      │    └── filter       ·         ·
+      │         │           filter    nspname = 'public'
+      │         └── values  ·         ·
+      └── filter            ·         ·
+           │                filter    objsubid = 0
+           └── values       ·         ·
 
 query TTT
 SELECT * FROM [EXPLAIN SHOW DATABASE] WHERE field != 'size'
@@ -241,9 +242,9 @@ sort                                       ·            ·
            │                               aggregate 5  ordinal_position
            │                               aggregate 6  is_hidden
            │                               aggregate 7  array_agg(index_name)
-           │                               group by     @1-@7
+           │                               group by     column_name, crdb_sql_type, is_nullable, column_default, generation_expression, ordinal_position, is_hidden
            └── render                      ·            ·
-                └── join                   ·            ·
+                └── hash-join              ·            ·
                      │                     type         left outer
                      │                     equality     (column_name) = (column_name)
                      ├── render            ·            ·
@@ -279,13 +280,13 @@ SELECT * FROM [EXPLAIN SHOW CONSTRAINTS FROM foo] WHERE field != 'size'
 sort                             ·         ·
  │                               order     +table_name,+constraint_name
  └── render                      ·         ·
-      └── join                   ·         ·
+      └── hash-join              ·         ·
            │                     type      inner
            │                     equality  (relnamespace, oid) = (oid, conrelid)
            ├── filter            ·         ·
            │    │                filter    relname = 'foo'
            │    └── values       ·         ·
-           └── join              ·         ·
+           └── hash-join         ·         ·
                 │                type      cross
                 ├── filter       ·         ·
                 │    │           filter    nspname = 'public'
@@ -513,7 +514,7 @@ render                    ·            ·                                      
       └── group           ·            ·                                                                          (agg0 int, agg1 int)  ·
            │              aggregate 0  v                                                                          ·                     ·
            │              aggregate 1  count(k)                                                                   ·                     ·
-           │              group by     @1                                                                         ·                     ·
+           │              group by     v                                                                          ·                     ·
            └── render     ·            ·                                                                          (v int, k int)        ·
                 │         render 0     (v)[int]                                                                   ·                     ·
                 │         render 1     (k)[int]                                                                   ·                     ·
@@ -533,7 +534,7 @@ render                    ·            ·                                      
       └── group           ·            ·                                                                          (agg0 int, agg1 int)  agg0!=NULL; key(agg0)
            │              aggregate 0  v                                                                          ·                     ·
            │              aggregate 1  count(k)                                                                   ·                     ·
-           │              group by     @1                                                                         ·                     ·
+           │              group by     v                                                                          ·                     ·
            └── render     ·            ·                                                                          (v int, k int)        v!=NULL; k!=NULL; key(k)
                 │         render 0     (v)[int]                                                                   ·                     ·
                 │         render 1     (k)[int]                                                                   ·                     ·
@@ -680,14 +681,15 @@ CREATE TABLE tt (x INT, y INT, INDEX a(x), INDEX b(y))
 query TTTTT
 EXPLAIN (TYPES) SELECT * FROM tt WHERE x < 10 AND y > 10
 ----
-render           ·         ·           (x int, y int)                                       x!=NULL; y!=NULL
- │               render 0  (x)[int]    ·                                                    ·
- │               render 1  (y)[int]    ·                                                    ·
- └── index-join  ·         ·           (x int, y int, rowid[hidden,omitted] int)            x!=NULL; y!=NULL; rowid!=NULL; key(x,rowid)
-      │          table     tt@primary  ·                                                    ·
-      └── scan   ·         ·           (x[omitted] int, y[omitted] int, rowid[hidden] int)  x!=NULL; y!=NULL; rowid!=NULL; key(x,rowid)
-·                table     tt@a        ·                                                    ·
-·                spans     /!NULL-/10  ·                                                    ·
+render           ·         ·                             (x int, y int)                                       x!=NULL; y!=NULL
+ │               render 0  (x)[int]                      ·                                                    ·
+ │               render 1  (y)[int]                      ·                                                    ·
+ └── index-join  ·         ·                             (x int, y int, rowid[hidden,omitted] int)            x!=NULL; y!=NULL; rowid!=NULL; key(x,rowid)
+      │          table     tt@primary                    ·                                                    ·
+      │          filter    ((y)[int] > (10)[int])[bool]  ·                                                    ·
+      └── scan   ·         ·                             (x[omitted] int, y[omitted] int, rowid[hidden] int)  x!=NULL; y!=NULL; rowid!=NULL; key(x,rowid)
+·                table     tt@a                          ·                                                    ·
+·                spans     /!NULL-/10                    ·                                                    ·
 
 query TTTTT
 EXPLAIN (TYPES,NOEXPAND) SELECT * FROM tt WHERE x < 10 AND y > 10

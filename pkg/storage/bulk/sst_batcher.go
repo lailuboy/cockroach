@@ -18,38 +18,20 @@ import (
 	"bytes"
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
 
-// FixedTimestampSSTBatcher is a wrapper for SSTBatcher that assigns a fixed
-// timestamp to all the added keys.
-type FixedTimestampSSTBatcher struct {
-	timestamp hlc.Timestamp
-	SSTBatcher
-}
+type sz int64
 
-// MakeFixedTimestampSSTBatcher makes a ready-to-use SSTBatcher that generates
-// an SST with all keys at the specified MVCC timestamp. If the rangeCache is
-// non-nil, it will be used to minimize retries due to SSTs that span ranges.
-func MakeFixedTimestampSSTBatcher(
-	db *client.DB, rangeCache *kv.RangeDescriptorCache, flushBytes int64, timestamp hlc.Timestamp,
-) (*FixedTimestampSSTBatcher, error) {
-	b := &FixedTimestampSSTBatcher{timestamp, SSTBatcher{db: db, maxSize: flushBytes, rc: rangeCache}}
-	err := b.Reset()
-	return b, err
-}
-
-// Add a key/value pair with the batcher's timestamp, flushing if needed.
-// Keys must be added in order.
-func (b *FixedTimestampSSTBatcher) Add(ctx context.Context, key roachpb.Key, value []byte) error {
-	return b.AddMVCCKey(ctx, engine.MVCCKey{Key: key, Timestamp: b.timestamp}, value)
+func (b sz) String() string {
+	return humanizeutil.IBytes(int64(b))
 }
 
 // SSTBatcher is a helper for bulk-adding many KVs in chunks via AddSSTable. An
@@ -59,11 +41,14 @@ func (b *FixedTimestampSSTBatcher) Add(ctx context.Context, key roachpb.Key, val
 // it to attempt to flush SSTs before they cross range boundaries to minimize
 // expensive on-split retries.
 type SSTBatcher struct {
-	db *client.DB
+	db sender
 
 	flushKeyChecked bool
 	flushKey        roachpb.Key
 	rc              *kv.RangeDescriptorCache
+
+	// skips duplicates (iff they are buffered together).
+	skipDuplicates bool
 
 	maxSize int64
 	// rows written in the current batch.
@@ -73,10 +58,16 @@ type SSTBatcher struct {
 	sstWriter     engine.RocksDBSstFileWriter
 	batchStartKey []byte
 	batchEndKey   []byte
+
+	flushCounts struct {
+		total   int
+		split   int
+		sstSize int
+	}
 }
 
 // MakeSSTBatcher makes a ready-to-use SSTBatcher.
-func MakeSSTBatcher(ctx context.Context, db *client.DB, flushBytes int64) (*SSTBatcher, error) {
+func MakeSSTBatcher(ctx context.Context, db sender, flushBytes int64) (*SSTBatcher, error) {
 	b := &SSTBatcher{db: db, maxSize: flushBytes}
 	err := b.Reset()
 	return b, err
@@ -87,6 +78,15 @@ func MakeSSTBatcher(ctx context.Context, db *client.DB, flushBytes int64) (*SSTB
 // keys -- like RESTORE where we want the restored data to look the like backup.
 // Keys must be added in order.
 func (b *SSTBatcher) AddMVCCKey(ctx context.Context, key engine.MVCCKey, value []byte) error {
+	if len(b.batchEndKey) > 0 && bytes.Equal(b.batchEndKey, key.Key) {
+		if b.skipDuplicates {
+			return nil
+		}
+		var err storagebase.DuplicateKeyError
+		err.Key = append(err.Key, key.Key...)
+		err.Value = append(err.Value, value...)
+		return err
+	}
 	// Check if we need to flush current batch *before* adding the next k/v --
 	// the batcher may want to flush the keys it already has, either because it
 	// is full or because it wants this key in a separate batch due to splits.
@@ -100,12 +100,11 @@ func (b *SSTBatcher) AddMVCCKey(ctx context.Context, key engine.MVCCKey, value [
 	}
 
 	// Update the range currently represented in this batch, as necessary.
-	if len(b.batchStartKey) == 0 || bytes.Compare(key.Key, b.batchStartKey) < 0 {
+	if len(b.batchStartKey) == 0 {
 		b.batchStartKey = append(b.batchStartKey[:0], key.Key...)
 	}
-	if len(b.batchEndKey) == 0 || bytes.Compare(key.Key, b.batchEndKey) > 0 {
-		b.batchEndKey = append(b.batchEndKey[:0], key.Key...)
-	}
+	b.batchEndKey = append(b.batchEndKey[:0], key.Key...)
+
 	if err := b.rowCounter.Count(key.Key); err != nil {
 		return err
 	}
@@ -144,18 +143,27 @@ func (b *SSTBatcher) shouldFlush(ctx context.Context, nextKey roachpb.Key) bool 
 				log.Warningf(ctx, "failed to determine where to split SST: %v", err)
 			} else if r != nil {
 				b.flushKey = r.EndKey.AsRawKey()
-				log.VEventf(ctx, 2, "building sstable that will flush before %v", b.flushKey)
+				log.VEventf(ctx, 3, "building sstable that will flush before %v", b.flushKey)
 			} else {
-				log.VEventf(ctx, 2, "no cached range desc available to determine sst flush key")
+				log.VEventf(ctx, 3, "no cached range desc available to determine sst flush key")
 			}
 		}
 	}
 
+	size := b.sstWriter.DataSize
+
 	if b.flushKey != nil && b.flushKey.Compare(nextKey) <= 0 {
+		log.VEventf(ctx, 3, "flushing %s SST due to range boundary %s", sz(size), b.flushKey)
+		b.flushCounts.split++
 		return true
 	}
 
-	return b.sstWriter.DataSize >= b.maxSize
+	if size >= b.maxSize {
+		log.VEventf(ctx, 3, "flushing %s SST due to size > %s", sz(size), sz(b.maxSize))
+		b.flushCounts.sstSize++
+		return true
+	}
+	return false
 }
 
 // Flush sends the current batch, if any.
@@ -163,6 +171,8 @@ func (b *SSTBatcher) Flush(ctx context.Context) error {
 	if b.sstWriter.DataSize == 0 {
 		return nil
 	}
+	b.flushCounts.total++
+
 	start := roachpb.Key(append([]byte(nil), b.batchStartKey...))
 	// The end key of the WriteBatch request is exclusive, but batchEndKey is
 	// currently the largest key in the batch. Increment it.
@@ -190,57 +200,95 @@ func (b *SSTBatcher) GetSummary() roachpb.BulkOpSummary {
 	return b.totalRows
 }
 
+type sender interface {
+	AddSSTable(ctx context.Context, begin, end interface{}, data []byte) error
+}
+
+type sstSpan struct {
+	start, end roachpb.Key
+	sstBytes   []byte
+}
+
 // AddSSTable retries db.AddSSTable if retryable errors occur, including if the
 // SST spans a split, in which case it is iterated and split into two SSTs, one
 // for each side of the split in the error, and each are retried.
-func AddSSTable(ctx context.Context, db *client.DB, start, end roachpb.Key, sstBytes []byte) error {
+func AddSSTable(ctx context.Context, db sender, start, end roachpb.Key, sstBytes []byte) error {
+	work := []*sstSpan{{start: start, end: end, sstBytes: sstBytes}}
+	// Create an iterator that iterates over the top level SST to produce all the splits.
+	var iter engine.SimpleIterator
+	defer func() {
+		if iter != nil {
+			iter.Close()
+		}
+	}()
 	const maxAddSSTableRetries = 10
-	var err error
-	for i := 0; i < maxAddSSTableRetries; i++ {
-		log.VEventf(ctx, 2, "sending %d byte AddSSTable [%s,%s)", len(sstBytes), start, end)
-		// This will fail if the range has split but we'll check for that below.
-		err = db.AddSSTable(ctx, start, end, sstBytes)
-		if err == nil {
-			return nil
+	for len(work) > 0 {
+		item := work[0]
+		work = work[1:]
+		if err := func() error {
+			var err error
+			for i := 0; i < maxAddSSTableRetries; i++ {
+				log.VEventf(ctx, 2, "sending %s AddSSTable [%s,%s)", sz(len(sstBytes)), start, end)
+				// This will fail if the range has split but we'll check for that below.
+				err = db.AddSSTable(ctx, item.start, item.end, item.sstBytes)
+				if err == nil {
+					return nil
+				}
+				// This range has split -- we need to split the SST to try again.
+				if m, ok := errors.Cause(err).(*roachpb.RangeKeyMismatchError); ok {
+					if iter == nil {
+						iter, err = engine.NewMemSSTIterator(sstBytes, false)
+						if err != nil {
+							return err
+						}
+					}
+					split := m.MismatchedRange.EndKey.AsRawKey()
+					log.Infof(ctx, "SSTable cannot be added spanning range bounds %v, retrying...", split)
+					left, right, err := createSplitSSTable(ctx, db, item.start, split, iter)
+					if err != nil {
+						return err
+					}
+					// Add more work.
+					work = append([]*sstSpan{left, right}, work...)
+					return nil
+				}
+				// Retry on AmbiguousResult.
+				if _, ok := err.(*roachpb.AmbiguousResultError); ok {
+					log.Warningf(ctx, "addsstable [%s,%s) attempt %d failed: %+v", start, end, i, err)
+					continue
+				}
+			}
+			return errors.Wrapf(err, "addsstable [%s,%s)", item.start, item.end)
+		}(); err != nil {
+			return err
 		}
-		// This range has split -- we need to split the SST to try again.
-		if m, ok := errors.Cause(err).(*roachpb.RangeKeyMismatchError); ok {
-			split := m.MismatchedRange.EndKey.AsRawKey()
-			log.Infof(ctx, "SSTable cannot be added spanning range bounds %v, retrying...", split)
-			return addSplitSSTable(ctx, db, sstBytes, start, split)
-		}
-		// Retry on AmbiguousResult.
-		if _, ok := err.(*roachpb.AmbiguousResultError); ok {
-			log.Warningf(ctx, "addsstable [%s,%s) attempt %d failed: %+v", start, end, i, err)
-			continue
-		}
+		// explicitly deallocate SST. This will not deallocate the
+		// top level SST which is kept around to iterate over.
+		item.sstBytes = nil
 	}
-	return errors.Wrapf(err, "addsstable [%s,%s)", start, end)
+
+	return nil
 }
 
-// addSplitSSTable is a helper for splitting up and retrying AddSStable calls.
-func addSplitSSTable(
-	ctx context.Context, db *client.DB, sstBytes []byte, start, splitKey roachpb.Key,
-) error {
-	iter, err := engine.NewMemSSTIterator(sstBytes, false)
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-
+// createSplitSSTable is a helper for splitting up SSTs. The iterator
+// passed in is over the top level SST passed into AddSSTTable().
+func createSplitSSTable(
+	ctx context.Context, db sender, start, splitKey roachpb.Key, iter engine.SimpleIterator,
+) (*sstSpan, *sstSpan, error) {
 	w, err := engine.MakeRocksDBSstFileWriter()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	defer w.Close()
 
 	split := false
 	var first, last roachpb.Key
+	var left, right *sstSpan
 
 	iter.Seek(engine.MVCCKey{Key: start})
 	for {
 		if ok, err := iter.Valid(); err != nil {
-			return err
+			return nil, nil, err
 		} else if !ok {
 			break
 		}
@@ -250,15 +298,18 @@ func addSplitSSTable(
 		if !split && key.Key.Compare(splitKey) >= 0 {
 			res, err := w.Finish()
 			if err != nil {
-				return err
+				return nil, nil, err
 			}
-			if err := AddSSTable(ctx, db, first, last.PrefixEnd(), res); err != nil {
-				return err
+			left = &sstSpan{
+				start:    first,
+				end:      last.PrefixEnd(),
+				sstBytes: res,
 			}
+
 			w.Close()
 			w, err = engine.MakeRocksDBSstFileWriter()
 			if err != nil {
-				return err
+				return nil, nil, err
 			}
 
 			split = true
@@ -272,7 +323,7 @@ func addSplitSSTable(
 		last = append(last[:0], key.Key...)
 
 		if err := w.Add(engine.MVCCKeyValue{Key: key, Value: iter.UnsafeValue()}); err != nil {
-			return err
+			return nil, nil, err
 		}
 
 		iter.Next()
@@ -280,7 +331,12 @@ func addSplitSSTable(
 
 	res, err := w.Finish()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	return AddSSTable(ctx, db, first, last.PrefixEnd(), res)
+	right = &sstSpan{
+		start:    first,
+		end:      last.PrefixEnd(),
+		sstBytes: res,
+	}
+	return left, right, nil
 }

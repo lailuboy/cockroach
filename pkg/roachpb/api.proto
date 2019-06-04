@@ -65,8 +65,9 @@ message RequestHeader {
   // that the operation takes place on the key range from Key to EndKey,
   // including Key and excluding EndKey.
   bytes end_key = 4 [(gogoproto.casttype) = "Key"];
-  // A one-indexed transactional sequence number.
-  int32 sequence = 5;
+  // A zero-indexed transactional sequence number.
+  int32 sequence = 5 [
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb.TxnSeq"];
 }
 
 // ResponseHeader is returned with every storage node response.
@@ -422,6 +423,34 @@ message ReverseScanResponse {
   repeated bytes batch_responses = 4;
 }
 
+
+enum ChecksumMode {
+    // CHECK_VIA_QUEUE is set for requests made from the consistency queue. In
+    // this mode, a full check is carried out, and depending on the result a
+    // recursive consistency check is triggered:
+    //
+    // 1. no inconsistency found: if recomputed stats don't match persisted stats,
+    //    trigger a RecomputeStatsRequest.
+    // 2. inconsistency found: if a diff is available, print it and trigger fatal
+    //    error. If no diff found, trigger recursive check with diff requested
+    //    (which then triggers fatal error).
+    //
+    // TODO(tbg): these semantics are an artifact of how consistency checks were
+    // first implemented. The extra behavior here should move to the consistency
+    // check queue instead and this option dropped from the enum.
+    CHECK_VIA_QUEUE = 0;
+    // CHECK_FULL recomputes the hash of the replicate data in all replicas and
+    // uses this to determine whether there is an inconsistency.
+    CHECK_FULL = 1;
+    // CHECK_STATS only hashes the persisted lease applied state (which notably
+    // includes the persisted MVCCStats) only. This catches a large class of
+    // replica inconsistencies observed in the wild (where replicas apply a
+    // nonidentical log of commands, and as a result almost always have
+    // divergent stats), while doing work independent of the size of the data
+    // contained in the replicas.
+    CHECK_STATS = 2;
+}
+
 // A CheckConsistencyRequest is the argument to the CheckConsistency() method.
 // It specifies the start and end keys for a span of ranges to which a
 // consistency check should be applied. A consistency check on a range involves
@@ -430,14 +459,57 @@ message CheckConsistencyRequest {
   option (gogoproto.equal) = true;
 
   RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-  // log a diff of inconsistencies if such inconsistencies are found.
+  // log a diff of inconsistencies if such inconsistencies are found. This is only
+  // valid if mode == FROM_QUEUE
   bool with_diff = 2;
+  ChecksumMode mode = 3;
+  // Whether to create a RocksDB checkpoint on each replica at the log position
+  // at which the SHA is computed. The checkpoint is essentially a cheap point-
+  // in-time backup of the database. It will be put into the engines' auxiliary
+  // directory and needs to be removed manually to avoid leaking disk space.
+  bool checkpoint = 4;
 }
 
 // A CheckConsistencyResponse is the return value from the CheckConsistency() method.
-// If a replica finds itself to be inconsistent with its lease holder it will panic.
+// It returns the status the range was found in.
 message CheckConsistencyResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+
+  enum Status {
+    // No inconsistency was detected, but not all replicas returned a checksum.
+    RANGE_INDETERMINATE = 0;
+    // A definite inconsistency was detected.
+    RANGE_INCONSISTENT = 1;
+    // All replicas of the range agreed on the checksum.
+    RANGE_CONSISTENT = 2;
+    // Like RANGE_CONSISTENT, but the recomputed stats disagreed with the
+    // persisted stats. The persisted stats indicates estimates, so this is
+    // expected.
+    RANGE_CONSISTENT_STATS_ESTIMATED = 3;
+    // Like RANGE_CONSISTENT_STATS_ESTIMATED, but the mismatch occurred with
+    // persisted stats that claimed to be accurate. This is unexpected and
+    // likely indicates a bug in our logic to incrementally update the stats
+    // as commands are evaluated and applied.
+    RANGE_CONSISTENT_STATS_INCORRECT = 4;
+  }
+
+  message Result {
+    int64 range_id = 1 [(gogoproto.customname) = "RangeID", (gogoproto.casttype) = "RangeID"];
+    // start_key of the range corresponding to range_id (at the time of the
+    // check). This is useful to send additional requests to only a subset of
+    // ranges contained within a result later, as requests can only be routed by
+    // key.
+    bytes start_key = 2;
+    Status status = 3;
+    // detail contains information related to the operation. If no inconsistency
+    // is found, it contains informational value such as observed stats. If an
+    // inconsistency is found, it contains information about that inconsistency
+    // including the involved replica and, if requested, the diff.
+    string detail = 4;
+  }
+
+  // result contains a Result for each Range checked, in no particular order.
+  repeated Result result = 2 [(gogoproto.nullable) = false];
 }
 
 // An RecomputeStatsRequest triggers a stats recomputation on the Range addressed by
@@ -489,27 +561,43 @@ message EndTransactionRequest {
   RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // False to abort and rollback.
   bool commit = 2;
-  // If set, deadline represents the maximum timestamp at which the transaction
-  // can commit (i.e. the maximum timestamp for the txn's writes). If
-  // EndTransaction(Commit=true) finds that the txn's timestamp has been pushed
-  // above this deadline, an error will be returned and the client is supposed
-  // to rollback the txn.
-  // N.B. Assuming that the deadline was valid to begin with (i.e. it was higher
-  // than the txn's OrigTimestamp), only Snapshot transactions can get in
-  // trouble with the deadline check. A Serializable txn that has had its
-  // timestamp pushed has already lost before the deadline check: it will be
-  // forced to restart.
+  // If set, deadline represents the maximum (exclusive) timestamp at which the
+  // transaction can commit (i.e. the maximum timestamp for the txn's reads and
+  // writes).
+  // If EndTransaction(Commit=true) finds that the txn's timestamp has been
+  // pushed above this deadline, an error will be returned and the client is
+  // supposed to rollback the txn.
   util.hlc.Timestamp deadline = 3;
   // commit triggers. Note that commit triggers are for
   // internal use only and will cause an error if requested through the
   // external-facing KV API.
   InternalCommitTrigger internal_commit_trigger = 4;
-  // List of intents written by the transaction. These are spans where
-  // write intents have been written which must be resolved on txn
-  // completion. Note that these spans may be condensed to cover
-  // aggregate spans if the keys written by the transaction exceeded
-  // a size threshold.
+  // Set of spans that the transaction has written intents into. These
+  // are spans which must be resolved on txn completion. Note that these
+  // spans may be condensed to cover aggregate spans if the keys written
+  // by the transaction exceeded a size threshold.
+  //
+  // The set logically extends to include the keys of all writes in the
+  // in-flight write set. However, those keys are not stored in this set
+  // to avoid duplication. This means that elements that are removed from
+  // that set should be merged into this one.
+  //
+  // The slice is maintained in sorted order and all spans are maximally
+  // merged such that no two spans here overlap each other.
   repeated Span intent_spans = 5 [(gogoproto.nullable) = false];
+  // Set of in-flight intent writes that have been issued by the transaction but
+  // which may not have succeeded yet. If any promised writes are provided, a
+  // committing EndTransaction request will move a PENDING transaction to the
+  // STAGING status instead of the COMMITTED status. These in-flight writes must
+  // then all be confirmed as successful before the transaction can be moved
+  // from STAGING to COMMITTED. For more, see txnCommitter.
+  //
+  // The slice is maintained in sorted order by sequence number. This provides
+  // O(log n) access to individual writes in this set based on their sequence
+  // number. See SequencedWriteBySeq.Find and its uses. The set can contain
+  // multiple SequencedWrites with the same key, but all sequence numbers are
+  // unique.
+  repeated SequencedWrite in_flight_writes = 17 [(gogoproto.nullable) = false];
   // Requires that the transaction completes as a 1 phase commit. This
   // guarantees that all writes are to the same range and that no
   // intents are left in the event of an error.
@@ -542,6 +630,9 @@ message EndTransactionResponse {
   // This means that all writes which were part of the transaction
   // were written as a single, atomic write batch to just one range.
   bool one_phase_commit = 4;
+  // The commit timestamp of the STAGING transaction record written
+  // by the request. Only set if the transaction record was staged.
+  util.hlc.Timestamp staging_timestamp = 5 [(gogoproto.nullable) = false];
 }
 
 // An AdminSplitRequest is the argument to the AdminSplit() method. The
@@ -564,16 +655,41 @@ message EndTransactionResponse {
 // thought of as a mostly logical operation, though some other
 // metadata (e.g. abort span and range stats must be copied or
 // recomputed).
+//
+// The manual flag should be set when the split is requested manually
+// from a user operation (I.E. Running ALTER TABLE/INDEX ... SPLIT AT).
+// It should also be set when the split ranges should not be merged back
+// together automatically by the merge queue. Any split requested by the
+// split queue will have the manual flag unset.
 message AdminSplitRequest {
   option (gogoproto.equal) = true;
 
   RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   bytes split_key = 2 [(gogoproto.casttype) = "Key"];
+  bool manual = 3;
 }
 
 // An AdminSplitResponse is the return value from the AdminSplit()
 // method.
 message AdminSplitResponse {
+  ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
+// An AdminUnsplitRequest is the argument to the AdminUnsplit()
+// method. The sticky bit of the existing range whose starting key is
+// header.key is removed.
+//
+// Ranges that do not have the sticky bit set are eligible for
+// automatic merging.
+message AdminUnsplitRequest {
+  option (gogoproto.equal) = true;
+
+  RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
+// An AdminUnsplitResponse is the return value from the
+// AdminUnsplit() method.
+message AdminUnsplitResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
@@ -622,10 +738,28 @@ message AdminChangeReplicasRequest {
   RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   ReplicaChangeType change_type = 2;
   repeated ReplicationTarget targets = 3 [(gogoproto.nullable) = false];
+  // ExpDesc is the expected current range descriptor to modify. If ExpDesc is
+  // not nil and the value of the range descriptor is not identical to ExpDesc
+  // for the request will fail.
+  //
+  // If there is more than one change specified in targets, this expectation
+  // will be applied to the first change and subsequent changes will use the
+  // resultant descriptor from successfully applying the previous change.
+  // If a change with more than one target occurs concurrently with another
+  // it is possible that an error will occur after partial application of the
+  // change. Changes are applied in the order they appear in the request.
+  //
+  // This field was added for 19.1 release and must remain optional until 19.2.
+  // TODO(ajwerner): Make this non-nullable for 19.2.
+  RangeDescriptor exp_desc = 4;
 }
 
 message AdminChangeReplicasResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  // Desc is the value of the range descriptor upon success.
+  // This field was added for 19.1 release and must remain optional until 19.2.
+  // TODO(ajwerner): Make this non-nullable for 19.2.
+  RangeDescriptor desc = 2;
 }
 
 // An AdminRelocateRangeRequest is the argument to the AdminRelocateRange()
@@ -734,15 +868,23 @@ message PushTxnRequest {
   // up-to-date value of the transaction record, but will be set or
   // merged as appropriate.
   storage.engine.enginepb.TxnMeta pushee_txn = 3 [(gogoproto.nullable) = false];
-  // PushTo is the timestamp just after which PusheeTxn is attempted to be
-  // pushed. During conflict resolution, it should be set to the timestamp
-  // of the its conflicting write.
+  // PushTo is the timestamp which PusheeTxn should be pushed to. During
+  // conflict resolution, it should be set just after the timestamp of the
+  // conflicting read or write.
   util.hlc.Timestamp push_to = 4 [(gogoproto.nullable) = false];
-  // Now holds the timestamp used to compare the last heartbeat of the pushee
-  // against. This is necessary since the request header's timestamp does not
-  // necessarily advance with the node clock across retries and hence cannot
-  // detect abandoned transactions.
-  util.hlc.Timestamp now = 5 [(gogoproto.nullable) = false];
+  // InclusivePushTo is sent by nodes to specify that their PushTo timestamp
+  // is the timestamp they want the transaction to be pushed to, instead of
+  // the timestamp before the one they want the transaction to be pushed to.
+  // It is used to assist that field's migration.
+  // TODO(nvanbenschoten): Remove this field in 19.2.
+  bool inclusive_push_to = 9;
+  // DeprecatedNow holds the timestamp used to compare the last heartbeat of the
+  // pushee against.
+  //
+  // The field remains for compatibility with 2.1 nodes. Users should set the
+  // same value for this field and the batch header timestamp.
+  // TODO(nvanbenschoten): Remove this field in 19.2.
+  util.hlc.Timestamp deprecated_now = 5 [(gogoproto.nullable) = false];
   // Readers set this to PUSH_TIMESTAMP to move pushee_txn's provisional
   // commit timestamp forward. Writers set this to PUSH_ABORT to request
   // that pushee_txn be aborted if possible. Inconsistent readers set
@@ -768,6 +910,34 @@ message PushTxnResponse {
   // TODO(tschottdorf): Maybe this can be a TxnMeta instead; probably requires
   // factoring out the new Priority.
   Transaction pushee_txn = 2 [(gogoproto.nullable) = false];
+}
+
+// A RecoverTxnRequest is arguments to the RecoverTxn() method. It is sent
+// during the recovery process for a transaction abandoned in the STAGING state.
+// The sender is expected to have queried all of the abandoned transaction's
+// in-flight writes and determined whether they all succeeded or not. This is
+// used to determine whether the result of the recovery should be committing the
+// abandoned transaction or aborting it.
+message RecoverTxnRequest {
+  option (gogoproto.equal) = true;
+
+  RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  // Transaction record to recover.
+  storage.engine.enginepb.TxnMeta txn = 2 [(gogoproto.nullable) = false];
+  // Did all of the STAGING transaction's writes succeed? If so, the transaction
+  // is implicitly committed and the commit can be made explicit by giving its
+  // record a COMMITTED status. If not, the transaction can be aborted as long
+  // as a write that was found to have failed was prevented from ever succeeding
+  // in the future.
+  bool implicitly_committed = 3;
+}
+
+// A RecoverTxnResponse is the return value from the RecoverTxn() method.
+message RecoverTxnResponse {
+  ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+
+  // Contains the finalized state of the recovered transaction.
+  Transaction recovered_txn = 2 [(gogoproto.nullable) = false];
 }
 
 // A QueryTxnResponse is arguments to the QueryTxn() method. It's sent
@@ -799,7 +969,8 @@ message QueryTxnResponse {
 
 // A QueryIntentRequest is arguments to the QueryIntent() method. It visits
 // the specified key and checks whether an intent is present for the given
-// transaction.
+// transaction. If the intent is found to be missing then it is prevented
+// from ever being written in the future.
 message QueryIntentRequest {
   option (gogoproto.equal) = true;
 
@@ -810,12 +981,10 @@ message QueryIntentRequest {
   // be committed by the provided transaction. If an intent is found at the
   // specified key, the intent is only considered a match if it has the same ID,
   // the same epoch, and a provisional commit timestamp that is equal to or less
-  // than that in the provided transaction. For SERIALIZABLE transactions, if
-  // the intent's timestamp is greater than that in the provided transaction, it
-  // would prevent the transaction from committing and is therefore not a match.
-  // However, for SNAPSHOT transactions, if the intent's timestamp is greater
-  // than that in the provided transaction, it would not prevent the transaction
-  // from committing and therefore is a match.
+  // than that in the provided transaction. The TxnMeta's provisional commit
+  // timestamp is forwarded by the provisional commit timestamp of the request
+  // header transaction if the transactions are the same (i.e. a transaction is
+  // querying its own intent after successfully having refreshed).
   //
   // Additionally, the intent is only considered a match if its sequence number
   // is equal to or greater than the expected txn's sequence number. The
@@ -827,24 +996,10 @@ message QueryIntentRequest {
   // well.
   storage.engine.enginepb.TxnMeta txn = 2 [(gogoproto.nullable) = false];
 
-  enum IfMissingBehavior {
-    // Don't do anything special, just note that the intent was not found in the
-    // response.
-    DO_NOTHING = 0;
-    // Return an IntentMissingError. Special-cased to return a SERIALIZABLE
-    // retry error if a SERIALIZABLE transaction queries its own intent and
-    // finds it has been pushed.
-    RETURN_ERROR = 1;
-    // Prevent the intent from ever being written in the future. If set as the
-    // behavior, a response with found_intent=false implies that an intent will
-    // never be writtable at the key at the transaction's timestamp or below.
-    //
-    // Cannot be used with SNAPSHOT transactions.
-    PREVENT = 2;
-  }
-  // The behavior of the request if the expected intent is found to be not
-  // present.
-  IfMissingBehavior if_missing = 3;
+  // If true, return an IntentMissingError if a matching intent is not found.
+  // Special-cased to return a SERIALIZABLE retry error if a SERIALIZABLE
+  // transaction queries its own intent and finds it has been pushed.
+  bool error_if_missing = 3;
 }
 
 // A QueryIntentResponse is the return value from the QueryIntent() method.
@@ -1021,6 +1176,13 @@ message ComputeChecksumRequest {
   // Compute a checksum along with a snapshot of the entire range, that will be
   // used in logging a diff during checksum verification.
   bool snapshot = 4;
+  // The type of checksum to compute. See ChecksumMode.
+  ChecksumMode mode = 5;
+  // If set, a checkpoint (i.e. cheap backup) of the engine will be taken. This
+  // is expected to be set only if we already know that there is a problem and
+  // we want to preserve as much state as possible. The checkpoint will be stored
+  // in the engine's auxiliary directory.
+  bool checkpoint = 6;
 }
 
 // A ComputeChecksumResponse is the response to a ComputeChecksum() operation.
@@ -1153,6 +1315,20 @@ message ExportRequest {
   // may still be set if the request is served by an old node, but since the
   // caller has declare they're not going to use it, that's okay.
   bool omit_checksum = 6;
+
+  // EnableTimeBoundIteratorOptimization, if true, enables a performance
+  // optimization that allows us to entirely skip over sstables in RocksDB that
+  // don't have data relevant to the time bounds in this request.
+  //
+  // This can have a dramatic impact on performance, but we've seen a number of
+  // extremely subtle and hard to detect correctness issues with this (see
+  // #28358 #34819). As a result, we've decided to skip the optimization
+  // everywhere that it isn't absolutely necessary for the feature to work
+  // (leaving one place: poller-based changefeeds, which are being phased out
+  // anyway). This will both give increased confidence in correctness as well as
+  // eliminate any need to investigate time-bound iterators when/if someone hits
+  // a correctness bug.
+  bool enable_time_bound_iterator_optimization = 7;
 }
 
 message BulkOpSummary {
@@ -1323,7 +1499,13 @@ message SubsumeRequest {
 
   // The range descriptor for the left-hand side of the merge. Used by the
   // right-hand side to sanity-check the validity of the merge.
-  RangeDescriptor left_range = 2 [(gogoproto.nullable) = false];
+  RangeDescriptor left_desc = 2 [(gogoproto.nullable) = false];
+  // The range descriptor for the right-hand side of the merge. Should match
+  // the range descriptor of the range evaluating this request.
+  // TODO(nvanbenschoten): make this field nullable once we can be sure
+  // that all users of SubsumeRequest will use it. The field will be sent
+  // by all 19.2 nodes, so it will be reliably non-null for 19.3 binaries.
+  RangeDescriptor right_desc = 3;
 }
 
 // SubsumeResponse is the response to a SubsumeRequest.
@@ -1391,6 +1573,7 @@ message RequestUnion {
     BeginTransactionRequest begin_transaction = 8;
     EndTransactionRequest end_transaction = 9;
     AdminSplitRequest admin_split = 10;
+    AdminUnsplitRequest admin_unsplit = 47;
     AdminMergeRequest admin_merge = 11;
     AdminTransferLeaseRequest admin_transfer_lease = 29;
     AdminChangeReplicasRequest admin_change_replicas = 35;
@@ -1398,6 +1581,7 @@ message RequestUnion {
     HeartbeatTxnRequest heartbeat_txn = 12;
     GCRequest gc = 13;
     PushTxnRequest push_txn = 14;
+    RecoverTxnRequest recover_txn = 46;
     ResolveIntentRequest resolve_intent = 16;
     ResolveIntentRangeRequest resolve_intent_range = 17;
     MergeRequest merge = 18;
@@ -1440,6 +1624,7 @@ message ResponseUnion {
     BeginTransactionResponse begin_transaction = 8;
     EndTransactionResponse end_transaction = 9;
     AdminSplitResponse admin_split = 10;
+    AdminUnsplitResponse admin_unsplit = 47;
     AdminMergeResponse admin_merge = 11;
     AdminTransferLeaseResponse admin_transfer_lease = 29;
     AdminChangeReplicasResponse admin_change_replicas = 35;
@@ -1447,6 +1632,7 @@ message ResponseUnion {
     HeartbeatTxnResponse heartbeat_txn = 12;
     GCResponse gc = 13;
     PushTxnResponse push_txn = 14;
+    RecoverTxnResponse recover_txn = 46;
     ResolveIntentResponse resolve_intent = 16;
     ResolveIntentRangeResponse resolve_intent_range = 17;
     MergeResponse merge = 18;
@@ -1612,6 +1798,9 @@ message RangeFeedValue {
 // promise that no more RangeFeedValue events with keys in the specified span
 // with timestamps less than or equal to the specified resolved timestamp will
 // be emitted on the RangeFeed response stream.
+//
+// Note that these resolved timestamps may be lower than the timestamp used in
+// the RangeFeedRequest used to start the RangeFeed.
 message RangeFeedCheckpoint {
   Span               span        = 1 [(gogoproto.nullable) = false];
   util.hlc.Timestamp resolved_ts = 2 [

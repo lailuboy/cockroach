@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -186,11 +187,149 @@ func TestUsageQuantization(t *testing.T) {
 	}
 }
 
+func TestCBOReportUsage(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const elemName = "somestring"
+	ctx := context.TODO()
+
+	r := makeMockRecorder(t)
+	defer stubURL(&reportingURL, r.url)()
+	defer r.Close()
+
+	st := cluster.MakeTestingClusterSettings()
+
+	storeSpec := base.DefaultTestStoreSpec
+	storeSpec.Attributes = roachpb.Attributes{Attrs: []string{elemName}}
+	params := base.TestServerArgs{
+		StoreSpecs: []base.StoreSpec{
+			storeSpec,
+			base.DefaultTestStoreSpec,
+		},
+		Settings: st,
+		Locality: roachpb.Locality{
+			Tiers: []roachpb.Tier{
+				{Key: "region", Value: "east"},
+				{Key: "zone", Value: elemName},
+				{Key: "state", Value: "ny"},
+				{Key: "city", Value: "nyc"},
+			},
+		},
+		Knobs: base.TestingKnobs{
+			SQLLeaseManager: &sql.LeaseManagerTestingKnobs{
+				// Disable SELECT called for delete orphaned leases to keep
+				// query stats stable.
+				DisableDeleteOrphanedLeases: true,
+			},
+		},
+	}
+
+	s, db, _ := serverutils.StartServer(t, params)
+	// Stopper will wait for the update/report loop to finish too.
+	defer s.Stopper().Stop(context.TODO())
+	ts := s.(*TestServer)
+
+	// make sure the test's generated activity is the only activity we measure.
+	telemetry.GetFeatureCounts(telemetry.Raw, telemetry.ResetCounts)
+
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	sqlDB.Exec(t, fmt.Sprintf(`CREATE DATABASE %s`, elemName))
+	sqlDB.Exec(t, `CREATE TABLE x (a INT PRIMARY KEY)`)
+	sqlDB.Exec(t, `CREATE STATISTICS stats FROM x`)
+	// Run a variety of hinted queries.
+	sqlDB.Exec(t, `SELECT * FROM x@primary`)
+	sqlDB.Exec(t, `EXPLAIN SELECT * FROM x`)
+	sqlDB.Exec(t, `EXPLAIN (distsql) SELECT * FROM x`)
+	sqlDB.Exec(t, `EXPLAIN ANALYZE SELECT * FROM x`)
+	sqlDB.Exec(t, `EXPLAIN (opt) SELECT * FROM x`)
+	sqlDB.Exec(t, `EXPLAIN (opt, verbose) SELECT * FROM x`)
+	// Do joins different numbers of times to disambiguate them in the expected,
+	// output but make sure the query strings are different each time so that the
+	// plan cache doesn't affect our results.
+	sqlDB.Exec(
+		t,
+		`SELECT x FROM (VALUES (1)) AS a(x) INNER HASH JOIN (VALUES (1)) AS b(y) ON x = y`,
+	)
+	for i := 0; i < 2; i++ {
+		sqlDB.Exec(
+			t,
+			fmt.Sprintf(
+				`SELECT x FROM (VALUES (%d)) AS a(x) INNER MERGE JOIN (VALUES (1)) AS b(y) ON x = y`,
+				i,
+			),
+		)
+	}
+	for i := 0; i < 3; i++ {
+		sqlDB.Exec(
+			t,
+			fmt.Sprintf(
+				`SELECT a FROM (VALUES (%d)) AS b(y) INNER LOOKUP JOIN x ON y = a`,
+				i,
+			),
+		)
+	}
+
+	for i := 0; i < 20; i += 3 {
+		sqlDB.Exec(
+			t,
+			fmt.Sprintf(
+				`SET CLUSTER SETTING sql.defaults.reorder_joins_limit = %d`,
+				i,
+			),
+		)
+	}
+
+	sqlDB.Exec(
+		t,
+		`SET CLUSTER SETTING sql.stats.automatic_collection.enabled = on`,
+	)
+
+	sqlDB.Exec(
+		t,
+		`SET CLUSTER SETTING sql.stats.automatic_collection.enabled = off`,
+	)
+
+	if _, err := db.Exec(`RESET CLUSTER SETTING sql.stats.automatic_collection.enabled`); err != nil {
+		t.Fatal(err)
+	}
+
+	ts.reportDiagnostics(ctx)
+
+	expectedFeatureUsage := map[string]int32{
+		"sql.plan.hints.hash-join":              1,
+		"sql.plan.hints.merge-join":             2,
+		"sql.plan.hints.lookup-join":            3,
+		"sql.plan.hints.index":                  1,
+		"sql.plan.reorder-joins.set-limit-0":    1,
+		"sql.plan.reorder-joins.set-limit-3":    1,
+		"sql.plan.reorder-joins.set-limit-6":    1,
+		"sql.plan.reorder-joins.set-limit-9":    1,
+		"sql.plan.reorder-joins.set-limit-more": 3,
+		"sql.plan.automatic-stats.enabled":      2,
+		"sql.plan.automatic-stats.disabled":     1,
+		"sql.plan.stats.created":                1,
+		"sql.plan.explain":                      1,
+		"sql.plan.explain-analyze":              1,
+		"sql.plan.explain-opt":                  1,
+		"sql.plan.explain-opt-verbose":          1,
+		"sql.plan.explain-distsql":              1,
+	}
+
+	for key, expected := range expectedFeatureUsage {
+		if got, ok := r.last.FeatureUsage[key]; !ok {
+			t.Fatalf("expected report of feature %q", key)
+		} else if got != expected {
+			t.Fatalf("expected reported value of feature %q to be %d not %d", key, expected, got)
+		}
+	}
+}
+
 func TestReportUsage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	const elemName = "somestring"
-	const internalAppName = sql.InternalAppNamePrefix + "foo"
+	const internalAppName = sqlbase.ReportableAppNamePrefix + "foo"
 	ctx := context.TODO()
 
 	r := makeMockRecorder(t)
@@ -229,7 +368,7 @@ func TestReportUsage(t *testing.T) {
 	ts := s.(*TestServer)
 
 	// make sure the test's generated activity is the only activity we measure.
-	telemetry.GetAndResetFeatureCounts(false)
+	telemetry.GetFeatureCounts(telemetry.Raw, telemetry.ResetCounts)
 
 	if _, err := db.Exec(fmt.Sprintf(`CREATE DATABASE %s`, elemName)); err != nil {
 		t.Fatal(err)
@@ -271,6 +410,12 @@ func TestReportUsage(t *testing.T) {
 
 	if _, err := db.Exec(
 		fmt.Sprintf(`CREATE TABLE %[1]s.%[1]s (%[1]s INT8 CONSTRAINT %[1]s CHECK (%[1]s > 1))`, elemName),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec(
+		fmt.Sprintf(`CREATE TABLE %[1]s.%[1]s_s (%[1]s SERIAL2)`, elemName),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -330,7 +475,7 @@ func TestReportUsage(t *testing.T) {
 		) {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec(`ALTER TABLE foo RENAME CONSTRAINT x TO y`); !testutils.IsError(
+		if _, err := db.Exec(`ALTER TABLE foo ALTER COLUMN x SET NOT NULL`); !testutils.IsError(
 			err, "unimplemented",
 		) {
 			t.Fatal(err)
@@ -378,13 +523,25 @@ func TestReportUsage(t *testing.T) {
 		if _, err := db.Exec(`RESET application_name`); err != nil {
 			t.Fatal(err)
 		}
+		// Try some esoteric operators unlikely to be executed in background activity.
+		if _, err := db.Exec(`SELECT '1.2.3.4'::STRING::INET, '{"a":"b","c":123}'::JSON - 'a', ARRAY (SELECT 1)[1]`); err != nil {
+			t.Fatal(err)
+		}
+		// Try a CTE to check CTE feature reporting.
+		if _, err := db.Exec(`WITH a AS (SELECT 1) SELECT * FROM a`); err != nil {
+			t.Fatal(err)
+		}
+		// Try a correlated subquery to check that feature reporting.
+		if _, err := db.Exec(`SELECT x	FROM (VALUES (1)) AS b(x) WHERE EXISTS(SELECT * FROM (VALUES (1)) AS a(x) WHERE a.x = b.x)`); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	tables, err := ts.collectSchemaInfo(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if actual := len(tables); actual != 1 {
+	if actual := len(tables); actual != 2 {
 		t.Fatalf("unexpected table count %d", actual)
 	}
 	for _, table := range tables {
@@ -517,15 +674,8 @@ func TestReportUsage(t *testing.T) {
 
 	// This test would be infuriating if it had to be updated on every
 	// edit to the Go code that changed the line number of the trace
-	// produced by force_assertion_error, so just scrub the trace
+	// produced by force_error, so just scrub the trace
 	// here.
-	for k := range r.last.FeatureUsage {
-		if strings.HasPrefix(k, "internalerror.") {
-			r.last.FeatureUsage["internalerror."] = r.last.FeatureUsage[k]
-			delete(r.last.FeatureUsage, k)
-			break
-		}
-	}
 	for k := range r.last.FeatureUsage {
 		if strings.HasPrefix(k, "othererror.builtins.go") {
 			r.last.FeatureUsage["othererror.builtins.go"] = r.last.FeatureUsage[k]
@@ -539,12 +689,30 @@ func TestReportUsage(t *testing.T) {
 		"test.b": 2,
 		"test.c": 3,
 
+		// SERIAL normalization.
+		"sql.schema.serial.rowid.int2": 1,
+
+		// Although the query is executed 10 times, due to plan caching
+		// keyed by the SQL text, the planning only occurs once.
+		"sql.plan.ops.cast.string::inet":                                            1,
+		"sql.plan.ops.bin.jsonb - string":                                           1,
+		"sql.plan.builtins.crdb_internal.force_assertion_error(msg: string) -> int": 1,
+		"sql.plan.ops.array.ind":                                                    1,
+		"sql.plan.ops.array.cons":                                                   1,
+		"sql.plan.ops.array.flatten":                                                1,
+
+		// The subquery counter is exercised by `(1, 20, 30, 40) = (SELECT ...)`.
+		"sql.plan.subquery": 1,
+		// The correlated sq counter is exercised by `WHERE EXISTS ( ... )` above.
+		"sql.plan.subquery.correlated": 1,
+		// The CTE counter is exercised by `WITH a AS (SELECT 1) ...`.
+		"sql.plan.cte": 10,
+
 		"unimplemented.#33285.json_object_agg":          10,
 		"unimplemented.pg_catalog.pg_stat_wal_receiver": 10,
-		"unimplemented.syntax.#32555":                   10,
+		"unimplemented.syntax.#28751":                   10,
 		"unimplemented.syntax.#32564":                   10,
 		"unimplemented.#9148":                           10,
-		"internalerror.":                                10,
 		"othererror.builtins.go":                        10,
 		"othererror." +
 			pgerror.CodeDataExceptionError +
@@ -557,8 +725,8 @@ func TestReportUsage(t *testing.T) {
 		"errorcodes." + pgerror.CodeDivisionByZeroError:      10,
 	}
 
-	if expected, actual := len(expectedFeatureUsage), len(r.last.FeatureUsage); expected != actual {
-		t.Fatalf("expected %d feature usage counts, got %d: %v", expected, actual, r.last.FeatureUsage)
+	if expected, actual := len(expectedFeatureUsage), len(r.last.FeatureUsage); actual < expected {
+		t.Fatalf("expected at least %d feature usage counts, got %d: %v", expected, actual, r.last.FeatureUsage)
 	}
 	for key, expected := range expectedFeatureUsage {
 		if got, ok := r.last.FeatureUsage[key]; !ok {
@@ -609,7 +777,7 @@ func TestReportUsage(t *testing.T) {
 	hashedZone := sql.HashForReporting(clusterSecret, "zone")
 	for id, zone := range r.last.ZoneConfigs {
 		if id == keys.RootNamespaceID {
-			if defZone := config.DefaultZoneConfig(); !reflect.DeepEqual(zone, defZone) {
+			if defZone := ts.Cfg.DefaultZoneConfig; !reflect.DeepEqual(zone, defZone) {
 				t.Errorf("default zone config does not match: expected\n%+v got\n%+v", defZone, zone)
 			}
 		}
@@ -662,7 +830,7 @@ func TestReportUsage(t *testing.T) {
 
 	var foundKeys []string
 	for _, s := range r.last.SqlStats {
-		if strings.HasPrefix(s.Key.App, sql.InternalAppNamePrefix+"internal") {
+		if strings.HasPrefix(s.Key.App, sqlbase.InternalAppNamePrefix) {
 			// Let's ignore all internal queries for this test.
 			continue
 		}
@@ -680,13 +848,17 @@ func TestReportUsage(t *testing.T) {
 		`[false,false,false] SET application_name = $1`,
 		`[false,false,false] SET application_name = DEFAULT`,
 		`[false,false,false] SET application_name = _`,
+		`[true,false,false] CREATE TABLE _ (_ INT8 NOT NULL DEFAULT unique_rowid())`,
 		`[true,false,false] CREATE TABLE _ (_ INT8, CONSTRAINT _ CHECK (_ > _))`,
 		`[true,false,false] INSERT INTO _ SELECT unnest(ARRAY[_, _, __more2__])`,
 		`[true,false,false] INSERT INTO _ VALUES (_), (__more2__)`,
 		`[true,false,false] INSERT INTO _ VALUES (length($1::STRING)), (__more1__)`,
 		`[true,false,false] INSERT INTO _(_, _) VALUES (_, _)`,
 		`[true,false,false] SELECT (_, _, __more2__) = (SELECT _, _, _, _ FROM _ LIMIT _)`,
+		`[true,false,false] SELECT _ FROM (VALUES (_)) AS _ (_) WHERE EXISTS (SELECT * FROM (VALUES (_)) AS _ (_) WHERE _._ = _._)`,
+		"[true,false,false] SELECT _::STRING::INET, _::JSONB - _, ARRAY (SELECT _)[_]",
 		`[true,false,false] UPDATE _ SET _ = _ + _`,
+		"[true,false,false] WITH _ AS (SELECT _) SELECT * FROM _",
 		`[true,false,true] CREATE TABLE _ (_ INT8 PRIMARY KEY, _ INT8, INDEX (_) INTERLEAVE IN PARENT _ (_))`,
 		`[true,false,true] SELECT _ / $1`,
 		`[true,false,true] SELECT _ / _`,
@@ -712,7 +884,7 @@ func TestReportUsage(t *testing.T) {
 
 	bucketByApp := make(map[string][]roachpb.CollectedStatementStatistics)
 	for _, s := range r.last.SqlStats {
-		if strings.HasPrefix(s.Key.App, sql.InternalAppNamePrefix+"internal") {
+		if strings.HasPrefix(s.Key.App, sqlbase.InternalAppNamePrefix) {
 			// Let's ignore all internal queries for this test.
 			continue
 		}
@@ -729,12 +901,15 @@ func TestReportUsage(t *testing.T) {
 			`ALTER TABLE _ CONFIGURE ZONE = _`,
 			`CREATE DATABASE _`,
 			`CREATE TABLE _ (_ INT8, CONSTRAINT _ CHECK (_ > _))`,
+			`CREATE TABLE _ (_ INT8 NOT NULL DEFAULT unique_rowid())`,
 			`CREATE TABLE _ (_ INT8 PRIMARY KEY, _ INT8, INDEX (_) INTERLEAVE IN PARENT _ (_))`,
 			`INSERT INTO _ VALUES (length($1::STRING)), (__more1__)`,
 			`INSERT INTO _ VALUES (_), (__more2__)`,
 			`INSERT INTO _ SELECT unnest(ARRAY[_, _, __more2__])`,
 			`INSERT INTO _(_, _) VALUES (_, _)`,
 			`SELECT (_, _, __more2__) = (SELECT _, _, _, _ FROM _ LIMIT _)`,
+			`SELECT _ FROM (VALUES (_)) AS _ (_) WHERE EXISTS (SELECT * FROM (VALUES (_)) AS _ (_) WHERE _._ = _._)`,
+			`SELECT _::STRING::INET, _::JSONB - _, ARRAY (SELECT _)[_]`,
 			`SELECT * FROM _ WHERE (_ = length($1::STRING)) OR (_ = $2)`,
 			`SELECT * FROM _ WHERE (_ = _) AND (_ = _)`,
 			`SELECT _ / $1`,
@@ -745,6 +920,7 @@ func TestReportUsage(t *testing.T) {
 			`SET CLUSTER SETTING "server.time_until_store_dead" = _`,
 			`SET CLUSTER SETTING "diagnostics.reporting.send_crash_reports" = _`,
 			`SET application_name = _`,
+			`WITH _ AS (SELECT _) SELECT * FROM _`,
 		},
 		elemName: {
 			`SELECT _ FROM _ WHERE (_ = _) AND (lower(_) = lower(_))`,

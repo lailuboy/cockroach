@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"os/exec"
 	"regexp"
@@ -41,12 +40,23 @@ const (
 	ProviderName = "gce"
 )
 
+// DefaultProject returns the default GCE project.
+func DefaultProject() string {
+	return defaultProject
+}
+
+// projects for which a cron GC job exists.
+var projectsWithGC = []string{defaultProject, "andrei-jepsen"}
+
 // init will inject the GCE provider into vm.Providers, but only if the gcloud tool is available on the local path.
 func init() {
-	var p vm.Provider = &Provider{}
+	var p vm.Provider
 	if _, err := exec.LookPath("gcloud"); err != nil {
 		p = flagstub.New(p, "please install the gcloud CLI utilities "+
 			"(https://cloud.google.com/sdk/downloads)")
+	} else {
+		gceP := makeProvider()
+		p = &gceP
 	}
 	vm.Providers[ProviderName] = p
 }
@@ -60,8 +70,9 @@ func runJSONCommand(args []string, parsed interface{}) error {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			stderr = exitErr.Stderr
 		}
-		// TODO(peter): Remove this hack once gcloud is behaving again.
-		if matched, _ := regexp.Match(`europe-north.*Unknown zone`, stderr); !matched {
+		// TODO(peter,ajwerner): Remove this hack once gcloud behaves when adding
+		// new zones.
+		if matched, _ := regexp.Match(`.*Unknown zone`, stderr); !matched {
 			return errors.Errorf("failed to run: gcloud %s: %s\nstdout: %s\nstderr: %s",
 				strings.Join(args, " "), err, bytes.TrimSpace(rawJSON), bytes.TrimSpace(stderr))
 		}
@@ -150,6 +161,7 @@ func (jsonVM *jsonVM) toVM(project string) *vm.VM {
 		VPC:         vpc,
 		MachineType: machineType,
 		Zone:        zone,
+		Project:     project,
 	}
 }
 
@@ -160,10 +172,71 @@ type jsonAuth struct {
 
 // User-configurable, provider-specific options
 type providerOpts struct {
-	Project        string
+	// projects represent the GCE projects to operate on. Accessed through
+	// GetProject() or GetProjects() depending on whether the command accepts
+	// multiple projects or a single one.
+	projects       []string
 	ServiceAccount string
 	MachineType    string
 	Zones          []string
+}
+
+// projectsVal is the implementation for the --gce-projects flag. It populates
+// opts.projects.
+type projectsVal struct {
+	acceptMultipleProjects bool
+	opts                   *providerOpts
+}
+
+// Set is part of the pflag.Value interface.
+func (v projectsVal) Set(projects string) error {
+	if projects == "" {
+		return fmt.Errorf("empty GCE project")
+	}
+	prj := strings.Split(projects, ",")
+	if !v.acceptMultipleProjects && len(prj) > 1 {
+		return fmt.Errorf("multiple GCE projects not supported for command")
+	}
+	v.opts.projects = prj
+	return nil
+}
+
+// Type is part of the pflag.Value interface.
+func (v projectsVal) Type() string {
+	if v.acceptMultipleProjects {
+		return "comma-separated list of GCE projects"
+	}
+	return "GCE project name"
+}
+
+// String is part of the pflag.Value interface.
+func (v projectsVal) String() string {
+	return strings.Join(v.opts.projects, ",")
+}
+
+func makeProviderOpts() providerOpts {
+	return providerOpts{
+		// projects needs space for one project, which is set by the flags for
+		// commands that accept a single project.
+		projects: []string{defaultProject},
+	}
+}
+
+// GetProject returns the GCE project on which we're configured to operate.
+// If multiple projects were configured, this panics.
+func (p *Provider) GetProject() string {
+	o := p.opts
+	if len(o.projects) > 1 {
+		panic(fmt.Sprintf(
+			"multiple projects not supported (%d specified)", len(o.projects)))
+	}
+	return o.projects[0]
+}
+
+// GetProjects returns the list of GCE projects on which we're configured to
+// operate.
+func (p *Provider) GetProjects() []string {
+	return p.opts.projects
 }
 
 func (o *providerOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
@@ -180,61 +253,83 @@ func (o *providerOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 		[]string{"us-east1-b", "us-west1-b", "europe-west2-b"}, "Zones for cluster")
 }
 
-func (o *providerOpts) ConfigureClusterFlags(flags *pflag.FlagSet) {
+func (o *providerOpts) ConfigureClusterFlags(flags *pflag.FlagSet, opt vm.MultipleProjectsOption) {
 	project := os.Getenv("GCE_PROJECT")
 	if project == "" {
 		project = defaultProject
 	}
-	flags.StringVar(&o.Project, ProviderName+"-project", project,
-		"Project to create cluster in")
+
+	var usage string
+	if opt == vm.SingleProject {
+		usage = "GCE project to manage"
+	} else {
+		usage = "List of GCE projects to manage"
+	}
+
+	flags.Var(
+		projectsVal{
+			acceptMultipleProjects: opt == vm.AcceptMultipleProjects,
+			opts:                   o,
+		},
+		ProviderName+"-project", /* name */
+		usage)
 }
 
-// Provider TODO(peter): document
+// Provider is the GCE implementation of the vm.Provider interface.
 type Provider struct {
 	opts providerOpts
 }
 
+func makeProvider() Provider {
+	return Provider{opts: makeProviderOpts()}
+}
+
 // CleanSSH TODO(peter): document
 func (p *Provider) CleanSSH() error {
-	args := []string{"compute", "config-ssh", "--project", p.opts.Project, "--quiet", "--remove"}
-	cmd := exec.Command("gcloud", args...)
+	for _, prj := range p.GetProjects() {
+		args := []string{"compute", "config-ssh", "--project", prj, "--quiet", "--remove"}
+		cmd := exec.Command("gcloud", args...)
 
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", args, output)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", args, output)
+		}
 	}
 	return nil
 }
 
 // ConfigSSH TODO(peter): document
 func (p *Provider) ConfigSSH() error {
-	args := []string{"compute", "config-ssh", "--project", p.opts.Project, "--quiet"}
-	cmd := exec.Command("gcloud", args...)
+	for _, prj := range p.GetProjects() {
+		args := []string{"compute", "config-ssh", "--project", prj, "--quiet"}
+		cmd := exec.Command("gcloud", args...)
 
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", args, output)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", args, output)
+		}
 	}
 	return nil
 }
 
 // Create TODO(peter): document
 func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
-	if p.opts.Project != defaultProject {
+	project := p.GetProject()
+	var gcJob bool
+	for _, prj := range projectsWithGC {
+		if prj == p.GetProject() {
+			gcJob = true
+			break
+		}
+	}
+	if !gcJob {
 		fmt.Printf("WARNING: --lifetime functionality requires "+
-			"`roachprod gc --gce-project=%s` cronjob\n", p.opts.Project)
+			"`roachprod gc --gce-project=%s` cronjob\n", project)
 	}
 
 	if !opts.GeoDistributed {
 		p.opts.Zones = []string{p.opts.Zones[0]}
 	}
-
-	totalNodes := float64(len(names))
-	totalZones := float64(len(p.opts.Zones))
-	nodesPerZone := int(math.Ceil(totalNodes / totalZones))
-
-	ct := int(0)
-	i := 0
 
 	// Fixed args.
 	args := []string{
@@ -248,7 +343,7 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 		"--boot-disk-type", "pd-ssd",
 	}
 
-	if p.opts.Project == defaultProject && p.opts.ServiceAccount == "" {
+	if project == defaultProject && p.opts.ServiceAccount == "" {
 		p.opts.ServiceAccount = "21965078311-compute@developer.gserviceaccount.com"
 	}
 	if p.opts.ServiceAccount != "" {
@@ -277,24 +372,19 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 	args = append(args, "--labels", fmt.Sprintf("lifetime=%s", opts.Lifetime))
 
 	args = append(args, "--metadata-from-file", fmt.Sprintf("startup-script=%s", filename))
-	args = append(args, "--project", p.opts.Project)
+	args = append(args, "--project", project)
 
 	var g errgroup.Group
 
-	// This is calculating the number of machines to allocate per zone by taking the ceiling of the the total number
-	// of machines left divided by the number of zones left. If the the number of machines isn't
-	// divisible by the number of zones, then the extra machines will be allocated one per zone until there are
-	// no more extra machines left.
-	for i < len(names) {
-		argsWithZone := append(args[:len(args):len(args)], "--zone", p.opts.Zones[ct])
-		ct++
-		argsWithZone = append(argsWithZone, names[i:i+nodesPerZone]...)
-		i += nodesPerZone
-
-		totalNodes -= float64(nodesPerZone)
-		totalZones--
-		nodesPerZone = int(math.Ceil(totalNodes / totalZones))
-
+	nodeZones := vm.ZonePlacement(len(p.opts.Zones), len(names))
+	zoneHostNames := make([][]string, len(p.opts.Zones))
+	for i, name := range names {
+		zone := nodeZones[i]
+		zoneHostNames[zone] = append(zoneHostNames[zone], name)
+	}
+	for i, zoneHosts := range zoneHostNames {
+		argsWithZone := append(args[:len(args):len(args)], "--zone", p.opts.Zones[i])
+		argsWithZone = append(argsWithZone, zoneHosts...)
 		g.Go(func() error {
 			cmd := exec.Command("gcloud", argsWithZone...)
 
@@ -312,36 +402,43 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 
 // Delete TODO(peter): document
 func (p *Provider) Delete(vms vm.List) error {
-	zoneMap := make(map[string][]string)
+	// Map from project to map of zone to list of machines in that project/zone.
+	projectZoneMap := make(map[string]map[string][]string)
 	for _, v := range vms {
 		if v.Provider != ProviderName {
 			return errors.Errorf("%s received VM instance from %s", ProviderName, v.Provider)
 		}
-		zoneMap[v.Zone] = append(zoneMap[v.Zone], v.Name)
+		if projectZoneMap[v.Project] == nil {
+			projectZoneMap[v.Project] = make(map[string][]string)
+		}
+
+		projectZoneMap[v.Project][v.Zone] = append(projectZoneMap[v.Project][v.Zone], v.Name)
 	}
 
 	var g errgroup.Group
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	for zone, names := range zoneMap {
-		args := []string{
-			"compute", "instances", "delete",
-			"--delete-disks", "all",
-		}
-
-		args = append(args, "--project", p.opts.Project)
-		args = append(args, "--zone", zone)
-		args = append(args, names...)
-
-		g.Go(func() error {
-			cmd := exec.CommandContext(ctx, "gcloud", args...)
-
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", args, output)
+	for project, zoneMap := range projectZoneMap {
+		for zone, names := range zoneMap {
+			args := []string{
+				"compute", "instances", "delete",
+				"--delete-disks", "all",
 			}
-			return nil
-		})
+
+			args = append(args, "--project", project)
+			args = append(args, "--zone", zone)
+			args = append(args, names...)
+
+			g.Go(func() error {
+				cmd := exec.CommandContext(ctx, "gcloud", args...)
+
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", args, output)
+				}
+				return nil
+			})
+		}
 	}
 
 	return g.Wait()
@@ -354,7 +451,7 @@ func (p *Provider) Extend(vms vm.List, lifetime time.Duration) error {
 	for _, v := range vms {
 		args := []string{"compute", "instances", "add-labels"}
 
-		args = append(args, "--project", p.opts.Project)
+		args = append(args, "--project", v.Project)
 		args = append(args, "--zone", v.Zone)
 		args = append(args, "--labels", fmt.Sprintf("lifetime=%s", lifetime))
 		args = append(args, v.Name)
@@ -399,18 +496,20 @@ func (p *Provider) Flags() vm.ProviderFlags {
 
 // List queries gcloud to produce a list of VM info objects.
 func (p *Provider) List() (vm.List, error) {
-	args := []string{"compute", "instances", "list", "--project", p.opts.Project, "--format", "json"}
+	var vms vm.List
+	for _, prj := range p.GetProjects() {
+		args := []string{"compute", "instances", "list", "--project", prj, "--format", "json"}
 
-	// Run the command, extracting the JSON payload
-	jsonVMS := make([]jsonVM, 0)
-	if err := runJSONCommand(args, &jsonVMS); err != nil {
-		return nil, err
-	}
+		// Run the command, extracting the JSON payload
+		jsonVMS := make([]jsonVM, 0)
+		if err := runJSONCommand(args, &jsonVMS); err != nil {
+			return nil, err
+		}
 
-	// Now, convert the json payload into our common VM type
-	vms := make(vm.List, len(jsonVMS))
-	for i, jsonVM := range jsonVMS {
-		vms[i] = *jsonVM.toVM(p.opts.Project)
+		// Now, convert the json payload into our common VM type
+		for _, jsonVM := range jsonVMS {
+			vms = append(vms, *jsonVM.toVM(prj))
+		}
 	}
 
 	return vms, nil
@@ -419,4 +518,9 @@ func (p *Provider) List() (vm.List, error) {
 // Name TODO(peter): document
 func (p *Provider) Name() string {
 	return ProviderName
+}
+
+// Active is part of the vm.Provider interface.
+func (p *Provider) Active() bool {
+	return true
 }

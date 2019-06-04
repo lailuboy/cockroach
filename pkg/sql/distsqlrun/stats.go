@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
@@ -38,7 +39,7 @@ func NewInputStatCollector(input RowSource) *InputStatCollector {
 
 // Next implements the RowSource interface. It calls Next on the embedded
 // RowSource and collects stats.
-func (isc *InputStatCollector) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (isc *InputStatCollector) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	start := timeutil.Now()
 	row, meta := isc.RowSource.Next()
 	if row != nil {
@@ -53,6 +54,7 @@ const (
 	stallTimeTagSuffix = "stalltime"
 	maxMemoryTagSuffix = "mem.max"
 	maxDiskTagSuffix   = "disk.max"
+	bytesReadTagSuffix = "bytes.read"
 )
 
 // Stats is a utility method that returns a map of the InputStats` stats to
@@ -69,6 +71,7 @@ const (
 	stallTimeQueryPlanSuffix = "stall time"
 	maxMemoryQueryPlanSuffix = "max memory used"
 	maxDiskQueryPlanSuffix   = "max disk used"
+	bytesReadQueryPlanSuffix = "bytes read"
 )
 
 // StatsForQueryPlan is a utility method that returns a list of the InputStats'

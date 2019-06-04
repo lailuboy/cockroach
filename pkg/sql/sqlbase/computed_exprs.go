@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // RowIndexedVarContainer is used to evaluate expressions over various rows.
@@ -49,7 +49,7 @@ func (r *RowIndexedVarContainer) IndexedVarEval(
 }
 
 // IndexedVarResolvedType implements tree.IndexedVarContainer.
-func (*RowIndexedVarContainer) IndexedVarResolvedType(idx int) types.T {
+func (*RowIndexedVarContainer) IndexedVarResolvedType(idx int) *types.T {
 	panic("unsupported")
 }
 
@@ -68,8 +68,8 @@ func (j *descContainer) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Dat
 	panic("unsupported")
 }
 
-func (j *descContainer) IndexedVarResolvedType(idx int) types.T {
-	return j.cols[idx].Type.ToDatumType()
+func (j *descContainer) IndexedVarResolvedType(idx int) *types.T {
+	return &j.cols[idx].Type
 }
 
 func (*descContainer) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
@@ -78,8 +78,8 @@ func (*descContainer) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
 
 // CannotWriteToComputedColError constructs a write error for a computed column.
 func CannotWriteToComputedColError(colName string) error {
-	return pgerror.NewErrorf(pgerror.CodeObjectNotInPrerequisiteStateError,
-		"cannot write directly to computed column %q", tree.ErrNameString(&colName))
+	return pgerror.Newf(pgerror.CodeObjectNotInPrerequisiteStateError,
+		"cannot write directly to computed column %q", tree.ErrNameString(colName))
 }
 
 // ProcessComputedColumns adds columns which are computed to the set of columns
@@ -103,7 +103,7 @@ func ProcessComputedColumns(
 	txCtx *transform.ExprTransformContext,
 	evalCtx *tree.EvalContext,
 ) ([]ColumnDescriptor, []ColumnDescriptor, []tree.TypedExpr, error) {
-	computedCols := processColumnSet(nil, tableDesc, func(col ColumnDescriptor) bool {
+	computedCols := processColumnSet(nil, tableDesc, func(col *ColumnDescriptor) bool {
 		return col.IsComputed()
 	})
 	cols = append(cols, computedCols...)
@@ -135,8 +135,8 @@ func MakeComputedExprs(
 	// are none, we don't bother with constructing the map as the expressions
 	// are all NULL.
 	haveComputed := false
-	for _, col := range cols {
-		if col.IsComputed() {
+	for i := range cols {
+		if cols[i].IsComputed() {
 			haveComputed = true
 			break
 		}
@@ -148,7 +148,8 @@ func MakeComputedExprs(
 	// Build the computed expressions map from the parsed statement.
 	computedExprs := make([]tree.TypedExpr, 0, len(cols))
 	exprStrings := make([]string, 0, len(cols))
-	for _, col := range cols {
+	for i := range cols {
+		col := &cols[i]
 		if col.IsComputed() {
 			exprStrings = append(exprStrings, *col.ComputeExpr)
 		}
@@ -172,16 +173,17 @@ func MakeComputedExprs(
 	semaCtx := tree.MakeSemaContext()
 	semaCtx.IVarContainer = iv
 
-	addColumnInfo := func(col ColumnDescriptor) {
+	addColumnInfo := func(col *ColumnDescriptor) {
 		ivarHelper.AppendSlot()
-		iv.cols = append(iv.cols, col)
+		iv.cols = append(iv.cols, *col)
 		sources = append(sources, NewSourceInfoForSingleTable(
-			*tn, ResultColumnsFromColDescs([]ColumnDescriptor{col}),
+			*tn, ResultColumnsFromColDescs([]ColumnDescriptor{*col}),
 		))
 	}
 
 	compExprIdx := 0
-	for _, col := range cols {
+	for i := range cols {
+		col := &cols[i]
 		if !col.IsComputed() {
 			computedExprs = append(computedExprs, tree.DNull)
 			if addingCols {
@@ -196,7 +198,7 @@ func MakeComputedExprs(
 			return nil, err
 		}
 
-		typedExpr, err := tree.TypeCheck(expr, &semaCtx, col.Type.ToDatumType())
+		typedExpr, err := tree.TypeCheck(expr, &semaCtx, &col.Type)
 		if err != nil {
 			return nil, err
 		}

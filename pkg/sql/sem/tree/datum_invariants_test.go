@@ -17,20 +17,20 @@ package tree
 import (
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 func TestAllTypesCastableToString(t *testing.T) {
-	for _, typ := range types.AnyNonArray {
-		if !isCastDeepValid(typ, types.String) {
+	for _, typ := range types.Scalar {
+		if ok, _ := isCastDeepValid(typ, types.String); !ok {
 			t.Errorf("%s is not castable to STRING, all types should be", typ)
 		}
 	}
 }
 
 func TestAllTypesCastableFromString(t *testing.T) {
-	for _, typ := range types.AnyNonArray {
-		if !isCastDeepValid(types.String, typ) {
+	for _, typ := range types.Scalar {
+		if ok, _ := isCastDeepValid(types.String, typ); !ok {
 			t.Errorf("%s is not castable from STRING, all types should be", typ)
 		}
 	}

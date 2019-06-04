@@ -58,7 +58,7 @@ func registerAllocator(r *registry) {
 			// TODO(dan): Ideally, the test would fail if this queryload failed,
 			// but we can't put it in monitor as-is because the test deadlocks.
 			go func() {
-				const cmd = `./workload run kv --tolerate-errors --min-block-bytes=8 --max-block-bytes=128`
+				const cmd = `./workload run kv --tolerate-errors --min-block-bytes=8 --max-block-bytes=127`
 				l, err := t.l.ChildLogger(fmt.Sprintf(`kv-%d`, node))
 				if err != nil {
 					t.Fatal(err)
@@ -257,7 +257,7 @@ func runWideReplication(ctx context.Context, t *test, c *cluster) {
 		t.Fatalf("9-node cluster required")
 	}
 
-	args := startArgs("--sequential", "--env=COCKROACH_SCAN_MAX_IDLE_TIME=5ms")
+	args := startArgs("--env=COCKROACH_SCAN_MAX_IDLE_TIME=5ms")
 	c.Put(ctx, cockroach, "./cockroach")
 	c.Start(ctx, t, c.All(), args)
 
@@ -339,7 +339,7 @@ func runWideReplication(ctx context.Context, t *test, c *cluster) {
 	c.Start(ctx, t, c.Range(1, 6), args)
 
 	waitForUnderReplicated := func(count int) {
-		for ; ; time.Sleep(time.Second) {
+		for start := timeutil.Now(); ; time.Sleep(time.Second) {
 			query := `
 SELECT sum((metrics->>'ranges.unavailable')::DECIMAL)::INT AS ranges_unavailable,
        sum((metrics->>'ranges.underreplicated')::DECIMAL)::INT AS ranges_underreplicated
@@ -351,7 +351,13 @@ FROM crdb_internal.kv_store_status
 			}
 			t.l.Printf("%d unavailable, %d under-replicated ranges\n", unavailable, underReplicated)
 			if unavailable != 0 {
-				t.Fatalf("%d unavailable ranges", unavailable)
+				// A freshly started cluster might show unavailable ranges for a brief
+				// period of time due to the way that metric is calculated. Only
+				// complain about unavailable ranges if they persist for too long.
+				if timeutil.Since(start) >= 30*time.Second {
+					t.Fatalf("%d unavailable ranges", unavailable)
+				}
+				continue
 			}
 			if underReplicated >= count {
 				break
@@ -380,4 +386,7 @@ FROM crdb_internal.kv_store_status
 	run(`SET CLUSTER SETTING server.time_until_store_dead = '90s'`)
 	setReplication(5)
 	waitForReplication(5)
+
+	// Restart the down nodes to prevent the dead node detector from complaining.
+	c.Start(ctx, t, c.Range(7, 9))
 }

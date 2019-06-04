@@ -18,10 +18,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
@@ -142,7 +142,10 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 	for _, def := range stmt.Defs {
 		switch def := def.(type) {
 		case *tree.CheckConstraintTableDef:
-			tab.Checks = append(tab.Checks, cat.CheckConstraint(tree.Serialize(def.Expr)))
+			tab.Checks = append(tab.Checks, cat.CheckConstraint{
+				Constraint: tree.Serialize(def.Expr),
+				Validated:  validatedCheckConstraint(def),
+			})
 		}
 	}
 
@@ -196,7 +199,34 @@ OuterLoop:
 	return tab
 }
 
-// resolveFK processes a foreign key constraint
+// CreateTableAs creates a table in the catalog with the given name and
+// columns. It should be used for creating a table from the CREATE TABLE <name>
+// AS <query> syntax. In addition to the provided columns, CreateTableAs adds a
+// unique rowid column as the primary key. It returns a pointer to the new
+// table.
+func (tc *Catalog) CreateTableAs(name tree.TableName, columns []*Column) *Table {
+	// Update the table name to include catalog and schema if not provided.
+	tc.qualifyTableName(&name)
+
+	tab := &Table{TabID: tc.nextStableID(), TabName: name, Catalog: tc, Columns: columns}
+
+	rowid := &Column{
+		Ordinal:     tab.ColumnCount(),
+		Name:        "rowid",
+		Type:        types.Int,
+		Hidden:      true,
+		DefaultExpr: &uniqueRowIDString,
+	}
+	tab.Columns = append(tab.Columns, rowid)
+	tab.addPrimaryColumnIndex("rowid")
+
+	// Add the new table to the catalog.
+	tc.AddTable(tab)
+
+	return tab
+}
+
+// resolveFK processes a foreign key constraint.
 func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 	fromCols := make([]int, len(d.FromCols))
 	for i, c := range d.FromCols {
@@ -204,11 +234,17 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 	}
 
 	targetTable := tc.Table(&d.Table)
-	targetTable.referenced = true
 
 	toCols := make([]int, len(d.ToCols))
 	for i, c := range d.ToCols {
 		toCols[i] = targetTable.FindOrdinal(string(c))
+	}
+
+	constraintName := string(d.Name)
+	if constraintName == "" {
+		constraintName = fmt.Sprintf(
+			"fk_%s_ref_%s", string(d.FromCols[0]), targetTable.TabName.Table(),
+		)
 	}
 
 	// Foreign keys require indexes in both tables:
@@ -262,21 +298,11 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 	for _, idx := range tab.Indexes {
 		if matches(idx, fromCols, false /* strict */) {
 			found = true
-			idx.foreignKey.TableID = targetTable.ID()
-			idx.foreignKey.IndexID = targetIndex.ID()
-			idx.foreignKey.PrefixLen = int32(len(fromCols))
-			idx.fkSet = true
 			break
 		}
 	}
 	if !found {
 		// Add a non-unique index on fromCols.
-		constraintName := string(d.Name)
-		if constraintName == "" {
-			constraintName = fmt.Sprintf(
-				"fk_%s_ref_%s", string(d.FromCols[0]), targetTable.TabName.Table(),
-			)
-		}
 		idx := tree.IndexTableDef{
 			Name:    tree.Name(fmt.Sprintf("%s_auto_index_%s", tab.TabName.Table(), constraintName)),
 			Columns: make(tree.IndexElemList, len(fromCols)),
@@ -285,23 +311,31 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 			idx.Columns[i].Column = tab.Columns[c].ColName()
 			idx.Columns[i].Direction = tree.Ascending
 		}
-		index := tab.addIndex(&idx, nonUniqueIndex)
-		index.foreignKey.TableID = targetTable.ID()
-		index.foreignKey.IndexID = targetIndex.ID()
-		index.foreignKey.PrefixLen = int32(len(fromCols))
-		index.fkSet = true
+		tab.addIndex(&idx, nonUniqueIndex)
 	}
+
+	fk := ForeignKeyConstraint{
+		name:                     constraintName,
+		originTableID:            tab.ID(),
+		referencedTableID:        targetTable.ID(),
+		originColumnOrdinals:     fromCols,
+		referencedColumnOrdinals: toCols,
+		validated:                true,
+		matchMethod:              tree.MatchSimple,
+	}
+	tab.outboundFKs = append(tab.outboundFKs, fk)
+	targetTable.inboundFKs = append(targetTable.inboundFKs, fk)
 }
 
 func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 	nullable := !def.PrimaryKey && def.Nullable.Nullability != tree.NotNull
-	typ := coltypes.CastTargetToDatumType(def.Type)
 	col := &Column{
 		Ordinal:  tt.ColumnCount(),
 		Name:     string(def.Name),
-		Type:     typ,
+		Type:     def.Type,
 		Nullable: nullable,
 	}
+	col.ColType = *def.Type
 
 	// Look for name suffixes indicating this is a mutation column.
 	if name, ok := extractWriteOnlyColumn(def); ok {
@@ -330,6 +364,7 @@ func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
 		IdxName:  tt.makeIndexName(def.Name, typ),
 		Unique:   typ != nonUniqueIndex,
 		Inverted: def.Inverted,
+		IdxZone:  &config.ZoneConfig{},
 		table:    tt,
 	}
 
@@ -539,4 +574,8 @@ func extractDeleteOnlyIndex(def *tree.IndexTableDef) (name string, ok bool) {
 		return "", false
 	}
 	return strings.TrimSuffix(string(def.Name), ":delete-only"), true
+}
+
+func validatedCheckConstraint(def *tree.CheckConstraintTableDef) bool {
+	return !strings.HasSuffix(string(def.Name), ":unvalidated")
 }

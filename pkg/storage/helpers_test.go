@@ -173,6 +173,12 @@ func (s *Store) ReservationCount() int {
 	return len(s.snapshotApplySem)
 }
 
+// ClearClosedTimestampStorage clears the closed timestamp storage of all
+// knowledge about closed timestamps.
+func (s *Store) ClearClosedTimestampStorage() {
+	s.cfg.ClosedTimestamp.Storage.Clear()
+}
+
 // AssertInvariants verifies that the store's bookkeping is self-consistent. It
 // is only valid to call this method when there is no in-flight traffic to the
 // store (e.g., after the store is shut down).
@@ -322,11 +328,12 @@ func (r *Replica) ShouldBackpressureWrites() bool {
 	return r.shouldBackpressureWrites()
 }
 
-// GetRaftLogSize returns the raft log size.
-func (r *Replica) GetRaftLogSize() int64 {
+// GetRaftLogSize returns the approximate raft log size and whether it is
+// trustworthy.. See r.mu.raftLogSize for details.
+func (r *Replica) GetRaftLogSize() (int64, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.mu.raftLogSize
+	return r.mu.raftLogSize, r.mu.raftLogSizeTrusted
 }
 
 // GetCachedLastTerm returns the cached last term value. May return
@@ -347,15 +354,16 @@ func (r *Replica) IsRaftGroupInitialized() bool {
 // can achieve quorum.
 func (r *Replica) HasQuorum() bool {
 	desc := r.Desc()
-	liveReplicas, _ := r.store.allocator.storePool.liveAndDeadReplicas(desc.RangeID, desc.Replicas)
-	quorum := computeQuorum(len(desc.Replicas))
+	liveReplicas, _ := r.store.allocator.storePool.liveAndDeadReplicas(desc.RangeID, desc.InternalReplicas)
+	quorum := computeQuorum(len(desc.InternalReplicas))
 	return len(liveReplicas) >= quorum
 }
 
 // GetStoreList exposes getStoreList for testing only, but with a hardcoded
 // storeFilter of storeFilterNone.
 func (sp *StorePool) GetStoreList(rangeID roachpb.RangeID) (StoreList, int, int) {
-	return sp.getStoreList(rangeID, storeFilterNone)
+	list, available, throttled := sp.getStoreList(rangeID, storeFilterNone)
+	return list, available, len(throttled)
 }
 
 // Stores returns a copy of sl.stores.
@@ -365,9 +373,10 @@ func (sl *StoreList) Stores() []roachpb.StoreDescriptor {
 	return stores
 }
 
-// SideloadedDir returns r.raftMu.sideloaded.Dir().
-func (r *Replica) SideloadedDir() string {
-	return r.raftMu.sideloaded.Dir()
+// SideloadedRaftMuLocked returns r.raftMu.sideloaded. Requires a previous call
+// to RaftLock() or some other guarantee that r.raftMu is held.
+func (r *Replica) SideloadedRaftMuLocked() SideloadStorage {
+	return r.raftMu.sideloaded
 }
 
 func MakeSSTable(key, value string, ts hlc.Timestamp) ([]byte, engine.MVCCKeyValue) {

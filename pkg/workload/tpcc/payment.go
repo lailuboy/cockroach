@@ -18,14 +18,15 @@ package tpcc
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach-go/crdb"
+	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/pkg/errors"
+	"golang.org/x/exp/rand"
 )
 
 // Section 2.5:
@@ -85,6 +86,8 @@ type payment struct {
 	selectByLastName  workload.StmtHandle
 	updateWithPayment workload.StmtHandle
 	insertHistory     workload.StmtHandle
+
+	a bufalloc.ByteAllocator
 }
 
 var _ tpccTx = &payment{}
@@ -161,7 +164,7 @@ func createPayment(ctx context.Context, config *tpcc, mcp *workload.MultiConnPoo
 func (p *payment) run(ctx context.Context, wID int) (interface{}, error) {
 	atomic.AddUint64(&p.config.auditor.paymentTransactions, 1)
 
-	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	rng := rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano())))
 
 	d := paymentData{
 		dID: rng.Intn(10) + 1,
@@ -190,7 +193,7 @@ func (p *payment) run(ctx context.Context, wID int) (interface{}, error) {
 	// 2.5.1.2: The customer is randomly selected 60% of the time by last name
 	// and 40% by number.
 	if rng.Intn(100) < 60 {
-		d.cLast = randCLast(rng)
+		d.cLast = string(randCLast(rng, &p.a))
 		atomic.AddUint64(&p.config.auditor.paymentsByLastName, 1)
 	} else {
 		d.cID = randCustomerID(rng)

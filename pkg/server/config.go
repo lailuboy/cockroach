@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
@@ -173,9 +174,14 @@ type Config struct {
 	// SQLQueryCacheSize is the memory size (in bytes) of the query plan cache.
 	SQLQueryCacheSize int64
 
+	// GoroutineDumpDirName is the directory name for goroutine dumps using
+	// goroutinedumper.
+	GoroutineDumpDirName string
+
 	// HeapProfileDirName is the directory name for heap profiles using
-	// heapprofiler.
+	// heapprofiler. If empty, no heap profiles will be collected.
 	HeapProfileDirName string
+
 	// Parsed values.
 
 	// NodeAttributes is the parsed representation of Attrs.
@@ -228,6 +234,15 @@ type Config struct {
 
 	// AmbientCtx is used to annotate contexts used inside the server.
 	AmbientCtx log.AmbientContext
+
+	// DefaultZoneConfig is used to set the default zone config inside the server.
+	// It can be overridden during tests by setting the DefaultZoneConfigOverride
+	// server testing knob.
+	DefaultZoneConfig config.ZoneConfig
+	// DefaultSystemZoneConfig is used to set the default system zone config
+	// inside the server. It can be overridden during tests by setting the
+	// DefaultSystemZoneConfigOverride server testing knob.
+	DefaultSystemZoneConfig config.ZoneConfig
 
 	// Locality is a description of the topography of the server.
 	Locality roachpb.Locality
@@ -327,6 +342,8 @@ func MakeConfig(ctx context.Context, st *cluster.Settings) Config {
 
 	cfg := Config{
 		Config:                         new(base.Config),
+		DefaultZoneConfig:              config.DefaultZoneConfig(),
+		DefaultSystemZoneConfig:        config.DefaultSystemZoneConfig(),
 		MaxOffset:                      MaxOffsetType(base.DefaultMaxClockOffset),
 		Settings:                       st,
 		CacheSize:                      DefaultCacheSize,

@@ -15,17 +15,16 @@
 package tree
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // IndexedVarContainer provides the implementation of TypeCheck, Eval, and
 // String for IndexedVars.
 type IndexedVarContainer interface {
 	IndexedVarEval(idx int, ctx *EvalContext) (Datum, error)
-	IndexedVarResolvedType(idx int) types.T
+	IndexedVarResolvedType(idx int) *types.T
 	// IndexedVarNodeFormatter returns a NodeFormatter; if an object that
 	// wishes to implement this interface has lost the textual name that an
 	// IndexedVar originates from, this function can return nil (and the
@@ -57,7 +56,7 @@ func (v *IndexedVar) Walk(_ Visitor) Expr {
 }
 
 // TypeCheck is part of the Expr interface.
-func (v *IndexedVar) TypeCheck(ctx *SemaContext, desired types.T) (TypedExpr, error) {
+func (v *IndexedVar) TypeCheck(ctx *SemaContext, desired *types.T) (TypedExpr, error) {
 	if ctx.IVarContainer == nil || ctx.IVarContainer == unboundContainer {
 		// A more technically correct message would be to say that the
 		// reference is unbound and thus cannot be typed. However this is
@@ -65,7 +64,7 @@ func (v *IndexedVar) TypeCheck(ctx *SemaContext, desired types.T) (TypedExpr, er
 		// instead we acknowledge that we only get here if someone has
 		// used a column reference in a place where it's not allowed by
 		// the docs, so just say that instead.
-		return nil, pgerror.NewErrorf(
+		return nil, pgerror.Newf(
 			pgerror.CodeUndefinedColumnError, "column reference @%d not allowed in this context", v.Idx+1)
 	}
 	v.typ = ctx.IVarContainer.IndexedVarResolvedType(v.Idx)
@@ -75,15 +74,16 @@ func (v *IndexedVar) TypeCheck(ctx *SemaContext, desired types.T) (TypedExpr, er
 // Eval is part of the TypedExpr interface.
 func (v *IndexedVar) Eval(ctx *EvalContext) (Datum, error) {
 	if ctx.IVarContainer == nil || ctx.IVarContainer == unboundContainer {
-		panic("indexed var must be bound to a container before evaluation")
+		return nil, pgerror.AssertionFailedf(
+			"indexed var must be bound to a container before evaluation")
 	}
 	return ctx.IVarContainer.IndexedVarEval(v.Idx, ctx)
 }
 
 // ResolvedType is part of the TypedExpr interface.
-func (v *IndexedVar) ResolvedType() types.T {
+func (v *IndexedVar) ResolvedType() *types.T {
 	if v.typ == nil {
-		panic("indexed var must be type checked first")
+		panic(pgerror.AssertionFailedf("indexed var must be type checked first"))
 	}
 	return v.typ
 }
@@ -109,7 +109,7 @@ func NewOrdinalReference(r int) *IndexedVar {
 
 // NewTypedOrdinalReference returns a new IndexedVar with the given index value
 // that is verified to be well-typed.
-func NewTypedOrdinalReference(r int, typ types.T) *IndexedVar {
+func NewTypedOrdinalReference(r int, typ *types.T) *IndexedVar {
 	return &IndexedVar{Idx: r, typeAnnotation: typeAnnotation{typ: typ}}
 }
 
@@ -150,7 +150,7 @@ func (h *IndexedVarHelper) BindIfUnbound(ivar *IndexedVar) (*IndexedVar, error) 
 	// bound, as a form of safety assertion against misreuse of ivars
 	// across containers.
 	if ivar.Idx < 0 || ivar.Idx >= len(h.vars) {
-		return ivar, pgerror.NewErrorf(
+		return ivar, pgerror.Newf(
 			pgerror.CodeUndefinedColumnError, "invalid column ordinal: @%d", ivar.Idx+1)
 	}
 
@@ -181,7 +181,8 @@ func (h *IndexedVarHelper) AppendSlot() int {
 
 func (h *IndexedVarHelper) checkIndex(idx int) {
 	if idx < 0 || idx >= len(h.vars) {
-		panic(fmt.Sprintf("invalid var index %d (columns: %d)", idx, len(h.vars)))
+		panic(pgerror.AssertionFailedf(
+			"invalid var index %d (columns: %d)", log.Safe(idx), log.Safe(len(h.vars))))
 	}
 }
 
@@ -207,7 +208,7 @@ func (h *IndexedVarHelper) IndexedVar(idx int) *IndexedVar {
 // type. The index must be valid. This should be used in the case where an
 // indexed var is being added before its container has a corresponding entry
 // for it.
-func (h *IndexedVarHelper) IndexedVarWithType(idx int, typ types.T) *IndexedVar {
+func (h *IndexedVarHelper) IndexedVarWithType(idx int, typ *types.T) *IndexedVar {
 	h.checkIndex(idx)
 	v := &h.vars[idx]
 	v.Idx = idx
@@ -285,32 +286,32 @@ var unboundContainer = &unboundContainerType{}
 
 // IndexedVarEval is part of the IndexedVarContainer interface.
 func (*unboundContainerType) IndexedVarEval(idx int, _ *EvalContext) (Datum, error) {
-	panic(fmt.Sprintf("unbound ordinal reference @%d", idx+1))
+	return nil, pgerror.AssertionFailedf("unbound ordinal reference @%d", log.Safe(idx+1))
 }
 
 // IndexedVarResolvedType is part of the IndexedVarContainer interface.
-func (*unboundContainerType) IndexedVarResolvedType(idx int) types.T {
-	panic(fmt.Sprintf("unbound ordinal reference @%d", idx+1))
+func (*unboundContainerType) IndexedVarResolvedType(idx int) *types.T {
+	panic(pgerror.AssertionFailedf("unbound ordinal reference @%d", log.Safe(idx+1)))
 }
 
 // IndexedVarNodeFormatter is part of the IndexedVarContainer interface.
 func (*unboundContainerType) IndexedVarNodeFormatter(idx int) NodeFormatter {
-	panic(fmt.Sprintf("unbound ordinal reference @%d", idx+1))
+	panic(pgerror.AssertionFailedf("unbound ordinal reference @%d", log.Safe(idx+1)))
 }
 
 type typeContainer struct {
-	types []types.T
+	types []*types.T
 }
 
 var _ IndexedVarContainer = &typeContainer{}
 
 // IndexedVarEval is part of the IndexedVarContainer interface.
 func (tc *typeContainer) IndexedVarEval(idx int, ctx *EvalContext) (Datum, error) {
-	panic("no eval allowed in typeContainer")
+	return nil, pgerror.AssertionFailedf("no eval allowed in typeContainer")
 }
 
 // IndexedVarResolvedType is part of the IndexedVarContainer interface.
-func (tc *typeContainer) IndexedVarResolvedType(idx int) types.T {
+func (tc *typeContainer) IndexedVarResolvedType(idx int) *types.T {
 	return tc.types[idx]
 }
 
@@ -322,7 +323,7 @@ func (tc *typeContainer) IndexedVarNodeFormatter(idx int) NodeFormatter {
 // MakeTypesOnlyIndexedVarHelper creates an IndexedVarHelper which provides
 // the given types for indexed vars. It does not support evaluation, unless
 // Rebind is used with another container which supports evaluation.
-func MakeTypesOnlyIndexedVarHelper(types []types.T) IndexedVarHelper {
+func MakeTypesOnlyIndexedVarHelper(types []*types.T) IndexedVarHelper {
 	c := &typeContainer{types: types}
 	return MakeIndexedVarHelper(c, len(types))
 }

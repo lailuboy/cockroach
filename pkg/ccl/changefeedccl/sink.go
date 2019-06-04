@@ -10,11 +10,15 @@ package changefeedccl
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	gosql "database/sql"
+	"encoding/base64"
 	"fmt"
 	"hash"
 	"hash/fnv"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
@@ -75,28 +80,89 @@ func getSink(
 	// Use a function here to delay creation of the sink until after we've done
 	// all the parameter verification.
 	var makeSink func() (Sink, error)
-	switch u.Scheme {
-	case sinkSchemeBuffer:
+	switch {
+	case u.Scheme == sinkSchemeBuffer:
 		makeSink = func() (Sink, error) { return &bufferSink{}, nil }
-	case sinkSchemeKafka:
-		kafkaTopicPrefix := q.Get(sinkParamTopicPrefix)
+	case u.Scheme == sinkSchemeKafka:
+		var cfg kafkaSinkConfig
+		cfg.kafkaTopicPrefix = q.Get(sinkParamTopicPrefix)
 		q.Del(sinkParamTopicPrefix)
-		schemaTopic := q.Get(sinkParamSchemaTopic)
-		q.Del(sinkParamSchemaTopic)
-		if schemaTopic != `` {
+		if schemaTopic := q.Get(sinkParamSchemaTopic); schemaTopic != `` {
 			return nil, errors.Errorf(`%s is not yet supported`, sinkParamSchemaTopic)
 		}
-		makeSink = func() (Sink, error) {
-			return makeKafkaSink(kafkaTopicPrefix, u.Host, targets)
+		q.Del(sinkParamSchemaTopic)
+		if tlsBool := q.Get(sinkParamTLSEnabled); tlsBool != `` {
+			var err error
+			if cfg.tlsEnabled, err = strconv.ParseBool(tlsBool); err != nil {
+				return nil, errors.Errorf(`param %s must be a bool: %s`, sinkParamTLSEnabled, err)
+			}
 		}
-	case `experimental-s3`, `experimental-gs`, `experimental-nodelocal`, `experimental-http`,
-		`experimental-https`, `experimental-azure`:
+		q.Del(sinkParamTLSEnabled)
+		if caCertHex := q.Get(sinkParamCACert); caCertHex != `` {
+			// TODO(dan): There's a straightforward and unambiguous transformation
+			// between the base 64 encoding defined in RFC 4648 and the URL variant
+			// defined in the same RFC: simply replace all `+` with `-` and `/` with
+			// `_`. Consider always doing this for the user and accepting either
+			// variant.
+			if cfg.caCert, err = base64.StdEncoding.DecodeString(caCertHex); err != nil {
+				return nil, errors.Errorf(`param %s must be base 64 encoded: %s`, sinkParamCACert, err)
+			}
+		}
+		q.Del(sinkParamCACert)
+
+		saslParam := q.Get(sinkParamSASLEnabled)
+		q.Del(sinkParamSASLEnabled)
+		if saslParam != `` {
+			b, err := strconv.ParseBool(saslParam)
+			if err != nil {
+				return nil, errors.Wrapf(err, `param %s must be a bool:`, sinkParamSASLEnabled)
+			}
+			cfg.saslEnabled = b
+		}
+		handshakeParam := q.Get(sinkParamSASLHandshake)
+		q.Del(sinkParamSASLHandshake)
+		if handshakeParam == `` {
+			cfg.saslHandshake = true
+		} else {
+			if !cfg.saslEnabled {
+				return nil, errors.Errorf(`%s must be enabled to configure SASL handshake behavior`, sinkParamSASLEnabled)
+			}
+			b, err := strconv.ParseBool(handshakeParam)
+			if err != nil {
+				return nil, errors.Wrapf(err, `param %s must be a bool:`, sinkParamSASLHandshake)
+			}
+			cfg.saslHandshake = b
+		}
+		cfg.saslUser = q.Get(sinkParamSASLUser)
+		q.Del(sinkParamSASLUser)
+		cfg.saslPassword = q.Get(sinkParamSASLPassword)
+		q.Del(sinkParamSASLPassword)
+		if cfg.saslEnabled {
+			if cfg.saslUser == `` {
+				return nil, errors.Errorf(`%s must be provided when SASL is enabled`, sinkParamSASLUser)
+			}
+			if cfg.saslPassword == `` {
+				return nil, errors.Errorf(`%s must be provided when SASL is enabled`, sinkParamSASLPassword)
+			}
+		} else {
+			if cfg.saslUser != `` {
+				return nil, errors.Errorf(`%s must be enabled if a SASL user is provided`, sinkParamSASLEnabled)
+			}
+			if cfg.saslPassword != `` {
+				return nil, errors.Errorf(`%s must be enabled if a SASL password is provided`, sinkParamSASLEnabled)
+			}
+		}
+
+		makeSink = func() (Sink, error) {
+			return makeKafkaSink(cfg, u.Host, targets)
+		}
+	case isCloudStorageSink(u):
 		fileSizeParam := q.Get(sinkParamFileSize)
 		q.Del(sinkParamFileSize)
 		var fileSize int64 = 16 << 20 // 16MB
 		if fileSizeParam != `` {
 			if fileSize, err = humanizeutil.ParseBytes(fileSizeParam); err != nil {
-				return nil, errors.Wrapf(err, `parsing %s`, fileSizeParam)
+				return nil, pgerror.Wrapf(err, pgerror.CodeSyntaxError, `parsing %s`, fileSizeParam)
 			}
 		}
 		u.Scheme = strings.TrimPrefix(u.Scheme, `experimental-`)
@@ -107,7 +173,7 @@ func getSink(
 		makeSink = func() (Sink, error) {
 			return makeCloudStorageSink(u.String(), nodeID, fileSize, settings, opts)
 		}
-	case sinkSchemeExperimentalSQL:
+	case u.Scheme == sinkSchemeExperimentalSQL:
 		// Swap the changefeed prefix for the sql connection one that sqlSink
 		// expects.
 		u.Scheme = `postgres`
@@ -137,17 +203,87 @@ func getSink(
 	return s, nil
 }
 
+// errorWrapperSink delegates to another sink and marks all returned errors as
+// retryable. During changefeed setup, we use the sink once without this to
+// verify configuration, but in the steady state, no sink error should be
+// terminal.
+type errorWrapperSink struct {
+	wrapped Sink
+}
+
+func (s errorWrapperSink) EmitRow(
+	ctx context.Context, table *sqlbase.TableDescriptor, key, value []byte, updated hlc.Timestamp,
+) error {
+	if err := s.wrapped.EmitRow(ctx, table, key, value, updated); err != nil {
+		return MarkRetryableError(err)
+	}
+	return nil
+}
+
+func (s errorWrapperSink) EmitResolvedTimestamp(
+	ctx context.Context, encoder Encoder, resolved hlc.Timestamp,
+) error {
+	if err := s.wrapped.EmitResolvedTimestamp(ctx, encoder, resolved); err != nil {
+		return MarkRetryableError(err)
+	}
+	return nil
+}
+
+func (s errorWrapperSink) Flush(ctx context.Context) error {
+	if err := s.wrapped.Flush(ctx); err != nil {
+		return MarkRetryableError(err)
+	}
+	return nil
+}
+
+func (s errorWrapperSink) Close() error {
+	if err := s.wrapped.Close(); err != nil {
+		return MarkRetryableError(err)
+	}
+	return nil
+}
+
+type kafkaLogAdapter struct {
+	ctx context.Context
+}
+
+var _ sarama.StdLogger = (*kafkaLogAdapter)(nil)
+
+func (l *kafkaLogAdapter) Print(v ...interface{}) {
+	log.InfoDepth(l.ctx, 1, v...)
+}
+func (l *kafkaLogAdapter) Printf(format string, v ...interface{}) {
+	log.InfofDepth(l.ctx, 1, format, v...)
+}
+func (l *kafkaLogAdapter) Println(v ...interface{}) {
+	log.InfoDepth(l.ctx, 1, v...)
+}
+
+func init() {
+	// We'd much prefer to make one of these per sink, so we can use the real
+	// context, but quite unfortunately, sarama only has a global logger hook.
+	ctx := context.Background()
+	ctx = logtags.AddTag(ctx, "kafka-producer", nil)
+	sarama.Logger = &kafkaLogAdapter{ctx: ctx}
+}
+
+type kafkaSinkConfig struct {
+	kafkaTopicPrefix string
+	tlsEnabled       bool
+	caCert           []byte
+	saslEnabled      bool
+	saslHandshake    bool
+	saslUser         string
+	saslPassword     string
+}
+
 // kafkaSink emits to Kafka asynchronously. It is not concurrency-safe; all
 // calls to Emit and Flush should be from the same goroutine.
 type kafkaSink struct {
-	// TODO(dan): This uses the shopify kafka producer library because the
-	// official confluent one depends on librdkafka and it didn't seem worth it
-	// to add a new c dep for the prototype. Revisit before 2.1 and check
-	// stability, performance, etc.
-	kafkaTopicPrefix string
-	client           sarama.Client
-	producer         sarama.AsyncProducer
-	topics           map[string]struct{}
+	cfg      kafkaSinkConfig
+	client   sarama.Client
+	producer sarama.AsyncProducer
+	topics   map[string]struct{}
 
 	lastMetadataRefresh time.Time
 
@@ -165,19 +301,39 @@ type kafkaSink struct {
 }
 
 func makeKafkaSink(
-	kafkaTopicPrefix string, bootstrapServers string, targets jobspb.ChangefeedTargets,
+	cfg kafkaSinkConfig, bootstrapServers string, targets jobspb.ChangefeedTargets,
 ) (Sink, error) {
-	sink := &kafkaSink{
-		kafkaTopicPrefix: kafkaTopicPrefix,
-	}
+	sink := &kafkaSink{cfg: cfg}
 	sink.topics = make(map[string]struct{})
 	for _, t := range targets {
-		sink.topics[kafkaTopicPrefix+SQLNameToKafkaName(t.StatementTimeName)] = struct{}{}
+		sink.topics[cfg.kafkaTopicPrefix+SQLNameToKafkaName(t.StatementTimeName)] = struct{}{}
 	}
 
 	config := sarama.NewConfig()
+	config.ClientID = `CockroachDB`
 	config.Producer.Return.Successes = true
 	config.Producer.Partitioner = newChangefeedPartitioner
+
+	if cfg.caCert != nil {
+		if !cfg.tlsEnabled {
+			return nil, errors.Errorf(`%s requires %s=true`, sinkParamCACert, sinkParamTLSEnabled)
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(cfg.caCert)
+		config.Net.TLS.Config = &tls.Config{
+			RootCAs: caCertPool,
+		}
+		config.Net.TLS.Enable = true
+	} else if cfg.tlsEnabled {
+		config.Net.TLS.Enable = true
+	}
+
+	if cfg.saslEnabled {
+		config.Net.SASL.Enable = true
+		config.Net.SASL.Handshake = cfg.saslHandshake
+		config.Net.SASL.User = cfg.saslUser
+		config.Net.SASL.Password = cfg.saslPassword
+	}
 
 	// When we emit messages to sarama, they're placed in a queue (as does any
 	// reasonable kafka producer client). When our sink's Flush is called, we
@@ -210,16 +366,22 @@ func makeKafkaSink(
 	// to test this one more before changing it.
 	config.Producer.Flush.MaxMessages = 1000
 
+	// config.Producer.Flush.Messages is set to 1 so we don't need this, but
+	// sarama prints scary things to the logs if we don't.
+	config.Producer.Flush.Frequency = time.Hour
+
 	var err error
 	sink.client, err = sarama.NewClient(strings.Split(bootstrapServers, `,`), config)
 	if err != nil {
-		err = errors.Wrapf(err, `connecting to kafka: %s`, bootstrapServers)
-		return nil, &retryableSinkError{cause: err}
+		err = pgerror.Wrapf(err, pgerror.CodeCannotConnectNowError,
+			`connecting to kafka: %s`, bootstrapServers)
+		return nil, err
 	}
 	sink.producer, err = sarama.NewAsyncProducerFromClient(sink.client)
 	if err != nil {
-		err = errors.Wrapf(err, `connecting to kafka: %s`, bootstrapServers)
-		return nil, &retryableSinkError{cause: err}
+		err = pgerror.Wrapf(err, pgerror.CodeCannotConnectNowError,
+			`connecting to kafka: %s`, bootstrapServers)
+		return nil, err
 	}
 
 	sink.start()
@@ -251,7 +413,7 @@ func (s *kafkaSink) Close() error {
 func (s *kafkaSink) EmitRow(
 	ctx context.Context, table *sqlbase.TableDescriptor, key, value []byte, _ hlc.Timestamp,
 ) error {
-	topic := s.kafkaTopicPrefix + SQLNameToKafkaName(table.Name)
+	topic := s.cfg.kafkaTopicPrefix + SQLNameToKafkaName(table.Name)
 	if _, ok := s.topics[topic]; !ok {
 		return errors.Errorf(`cannot emit to undeclared topic: %s`, topic)
 	}
@@ -332,9 +494,6 @@ func (s *kafkaSink) Flush(ctx context.Context) error {
 	s.mu.Unlock()
 
 	if immediateFlush {
-		if _, ok := flushErr.(*sarama.ProducerError); ok {
-			flushErr = &retryableSinkError{cause: flushErr}
-		}
 		return flushErr
 	}
 
@@ -349,9 +508,6 @@ func (s *kafkaSink) Flush(ctx context.Context) error {
 		flushErr := s.mu.flushErr
 		s.mu.flushErr = nil
 		s.mu.Unlock()
-		if _, ok := flushErr.(*sarama.ProducerError); ok {
-			flushErr = &retryableSinkError{cause: flushErr}
-		}
 		return flushErr
 	}
 }
@@ -649,47 +805,4 @@ func (s *bufferSink) Flush(_ context.Context) error {
 func (s *bufferSink) Close() error {
 	s.closed = true
 	return nil
-}
-
-// causer matches the (unexported) interface used by Go to allow errors to wrap
-// their parent cause.
-type causer interface {
-	Cause() error
-}
-
-// String and regex used to match retryable sink errors when they have been
-// "flattened" into a pgerror.
-const retryableSinkErrorString = "retryable sink error"
-
-// retryableSinkError should be used by sinks to wrap any error which may
-// be retried.
-type retryableSinkError struct {
-	cause error
-}
-
-func (e retryableSinkError) Error() string {
-	return fmt.Sprintf(retryableSinkErrorString+": %s", e.cause.Error())
-}
-func (e retryableSinkError) Cause() error { return e.cause }
-
-// isRetryableSinkError returns true if the supplied error, or any of its parent
-// causes, is a retryableSinkError.
-func isRetryableSinkError(err error) bool {
-	for {
-		if _, ok := err.(*retryableSinkError); ok {
-			return true
-		}
-		// TODO(mrtracy): This pathway, which occurs when the retryable error is
-		// detected on a non-local node of the distsql flow, is only currently
-		// being tested with a roachtest, which is expensive. See if it can be
-		// tested via a unit test,
-		if _, ok := err.(*pgerror.Error); ok {
-			return strings.Contains(err.Error(), retryableSinkErrorString)
-		}
-		if e, ok := err.(causer); ok {
-			err = e.Cause()
-			continue
-		}
-		return false
-	}
 }

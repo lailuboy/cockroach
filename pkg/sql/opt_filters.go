@@ -334,6 +334,11 @@ func (p *planner) propagateFilters(
 			return plan, extraFilter, err
 		}
 
+	case *unsplitNode:
+		if n.rows, err = p.triggerFilterPropagation(ctx, n.rows); err != nil {
+			return plan, extraFilter, err
+		}
+
 	case *relocateNode:
 		if n.rows, err = p.triggerFilterPropagation(ctx, n.rows); err != nil {
 			return plan, extraFilter, err
@@ -358,6 +363,16 @@ func (p *planner) propagateFilters(
 		// TODO(knz): we can propagate the part of the filter that applies
 		// to the source columns.
 		if n.source, err = p.triggerFilterPropagation(ctx, n.source); err != nil {
+			return plan, extraFilter, err
+		}
+
+	case *errorIfRowsNode:
+		if n.plan, err = p.triggerFilterPropagation(ctx, n.plan); err != nil {
+			return plan, extraFilter, err
+		}
+
+	case *bufferNode:
+		if n.plan, err = p.triggerFilterPropagation(ctx, n.plan); err != nil {
 			return plan, extraFilter, err
 		}
 
@@ -394,9 +409,9 @@ func (p *planner) propagateFilters(
 	case *setVarNode:
 	case *setClusterSettingNode:
 	case *setZoneConfigNode:
-	case *showZoneConfigNode:
 	case *showFingerprintsNode:
 	case *showTraceNode:
+	case *scanBufferNode:
 	case *scatterNode:
 
 	default:

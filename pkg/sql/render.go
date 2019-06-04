@@ -20,8 +20,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
@@ -90,7 +90,7 @@ type renderNode struct {
 
 // Select selects rows from a SELECT/UNION/VALUES, ordering and/or limiting them.
 func (p *planner) Select(
-	ctx context.Context, n *tree.Select, desiredTypes []types.T,
+	ctx context.Context, n *tree.Select, desiredTypes []*types.T,
 ) (planNode, error) {
 	wrapped := n.Select
 	limit := n.Limit
@@ -101,14 +101,14 @@ func (p *planner) Select(
 		wrapped = s.Select.Select
 		if s.Select.With != nil {
 			if with != nil {
-				return nil, pgerror.UnimplementedWithIssueError(24303,
+				return nil, pgerror.UnimplementedWithIssue(24303,
 					"multiple WITH clauses in parentheses")
 			}
 			with = s.Select.With
 		}
 		if s.Select.OrderBy != nil {
 			if orderBy != nil {
-				return nil, pgerror.NewErrorf(
+				return nil, pgerror.Newf(
 					pgerror.CodeSyntaxError, "multiple ORDER BY clauses not allowed",
 				)
 			}
@@ -116,7 +116,7 @@ func (p *planner) Select(
 		}
 		if s.Select.Limit != nil {
 			if limit != nil {
-				return nil, pgerror.NewErrorf(
+				return nil, pgerror.Newf(
 					pgerror.CodeSyntaxError, "multiple LIMIT clauses not allowed",
 				)
 			}
@@ -182,7 +182,7 @@ func (p *planner) SelectClause(
 	orderBy tree.OrderBy,
 	limit *tree.Limit,
 	with *tree.With,
-	desiredTypes []types.T,
+	desiredTypes []*types.T,
 	scanVisibility scanVisibility,
 ) (result planNode, err error) {
 	// We need to save and restore the previous value of the field in
@@ -283,7 +283,7 @@ func (p *planner) SelectClause(
 			}
 
 			if !distinct.distinctOnColIdxs.Contains(order.ColIdx) {
-				return nil, pgerror.NewErrorf(
+				return nil, pgerror.Newf(
 					pgerror.CodeSyntaxError,
 					"SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
 				)
@@ -346,7 +346,7 @@ func (r *renderNode) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum,
 }
 
 // IndexedVarResolvedType implements the tree.IndexedVarContainer interface.
-func (r *renderNode) IndexedVarResolvedType(idx int) types.T {
+func (r *renderNode) IndexedVarResolvedType(idx int) *types.T {
 	return r.sourceInfo[0].SourceColumns[idx].Typ
 }
 
@@ -391,7 +391,7 @@ func (p *planner) initFrom(
 // This function clobbers the planner's semaCtx so the caller is responsible
 // for saving and restoring it.
 func (p *planner) initTargets(
-	ctx context.Context, r *renderNode, targets tree.SelectExprs, desiredTypes []types.T,
+	ctx context.Context, r *renderNode, targets tree.SelectExprs, desiredTypes []*types.T,
 ) error {
 	// We need to rewrite the SRFs first thing, because the ivarHelper
 	// initialized below needs to know the final shape of the FROM clause,
@@ -477,7 +477,8 @@ func (p *planner) getTimestamp(asOf tree.AsOfClause) (hlc.Timestamp, bool, error
 		// would not be set globally for the entire txn.
 		if p.semaCtx.AsOfTimestamp == nil {
 			return hlc.MaxTimestamp, false,
-				fmt.Errorf("AS OF SYSTEM TIME must be provided on a top-level statement")
+				pgerror.Newf(pgerror.CodeSyntaxError,
+					"AS OF SYSTEM TIME must be provided on a top-level statement")
 		}
 
 		// The Executor found an AS OF SYSTEM TIME clause at the top
@@ -490,7 +491,8 @@ func (p *planner) getTimestamp(asOf tree.AsOfClause) (hlc.Timestamp, bool, error
 		}
 		if ts != *p.semaCtx.AsOfTimestamp {
 			return hlc.MaxTimestamp, false,
-				fmt.Errorf("cannot specify AS OF SYSTEM TIME with different timestamps")
+				pgerror.UnimplementedWithIssue(35712,
+					"cannot specify AS OF SYSTEM TIME with different timestamps")
 		}
 		return ts, true, nil
 	}
@@ -636,7 +638,7 @@ func (r *renderNode) colIdxByRenderAlias(
 						// This plays nice with `SELECT b, * FROM t ORDER BY b`. Otherwise,
 						// reject with an ambiguity error.
 						if r == nil || !r.equivalentRenders(j, index) {
-							return 0, pgerror.NewErrorf(
+							return 0, pgerror.Newf(
 								pgerror.CodeAmbiguousAliasError,
 								"%s \"%s\" is ambiguous", op, target,
 							)

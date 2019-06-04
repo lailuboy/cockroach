@@ -17,6 +17,7 @@ package txnwait
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
@@ -29,37 +30,37 @@ func TestShouldPushImmediately(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		typ        roachpb.PushTxnType
-		pusherPri  int32
-		pusheePri  int32
+		pusherPri  enginepb.TxnPriority
+		pusheePri  enginepb.TxnPriority
 		shouldPush bool
 	}{
-		{roachpb.PUSH_ABORT, roachpb.MinTxnPriority, roachpb.MinTxnPriority, false},
-		{roachpb.PUSH_ABORT, roachpb.MinTxnPriority, 1, false},
-		{roachpb.PUSH_ABORT, roachpb.MinTxnPriority, roachpb.MaxTxnPriority, false},
-		{roachpb.PUSH_ABORT, 1, roachpb.MinTxnPriority, true},
+		{roachpb.PUSH_ABORT, enginepb.MinTxnPriority, enginepb.MinTxnPriority, false},
+		{roachpb.PUSH_ABORT, enginepb.MinTxnPriority, 1, false},
+		{roachpb.PUSH_ABORT, enginepb.MinTxnPriority, enginepb.MaxTxnPriority, false},
+		{roachpb.PUSH_ABORT, 1, enginepb.MinTxnPriority, true},
 		{roachpb.PUSH_ABORT, 1, 1, false},
-		{roachpb.PUSH_ABORT, 1, roachpb.MaxTxnPriority, false},
-		{roachpb.PUSH_ABORT, roachpb.MaxTxnPriority, roachpb.MinTxnPriority, true},
-		{roachpb.PUSH_ABORT, roachpb.MaxTxnPriority, 1, true},
-		{roachpb.PUSH_ABORT, roachpb.MaxTxnPriority, roachpb.MaxTxnPriority, false},
-		{roachpb.PUSH_TIMESTAMP, roachpb.MinTxnPriority, roachpb.MinTxnPriority, false},
-		{roachpb.PUSH_TIMESTAMP, roachpb.MinTxnPriority, 1, false},
-		{roachpb.PUSH_TIMESTAMP, roachpb.MinTxnPriority, roachpb.MaxTxnPriority, false},
-		{roachpb.PUSH_TIMESTAMP, 1, roachpb.MinTxnPriority, true},
+		{roachpb.PUSH_ABORT, 1, enginepb.MaxTxnPriority, false},
+		{roachpb.PUSH_ABORT, enginepb.MaxTxnPriority, enginepb.MinTxnPriority, true},
+		{roachpb.PUSH_ABORT, enginepb.MaxTxnPriority, 1, true},
+		{roachpb.PUSH_ABORT, enginepb.MaxTxnPriority, enginepb.MaxTxnPriority, false},
+		{roachpb.PUSH_TIMESTAMP, enginepb.MinTxnPriority, enginepb.MinTxnPriority, false},
+		{roachpb.PUSH_TIMESTAMP, enginepb.MinTxnPriority, 1, false},
+		{roachpb.PUSH_TIMESTAMP, enginepb.MinTxnPriority, enginepb.MaxTxnPriority, false},
+		{roachpb.PUSH_TIMESTAMP, 1, enginepb.MinTxnPriority, true},
 		{roachpb.PUSH_TIMESTAMP, 1, 1, false},
-		{roachpb.PUSH_TIMESTAMP, 1, roachpb.MaxTxnPriority, false},
-		{roachpb.PUSH_TIMESTAMP, roachpb.MaxTxnPriority, roachpb.MinTxnPriority, true},
-		{roachpb.PUSH_TIMESTAMP, roachpb.MaxTxnPriority, 1, true},
-		{roachpb.PUSH_TIMESTAMP, roachpb.MaxTxnPriority, roachpb.MaxTxnPriority, false},
-		{roachpb.PUSH_TOUCH, roachpb.MinTxnPriority, roachpb.MinTxnPriority, true},
-		{roachpb.PUSH_TOUCH, roachpb.MinTxnPriority, 1, true},
-		{roachpb.PUSH_TOUCH, roachpb.MinTxnPriority, roachpb.MaxTxnPriority, true},
-		{roachpb.PUSH_TOUCH, 1, roachpb.MinTxnPriority, true},
+		{roachpb.PUSH_TIMESTAMP, 1, enginepb.MaxTxnPriority, false},
+		{roachpb.PUSH_TIMESTAMP, enginepb.MaxTxnPriority, enginepb.MinTxnPriority, true},
+		{roachpb.PUSH_TIMESTAMP, enginepb.MaxTxnPriority, 1, true},
+		{roachpb.PUSH_TIMESTAMP, enginepb.MaxTxnPriority, enginepb.MaxTxnPriority, false},
+		{roachpb.PUSH_TOUCH, enginepb.MinTxnPriority, enginepb.MinTxnPriority, true},
+		{roachpb.PUSH_TOUCH, enginepb.MinTxnPriority, 1, true},
+		{roachpb.PUSH_TOUCH, enginepb.MinTxnPriority, enginepb.MaxTxnPriority, true},
+		{roachpb.PUSH_TOUCH, 1, enginepb.MinTxnPriority, true},
 		{roachpb.PUSH_TOUCH, 1, 1, true},
-		{roachpb.PUSH_TOUCH, 1, roachpb.MaxTxnPriority, true},
-		{roachpb.PUSH_TOUCH, roachpb.MaxTxnPriority, roachpb.MinTxnPriority, true},
-		{roachpb.PUSH_TOUCH, roachpb.MaxTxnPriority, 1, true},
-		{roachpb.PUSH_TOUCH, roachpb.MaxTxnPriority, roachpb.MaxTxnPriority, true},
+		{roachpb.PUSH_TOUCH, 1, enginepb.MaxTxnPriority, true},
+		{roachpb.PUSH_TOUCH, enginepb.MaxTxnPriority, enginepb.MinTxnPriority, true},
+		{roachpb.PUSH_TOUCH, enginepb.MaxTxnPriority, 1, true},
+		{roachpb.PUSH_TOUCH, enginepb.MaxTxnPriority, enginepb.MaxTxnPriority, true},
 	}
 	for _, test := range testCases {
 		t.Run("", func(t *testing.T) {
@@ -95,14 +96,19 @@ func TestIsPushed(t *testing.T) {
 		isPushed     bool
 	}{
 		{roachpb.PUSH_ABORT, hlc.Timestamp{}, roachpb.PENDING, hlc.Timestamp{}, false},
+		{roachpb.PUSH_ABORT, hlc.Timestamp{}, roachpb.STAGING, hlc.Timestamp{}, false},
 		{roachpb.PUSH_ABORT, hlc.Timestamp{}, roachpb.ABORTED, hlc.Timestamp{}, true},
 		{roachpb.PUSH_ABORT, hlc.Timestamp{}, roachpb.COMMITTED, hlc.Timestamp{}, true},
 		{roachpb.PUSH_TIMESTAMP, makeTS(10, 1), roachpb.PENDING, hlc.Timestamp{}, false},
+		{roachpb.PUSH_TIMESTAMP, makeTS(10, 1), roachpb.STAGING, hlc.Timestamp{}, false},
 		{roachpb.PUSH_TIMESTAMP, makeTS(10, 1), roachpb.ABORTED, hlc.Timestamp{}, true},
 		{roachpb.PUSH_TIMESTAMP, makeTS(10, 1), roachpb.COMMITTED, hlc.Timestamp{}, true},
 		{roachpb.PUSH_TIMESTAMP, makeTS(10, 1), roachpb.PENDING, makeTS(10, 0), false},
-		{roachpb.PUSH_TIMESTAMP, makeTS(10, 1), roachpb.PENDING, makeTS(10, 1), false},
+		{roachpb.PUSH_TIMESTAMP, makeTS(10, 1), roachpb.PENDING, makeTS(10, 1), true},
 		{roachpb.PUSH_TIMESTAMP, makeTS(10, 1), roachpb.PENDING, makeTS(10, 2), true},
+		{roachpb.PUSH_TIMESTAMP, makeTS(10, 1), roachpb.STAGING, makeTS(10, 0), false},
+		{roachpb.PUSH_TIMESTAMP, makeTS(10, 1), roachpb.STAGING, makeTS(10, 1), true},
+		{roachpb.PUSH_TIMESTAMP, makeTS(10, 1), roachpb.STAGING, makeTS(10, 2), true},
 	}
 	for _, test := range testCases {
 		t.Run("", func(t *testing.T) {
@@ -127,13 +133,21 @@ type mockRepl struct{}
 
 func (mockRepl) ContainsKey(_ roachpb.Key) bool { return true }
 
+type mockStore struct {
+	StoreInterface
+	metrics *Metrics
+}
+
+func (s mockStore) GetTxnWaitMetrics() *Metrics { return s.metrics }
+
 // TestMaybeWaitForQueryWithContextCancellation adds a new waiting query to the
 // queue and cancels its context. It then verifies that the query was cleaned
 // up. Regression test against #28849, before which the waiting query would
 // leak.
 func TestMaybeWaitForQueryWithContextCancellation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	q := NewQueue(nil /* StoreInterface */)
+	metrics := NewMetrics(time.Minute)
+	q := NewQueue(mockStore{metrics: metrics})
 	q.Enable()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -149,5 +163,14 @@ func TestMaybeWaitForQueryWithContextCancellation(t *testing.T) {
 	}
 	if len(q.mu.queries) != 0 {
 		t.Errorf("expected no waiting queries, found %v", q.mu.queries)
+	}
+
+	allMetricsAreZero := metrics.PusheeWaiting.Value() == 0 &&
+		metrics.PusherWaiting.Value() == 0 &&
+		metrics.QueryWaiting.Value() == 0 &&
+		metrics.PusherSlow.Value() == 0
+
+	if !allMetricsAreZero {
+		t.Errorf("expected all metric gauges to be zero, got some that aren't")
 	}
 }

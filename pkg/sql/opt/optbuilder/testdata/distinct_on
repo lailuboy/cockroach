@@ -331,7 +331,20 @@ distinct-on
 build
 SELECT DISTINCT ON(row_number() OVER()) y FROM xyz
 ----
-error (0A000): window functions are not supported
+distinct-on
+ ├── columns: y:2(int)  [hidden: row_number:6(int)]
+ ├── grouping columns: row_number:6(int)
+ ├── project
+ │    ├── columns: y:2(int) row_number:6(int)
+ │    └── window partition=()
+ │         ├── columns: x:1(int) y:2(int) z:3(int) pk1:4(int!null) pk2:5(int!null) row_number:6(int)
+ │         ├── scan xyz
+ │         │    └── columns: x:1(int) y:2(int) z:3(int) pk1:4(int!null) pk2:5(int!null)
+ │         └── windows
+ │              └── row-number [type=undefined]
+ └── aggregations
+      └── first-agg [type=int]
+           └── variable: y [type=int]
 
 ###########################
 # With ordinal references #
@@ -415,17 +428,18 @@ distinct-on
 build
 SELECT DISTINCT ON(pk1, pk2, x, y) x, y, z FROM xyz ORDER BY x, y
 ----
-sort
+distinct-on
  ├── columns: x:1(int) y:2(int) z:3(int)  [hidden: pk1:4(int!null) pk2:5(int!null)]
+ ├── grouping columns: x:1(int) y:2(int) pk1:4(int!null) pk2:5(int!null)
  ├── ordering: +1,+2
- └── distinct-on
-      ├── columns: x:1(int) y:2(int) z:3(int) pk1:4(int!null) pk2:5(int!null)
-      ├── grouping columns: x:1(int) y:2(int) pk1:4(int!null) pk2:5(int!null)
-      ├── scan xyz
-      │    └── columns: x:1(int) y:2(int) z:3(int) pk1:4(int!null) pk2:5(int!null)
-      └── aggregations
-           └── first-agg [type=int]
-                └── variable: z [type=int]
+ ├── sort
+ │    ├── columns: x:1(int) y:2(int) z:3(int) pk1:4(int!null) pk2:5(int!null)
+ │    ├── ordering: +1,+2
+ │    └── scan xyz
+ │         └── columns: x:1(int) y:2(int) z:3(int) pk1:4(int!null) pk2:5(int!null)
+ └── aggregations
+      └── first-agg [type=int]
+           └── variable: z [type=int]
 
 build
 SELECT DISTINCT ON (x, y, z) pk1 FROM xyz ORDER BY x

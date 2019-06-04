@@ -15,9 +15,11 @@
 package exec
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
 )
 
@@ -32,7 +34,7 @@ func NewSorter(
 
 func newSorter(
 	input spooler, inputTypes []types.T, orderingCols []distsqlpb.Ordering_Column,
-) (Operator, error) {
+) (resettableOperator, error) {
 	sorters := make([]colSorter, len(orderingCols))
 	partitioners := make([]partitioner, len(orderingCols)-1)
 	isOrderingCol := make([]bool, len(inputTypes))
@@ -71,9 +73,9 @@ type spooler interface {
 	// init initializes this spooler and will be called once at the setup time.
 	init()
 	// spool performs the actual spooling.
-	spool()
-	// getValues returns ith ColVec of the already spooled data.
-	getValues(i int) ColVec
+	spool(context.Context)
+	// getValues returns ith Vec of the already spooled data.
+	getValues(i int) coldata.Vec
 	// getNumTuples returns the number of spooled tuples.
 	getNumTuples() uint64
 	// getPartitionsCol returns a partitions column vector in which every true
@@ -90,14 +92,16 @@ type allSpooler struct {
 
 	// inputTypes contains the types of all of the columns from the input.
 	inputTypes []types.T
-	// values stores all the values from the input after spooling. Each ColVec in
+	// values stores all the values from the input after spooling. Each Vec in
 	// this slice is the entire column from the input.
-	values []ColVec
+	values []coldata.Vec
 	// spooledTuples is the number of tuples spooled.
 	spooledTuples uint64
 	// spooled indicates whether spool() has already been called.
 	spooled bool
 }
+
+var _ spooler = &allSpooler{}
 
 func newAllSpooler(input Operator, inputTypes []types.T) spooler {
 	return &allSpooler{
@@ -108,20 +112,20 @@ func newAllSpooler(input Operator, inputTypes []types.T) spooler {
 
 func (p *allSpooler) init() {
 	p.input.Init()
-	p.values = make([]ColVec, len(p.inputTypes))
+	p.values = make([]coldata.Vec, len(p.inputTypes))
 	for i := 0; i < len(p.inputTypes); i++ {
-		p.values[i] = newMemColumn(p.inputTypes[i], 0)
+		p.values[i] = coldata.NewMemColumn(p.inputTypes[i], 0)
 	}
 }
 
-func (p *allSpooler) spool() {
+func (p *allSpooler) spool(ctx context.Context) {
 	if p.spooled {
 		panic("spool() is called for the second time")
 	}
 	p.spooled = true
-	batch := p.input.Next()
+	batch := p.input.Next(ctx)
 	var nTuples uint64
-	for ; batch.Length() != 0; batch = p.input.Next() {
+	for ; batch.Length() != 0; batch = p.input.Next(ctx) {
 		for i := 0; i < len(p.values); i++ {
 			if batch.Selection() == nil {
 				p.values[i].Append(batch.ColVec(i),
@@ -143,7 +147,7 @@ func (p *allSpooler) spool() {
 	p.spooledTuples = nTuples
 }
 
-func (p *allSpooler) getValues(i int) ColVec {
+func (p *allSpooler) getValues(i int) coldata.Vec {
 	if !p.spooled {
 		panic("getValues() is called before spool()")
 	}
@@ -162,6 +166,13 @@ func (p *allSpooler) getPartitionsCol() []bool {
 		panic("getPartitionsCol() is called before spool()")
 	}
 	return nil
+}
+
+func (p *allSpooler) reset() {
+	p.spooledTuples = 0
+	if r, ok := p.input.(resetter); ok {
+		r.reset()
+	}
 }
 
 type sortOp struct {
@@ -194,28 +205,31 @@ type sortOp struct {
 	// state is the current state of the sort.
 	state sortState
 
-	output ColBatch
+	workingSpace []uint64
+	output       coldata.Batch
 }
+
+var _ Operator = &sortOp{}
 
 // colSorter is a single-column sorter, specialized on a particular type.
 type colSorter interface {
-	// init prepares this sorter, given a particular ColVec and an order vector,
-	// which must be the same size as the input ColVec and will be permuted with
+	// init prepares this sorter, given a particular Vec and an order vector,
+	// which must be the same size as the input Vec and will be permuted with
 	// the same swaps as the column. workingSpace is a vector of the same size as
 	// the column that is needed for temporary space.
-	init(col ColVec, order []uint64, workingSpace []uint64)
+	init(col coldata.Vec, order []uint64, workingSpace []uint64)
 	// sort globally sorts this sorter's column.
-	sort()
+	sort(ctx context.Context)
 	// sortPartitions sorts this sorter's column once for every partition in the
 	// partition slice.
-	sortPartitions(partitions []uint64)
+	sortPartitions(ctx context.Context, partitions []uint64)
 	// reorder reorders this sorter's column according to its order vector.
 	reorder()
 }
 
 func (p *sortOp) Init() {
 	p.input.init()
-	p.output = NewMemBatch(p.inputTypes)
+	p.output = coldata.NewMemBatch(p.inputTypes)
 }
 
 // sortState represents the state of the sort operator.
@@ -233,18 +247,18 @@ const (
 	sortEmitting
 )
 
-func (p *sortOp) Next() ColBatch {
+func (p *sortOp) Next(ctx context.Context) coldata.Batch {
 	switch p.state {
 	case sortSpooling:
-		p.input.spool()
+		p.input.spool(ctx)
 		p.state = sortSorting
 		fallthrough
 	case sortSorting:
-		p.sort()
+		p.sort(ctx)
 		p.state = sortEmitting
 		fallthrough
 	case sortEmitting:
-		newEmitted := p.emitted + ColBatchSize
+		newEmitted := p.emitted + uint64(coldata.BatchSize)
 		if newEmitted > p.input.getNumTuples() {
 			newEmitted = p.input.getNumTuples()
 		}
@@ -267,32 +281,58 @@ func (p *sortOp) Next() ColBatch {
 	panic(fmt.Sprintf("invalid sort state %v", p.state))
 }
 
-func (p *sortOp) sort() {
+// sort sorts the spooled tuples, so it must be called after spool() has been
+// performed.
+func (p *sortOp) sort(ctx context.Context) {
 	spooledTuples := p.input.getNumTuples()
+	if spooledTuples == 0 {
+		// There is nothing to sort.
+		return
+	}
+	// Allocate p.order and p.workingSpace if it hasn't been allocated yet or the
+	// underlying memory is insufficient.
+	if p.order == nil || uint64(cap(p.order)) < spooledTuples {
+		p.order = make([]uint64, spooledTuples)
+		p.workingSpace = make([]uint64, spooledTuples)
+	}
+	p.order = p.order[:spooledTuples]
+	p.workingSpace = p.workingSpace[:spooledTuples]
+
 	// Initialize the order vector to the ordinal positions within the input set.
-	p.order = make([]uint64, spooledTuples)
 	for i := uint64(0); i < uint64(len(p.order)); i++ {
 		p.order[i] = i
 	}
 
-	workingSpace := make([]uint64, spooledTuples)
 	for i := range p.orderingCols {
-		p.sorters[i].init(p.input.getValues(int(p.orderingCols[i].ColIdx)), p.order, workingSpace)
+		p.sorters[i].init(p.input.getValues(int(p.orderingCols[i].ColIdx)), p.order, p.workingSpace)
 	}
 
 	// Now, sort each column in turn.
 	sorters := p.sorters
 	partitionsCol := p.input.getPartitionsCol()
+	omitNextPartitioning := false
+	offset := 0
 	if partitionsCol == nil {
 		// All spooled tuples belong to the same partition, so the first column
 		// doesn't need special treatment - we just globally sort it.
-		p.sorters[0].sort()
+		p.sorters[0].sort(ctx)
 		if len(p.sorters) == 1 {
 			// We're done sorting. Transition to emitting.
 			return
 		}
 		sorters = sorters[1:]
 		partitionsCol = make([]bool, spooledTuples)
+	} else {
+		// There are at least two partitions already, so the first column needs the
+		// same special treatment as all others. The general sequence is as
+		// follows: global sort -> partition -> sort partitions -> partition ->
+		// -> sort partitions -> partition -> sort partitions -> ..., but in this
+		// case, global sort doesn't make sense and partitioning has already been
+		// done, so we want to skip the first partitioning step and sort partitions
+		// right away. Also, in order to account for not performed global sort, we
+		// introduce an offset of 1 for partitioners.
+		omitNextPartitioning = true
+		offset = 1
 	}
 
 	// The rest of the columns need p sorts, one per partition in the previous
@@ -310,7 +350,7 @@ func (p *sortOp) sort() {
 	// 2  b
 	// 2  a
 	//
-	// Then, for each group in the sorted, first column, we sort the second col:
+	// Then, for each group in the sorted, first column, we sort the second coldata:
 	//
 	// 1 a
 	// 1 b
@@ -319,11 +359,15 @@ func (p *sortOp) sort() {
 
 	partitions := make([]uint64, 0, 16)
 	for i, sorter := range sorters {
-		// We partition the previous column by running an ordered distinct operation
-		// on it, ORing the results together with each subsequent column. This
-		// produces a distinct vector (a boolean vector that has true in each
-		// position that is different from the last position).
-		p.partitioners[i].partition(p.input.getValues(int(p.orderingCols[i].ColIdx)), partitionsCol, spooledTuples)
+		if !omitNextPartitioning {
+			// We partition the previous column by running an ordered distinct operation
+			// on it, ORing the results together with each subsequent column. This
+			// produces a distinct vector (a boolean vector that has true in each
+			// position that is different from the last position).
+			p.partitioners[i-offset].partition(p.input.getValues(int(p.orderingCols[i-offset].ColIdx)), partitionsCol, spooledTuples)
+		} else {
+			omitNextPartitioning = false
+		}
 		// Convert the distinct vector into a selection vector - a vector of indices
 		// that were true in the distinct vector.
 		partitions = boolVecToSel64(partitionsCol, partitions[:0])
@@ -332,6 +376,14 @@ func (p *sortOp) sort() {
 		sorter.reorder()
 		// For each partition (set of tuples that are identical in all of the sort
 		// columns we've seen so far), sort based on the new column.
-		sorter.sortPartitions(partitions)
+		sorter.sortPartitions(ctx, partitions)
 	}
+}
+
+func (p *sortOp) reset() {
+	if r, ok := p.input.(resetter); ok {
+		r.reset()
+	}
+	p.emitted = 0
+	p.state = sortSpooling
 }

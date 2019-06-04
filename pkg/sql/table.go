@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -48,60 +47,6 @@ func TestDisableTableLeases() func() {
 	return func() {
 		testDisableTableLeases = false
 	}
-}
-
-type namespaceKey struct {
-	parentID sqlbase.ID
-	name     string
-}
-
-// getAllNames returns a map from ID to namespaceKey for every entry in
-// system.namespace.
-func (p *planner) getAllNames(ctx context.Context) (map[sqlbase.ID]namespaceKey, error) {
-	namespace := map[sqlbase.ID]namespaceKey{}
-	rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
-		ctx, "get-all-names", p.txn,
-		`SELECT id, "parentID", name FROM system.namespace`,
-	)
-	if err != nil {
-		return nil, err
-	}
-	for _, r := range rows {
-		id, parentID, name := tree.MustBeDInt(r[0]), tree.MustBeDInt(r[1]), tree.MustBeDString(r[2])
-		namespace[sqlbase.ID(id)] = namespaceKey{
-			parentID: sqlbase.ID(parentID),
-			name:     string(name),
-		}
-	}
-	return namespace, nil
-}
-
-// tableKey implements sqlbase.DescriptorKey.
-type tableKey namespaceKey
-
-func (tk tableKey) Key() roachpb.Key {
-	return sqlbase.MakeNameMetadataKey(tk.parentID, tk.name)
-}
-
-func (tk tableKey) Name() string {
-	return tk.name
-}
-
-// GetKeysForTableDescriptor retrieves the KV keys corresponding
-// to the zone, name and descriptor of a table.
-func GetKeysForTableDescriptor(
-	tableDesc *sqlbase.TableDescriptor,
-) (zoneKey roachpb.Key, nameKey roachpb.Key, descKey roachpb.Key) {
-	zoneKey = config.MakeZoneKey(uint32(tableDesc.ID))
-	nameKey = sqlbase.MakeNameMetadataKey(tableDesc.ParentID, tableDesc.GetName())
-	descKey = sqlbase.MakeDescMetadataKey(tableDesc.ID)
-	return
-}
-
-// A unique id for a particular table descriptor version.
-type tableVersionID struct {
-	id      sqlbase.ID
-	version sqlbase.DescriptorVersion
 }
 
 func (p *planner) getVirtualTabler() VirtualTabler {
@@ -161,6 +106,7 @@ type TableCollection struct {
 	uncommittedTables []uncommittedTable
 
 	// databaseCache is used as a cache for database names.
+	// This field is nil when the field is initialized for an internalPlanner.
 	// TODO(andrei): get rid of it and replace it with a leasing system for
 	// database descriptors.
 	databaseCache *databaseCache
@@ -195,47 +141,47 @@ type dbCacheSubscriber interface {
 //
 func (tc *TableCollection) getMutableTableDescriptor(
 	ctx context.Context, txn *client.Txn, tn *tree.TableName, flags ObjectLookupFlags,
-) (*sqlbase.MutableTableDescriptor, *sqlbase.DatabaseDescriptor, error) {
+) (*sqlbase.MutableTableDescriptor, error) {
 	if log.V(2) {
 		log.Infof(ctx, "reading mutable descriptor on table '%s'", tn)
 	}
 
 	if tn.SchemaName != tree.PublicSchemaName {
 		if flags.required {
-			return nil, nil, sqlbase.NewUnsupportedSchemaUsageError(tree.ErrString(tn))
+			return nil, sqlbase.NewUnsupportedSchemaUsageError(tree.ErrString(tn))
 		}
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	refuseFurtherLookup, dbID, err := tc.getUncommittedDatabaseID(tn.Catalog(), flags.required)
 	if refuseFurtherLookup || err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	if dbID == 0 {
+	if dbID == sqlbase.InvalidID && tc.databaseCache != nil {
 		// Resolve the database from the database cache when the transaction
 		// hasn't modified the database.
 		dbID, err = tc.databaseCache.getDatabaseID(ctx,
-			tc.leaseMgr.execCfg.DB.Txn, tn.Catalog(), flags.required)
-		if err != nil || dbID == 0 {
-			// dbID can still be 0 if required is false and the database is not found.
-			return nil, nil, err
+			tc.leaseMgr.db.Txn, tn.Catalog(), flags.required)
+		if err != nil || dbID == sqlbase.InvalidID {
+			// dbID can still be invalid if required is false and the database is not found.
+			return nil, err
 		}
 	}
 
 	if refuseFurtherLookup, table, err := tc.getUncommittedTable(dbID, tn, flags.required); refuseFurtherLookup || err != nil {
-		return nil, nil, err
+		return nil, err
 	} else if mut := table.MutableTableDescriptor; mut != nil {
 		log.VEventf(ctx, 2, "found uncommitted table %d", mut.ID)
-		return mut, nil, nil
+		return mut, nil
 	}
 
 	phyAccessor := UncachedPhysicalAccessor{}
-	obj, db, err := phyAccessor.GetObjectDesc(ctx, txn, tn, flags)
+	obj, err := phyAccessor.GetObjectDesc(ctx, txn, tn, flags)
 	if obj == nil {
-		return nil, db, err
+		return nil, err
 	}
-	return obj.(*sqlbase.MutableTableDescriptor), db, err
+	return obj.(*sqlbase.MutableTableDescriptor), err
 }
 
 // getTableVersion returns a table descriptor with a version suitable for
@@ -251,31 +197,31 @@ func (tc *TableCollection) getMutableTableDescriptor(
 //
 func (tc *TableCollection) getTableVersion(
 	ctx context.Context, txn *client.Txn, tn *tree.TableName, flags ObjectLookupFlags,
-) (*sqlbase.ImmutableTableDescriptor, *sqlbase.DatabaseDescriptor, error) {
+) (*sqlbase.ImmutableTableDescriptor, error) {
 	if log.V(2) {
 		log.Infof(ctx, "planner acquiring lease on table '%s'", tn)
 	}
 
 	if tn.SchemaName != tree.PublicSchemaName {
 		if flags.required {
-			return nil, nil, sqlbase.NewUnsupportedSchemaUsageError(tree.ErrString(tn))
+			return nil, sqlbase.NewUnsupportedSchemaUsageError(tree.ErrString(tn))
 		}
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	refuseFurtherLookup, dbID, err := tc.getUncommittedDatabaseID(tn.Catalog(), flags.required)
 	if refuseFurtherLookup || err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	if dbID == 0 {
+	if dbID == sqlbase.InvalidID && tc.databaseCache != nil {
 		// Resolve the database from the database cache when the transaction
 		// hasn't modified the database.
 		dbID, err = tc.databaseCache.getDatabaseID(ctx,
-			tc.leaseMgr.execCfg.DB.Txn, tn.Catalog(), flags.required)
-		if err != nil || dbID == 0 {
-			// dbID can still be 0 if required is false and the database is not found.
-			return nil, nil, err
+			tc.leaseMgr.db.Txn, tn.Catalog(), flags.required)
+		if err != nil || dbID == sqlbase.InvalidID {
+			// dbID can still be invalid if required is false and the database is not found.
+			return nil, err
 		}
 	}
 
@@ -290,7 +236,7 @@ func (tc *TableCollection) getTableVersion(
 		(tn.Catalog() == sqlbase.SystemDB.Name && tn.TableName.String() != sqlbase.RoleMembersTable.Name)
 
 	if refuseFurtherLookup, table, err := tc.getUncommittedTable(dbID, tn, flags.required); refuseFurtherLookup || err != nil {
-		return nil, nil, err
+		return nil, err
 	} else if immut := table.ImmutableTableDescriptor; immut != nil {
 		// If not forcing to resolve using KV, tables being added aren't visible.
 		if immut.Adding() && !avoidCache {
@@ -298,20 +244,20 @@ func (tc *TableCollection) getTableVersion(
 			if !flags.required {
 				err = nil
 			}
-			return nil, nil, err
+			return nil, err
 		}
 
 		log.VEventf(ctx, 2, "found uncommitted table %d", immut.ID)
-		return immut, nil, nil
+		return immut, nil
 	}
 
-	readTableFromStore := func() (*sqlbase.ImmutableTableDescriptor, *sqlbase.DatabaseDescriptor, error) {
+	readTableFromStore := func() (*sqlbase.ImmutableTableDescriptor, error) {
 		phyAccessor := UncachedPhysicalAccessor{}
-		obj, db, err := phyAccessor.GetObjectDesc(ctx, txn, tn, flags)
+		obj, err := phyAccessor.GetObjectDesc(ctx, txn, tn, flags)
 		if obj == nil {
-			return nil, db, err
+			return nil, err
 		}
-		return obj.(*sqlbase.ImmutableTableDescriptor), db, err
+		return obj.(*sqlbase.ImmutableTableDescriptor), err
 	}
 
 	if avoidCache {
@@ -326,7 +272,7 @@ func (tc *TableCollection) getTableVersion(
 		if table.Name == string(tn.TableName) &&
 			table.ParentID == dbID {
 			log.VEventf(ctx, 2, "found table in table collection for table '%s'", tn)
-			return table, nil, nil
+			return table, nil
 		}
 	}
 
@@ -341,7 +287,7 @@ func (tc *TableCollection) getTableVersion(
 		}
 		// Lease acquisition failed with some other error. This we don't
 		// know how to deal with, so propagate the error.
-		return nil, nil, err
+		return nil, err
 	}
 
 	if !origTimestamp.Less(expiration) {
@@ -356,7 +302,7 @@ func (tc *TableCollection) getTableVersion(
 	// so we need to set a deadline on the transaction to prevent it from committing
 	// beyond the table version expiration time.
 	txn.UpdateDeadlineMaybe(ctx, expiration)
-	return table, nil, nil
+	return table, nil
 }
 
 // getTableVersionByID is a by-ID variant of getTableVersion (i.e. uses same cache).
@@ -472,8 +418,8 @@ func (tc *TableCollection) waitForCacheToDropDatabases(ctx context.Context) {
 		tc.dbCacheSubscriber.waitForCacheState(
 			func(dc *databaseCache) bool {
 				// Resolve the database name from the database cache.
-				dbID, err := dc.getCachedDatabaseID(ctx, uc.name)
-				if err != nil || dbID == 0 {
+				dbID, err := dc.getCachedDatabaseID(uc.name)
+				if err != nil || dbID == sqlbase.InvalidID {
 					// dbID can still be 0 if required is false and
 					// the database is not found. Swallowing error here
 					// because it was felt there was no value in returning
@@ -558,14 +504,14 @@ func (tc *TableCollection) getUncommittedDatabaseID(
 		if requestedDbName == db.name {
 			if db.dropped {
 				if required {
-					return true, 0, sqlbase.NewUndefinedDatabaseError(requestedDbName)
+					return true, sqlbase.InvalidID, sqlbase.NewUndefinedDatabaseError(requestedDbName)
 				}
-				return true, 0, nil
+				return true, sqlbase.InvalidID, nil
 			}
 			return false, db.id, nil
 		}
 	}
-	return false, 0, nil
+	return false, sqlbase.InvalidID, nil
 }
 
 // getUncommittedTable returns a table for the requested tablename
@@ -780,9 +726,9 @@ func (p *planner) createDropTablesJob(
 		droppedDetail.Status = detailStatus
 	}
 
-	runningStatus := jobs.RunningStatusDrainingNames
+	runningStatus := RunningStatusDrainingNames
 	if !drainNames {
-		runningStatus = jobs.RunningStatusWaitingGC
+		runningStatus = RunningStatusWaitingGC
 	}
 	jobRecord := jobs.Record{
 		Description:   stmt,
@@ -876,7 +822,7 @@ func (p *planner) writeTableDescToBatch(
 	b *client.Batch,
 ) error {
 	if tableDesc.IsVirtualTable() {
-		return pgerror.NewAssertionErrorf("virtual descriptors cannot be stored, found: %v", tableDesc)
+		return pgerror.AssertionFailedf("virtual descriptors cannot be stored, found: %v", tableDesc)
 	}
 
 	if tableDesc.IsNewTable() {
@@ -892,7 +838,7 @@ func (p *planner) writeTableDescToBatch(
 		}
 	} else {
 		// Only increment the table descriptor version once in this transaction.
-		if err := maybeIncrementVersion(ctx, tableDesc, p.txn); err != nil {
+		if err := tableDesc.MaybeIncrementVersion(ctx, p.txn); err != nil {
 			return err
 		}
 
@@ -901,7 +847,7 @@ func (p *planner) writeTableDescToBatch(
 	}
 
 	if err := tableDesc.ValidateTable(p.extendedEvalCtx.Settings); err != nil {
-		return pgerror.NewAssertionErrorf("table descriptor is not valid: %s\n%v", err, tableDesc)
+		return pgerror.AssertionFailedf("table descriptor is not valid: %s\n%v", err, tableDesc)
 	}
 
 	if err := p.Tables().addUncommittedTable(*tableDesc); err != nil {

@@ -15,9 +15,12 @@
 package sqlsmith
 
 import (
-	"bytes"
 	gosql "database/sql"
+	"fmt"
 	"math/rand"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
 // sqlsmith-go
@@ -54,27 +57,104 @@ const retryCount = 20
 
 // Smither is a sqlsmith generator.
 type Smither struct {
-	schema *schema
+	rnd            *rand.Rand
+	db             *gosql.DB
+	lock           syncutil.RWMutex
+	tables         []*tableRef
+	indexes        map[tree.TableName]map[tree.Name]*tree.CreateIndex
+	nameCounts     map[string]int
+	alters         *WeightedSampler
+	scalars, bools *WeightedSampler
+	selectStmts    *WeightedSampler
+
+	stmtSampler, tableExprSampler *WeightedSampler
+	statements                    statementWeights
+	tableExprs                    tableExprWeights
+
+	disableWith bool
 }
 
-// NewSmither creates a new Smither.
-func NewSmither(db *gosql.DB, rnd *rand.Rand) (*Smither, error) {
-	schema, err := makeSchema(db, rnd)
-	return &Smither{
-		schema: schema,
-	}, err
+// NewSmither creates a new Smither. db is used to populate existing tables
+// for use as column references. It can be nil to skip table population.
+func NewSmither(db *gosql.DB, rnd *rand.Rand, opts ...SmitherOption) (*Smither, error) {
+	s := &Smither{
+		rnd:         rnd,
+		db:          db,
+		nameCounts:  map[string]int{},
+		scalars:     NewWeightedSampler(scalarWeights, rnd.Int63()),
+		bools:       NewWeightedSampler(boolWeights, rnd.Int63()),
+		selectStmts: NewWeightedSampler(selectStmtWeights, rnd.Int63()),
+		alters:      NewWeightedSampler(alterWeights, rnd.Int63()),
+
+		statements: allStatements,
+		tableExprs: allTableExprs,
+	}
+	for _, opt := range opts {
+		opt.Apply(s)
+	}
+	s.stmtSampler = NewWeightedSampler(s.statements.Weights(), rnd.Int63())
+	s.tableExprSampler = NewWeightedSampler(s.tableExprs.Weights(), rnd.Int63())
+	return s, s.ReloadSchemas()
 }
+
+var prettyCfg = func() tree.PrettyCfg {
+	cfg := tree.DefaultPrettyCfg()
+	cfg.LineWidth = 120
+	cfg.Simplify = false
+	return cfg
+}()
 
 // Generate returns a random SQL string.
 func (s *Smither) Generate() string {
+	i := 0
 	for {
-		scope := s.schema.makeScope()
+		scope := s.makeScope()
 		stmt, ok := scope.makeStmt()
 		if !ok {
+			i++
+			if i > 1000 {
+				panic("exhausted generation attempts")
+			}
 			continue
 		}
-		var buf bytes.Buffer
-		stmt.expr.Format(&buf)
-		return buf.String()
+		i = 0
+		return prettyCfg.Pretty(stmt)
 	}
+}
+
+func (s *Smither) name(prefix string) tree.Name {
+	s.lock.Lock()
+	s.nameCounts[prefix]++
+	count := s.nameCounts[prefix]
+	s.lock.Unlock()
+	return tree.Name(fmt.Sprintf("%s_%d", prefix, count))
+}
+
+// SmitherOption is an option for the Smither client.
+type SmitherOption interface {
+	Apply(*Smither)
+}
+
+// DisableMutations causes the Smither to not emit statements that could
+// mutate any on-disk data.
+func DisableMutations() SmitherOption {
+	return disableMutations{}
+}
+
+type disableMutations struct{}
+
+func (d disableMutations) Apply(s *Smither) {
+	s.statements = nonMutatingStatements
+	s.tableExprs = nonMutatingTableExprs
+}
+
+// DisableWith causes the Smither to not emit WITH clauses.
+func DisableWith() SmitherOption {
+	return disableWith{}
+}
+
+type disableWith struct{}
+
+func (d disableWith) Apply(s *Smither) {
+	s.disableWith = true
 }

@@ -27,11 +27,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -50,7 +50,7 @@ func TestSorter(t *testing.T) {
 		name     string
 		spec     distsqlpb.SorterSpec
 		post     distsqlpb.PostProcessSpec
-		types    []sqlbase.ColumnType
+		types    []types.T
 		input    sqlbase.EncDatumRows
 		expected sqlbase.EncDatumRows
 	}{
@@ -215,7 +215,7 @@ func TestSorter(t *testing.T) {
 						{ColIdx: 3, Direction: asc},
 					}),
 			},
-			types: []sqlbase.ColumnType{sqlbase.IntType, sqlbase.IntType, sqlbase.IntType, sqlbase.IntType},
+			types: []types.T{*types.Int, *types.Int, *types.Int, *types.Int},
 			input: sqlbase.EncDatumRows{
 				{v[1], v[1], v[2], v[5]},
 				{v[0], v[1], v[2], v[4]},
@@ -247,7 +247,7 @@ func TestSorter(t *testing.T) {
 						{ColIdx: 3, Direction: asc},
 					}),
 			},
-			types: []sqlbase.ColumnType{sqlbase.IntType, sqlbase.IntType, sqlbase.IntType, sqlbase.IntType},
+			types: []types.T{*types.Int, *types.Int, *types.Int, *types.Int},
 			input: sqlbase.EncDatumRows{
 				{v[1], v[1], v[2], v[2]},
 				{v[0], v[1], v[2], v[3]},
@@ -536,18 +536,4 @@ func BenchmarkSortChunks(b *testing.B) {
 			})
 		}
 	}
-}
-
-func makeTestDiskMonitor(ctx context.Context, st *cluster.Settings) *mon.BytesMonitor {
-	diskMonitor := mon.MakeMonitor(
-		"test-disk",
-		mon.DiskResource,
-		nil, /* curCount */
-		nil, /* maxHist */
-		-1,  /* increment: use default block size */
-		math.MaxInt64,
-		st,
-	)
-	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
-	return &diskMonitor
 }

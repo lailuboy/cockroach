@@ -184,6 +184,9 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 	case *splitNode:
 		p.setUnlimited(n.rows)
 
+	case *unsplitNode:
+		p.setUnlimited(n.rows)
+
 	case *relocateNode:
 		p.setUnlimited(n.rows)
 
@@ -195,6 +198,12 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 
 	case *controlJobsNode:
 		p.setUnlimited(n.rows)
+
+	case *errorIfRowsNode:
+		p.setUnlimited(n.plan)
+
+	case *bufferNode:
+		p.setUnlimited(n.plan)
 
 	case *valuesNode:
 	case *virtualTableNode:
@@ -231,16 +240,13 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 	case *setVarNode:
 	case *setClusterSettingNode:
 	case *setZoneConfigNode:
-	case *showZoneConfigNode:
 	case *showFingerprintsNode:
 	case *showTraceNode:
 	case *scatterNode:
+	case *scanBufferNode:
 
-	case *lookupJoinNode:
-		// The lookup join node is only planned by the optimizer.
-
-	case *zigzagJoinNode:
-		// The zigzag join node is only planned by the optimizer.
+	case *applyJoinNode, *lookupJoinNode, *zigzagJoinNode, *saveTableNode:
+		// These nodes are only planned by the optimizer.
 
 	default:
 		panic(fmt.Sprintf("unhandled node type: %T", plan))

@@ -55,6 +55,7 @@ type virtualSchemaDef interface {
 	initVirtualTableDesc(
 		ctx context.Context, st *cluster.Settings, id sqlbase.ID,
 	) (sqlbase.TableDescriptor, error)
+	getComment() string
 }
 
 // virtualSchemaTable represents a table within a virtualSchema.
@@ -62,6 +63,9 @@ type virtualSchemaTable struct {
 	// Exactly one of the populate and generator fields should be defined for
 	// each virtualSchemaTable.
 	schema string
+
+	// comment represents comment of virtual schema table.
+	comment string
 
 	// populate, if non-nil, is a function that is used when creating a
 	// valuesNode. This function eagerly loads every row of the virtual table
@@ -126,6 +130,11 @@ func (t virtualSchemaTable) initVirtualTableDesc(
 	return mutDesc.TableDescriptor, err
 }
 
+// getComment is part of the virtualSchemaDef interface.
+func (t virtualSchemaTable) getComment() string {
+	return t.comment
+}
+
 // getSchema is part of the virtualSchemaDef interface.
 func (v virtualSchemaView) getSchema() string {
 	return v.schema
@@ -153,6 +162,11 @@ func (v virtualSchemaView) initVirtualTableDesc(
 		nil, // evalCtx
 	)
 	return mutDesc.TableDescriptor, err
+}
+
+// getComment is part of the virtualSchemaDef interface.
+func (v virtualSchemaView) getComment() string {
+	return ""
 }
 
 // virtualSchemas holds a slice of statically registered virtualSchema objects.
@@ -190,21 +204,22 @@ type virtualSchemaEntry struct {
 type virtualDefEntry struct {
 	virtualDef                 virtualSchemaDef
 	desc                       *sqlbase.TableDescriptor
+	comment                    string
 	validWithNoDatabaseContext bool
 }
 
 type virtualTableConstructor func(context.Context, *planner, string) (planNode, error)
 
-var errInvalidDbPrefix = pgerror.NewError(pgerror.CodeUndefinedObjectError,
+var errInvalidDbPrefix = pgerror.New(pgerror.CodeUndefinedObjectError,
 	"cannot access virtual schema in anonymous database",
 ).SetHintf("verify that the current database is set")
 
 func newInvalidVirtualSchemaError() error {
-	return pgerror.NewAssertionErrorf("virtualSchema cannot have both the populate and generator functions defined")
+	return pgerror.AssertionFailedf("virtualSchema cannot have both the populate and generator functions defined")
 }
 
 func newInvalidVirtualDefEntryError() error {
-	return pgerror.NewAssertionErrorf("virtualDefEntry.virtualDef must be a virtualSchemaTable")
+	return pgerror.AssertionFailedf("virtualDefEntry.virtualDef must be a virtualSchemaTable")
 }
 
 // getPlanInfo returns the column metadata and a constructor for a new
@@ -213,10 +228,11 @@ func newInvalidVirtualDefEntryError() error {
 // where we can't guarantee it will be Close()d in case of error.
 func (e virtualDefEntry) getPlanInfo() (sqlbase.ResultColumns, virtualTableConstructor) {
 	var columns sqlbase.ResultColumns
-	for _, col := range e.desc.Columns {
+	for i := range e.desc.Columns {
+		col := &e.desc.Columns[i]
 		columns = append(columns, sqlbase.ResultColumn{
 			Name: col.Name,
-			Typ:  col.Type.ToDatumType(),
+			Typ:  &col.Type,
 		})
 	}
 
@@ -306,12 +322,13 @@ func NewVirtualSchemaHolder(
 			tableDesc, err := def.initVirtualTableDesc(ctx, st, id)
 
 			if err != nil {
-				return nil, errors.Wrapf(err, "failed to initialize %s", def.getSchema())
+				return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+					"failed to initialize %s", log.Safe(def.getSchema()))
 			}
 
 			if schema.tableValidator != nil {
 				if err := schema.tableValidator(&tableDesc); err != nil {
-					return nil, errors.Wrap(err, "programmer error")
+					return nil, pgerror.NewAssertionErrorWithWrappedErrf(err, "programmer error")
 				}
 			}
 
@@ -319,6 +336,7 @@ func NewVirtualSchemaHolder(
 				virtualDef:                 def,
 				desc:                       &tableDesc,
 				validWithNoDatabaseContext: schema.validWithNoDatabaseContext,
+				comment:                    def.getComment(),
 			}
 			orderedDefNames = append(orderedDefNames, tableDesc.Name)
 		}
@@ -381,7 +399,7 @@ func (vs *VirtualSchemaHolder) getVirtualTableEntry(tn *tree.TableName) (virtual
 			return t, nil
 		}
 		if _, ok := db.allTableNames[tableName]; ok {
-			return virtualDefEntry{}, pgerror.Unimplemented(tn.Schema()+"."+tableName,
+			return virtualDefEntry{}, pgerror.Unimplementedf(tn.Schema()+"."+tableName,
 				"virtual schema table not implemented: %s.%s", tn.Schema(), tableName)
 		}
 		return virtualDefEntry{}, sqlbase.NewUndefinedRelationError(tn)

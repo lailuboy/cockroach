@@ -16,17 +16,19 @@ package testcat
 
 import (
 	"context"
-	"fmt"
+	"sort"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 )
 
@@ -37,9 +39,8 @@ const (
 
 // Catalog implements the cat.Catalog interface for testing purposes.
 type Catalog struct {
-	testSchema  Schema
-	dataSources map[string]cat.DataSource
-	counter     int
+	testSchema Schema
+	counter    int
 }
 
 var _ cat.Catalog = &Catalog{}
@@ -55,14 +56,14 @@ func New() *Catalog {
 				ExplicitSchema:  true,
 				ExplicitCatalog: true,
 			},
+			dataSources: make(map[string]cat.DataSource),
 		},
-		dataSources: make(map[string]cat.DataSource),
 	}
 }
 
 // ResolveSchema is part of the cat.Catalog interface.
 func (tc *Catalog) ResolveSchema(
-	_ context.Context, name *cat.SchemaName,
+	_ context.Context, _ cat.Flags, name *cat.SchemaName,
 ) (cat.Schema, cat.SchemaName, error) {
 	// This is a simplified version of tree.TableName.ResolveTarget() from
 	// sql/tree/name_resolution.go.
@@ -96,7 +97,7 @@ func (tc *Catalog) ResolveSchema(
 
 // ResolveDataSource is part of the cat.Catalog interface.
 func (tc *Catalog) ResolveDataSource(
-	_ context.Context, name *cat.DataSourceName,
+	_ context.Context, _ cat.Flags, name *cat.DataSourceName,
 ) (cat.DataSource, cat.DataSourceName, error) {
 	// This is a simplified version of tree.TableName.ResolveExisting() from
 	// sql/tree/name_resolution.go.
@@ -153,33 +154,38 @@ func (tc *Catalog) ResolveDataSource(
 func (tc *Catalog) ResolveDataSourceByID(
 	ctx context.Context, id cat.StableID,
 ) (cat.DataSource, error) {
-	for _, ds := range tc.dataSources {
+	for _, ds := range tc.testSchema.dataSources {
 		if tab, ok := ds.(*Table); ok && tab.TabID == id {
 			return ds, nil
 		}
 	}
-	return nil, pgerror.NewErrorf(pgerror.CodeUndefinedTableError,
+	return nil, pgerror.Newf(pgerror.CodeUndefinedTableError,
 		"relation [%d] does not exist", id)
 }
 
 // CheckPrivilege is part of the cat.Catalog interface.
 func (tc *Catalog) CheckPrivilege(ctx context.Context, o cat.Object, priv privilege.Kind) error {
+	return tc.CheckAnyPrivilege(ctx, o)
+}
+
+// CheckAnyPrivilege is part of the cat.Catalog interface.
+func (tc *Catalog) CheckAnyPrivilege(ctx context.Context, o cat.Object) error {
 	switch t := o.(type) {
 	case *Schema:
 		if t.Revoked {
-			return fmt.Errorf("user does not have privilege to access %v", t.SchemaName)
+			return pgerror.Newf(pgerror.CodeInsufficientPrivilegeError, "user does not have privilege to access %v", t.SchemaName)
 		}
 	case *Table:
 		if t.Revoked {
-			return fmt.Errorf("user does not have privilege to access %v", t.TabName)
+			return pgerror.Newf(pgerror.CodeInsufficientPrivilegeError, "user does not have privilege to access %v", t.TabName)
 		}
 	case *View:
 		if t.Revoked {
-			return fmt.Errorf("user does not have privilege to access %v", t.ViewName)
+			return pgerror.Newf(pgerror.CodeInsufficientPrivilegeError, "user does not have privilege to access %v", t.ViewName)
 		}
 	case *Sequence:
 		if t.Revoked {
-			return fmt.Errorf("user does not have privilege to access %v", t.SeqName)
+			return pgerror.Newf(pgerror.CodeInsufficientPrivilegeError, "user does not have privilege to access %v", t.SeqName)
 		}
 	default:
 		panic("invalid Object")
@@ -187,16 +193,19 @@ func (tc *Catalog) CheckPrivilege(ctx context.Context, o cat.Object, priv privil
 	return nil
 }
 
+// RequireSuperUser is part of the cat.Catalog interface.
+func (tc *Catalog) RequireSuperUser(ctx context.Context, action string) error {
+	return nil
+}
+
 func (tc *Catalog) resolveSchema(toResolve *cat.SchemaName) (cat.Schema, cat.SchemaName, error) {
 	if string(toResolve.CatalogName) != testDB {
-		return nil, cat.SchemaName{}, pgerror.NewErrorf(pgerror.CodeInvalidSchemaNameError,
-			"cannot create %q because the target database or schema does not exist",
-			tree.ErrString(&toResolve.CatalogName)).
-			SetHintf("verify that the current database and search_path are valid and/or the target database exists")
+		return nil, cat.SchemaName{}, pgerror.Newf(pgerror.CodeInvalidSchemaNameError,
+			"target database or schema does not exist")
 	}
 
 	if string(toResolve.SchemaName) != tree.PublicSchema {
-		return nil, cat.SchemaName{}, pgerror.NewErrorf(pgerror.CodeInvalidNameError,
+		return nil, cat.SchemaName{}, pgerror.Newf(pgerror.CodeInvalidNameError,
 			"schema cannot be modified: %q", tree.ErrString(toResolve))
 	}
 
@@ -207,10 +216,11 @@ func (tc *Catalog) resolveSchema(toResolve *cat.SchemaName) (cat.Schema, cat.Sch
 // Catalog. If it does, returns the corresponding data source. Otherwise, it
 // returns an error.
 func (tc *Catalog) resolveDataSource(toResolve *cat.DataSourceName) (cat.DataSource, error) {
-	if table, ok := tc.dataSources[toResolve.FQString()]; ok {
+	if table, ok := tc.testSchema.dataSources[toResolve.FQString()]; ok {
 		return table, nil
 	}
-	return nil, fmt.Errorf("no data source matches prefix: %q", tree.ErrString(toResolve))
+	return nil, pgerror.Newf(pgerror.CodeUndefinedTableError,
+		"no data source matches prefix: %q", tree.ErrString(toResolve))
 }
 
 // Schema returns the singleton test schema.
@@ -220,53 +230,76 @@ func (tc *Catalog) Schema() *Schema {
 
 // Table returns the test table that was previously added with the given name.
 func (tc *Catalog) Table(name *tree.TableName) *Table {
-	ds, _, err := tc.ResolveDataSource(context.TODO(), name)
+	ds, _, err := tc.ResolveDataSource(context.TODO(), cat.Flags{}, name)
 	if err != nil {
 		panic(err)
 	}
 	if tab, ok := ds.(*Table); ok {
 		return tab
 	}
-	panic(fmt.Errorf("\"%q\" is not a table", tree.ErrString(name)))
+	panic(pgerror.Newf(pgerror.CodeWrongObjectTypeError,
+		"\"%q\" is not a table", tree.ErrString(name)))
 }
 
 // AddTable adds the given test table to the catalog.
 func (tc *Catalog) AddTable(tab *Table) {
 	fq := tab.TabName.FQString()
-	if _, ok := tc.dataSources[fq]; ok {
-		panic(fmt.Errorf("table %q already exists", tree.ErrString(&tab.TabName)))
+	if _, ok := tc.testSchema.dataSources[fq]; ok {
+		panic(pgerror.Newf(pgerror.CodeDuplicateObjectError,
+			"table %q already exists", tree.ErrString(&tab.TabName)))
 	}
-	tc.dataSources[fq] = tab
+	tc.testSchema.dataSources[fq] = tab
 }
 
 // View returns the test view that was previously added with the given name.
 func (tc *Catalog) View(name *cat.DataSourceName) *View {
-	ds, _, err := tc.ResolveDataSource(context.TODO(), name)
+	ds, _, err := tc.ResolveDataSource(context.TODO(), cat.Flags{}, name)
 	if err != nil {
 		panic(err)
 	}
 	if vw, ok := ds.(*View); ok {
 		return vw
 	}
-	panic(fmt.Errorf("\"%q\" is not a view", tree.ErrString(name)))
+	panic(pgerror.Newf(pgerror.CodeWrongObjectTypeError,
+		"\"%q\" is not a view", tree.ErrString(name)))
 }
 
 // AddView adds the given test view to the catalog.
 func (tc *Catalog) AddView(view *View) {
 	fq := view.ViewName.FQString()
-	if _, ok := tc.dataSources[fq]; ok {
-		panic(fmt.Errorf("view %q already exists", tree.ErrString(&view.ViewName)))
+	if _, ok := tc.testSchema.dataSources[fq]; ok {
+		panic(pgerror.Newf(pgerror.CodeDuplicateObjectError,
+			"view %q already exists", tree.ErrString(&view.ViewName)))
 	}
-	tc.dataSources[fq] = view
+	tc.testSchema.dataSources[fq] = view
 }
 
 // AddSequence adds the given test sequence to the catalog.
 func (tc *Catalog) AddSequence(seq *Sequence) {
 	fq := seq.SeqName.FQString()
-	if _, ok := tc.dataSources[fq]; ok {
-		panic(fmt.Errorf("sequence %q already exists", tree.ErrString(&seq.SeqName)))
+	if _, ok := tc.testSchema.dataSources[fq]; ok {
+		panic(pgerror.Newf(pgerror.CodeDuplicateObjectError,
+			"sequence %q already exists", tree.ErrString(&seq.SeqName)))
 	}
-	tc.dataSources[fq] = seq
+	tc.testSchema.dataSources[fq] = seq
+}
+
+// ExecuteMultipleDDL parses the given semicolon-separated DDL SQL statements
+// and applies each of them to the test catalog.
+func (tc *Catalog) ExecuteMultipleDDL(sql string) error {
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		return err
+	}
+
+	for _, stmt := range stmts {
+		_, err := tc.ExecuteDDL(stmt.SQL)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // ExecuteDDL parses the given DDL SQL statement and creates objects in the test
@@ -277,8 +310,10 @@ func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
 		return "", err
 	}
 
-	if stmt.AST.StatementType() != tree.DDL {
-		return "", fmt.Errorf("statement type is not DDL: %v", stmt.AST.StatementType())
+	switch stmt.AST.StatementType() {
+	case tree.DDL, tree.RowsAffected:
+	default:
+		return "", pgerror.AssertionFailedf("statement type is not DDL or RowsAffected: %v", log.Safe(stmt.AST.StatementType()))
 	}
 
 	switch stmt := stmt.AST.(type) {
@@ -302,8 +337,14 @@ func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
 		seq := tc.CreateSequence(stmt)
 		return seq.String(), nil
 
+	case *tree.SetZoneConfig:
+		zone := tc.SetZoneConfig(stmt)
+		tp := treeprinter.New()
+		cat.FormatZone(zone, tp)
+		return tp.String(), nil
+
 	default:
-		return "", fmt.Errorf("unsupported statement: %v", stmt)
+		return "", pgerror.AssertionFailedf("unsupported statement: %v", stmt)
 	}
 }
 
@@ -355,6 +396,8 @@ type Schema struct {
 
 	// If Revoked is true, then the user has had privileges on the schema revoked.
 	Revoked bool
+
+	dataSources map[string]cat.DataSource
 }
 
 var _ cat.Schema = &Schema{}
@@ -375,6 +418,20 @@ func (s *Schema) Name() *cat.SchemaName {
 	return &s.SchemaName
 }
 
+// GetDataSourceNames is part of the cat.Schema interface.
+func (s *Schema) GetDataSourceNames(ctx context.Context) ([]cat.DataSourceName, error) {
+	var keys []string
+	for k := range s.dataSources {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var res []cat.DataSourceName
+	for _, k := range keys {
+		res = append(res, *s.dataSources[k].Name())
+	}
+	return res, nil
+}
+
 // View implements the cat.View interface for testing purposes.
 type View struct {
 	ViewID      cat.StableID
@@ -391,7 +448,7 @@ var _ cat.View = &View{}
 
 func (tv *View) String() string {
 	tp := treeprinter.New()
-	cat.FormatCatalogView(tv, tp)
+	cat.FormatView(tv, tp)
 	return tp.String()
 }
 
@@ -454,16 +511,15 @@ type Table struct {
 	// other table(s).
 	interleaved bool
 
-	// referenced is set to true when another table has referenced this table
-	// via a foreign key.
-	referenced bool
+	outboundFKs []ForeignKeyConstraint
+	inboundFKs  []ForeignKeyConstraint
 }
 
 var _ cat.Table = &Table{}
 
 func (tt *Table) String() string {
 	tp := treeprinter.New()
-	cat.FormatCatalogTable(tt.Catalog, tt, tp)
+	cat.FormatTable(tt.Catalog, tt, tp)
 	return tp.String()
 }
 
@@ -494,11 +550,6 @@ func (tt *Table) IsVirtualTable() bool {
 // IsInterleaved is part of the cat.Table interface.
 func (tt *Table) IsInterleaved() bool {
 	return false
-}
-
-// IsReferenced is part of the cat.Table interface.
-func (tt *Table) IsReferenced() bool {
-	return tt.referenced
 }
 
 // ColumnCount is part of the cat.Table interface.
@@ -571,6 +622,26 @@ func (tt *Table) Family(i int) cat.Family {
 	return tt.Families[i]
 }
 
+// OutboundForeignKeyCount is part of the cat.Table interface.
+func (tt *Table) OutboundForeignKeyCount() int {
+	return len(tt.outboundFKs)
+}
+
+// OutboundForeignKey is part of the cat.Table interface.
+func (tt *Table) OutboundForeignKey(i int) cat.ForeignKeyConstraint {
+	return &tt.outboundFKs[i]
+}
+
+// InboundForeignKeyCount is part of the cat.Table interface.
+func (tt *Table) InboundForeignKeyCount() int {
+	return len(tt.inboundFKs)
+}
+
+// InboundForeignKey is part of the cat.Table interface.
+func (tt *Table) InboundForeignKey(i int) cat.ForeignKeyConstraint {
+	return &tt.inboundFKs[i]
+}
+
 // FindOrdinal returns the ordinal of the column with the given name.
 func (tt *Table) FindOrdinal(name string) int {
 	for i, col := range tt.Columns {
@@ -578,7 +649,7 @@ func (tt *Table) FindOrdinal(name string) int {
 			return i
 		}
 	}
-	panic(fmt.Sprintf(
+	panic(pgerror.Newf(pgerror.CodeUndefinedColumnError,
 		"cannot find column %q in table %q",
 		tree.ErrString((*tree.Name)(&name)),
 		tree.ErrString(&tt.TabName),
@@ -609,14 +680,12 @@ type Index struct {
 
 	Columns []cat.IndexColumn
 
+	// IdxZone is the zone associated with the index. This may be inherited from
+	// the parent table, database, or even the default zone.
+	IdxZone *config.ZoneConfig
+
 	// table is a back reference to the table this index is on.
 	table *Table
-
-	// foreignKey is a struct representing an outgoing foreign key
-	// reference. If fkSet is true, then foreignKey is a valid
-	// index reference.
-	foreignKey cat.ForeignKeyReference
-	fkSet      bool
 }
 
 // ID is part of the cat.Index interface.
@@ -664,9 +733,14 @@ func (ti *Index) Column(i int) cat.IndexColumn {
 	return ti.Columns[i]
 }
 
-// ForeignKey is part of the cat.Index interface.
-func (ti *Index) ForeignKey() (cat.ForeignKeyReference, bool) {
-	return ti.foreignKey, ti.fkSet
+// Zone is part of the cat.Index interface.
+func (ti *Index) Zone() cat.Zone {
+	return ti.IdxZone
+}
+
+// Span is part of the cat.Index interface.
+func (ti *Index) Span() roachpb.Span {
+	panic("not implemented")
 }
 
 // Column implements the cat.Column interface for testing purposes.
@@ -675,7 +749,8 @@ type Column struct {
 	Hidden       bool
 	Nullable     bool
 	Name         string
-	Type         types.T
+	Type         *types.T
+	ColType      types.T
 	DefaultExpr  *string
 	ComputedExpr *string
 }
@@ -698,17 +773,35 @@ func (tc *Column) ColName() tree.Name {
 }
 
 // DatumType is part of the cat.Column interface.
-func (tc *Column) DatumType() types.T {
+func (tc *Column) DatumType() *types.T {
 	return tc.Type
+}
+
+// ColTypePrecision is part of the cat.Column interface.
+func (tc *Column) ColTypePrecision() int {
+	if tc.ColType.Family() == types.ArrayFamily {
+		if tc.ColType.ArrayContents().Family() == types.ArrayFamily {
+			panic(pgerror.AssertionFailedf("column type should never be a nested array"))
+		}
+		return int(tc.ColType.ArrayContents().Precision())
+	}
+	return int(tc.ColType.Precision())
+}
+
+// ColTypeWidth is part of the cat.Column interface.
+func (tc *Column) ColTypeWidth() int {
+	if tc.ColType.Family() == types.ArrayFamily {
+		if tc.ColType.ArrayContents().Family() == types.ArrayFamily {
+			panic(pgerror.AssertionFailedf("column type should never be a nested array"))
+		}
+		return int(tc.ColType.ArrayContents().Width())
+	}
+	return int(tc.ColType.Width())
 }
 
 // ColTypeStr is part of the cat.Column interface.
 func (tc *Column) ColTypeStr() string {
-	t, err := coltypes.DatumTypeToColumnType(tc.Type)
-	if err != nil {
-		panic(err)
-	}
-	return t.String()
+	return tc.ColType.SQLString()
 }
 
 // IsHidden is part of the cat.Column interface.
@@ -795,6 +888,75 @@ func (ts TableStats) Swap(i, j int) {
 	ts[i], ts[j] = ts[j], ts[i]
 }
 
+// ForeignKeyConstraint implements cat.ForeignKeyConstraint. See that interface
+// for more information on the fields.
+type ForeignKeyConstraint struct {
+	name              string
+	originTableID     cat.StableID
+	referencedTableID cat.StableID
+
+	originColumnOrdinals     []int
+	referencedColumnOrdinals []int
+
+	validated   bool
+	matchMethod tree.CompositeKeyMatchMethod
+}
+
+var _ cat.ForeignKeyConstraint = &ForeignKeyConstraint{}
+
+// Name is part of the cat.ForeignKeyConstraint interface.
+func (fk *ForeignKeyConstraint) Name() string {
+	return fk.name
+}
+
+// OriginTableID is part of the cat.ForeignKeyConstraint interface.
+func (fk *ForeignKeyConstraint) OriginTableID() cat.StableID {
+	return fk.originTableID
+}
+
+// ReferencedTableID is part of the cat.ForeignKeyConstraint interface.
+func (fk *ForeignKeyConstraint) ReferencedTableID() cat.StableID {
+	return fk.referencedTableID
+}
+
+// ColumnCount is part of the cat.ForeignKeyConstraint interface.
+func (fk *ForeignKeyConstraint) ColumnCount() int {
+	return len(fk.originColumnOrdinals)
+}
+
+// OriginColumnOrdinal is part of the cat.ForeignKeyConstraint interface.
+func (fk *ForeignKeyConstraint) OriginColumnOrdinal(originTable cat.Table, i int) int {
+	if originTable.ID() != fk.originTableID {
+		panic(pgerror.AssertionFailedf(
+			"invalid table %d passed to OriginColumnOrdinal (expected %d)",
+			originTable.ID(), fk.originTableID,
+		))
+	}
+
+	return fk.originColumnOrdinals[i]
+}
+
+// ReferencedColumnOrdinal is part of the cat.ForeignKeyConstraint interface.
+func (fk *ForeignKeyConstraint) ReferencedColumnOrdinal(referencedTable cat.Table, i int) int {
+	if referencedTable.ID() != fk.referencedTableID {
+		panic(pgerror.AssertionFailedf(
+			"invalid table %d passed to ReferencedColumnOrdinal (expected %d)",
+			referencedTable.ID(), fk.referencedTableID,
+		))
+	}
+	return fk.referencedColumnOrdinals[i]
+}
+
+// Validated is part of the cat.ForeignKeyConstraint interface.
+func (fk *ForeignKeyConstraint) Validated() bool {
+	return fk.validated
+}
+
+// MatchMethod is part of the cat.ForeignKeyConstraint interface.
+func (fk *ForeignKeyConstraint) MatchMethod() tree.CompositeKeyMatchMethod {
+	return fk.matchMethod
+}
+
 // Sequence implements the cat.Sequence interface for testing purposes.
 type Sequence struct {
 	SeqID      cat.StableID
@@ -834,7 +996,7 @@ func (ts *Sequence) SequenceName() *tree.TableName {
 
 func (ts *Sequence) String() string {
 	tp := treeprinter.New()
-	cat.FormatCatalogSequence(ts.Catalog, ts, tp)
+	cat.FormatSequence(ts.Catalog, ts, tp)
 	return tp.String()
 }
 

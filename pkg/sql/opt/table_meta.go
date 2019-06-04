@@ -16,6 +16,7 @@ package opt
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
 )
@@ -55,7 +56,7 @@ func (t TableID) ColumnID(ord int) ColumnID {
 func (t TableID) ColumnOrdinal(id ColumnID) int {
 	if util.RaceEnabled {
 		if id < t.firstColID() {
-			panic("ordinal cannot be negative")
+			panic(pgerror.AssertionFailedf("ordinal cannot be negative"))
 		}
 	}
 	return int(id - t.firstColID())
@@ -129,8 +130,20 @@ type TableMeta struct {
 	// is always an unqualified name.
 	Alias tree.TableName
 
+	// IgnoreForeignKeys is true if we should disable any rules that depend on the
+	// consistency of outgoing foreign key references. Set by the
+	// IGNORE_FOREIGN_KEYS table hint; useful for scrub queries meant to verify
+	// the consistency of foreign keys.
+	IgnoreForeignKeys bool
+
 	// anns annotates the table metadata with arbitrary data.
 	anns [maxTableAnnIDCount]interface{}
+
+	// constraints stores the list of validated check constraints on the table
+	// stored in the ScalarExpr form so they can possibly be used as filters
+	// in certain queries. See comment above GenerateConstrainedScans for more
+	// detail.
+	constraints []ScalarExpr
 }
 
 // clearAnnotations resets all the table annotations; used when copying a
@@ -168,6 +181,23 @@ func (tm *TableMeta) IndexKeyColumns(indexOrd int) ColSet {
 	return indexCols
 }
 
+// ConstraintCount returns the number of validated check constraints that are
+// applied to the table.
+func (tm *TableMeta) ConstraintCount() int {
+	return len(tm.constraints)
+}
+
+// Constraint looks up the ith valid table constraint on the table where
+// i < ConstraintCount().
+func (tm *TableMeta) Constraint(i int) ScalarExpr {
+	return tm.constraints[i]
+}
+
+// AddConstraint adds a valid table constraint to the table's metadata.
+func (tm *TableMeta) AddConstraint(constraint ScalarExpr) {
+	tm.constraints = append(tm.constraints, constraint)
+}
+
 // TableAnnotation returns the given annotation that is associated with the
 // given table. If the table has no such annotation, TableAnnotation returns
 // nil.
@@ -197,7 +227,8 @@ func (md *Metadata) SetTableAnnotation(tabID TableID, tabAnnID TableAnnID, ann i
 // See the TableAnnID comment for more details and a usage example.
 func NewTableAnnID() TableAnnID {
 	if tableAnnIDCount == maxTableAnnIDCount {
-		panic("can't allocate table annotation id; increase maxTableAnnIDCount to allow")
+		panic(pgerror.AssertionFailedf(
+			"can't allocate table annotation id; increase maxTableAnnIDCount to allow"))
 	}
 	cnt := tableAnnIDCount
 	tableAnnIDCount++

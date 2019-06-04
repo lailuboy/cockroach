@@ -65,6 +65,13 @@ const (
 	VersionCreateStats
 	VersionDirectImport
 	VersionSideloadedStorageNoReplicaID // see versionsSingleton for details
+	VersionPushTxnToInclusive
+	VersionSnapshotsWithoutLog
+	Version19_1
+	VersionStart19_2
+	VersionQueryTxnTimestamp
+	VersionStickyBit
+	VersionParallelCommits
 
 	// Add new versions here (step one of two).
 
@@ -415,6 +422,7 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		Version: roachpb.Version{Major: 2, Minor: 1, Unstable: 7},
 	},
 	{
+		// VersionDirectImport is https://github.com/cockroachdb/cockroach/pull/34751.
 		Key:     VersionDirectImport,
 		Version: roachpb.Version{Major: 2, Minor: 1, Unstable: 8},
 	},
@@ -436,6 +444,41 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		Key:     VersionSideloadedStorageNoReplicaID,
 		Version: roachpb.Version{Major: 2, Minor: 1, Unstable: 9},
 	},
+	{
+		// VersionPushTxnToInclusive is https://github.com/cockroachdb/cockroach/pull/35297.
+		Key:     VersionPushTxnToInclusive,
+		Version: roachpb.Version{Major: 2, Minor: 1, Unstable: 10},
+	},
+	{
+		// VersionSnapshotsWithoutLog is https://github.com/cockroachdb/cockroach/pull/36714.
+		Key:     VersionSnapshotsWithoutLog,
+		Version: roachpb.Version{Major: 2, Minor: 1, Unstable: 11},
+	},
+	{
+		// Version19_1 is CockroachDB v19.1. It's used for all v19.1.x patch releases.
+		Key:     Version19_1,
+		Version: roachpb.Version{Major: 19, Minor: 1},
+	},
+	{
+		// Version19_2_Start demarcates work towards CockroachDB v19.2.
+		Key:     VersionStart19_2,
+		Version: roachpb.Version{Major: 19, Minor: 1, Unstable: 1},
+	},
+	{
+		// VersionQueryTxnTimestamp is https://github.com/cockroachdb/cockroach/pull/36307.
+		Key:     VersionQueryTxnTimestamp,
+		Version: roachpb.Version{Major: 19, Minor: 1, Unstable: 2},
+	},
+	{
+		// VersionStickyBit is https://github.com/cockroachdb/cockroach/pull/37506.
+		Key:     VersionStickyBit,
+		Version: roachpb.Version{Major: 19, Minor: 1, Unstable: 3},
+	},
+	{
+		// VersionParallelCommits is https://github.com/cockroachdb/cockroach/pull/37777.
+		Key:     VersionParallelCommits,
+		Version: roachpb.Version{Major: 19, Minor: 1, Unstable: 4},
+	},
 
 	// Add new versions here (step two of two).
 
@@ -446,7 +489,7 @@ var (
 	// this binary. If this binary is started using a store marked with an older
 	// version than BinaryMinimumSupportedVersion, then the binary will exit with
 	// an error.
-	BinaryMinimumSupportedVersion = VersionByKey(Version2_0)
+	BinaryMinimumSupportedVersion = VersionByKey(Version19_1)
 
 	// BinaryServerVersion is the version of this binary.
 	//

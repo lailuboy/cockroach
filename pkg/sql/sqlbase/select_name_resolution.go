@@ -23,8 +23,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // NameResolutionVisitor is a tree.Visitor implementation used to
@@ -257,7 +257,7 @@ func expandStar(
 	ctx context.Context, src MultiSourceInfo, v tree.VarName, ivarHelper tree.IndexedVarHelper,
 ) (columns ResultColumns, exprs []tree.TypedExpr, err error) {
 	if len(src) == 0 || len(src[0].SourceColumns) == 0 {
-		return nil, nil, pgerror.NewErrorf(pgerror.CodeInvalidNameError,
+		return nil, nil, pgerror.Newf(pgerror.CodeInvalidNameError,
 			"cannot use %q without a FROM clause", tree.ErrString(v))
 	}
 
@@ -315,8 +315,7 @@ func expandTupleStar(
 	}
 
 	typ := normalized.ResolvedType()
-	tType, ok := typ.(types.TTuple)
-	if !ok || tType.Labels == nil {
+	if typ.Family() != types.TupleFamily || typ.TupleLabels() == nil {
 		return nil, nil, tree.NewTypeIsNotCompositeError(typ)
 	}
 
@@ -324,17 +323,17 @@ func expandTupleStar(
 	// Otherwise we'll re-evaluate the expression multiple times.
 	tTuple, isTuple := normalized.(*tree.Tuple)
 
-	columns = make(ResultColumns, len(tType.Types))
-	exprs = make([]tree.TypedExpr, len(tType.Types))
-	for i, colType := range tType.Types {
-		columns[i].Typ = colType
-		columns[i].Name = tType.Labels[i]
+	columns = make(ResultColumns, len(typ.TupleContents()))
+	exprs = make([]tree.TypedExpr, len(typ.TupleContents()))
+	for i := range typ.TupleContents() {
+		columns[i].Typ = &typ.TupleContents()[i]
+		columns[i].Name = typ.TupleLabels()[i]
 		if isTuple {
 			// De-tuplify: ((a,b,c)).* -> a, b, c
 			exprs[i] = tTuple.Exprs[i].(tree.TypedExpr)
 		} else {
 			// Can't de-tuplify: (Expr).* -> (Expr).a, (Expr).b, (Expr).c
-			exprs[i] = tree.NewTypedColumnAccessExpr(normalized, tType.Labels[i], i)
+			exprs[i] = tree.NewTypedColumnAccessExpr(normalized, typ.TupleLabels()[i], i)
 		}
 	}
 	return columns, exprs, nil
@@ -363,7 +362,7 @@ func CheckRenderStar(
 
 	case tree.UnqualifiedStar, *tree.AllColumnsSelector:
 		if target.As != "" {
-			return false, nil, nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+			return false, nil, nil, pgerror.Newf(pgerror.CodeSyntaxError,
 				"%q cannot be aliased", tree.ErrString(v))
 		}
 

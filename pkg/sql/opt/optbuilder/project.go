@@ -19,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // constructProjectForScope constructs a projection if it will result in a
@@ -65,7 +65,7 @@ func (b *Builder) constructProject(input memo.RelExpr, cols []scopeColumn) memo.
 // and adds the resulting aliases and typed expressions to outScope. See the
 // header comment for analyzeSelectList.
 func (b *Builder) analyzeProjectionList(
-	selects tree.SelectExprs, desiredTypes []types.T, inScope, outScope *scope,
+	selects tree.SelectExprs, desiredTypes []*types.T, inScope, outScope *scope,
 ) {
 	// We need to save and restore the previous values of the replaceSRFs field
 	// and the field in semaCtx in case we are recursively called within a
@@ -84,7 +84,7 @@ func (b *Builder) analyzeProjectionList(
 // and adds the resulting aliases and typed expressions to outScope. See the
 // header comment for analyzeSelectList.
 func (b *Builder) analyzeReturningList(
-	returning tree.ReturningExprs, desiredTypes []types.T, inScope, outScope *scope,
+	returning tree.ReturningExprs, desiredTypes []*types.T, inScope, outScope *scope,
 ) {
 	// We need to save and restore the previous value of the field in
 	// semaCtx in case we are recursively called within a subquery
@@ -106,7 +106,7 @@ func (b *Builder) analyzeReturningList(
 // As a side-effect, the appropriate scopes are updated with aggregations
 // (scope.groupby.aggs)
 func (b *Builder) analyzeSelectList(
-	selects tree.SelectExprs, desiredTypes []types.T, inScope, outScope *scope,
+	selects tree.SelectExprs, desiredTypes []*types.T, inScope, outScope *scope,
 ) {
 	for i, e := range selects {
 		// Start with fast path, looking for simple column reference.
@@ -123,8 +123,8 @@ func (b *Builder) analyzeSelectList(
 				switch v.(type) {
 				case tree.UnqualifiedStar, *tree.AllColumnsSelector, *tree.TupleStar:
 					if e.As != "" {
-						panic(builderError{pgerror.NewErrorf(pgerror.CodeSyntaxError,
-							"%q cannot be aliased", tree.ErrString(v))})
+						panic(pgerror.Newf(pgerror.CodeSyntaxError,
+							"%q cannot be aliased", tree.ErrString(v)))
 					}
 
 					aliases, exprs := b.expandStar(e.Expr, inScope)
@@ -249,15 +249,13 @@ func (b *Builder) finishBuildScalar(
 func (b *Builder) finishBuildScalarRef(
 	col *scopeColumn, inScope, outScope *scope, outCol *scopeColumn, colRefs *opt.ColSet,
 ) (out opt.ScalarExpr) {
-	isOuterColumn := inScope == nil || inScope.isOuterColumn(col.id)
-
-	// Remember whether the query was correlated for later.
-	b.IsCorrelated = b.IsCorrelated || isOuterColumn
-
 	// Update the sets of column references and outer columns if needed.
 	if colRefs != nil {
 		colRefs.Add(int(col.id))
 	}
+
+	// Collect the outer columns of the current subquery, if any.
+	isOuterColumn := inScope == nil || inScope.isOuterColumn(col.id)
 	if isOuterColumn && b.subquery != nil {
 		b.subquery.outerCols.Add(int(col.id))
 	}

@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -22,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlplan/replicaoracle"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -58,6 +58,7 @@ func TestCanSendToFollower(t *testing.T) {
 	defer disableEnterprise()
 	st := cluster.MakeTestingClusterSettings()
 	storage.FollowerReadsEnabled.Override(&st.SV, true)
+
 	old := hlc.Timestamp{
 		WallTime: timeutil.Now().Add(2 * expectedFollowerReadOffset).UnixNano(),
 	}
@@ -69,6 +70,11 @@ func TestCanSendToFollower(t *testing.T) {
 	if canSendToFollower(uuid.MakeV4(), st, rw) {
 		t.Fatalf("should not be able to send a rw request to a follower")
 	}
+	roNonTxn := roachpb.BatchRequest{Header: oldHeader}
+	roNonTxn.Add(&roachpb.QueryTxnRequest{})
+	if canSendToFollower(uuid.MakeV4(), st, roNonTxn) {
+		t.Fatalf("should not be able to send a non-transactional ro request to a follower")
+	}
 	roNoTxn := roachpb.BatchRequest{}
 	roNoTxn.Add(&roachpb.GetRequest{})
 	if canSendToFollower(uuid.MakeV4(), st, roNoTxn) {
@@ -78,6 +84,16 @@ func TestCanSendToFollower(t *testing.T) {
 	roOld.Add(&roachpb.GetRequest{})
 	if !canSendToFollower(uuid.MakeV4(), st, roOld) {
 		t.Fatalf("should be able to send an old ro batch to a follower")
+	}
+	roRWTxnOld := roachpb.BatchRequest{Header: roachpb.Header{
+		Txn: &roachpb.Transaction{
+			TxnMeta:       enginepb.TxnMeta{Key: []byte("key")},
+			OrigTimestamp: old,
+		},
+	}}
+	roRWTxnOld.Add(&roachpb.GetRequest{})
+	if canSendToFollower(uuid.MakeV4(), st, roRWTxnOld) {
+		t.Fatalf("should not be able to send a ro request from a rw txn to a follower")
 	}
 	storage.FollowerReadsEnabled.Override(&st.SV, false)
 	if canSendToFollower(uuid.MakeV4(), st, roOld) {
@@ -91,6 +107,15 @@ func TestCanSendToFollower(t *testing.T) {
 	}}
 	if canSendToFollower(uuid.MakeV4(), st, roNew) {
 		t.Fatalf("should not be able to send a new ro batch to a follower")
+	}
+	roOldWithNewMax := roachpb.BatchRequest{Header: roachpb.Header{
+		Txn: &roachpb.Transaction{
+			MaxTimestamp: hlc.Timestamp{WallTime: timeutil.Now().UnixNano()},
+		},
+	}}
+	roOldWithNewMax.Add(&roachpb.GetRequest{})
+	if canSendToFollower(uuid.MakeV4(), st, roNew) {
+		t.Fatalf("should not be able to send a ro batch with new MaxTimestamp to a follower")
 	}
 	disableEnterprise()
 	if canSendToFollower(uuid.MakeV4(), st, roOld) {
@@ -122,14 +147,7 @@ func TestOracleFactory(t *testing.T) {
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	aCtx := log.AmbientContext{Tracer: tracing.NewTracer()}
-	rpcContext := rpc.NewContext(
-		aCtx,
-		&base.Config{Insecure: true},
-		clock,
-		stopper,
-		&st.Version,
-	)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
 	c := client.NewDB(log.AmbientContext{
 		Tracer: tracing.NewTracer(),
 	}, client.MockTxnSenderFactory{},

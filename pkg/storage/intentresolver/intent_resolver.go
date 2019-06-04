@@ -55,17 +55,16 @@ const (
 	// TODO(bdarnell): how to determine best value?
 	defaultTaskLimit = 1000
 
-	// intentResolverTimeout is the timeout when processing a group of intents.
-	// The timeout prevents intent resolution from getting stuck. Since
-	// processing intents is best effort, we'd rather give up than wait too long
-	// (this helps avoid deadlocks during test shutdown).
-	intentResolverTimeout = 30 * time.Second
+	// asyncIntentResolutionTimeout is the timeout when processing a group of
+	// intents asynchronously. The timeout prevents async intent resolution from
+	// getting stuck. Since processing intents is best effort, we'd rather give
+	// up than wait too long (this helps avoid deadlocks during test shutdown).
+	asyncIntentResolutionTimeout = 30 * time.Second
 
 	// intentResolverBatchSize is the maximum number of intents that will be
 	// resolved in a single batch. Batches that span many ranges (which is
 	// possible for the commit of a transaction that spans many ranges) will be
-	// split into many batches by the DistSender, leading to high CPU overhead
-	// and quadratic memory usage.
+	// split into many batches by the DistSender.
 	// TODO(ajwerner): justify this value
 	intentResolverBatchSize = 100
 
@@ -422,38 +421,29 @@ func (ir *IntentResolver) MaybePushTransactions(
 		return nil, nil
 	}
 
+	pusherTxn := getPusherTxn(h)
 	log.Eventf(ctx, "pushing %d transaction(s)", len(pushTxns))
 
 	// Attempt to push the transaction(s).
-	now := ir.clock.Now()
-	pusherTxn := getPusherTxn(h)
-	var pushReqs []roachpb.Request
+	b := &client.Batch{}
+	b.Header.Timestamp = ir.clock.Now()
 	for _, pushTxn := range pushTxns {
-		pushReqs = append(pushReqs, &roachpb.PushTxnRequest{
+		b.AddRawRequest(&roachpb.PushTxnRequest{
 			RequestHeader: roachpb.RequestHeader{
 				Key: pushTxn.Key,
 			},
-			PusherTxn: pusherTxn,
-			PusheeTxn: pushTxn,
-			PushTo:    h.Timestamp,
-			// The timestamp is used by PushTxn for figuring out whether the
-			// transaction is abandoned. If we used the argument's timestamp
-			// here, we would run into busy loops because that timestamp
-			// usually stays fixed among retries, so it will never realize
-			// that a transaction has timed out. See #877.
-			Now:      now,
-			PushType: pushType,
+			PusherTxn:       pusherTxn,
+			PusheeTxn:       pushTxn,
+			PushTo:          h.Timestamp.Next(),
+			InclusivePushTo: true,
+			DeprecatedNow:   b.Header.Timestamp,
+			PushType:        pushType,
 		})
 	}
-	b := &client.Batch{}
-	b.AddRawRequest(pushReqs...)
-	var pErr *roachpb.Error
-	if err := ir.db.Run(ctx, b); err != nil {
-		pErr = b.MustPErr()
-	}
+	err := ir.db.Run(ctx, b)
 	cleanupInFlightPushes()
-	if pErr != nil {
-		return nil, pErr
+	if err != nil {
+		return nil, b.MustPErr()
 	}
 
 	br := b.RawResponse()
@@ -461,7 +451,7 @@ func (ir *IntentResolver) MaybePushTransactions(
 	for _, resp := range br.Responses {
 		txn := resp.GetInner().(*roachpb.PushTxnResponse).PusheeTxn
 		if _, ok := pushedTxns[txn.ID]; ok {
-			log.Fatalf(ctx, "have two PushTxn responses for %s\nreqs: %+v", txn.ID, pushReqs)
+			log.Fatalf(ctx, "have two PushTxn responses for %s", txn.ID)
 		}
 		pushedTxns[txn.ID] = txn
 		log.Eventf(ctx, "%s is now %s", txn.ID, txn.Status)
@@ -513,10 +503,13 @@ func (ir *IntentResolver) CleanupIntentsAsync(
 	now := ir.clock.Now()
 	for _, item := range intents {
 		if err := ir.runAsyncTask(ctx, allowSyncProcessing, func(ctx context.Context) {
-			if _, err := ir.CleanupIntents(ctx, item.Intents, now, roachpb.PUSH_TOUCH); err != nil {
-				if ir.every.ShouldLog() {
-					log.Warning(ctx, err)
-				}
+			err := contextutil.RunWithTimeout(ctx, "async intent resolution",
+				asyncIntentResolutionTimeout, func(ctx context.Context) error {
+					_, err := ir.CleanupIntents(ctx, item.Intents, now, roachpb.PUSH_TOUCH)
+					return err
+				})
+			if err != nil && ir.every.ShouldLog() {
+				log.Warning(ctx, err)
 			}
 		}); err != nil {
 			return err
@@ -615,7 +608,7 @@ func (ir *IntentResolver) CleanupTxnIntentsAsync(
 				return
 			}
 			defer release()
-			intents := roachpb.AsIntents(et.Txn.Intents, &et.Txn)
+			intents := roachpb.AsIntents(et.Txn.IntentSpans, &et.Txn)
 			if err := ir.cleanupFinishedTxnIntents(ctx, rangeID, &et.Txn, intents, now, et.Poison, nil); err != nil {
 				if ir.every.ShouldLog() {
 					log.Warningf(ctx, "failed to cleanup transaction intents: %s", err)
@@ -650,13 +643,12 @@ func (ir *IntentResolver) lockInFlightTxnCleanup(
 	}
 }
 
-// CleanupTxnIntentsOnGCAsync cleans up extant intents owned by a
-// single transaction, asynchronously (but returning an error if the
-// IntentResolver's semaphore is maxed out). If the transaction is
-// PENDING, but expired, it is pushed first to abort it. onComplete is
-// called if non-nil upon completion of async task with the intention that
-// it be used as a hook to update metrics. It will not be called if an error
-// is returned.
+// CleanupTxnIntentsOnGCAsync cleans up extant intents owned by a single
+// transaction, asynchronously (but returning an error if the IntentResolver's
+// semaphore is maxed out). If the transaction is not finalized, but expired, it
+// is pushed first to abort it. onComplete is called if non-nil upon completion
+// of async task with the intention that it be used as a hook to update metrics.
+// It will not be called if an error is returned.
 func (ir *IntentResolver) CleanupTxnIntentsOnGCAsync(
 	ctx context.Context,
 	rangeID roachpb.RangeID,
@@ -691,33 +683,35 @@ func (ir *IntentResolver) CleanupTxnIntentsOnGCAsync(
 				return
 			}
 			defer release()
-			// If the transaction is still pending, but expired, push it
+			// If the transaction is not yet finalized, but expired, push it
 			// before resolving the intents.
-			if txn.Status == roachpb.PENDING {
+			if !txn.Status.IsFinalized() {
 				if !txnwait.IsExpired(now, txn) {
-					log.VErrEventf(ctx, 3, "cannot push a PENDING transaction which is not expired: %s", txn)
+					log.VErrEventf(ctx, 3, "cannot push a %s transaction which is not expired: %s", txn.Status, txn)
 					return
 				}
 				b := &client.Batch{}
+				b.Header.Timestamp = now
 				b.AddRawRequest(&roachpb.PushTxnRequest{
 					RequestHeader: roachpb.RequestHeader{Key: txn.Key},
 					PusherTxn: roachpb.Transaction{
-						TxnMeta: enginepb.TxnMeta{Priority: roachpb.MaxTxnPriority},
+						TxnMeta: enginepb.TxnMeta{Priority: enginepb.MaxTxnPriority},
 					},
-					PusheeTxn: txn.TxnMeta,
-					Now:       now,
-					PushType:  roachpb.PUSH_ABORT,
+					PusheeTxn:       txn.TxnMeta,
+					DeprecatedNow:   b.Header.Timestamp,
+					PushType:        roachpb.PUSH_ABORT,
+					InclusivePushTo: true,
 				})
 				pushed = true
 				if err := ir.db.Run(ctx, b); err != nil {
-					log.VErrEventf(ctx, 2, "failed to push PENDING, expired txn (%s): %s", txn, err)
+					log.VErrEventf(ctx, 2, "failed to push %s, expired txn (%s): %s", txn.Status, txn, err)
 					return
 				}
 				// Get the pushed txn and update the intents slice.
 				txn = &b.RawResponse().Responses[0].GetInner().(*roachpb.PushTxnResponse).PusheeTxn
-				for _, intent := range intents {
-					intent.Txn = txn.TxnMeta
-					intent.Status = txn.Status
+				for i := range intents {
+					intents[i].Txn = txn.TxnMeta
+					intents[i].Status = txn.Status
 				}
 			}
 			var onCleanupComplete func(error)
@@ -942,10 +936,7 @@ func (ir *IntentResolver) ResolveIntents(
 			b := &client.Batch{}
 			b.Header.MaxSpanRequestKeys = intentResolverBatchSize
 			b.AddRawRequest(req)
-			if err := contextutil.RunWithTimeout(ctx, "resolve span intents", intentResolverTimeout,
-				func(ctx context.Context) error {
-					return ir.db.Run(ctx, b)
-				}); err != nil {
+			if err := ir.db.Run(ctx, b); err != nil {
 				return err
 			}
 			// Check response to see if it must be resumed.

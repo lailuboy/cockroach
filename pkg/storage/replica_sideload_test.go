@@ -94,7 +94,7 @@ func TestSideloadingSideloadedStorage(t *testing.T) {
 	t.Run("Disk", func(t *testing.T) {
 		maker := func(
 			s *cluster.Settings, rangeID roachpb.RangeID, rep roachpb.ReplicaID, name string, eng engine.Engine,
-		) (sideloadStorage, error) {
+		) (SideloadStorage, error) {
 			return newDiskSideloadStorage(s, rangeID, rep, name, rate.NewLimiter(rate.Inf, math.MaxInt64), eng)
 		}
 		testSideloadingSideloadedStorage(t, maker)
@@ -103,7 +103,7 @@ func TestSideloadingSideloadedStorage(t *testing.T) {
 
 func testSideloadingSideloadedStorage(
 	t *testing.T,
-	maker func(*cluster.Settings, roachpb.RangeID, roachpb.ReplicaID, string, engine.Engine) (sideloadStorage, error),
+	maker func(*cluster.Settings, roachpb.RangeID, roachpb.ReplicaID, string, engine.Engine) (SideloadStorage, error),
 ) {
 	dir, cleanup := testutils.TempDir(t)
 	defer cleanup()
@@ -193,7 +193,7 @@ func testSideloadingSideloadedStorage(
 		{
 			err: nil,
 			fun: func() error {
-				_, err := ss.TruncateTo(ctx, 123)
+				_, _, err := ss.TruncateTo(ctx, 123)
 				return err
 			},
 		},
@@ -258,7 +258,7 @@ func testSideloadingSideloadedStorage(
 
 	for n := range payloads {
 		// Truncate indexes <= payloads[n] (payloads is sorted in increasing order).
-		if _, err := ss.TruncateTo(ctx, payloads[n]); err != nil {
+		if _, _, err := ss.TruncateTo(ctx, payloads[n]); err != nil {
 			t.Fatalf("%d: %s", n, err)
 		}
 		// Index payloads[n] and above are still there (truncation is exclusive)
@@ -291,7 +291,7 @@ func testSideloadingSideloadedStorage(
 		}
 		defer f.Close()
 
-		_, err = ss.TruncateTo(ctx, math.MaxUint64)
+		_, _, err = ss.TruncateTo(ctx, math.MaxUint64)
 		if err == nil {
 			t.Fatalf("sideloaded directory should not have been removable due to extra file %s", nonRemovableFile)
 		}
@@ -306,7 +306,7 @@ func testSideloadingSideloadedStorage(
 		}
 
 		// Test that directory is removed when filepath.Glob returns 0 matches.
-		if _, err := ss.TruncateTo(ctx, math.MaxUint64); err != nil {
+		if _, _, err := ss.TruncateTo(ctx, math.MaxUint64); err != nil {
 			t.Fatal(err)
 		}
 		// Ensure directory is removed, now that all files should be gone.
@@ -330,7 +330,7 @@ func testSideloadingSideloadedStorage(
 			}
 		}
 		assertCreated(true)
-		if _, err := ss.TruncateTo(ctx, math.MaxUint64); err != nil {
+		if _, _, err := ss.TruncateTo(ctx, math.MaxUint64); err != nil {
 			t.Fatal(err)
 		}
 		// Ensure directory is removed when all records are removed.
@@ -352,7 +352,7 @@ func testSideloadingSideloadedStorage(
 	assertCreated(false)
 
 	// Sanity check that we can call TruncateTo without the directory existing.
-	if _, err := ss.TruncateTo(ctx, 1); err != nil {
+	if _, _, err := ss.TruncateTo(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -411,7 +411,7 @@ func TestSideloadedStorageReplicaIDMigration(t *testing.T) {
 	defer eng.Close()
 	limiter := rate.NewLimiter(rate.Inf, 1<<9)
 
-	var ss sideloadStorage
+	var ss SideloadStorage
 	create := func(st *cluster.Settings, replicaID roachpb.ReplicaID) *diskSideloadStorage {
 		t.Helper()
 		if err := moveSideloadedData(ss, dir, rangeID, replicaID); err != nil {
@@ -467,7 +467,7 @@ func TestRaftSSTableSideloadingInline(t *testing.T) {
 		// after having (perhaps) been modified.
 		thin, fat raftpb.Entry
 		// Populate the raft entry cache and sideload storage before running the test.
-		setup func(*raftentry.Cache, sideloadStorage)
+		setup func(*raftentry.Cache, SideloadStorage)
 		// If nonempty, the error expected from maybeInlineSideloadedRaftCommand.
 		expErr string
 		// If nonempty, a regex that the recorded trace span must match.
@@ -482,7 +482,7 @@ func TestRaftSSTableSideloadingInline(t *testing.T) {
 		CRC32: 0, // not checked
 	}
 
-	putOnDisk := func(ec *raftentry.Cache, ss sideloadStorage) {
+	putOnDisk := func(ec *raftentry.Cache, ss SideloadStorage) {
 		if err := ss.Put(context.Background(), 5, 6, sstFat.Data); err != nil {
 			t.Fatal(err)
 		}
@@ -509,14 +509,14 @@ func TestRaftSSTableSideloadingInline(t *testing.T) {
 		},
 		"v2-with-payload-with-file-with-cache": {
 			thin: mkEnt(v2, 5, 6, &sstThin), fat: mkEnt(v2, 5, 6, &sstFat),
-			setup: func(ec *raftentry.Cache, ss sideloadStorage) {
+			setup: func(ec *raftentry.Cache, ss SideloadStorage) {
 				putOnDisk(ec, ss)
-				ec.Add(rangeID, []raftpb.Entry{mkEnt(v2, 5, 6, &sstFat)})
+				ec.Add(rangeID, []raftpb.Entry{mkEnt(v2, 5, 6, &sstFat)}, true)
 			}, expTrace: "using cache hit",
 		},
 		"v2-fat-without-file": {
 			thin: mkEnt(v2, 5, 6, &sstFat), fat: mkEnt(v2, 5, 6, &sstFat),
-			setup:    func(ec *raftentry.Cache, ss sideloadStorage) {},
+			setup:    func(ec *raftentry.Cache, ss SideloadStorage) {},
 			expTrace: "already inlined",
 		},
 	}
@@ -569,66 +569,8 @@ func TestRaftSSTableSideloadingInline(t *testing.T) {
 	}
 }
 
-func TestRaftSSTableSideloadingInflight(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	ctx, collect, cancel := tracing.ContextWithRecordingSpan(context.Background(), "test-recording")
-	defer cancel()
-
-	sideloaded := mustNewInMemSideloadStorage(roachpb.RangeID(5), roachpb.ReplicaID(7), ".")
-
-	// We'll set things up so that while sideloading this entry, there
-	// unmarshaled one is already in memory (so the payload here won't even be
-	// looked at).
-	preEnts := []raftpb.Entry{mkEnt(raftVersionSideloaded, 7, 1, &storagepb.ReplicatedEvalResult_AddSSTable{
-		Data:  []byte("not the payload you're looking for"),
-		CRC32: 0, // not checked
-	})}
-
-	origBytes := []byte("compare me")
-
-	// Pretend there's an inflight command that actually has an SSTable in it.
-	var pendingCmd storagepb.RaftCommand
-	pendingCmd.ReplicatedEvalResult.AddSSTable = &storagepb.ReplicatedEvalResult_AddSSTable{
-		Data: origBytes, CRC32: 0, // not checked
-	}
-	maybeCmd := func(cmdID storagebase.CmdIDKey) (storagepb.RaftCommand, bool) {
-		return pendingCmd, true
-	}
-
-	// The entry should be recognized as "to be sideloaded", then maybeCmd is
-	// invoked and supplies the RaftCommand, whose SSTable is then persisted.
-	postEnts, size, err := maybeSideloadEntriesImpl(ctx, preEnts, sideloaded, maybeCmd)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(postEnts) != 1 {
-		t.Fatalf("expected exactly one entry: %+v", postEnts)
-	}
-	if size != int64(len(origBytes)) {
-		t.Fatalf("expected %d sideloadedSize, but found %d", len(origBytes), size)
-	}
-
-	if b, err := sideloaded.Get(ctx, preEnts[0].Index, preEnts[0].Term); err != nil {
-		t.Fatal(err)
-	} else if !bytes.Equal(b, origBytes) {
-		t.Fatalf("expected payload %s, got %s", origBytes, b)
-	}
-
-	re := regexp.MustCompile(`(?ms)copying entries slice of length 1.*command already in memory.*writing payload`)
-	if trace := tracing.FormatRecordedSpans(collect()); !re.MatchString(trace) {
-		t.Fatalf("trace did not match %s:\n%s", re, trace)
-	}
-}
-
 func TestRaftSSTableSideloadingSideload(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-
-	ctx := context.Background()
-	noCmd := func(storagebase.CmdIDKey) (cmd storagepb.RaftCommand, ok bool) {
-		return
-	}
 
 	addSST := storagepb.ReplicatedEvalResult_AddSSTable{
 		Data: []byte("foo"), CRC32: 0, // not checked
@@ -684,8 +626,9 @@ func TestRaftSSTableSideloadingSideload(t *testing.T) {
 
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
 			sideloaded := mustNewInMemSideloadStorage(roachpb.RangeID(3), roachpb.ReplicaID(17), ".")
-			postEnts, size, err := maybeSideloadEntriesImpl(ctx, test.preEnts, sideloaded, noCmd)
+			postEnts, size, err := maybeSideloadEntriesImpl(ctx, test.preEnts, sideloaded)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -840,7 +783,7 @@ func testRaftSSTableSideloadingProposal(t *testing.T, engineInMem, mockSideloade
 		}
 	}
 
-	if _, err := tc.store.raftLogQueue.Add(tc.repl, 99.99 /* priority */); err != nil {
+	if _, err := tc.store.raftLogQueue.testingAdd(ctx, tc.repl, 99.99 /* priority */); err != nil {
 		t.Fatal(err)
 	}
 	tc.store.MustForceRaftLogScanAndProcess()
@@ -997,7 +940,7 @@ func TestRaftSSTableSideloadingSnapshot(t *testing.T) {
 		for _, withSS := range []bool{false, true} {
 			tc.store.raftEntryCache.Clear(tc.repl.RangeID, sideloadedIndex+1)
 
-			var ss sideloadStorage
+			var ss SideloadStorage
 			if withSS {
 				ss = tc.repl.raftMu.sideloaded
 			}

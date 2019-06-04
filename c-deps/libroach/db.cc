@@ -18,6 +18,7 @@
 #include <rocksdb/perf_context.h>
 #include <rocksdb/sst_file_writer.h>
 #include <rocksdb/table.h>
+#include <rocksdb/utilities/checkpoint.h>
 #include <stdarg.h>
 #include "batch.h"
 #include "cache.h"
@@ -179,6 +180,9 @@ DBStatus DBOpen(DBEngine** db, DBSlice dir, DBOptions db_opts) {
     auto memenv = rocksdb::NewMemEnv(rocksdb::Env::Default());
     // Register it for deletion.
     env_mgr->TakeEnvOwnership(memenv);
+    // Create a root directory to suppress error messages that RocksDB would
+    // print if it had to create the DB directory itself.
+    memenv->CreateDir("/");
     // Make it the env that all other Envs must wrap.
     env_mgr->base_env = memenv;
     // Make it the env for rocksdb.
@@ -253,6 +257,22 @@ DBStatus DBOpen(DBEngine** db, DBSlice dir, DBOptions db_opts) {
                    db_opts.cache != nullptr ? db_opts.cache->rep : nullptr, event_listener);
   return kSuccess;
 }
+
+DBStatus DBCreateCheckpoint(DBEngine* db, DBSlice dir) {
+  const std::string cp_dir = ToString(dir);
+
+  rocksdb::Checkpoint* cp_ptr;
+  auto status = rocksdb::Checkpoint::Create(db->rep, &cp_ptr);
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+  // NB: passing 0 for log_size_for_flush forces a WAL sync, i.e. makes sure
+  // that the checkpoint is up to date.
+  status = cp_ptr->CreateCheckpoint(cp_dir, 0 /* log_size_for_flush */);
+  delete(cp_ptr);
+  return ToDBStatus(status);
+}
+
 
 DBStatus DBDestroy(DBSlice dir) {
   rocksdb::Options options;
@@ -657,6 +677,17 @@ DBStatus DBPartialMergeOne(DBSlice existing, DBSlice update, DBString* new_value
 // DBGetStats queries the given DBEngine for various operational stats and
 // write them to the provided DBStatsResult instance.
 DBStatus DBGetStats(DBEngine* db, DBStatsResult* stats) { return db->GetStats(stats); }
+
+// `DBGetTickersAndHistograms` retrieves maps of all RocksDB tickers and histograms.
+// It differs from `DBGetStats` by getting _every_ ticker and histogram, and by not
+// getting anything else (DB properties, for example).
+//
+// In addition to freeing the `DBString`s in the result, the caller is also
+// responsible for freeing `DBTickersAndHistogramsResult::tickers` and
+// `DBTickersAndHistogramsResult::histograms`.
+DBStatus DBGetTickersAndHistograms(DBEngine* db, DBTickersAndHistogramsResult* stats) {
+  return db->GetTickersAndHistograms(stats);
+}
 
 DBString DBGetCompactionStats(DBEngine* db) { return db->GetCompactionStats(); }
 

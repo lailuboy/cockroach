@@ -24,11 +24,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colencoding"
-	"github.com/cockroachdb/cockroach/pkg/sql/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/types/conv"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	semtypes "github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -72,6 +75,10 @@ type cTableInfo struct {
 	// index (into cols); -1 if we don't need the value for that column.
 	indexColOrdinals []int
 
+	// The set of column ordinals which are both composite and part of the index
+	// key.
+	compositeIndexColOrdinals util.FastIntSet
+
 	// One value per column that is part of the key; each value is a column
 	// index (into cols); -1 if we don't need the value for that column.
 	extraValColOrdinals []int
@@ -85,8 +92,8 @@ type cTableInfo struct {
 	// id pair at the start of the key.
 	knownPrefixLength int
 
-	keyValTypes []sqlbase.ColumnType
-	extraTypes  []sqlbase.ColumnType
+	keyValTypes []semtypes.T
+	extraTypes  []semtypes.T
 }
 
 // colIdxMap is a "map" that contains the ordinal in cols for each ColumnID
@@ -174,7 +181,7 @@ type CFetcher struct {
 	// requests. This has some cost, so it's only enabled by DistSQL when this
 	// info is actually useful for correcting the plan (e.g. not for the PK-side
 	// of an index-join).
-	// If set, GetRangeInfo() can be used to retrieve the accumulated info.
+	// If set, GetRangesInfo() can be used to retrieve the accumulated info.
 	returnRangeInfo bool
 
 	// traceKV indicates whether or not session tracing is enabled. It is set
@@ -211,11 +218,11 @@ type CFetcher struct {
 		prettyValueBuf *bytes.Buffer
 
 		// batch is the output batch the fetcher writes to.
-		batch exec.ColBatch
+		batch coldata.Batch
 
 		// colvecs is a slice of the ColVecs within batch, pulled out to avoid
-		// having to call batch.ColVec too often in the tight loop.
-		colvecs []exec.ColVec
+		// having to call batch.Vec too often in the tight loop.
+		colvecs []coldata.Vec
 	}
 }
 
@@ -227,7 +234,7 @@ func (rf *CFetcher) Init(
 	returnRangeInfo bool, isCheck bool, tables ...FetcherTableArgs,
 ) error {
 	if len(tables) == 0 {
-		panic("no tables to fetch from")
+		return pgerror.AssertionFailedf("no tables to fetch from")
 	}
 
 	rf.reverse = reverse
@@ -252,9 +259,9 @@ func (rf *CFetcher) Init(
 	colDescriptors := tableArgs.Cols
 	typs := make([]types.T, len(colDescriptors))
 	for i := range typs {
-		typs[i] = types.FromColumnType(colDescriptors[i].Type)
+		typs[i] = conv.FromColumnType(&colDescriptors[i].Type)
 		if typs[i] == types.Unhandled {
-			return errors.Errorf("unhandled type %+v", colDescriptors[i].Type)
+			return errors.Errorf("unhandled type %+v", &colDescriptors[i].Type)
 		}
 	}
 	table := cTableInfo{
@@ -271,7 +278,7 @@ func (rf *CFetcher) Init(
 		indexColOrdinals:    oldTable.indexColOrdinals[:0],
 		extraValColOrdinals: oldTable.extraValColOrdinals[:0],
 	}
-	rf.machine.batch = exec.NewMemBatch(typs)
+	rf.machine.batch = coldata.NewMemBatch(typs)
 	rf.machine.colvecs = rf.machine.batch.ColVecs()
 
 	var err error
@@ -313,16 +320,18 @@ func (rf *CFetcher) Init(
 			table.indexColOrdinals[i] = colIdx
 			if neededCols.Contains(int(id)) {
 				neededIndexCols++
-				if !compositeColumnIDs.Contains(int(id)) {
-					// A composite column lives both in the index and in the value; if
-					// its needed, it must also be decoded from the value.
+				// A composite column might also have a value encoding which must be
+				// decoded. Others can be removed from neededValueColsByIdx.
+				if compositeColumnIDs.Contains(int(id)) {
+					table.compositeIndexColOrdinals.Add(colIdx)
+				} else {
 					table.neededValueColsByIdx.Remove(colIdx)
 				}
 			}
 		} else {
 			table.indexColOrdinals[i] = -1
 			if neededCols.Contains(int(id)) {
-				panic(fmt.Sprintf("needed column %d not in colIdxMap", id))
+				return pgerror.AssertionFailedf("needed column %d not in colIdxMap", id)
 			}
 		}
 
@@ -403,7 +412,7 @@ func (rf *CFetcher) StartScan(
 	traceKV bool,
 ) error {
 	if len(spans) == 0 {
-		panic("no spans")
+		return pgerror.AssertionFailedf("no spans")
 	}
 
 	rf.traceKV = traceKV
@@ -516,13 +525,13 @@ const (
 // Turn this on to enable super verbose logging of the fetcher state machine.
 const debugState = false
 
-// NextBatch processes keys until we complete one batch of rows, ColBatchSize
-// in length, which are returned in columnar format as an exec.ColBatch. The
-// batch contains one ColVec per table column, regardless of the index used;
-// columns that are not needed (as per neededCols) are empty. The
-// ColBatch should not be modified and is only valid until the next call.
-// When there are no more rows, the ColBatch.Length is 0.
-func (rf *CFetcher) NextBatch(ctx context.Context) (exec.ColBatch, error) {
+// NextBatch processes keys until we complete one batch of rows,
+// coldata.BatchSize in length, which are returned in columnar format as an
+// exec.Batch. The batch contains one Vec per table column, regardless of the
+// index used; columns that are not needed (as per neededCols) are empty. The
+// Batch should not be modified and is only valid until the next call.
+// When there are no more rows, the Batch.Length is 0.
+func (rf *CFetcher) NextBatch(ctx context.Context) (coldata.Batch, error) {
 	for {
 		if debugState {
 			log.Infof(ctx, "State %s", rf.machine.state[0])
@@ -567,7 +576,7 @@ func (rf *CFetcher) NextBatch(ctx context.Context) (exec.ColBatch, error) {
 
 		case stateResetBatch:
 			for i := range rf.machine.colvecs {
-				rf.machine.colvecs[i].UnsetNulls()
+				rf.machine.colvecs[i].Nulls().UnsetNulls()
 			}
 			rf.machine.batch.SetSelection(false)
 			rf.shiftState()
@@ -703,7 +712,7 @@ func (rf *CFetcher) NextBatch(ctx context.Context) (exec.ColBatch, error) {
 			}
 			rf.machine.rowIdx++
 			rf.shiftState()
-			if rf.machine.rowIdx >= exec.ColBatchSize {
+			if rf.machine.rowIdx >= coldata.BatchSize {
 				rf.pushState(stateResetBatch)
 				rf.machine.batch.SetLength(rf.machine.rowIdx)
 				rf.machine.rowIdx = 0
@@ -885,7 +894,7 @@ func (rf *CFetcher) processValueSingle(
 			if len(val.RawBytes) == 0 {
 				return prettyKey, "", nil
 			}
-			typ := table.cols[idx].Type
+			typ := &table.cols[idx].Type
 			err := colencoding.UnmarshalColumnValueToCol(rf.machine.colvecs[idx], rf.machine.rowIdx, typ, val)
 			if err != nil {
 				return "", "", err
@@ -1003,12 +1012,18 @@ func (rf *CFetcher) processValueTuple(
 ) (prettyKey string, prettyValue string, err error) {
 	return rf.processValueBytes(ctx, table, tupleBytes, prettyKeyPrefix)
 }
+
 func (rf *CFetcher) fillNulls() error {
 	table := &rf.table
 	if rf.machine.remainingValueColsByIdx.Empty() {
 		return nil
 	}
 	for i, ok := rf.machine.remainingValueColsByIdx.Next(0); ok; i, ok = rf.machine.remainingValueColsByIdx.Next(i + 1) {
+		// Composite index columns may have a key but no value. Ignore them so we
+		// don't incorrectly mark them as null.
+		if table.compositeIndexColOrdinals.Contains(i) {
+			continue
+		}
 		if !table.cols[i].Nullable {
 			var indexColValues []string
 			for _, idx := range table.indexColOrdinals {
@@ -1024,7 +1039,13 @@ func (rf *CFetcher) fillNulls() error {
 					strings.Join(table.index.ColumnNames, ","), strings.Join(indexColValues, ",")))
 			}
 		}
-		rf.machine.colvecs[i].SetNull(rf.machine.rowIdx)
+		rf.machine.colvecs[i].Nulls().SetNull(rf.machine.rowIdx)
 	}
 	return nil
+}
+
+// GetRangesInfo returns information about the ranges where the rows came from.
+// The RangeInfo's are deduped and not ordered.
+func (rf *CFetcher) GetRangesInfo() []roachpb.RangeInfo {
+	return rf.fetcher.getRangesInfo()
 }

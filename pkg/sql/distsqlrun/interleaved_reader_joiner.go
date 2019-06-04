@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -95,7 +96,7 @@ func (irj *interleavedReaderJoiner) Start(ctx context.Context) context.Context {
 	return ctx
 }
 
-func (irj *interleavedReaderJoiner) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+func (irj *interleavedReaderJoiner) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
 	// Next is implemented as a state machine. The states are represented by the
 	// irjState enum at the top of this file.
 	// Roughly, the state machine is either in an initialization phase, a steady
@@ -104,7 +105,7 @@ func (irj *interleavedReaderJoiner) Next() (sqlbase.EncDatumRow, *ProducerMetada
 	// seen ancestor if the join type calls for it.
 	for irj.State == StateRunning {
 		var row sqlbase.EncDatumRow
-		var meta *ProducerMetadata
+		var meta *distsqlpb.ProducerMetadata
 		switch irj.runningState {
 		case irjReading:
 			irj.runningState, row, meta = irj.nextRow()
@@ -148,7 +149,11 @@ func (irj *interleavedReaderJoiner) findTable(
 // nextRow implements the steady state of the interleavedReaderJoiner. It
 // requests the next row from its backing kv fetcher, determines whether its an
 // ancestor or child row, and conditionally merges and outputs a result.
-func (irj *interleavedReaderJoiner) nextRow() (irjState, sqlbase.EncDatumRow, *ProducerMetadata) {
+func (irj *interleavedReaderJoiner) nextRow() (
+	irjState,
+	sqlbase.EncDatumRow,
+	*distsqlpb.ProducerMetadata,
+) {
 	row, desc, index, err := irj.fetcher.NextRow(irj.Ctx)
 	if err != nil {
 		irj.MoveToDraining(scrub.UnwrapScrubError(err))
@@ -266,6 +271,7 @@ func (irj *interleavedReaderJoiner) ConsumerClosed() {
 }
 
 var _ Processor = &interleavedReaderJoiner{}
+var _ distsqlpb.MetadataSource = &interleavedReaderJoiner{}
 
 // newInterleavedReaderJoiner creates a interleavedReaderJoiner.
 func newInterleavedReaderJoiner(
@@ -276,13 +282,13 @@ func newInterleavedReaderJoiner(
 	output RowReceiver,
 ) (*interleavedReaderJoiner, error) {
 	if flowCtx.nodeID == 0 {
-		return nil, errors.Errorf("attempting to create an interleavedReaderJoiner with uninitialized NodeID")
+		return nil, pgerror.AssertionFailedf("attempting to create an interleavedReaderJoiner with uninitialized NodeID")
 	}
 
 	// TODO(richardwu): We can relax this to < 2 (i.e. permit 2+ tables).
 	// This will require modifying joinerBase init logic.
 	if len(spec.Tables) != 2 {
-		return nil, errors.Errorf("interleavedReaderJoiner only reads from two tables in an interleaved hierarchy")
+		return nil, pgerror.AssertionFailedf("interleavedReaderJoiner only reads from two tables in an interleaved hierarchy")
 	}
 
 	// Ensure the column orderings of all tables being merged are in the
@@ -290,7 +296,7 @@ func newInterleavedReaderJoiner(
 	for i, c := range spec.Tables[0].Ordering.Columns {
 		for _, table := range spec.Tables[1:] {
 			if table.Ordering.Columns[i].Direction != c.Direction {
-				return nil, errors.Errorf("unmatched column orderings")
+				return nil, pgerror.AssertionFailedf("unmatched column orderings")
 			}
 		}
 	}
@@ -320,9 +326,10 @@ func newInterleavedReaderJoiner(
 		}
 
 		if err := tables[i].post.Init(
-			&table.Post, table.Desc.ColumnTypes(), flowCtx.EvalCtx, nil, /*output*/
+			&table.Post, table.Desc.ColumnTypes(), flowCtx.NewEvalCtx(), nil, /*output*/
 		); err != nil {
-			return nil, errors.Wrapf(err, "failed to initialize post-processing helper")
+			return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+				"failed to initialize post-processing helper")
 		}
 
 		tables[i].tableID = table.Desc.ID
@@ -334,7 +341,8 @@ func newInterleavedReaderJoiner(
 	}
 
 	if len(spec.Tables[0].Ordering.Columns) != numAncestorPKCols {
-		return nil, errors.Errorf("interleavedReaderJoiner only supports joins on the entire interleaved prefix")
+		return nil, pgerror.AssertionFailedf(
+			"interleavedReaderJoiner only supports joins on the entire interleaved prefix")
 	}
 
 	allSpans, _ = roachpb.MergeSpans(allSpans)
@@ -417,17 +425,29 @@ func (irj *interleavedReaderJoiner) initRowFetcher(
 		args...)
 }
 
-func (irj *interleavedReaderJoiner) generateTrailingMeta(ctx context.Context) []ProducerMetadata {
-	var trailingMeta []ProducerMetadata
-	ranges := misplannedRanges(irj.Ctx, irj.fetcher.GetRangeInfo(), irj.flowCtx.nodeID)
-	if ranges != nil {
-		trailingMeta = append(trailingMeta, ProducerMetadata{Ranges: ranges})
-	}
-	if meta := getTxnCoordMeta(ctx, irj.flowCtx.txn); meta != nil {
-		trailingMeta = append(trailingMeta, ProducerMetadata{TxnCoordMeta: meta})
-	}
+func (irj *interleavedReaderJoiner) generateTrailingMeta(
+	ctx context.Context,
+) []distsqlpb.ProducerMetadata {
+	trailingMeta := irj.generateMeta(ctx)
 	irj.InternalClose()
 	return trailingMeta
+}
+
+func (irj *interleavedReaderJoiner) generateMeta(ctx context.Context) []distsqlpb.ProducerMetadata {
+	var trailingMeta []distsqlpb.ProducerMetadata
+	ranges := misplannedRanges(ctx, irj.fetcher.GetRangesInfo(), irj.flowCtx.nodeID)
+	if ranges != nil {
+		trailingMeta = append(trailingMeta, distsqlpb.ProducerMetadata{Ranges: ranges})
+	}
+	if meta := getTxnCoordMeta(ctx, irj.flowCtx.txn); meta != nil {
+		trailingMeta = append(trailingMeta, distsqlpb.ProducerMetadata{TxnCoordMeta: meta})
+	}
+	return trailingMeta
+}
+
+// DrainMeta is part of the MetadataSource interface.
+func (irj *interleavedReaderJoiner) DrainMeta(ctx context.Context) []distsqlpb.ProducerMetadata {
+	return irj.generateMeta(ctx)
 }
 
 const interleavedReaderJoinerProcName = "interleaved reader joiner"

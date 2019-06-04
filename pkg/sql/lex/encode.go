@@ -181,6 +181,21 @@ func encodeEscapedSQLIdent(buf *bytes.Buffer, s string) {
 	buf.WriteByte('"')
 }
 
+// EncodeLocaleName writes the locale identifier in s to buf. Any dash
+// characters are mapped to underscore characters. Underscore characters do not
+// need to be quoted, and they are considered equivalent to dash characters by
+// the CLDR standard: http://cldr.unicode.org/.
+func EncodeLocaleName(buf *bytes.Buffer, s string) {
+	for i, n := 0, len(s); i < n; i++ {
+		ch := s[i]
+		if ch == '-' {
+			buf.WriteByte('_')
+		} else {
+			buf.WriteByte(ch)
+		}
+	}
+}
+
 // EncodeSQLBytes encodes the SQL byte array in 'in' to buf, to a
 // format suitable for re-scanning. We don't use a straightforward hex
 // encoding here with x'...'  because the result would be less
@@ -292,7 +307,7 @@ func DecodeRawBytesToByteArray(data string, be sessiondata.BytesEncodeFormat) ([
 				continue
 			}
 			if i >= len(data)-1 {
-				return nil, pgerror.NewError(pgerror.CodeInvalidEscapeSequenceError,
+				return nil, pgerror.New(pgerror.CodeInvalidEscapeSequenceError,
 					"bytea encoded value ends with escape character")
 			}
 			if data[i+1] == '\\' {
@@ -301,14 +316,14 @@ func DecodeRawBytesToByteArray(data string, be sessiondata.BytesEncodeFormat) ([
 				continue
 			}
 			if i+3 >= len(data) {
-				return nil, pgerror.NewError(pgerror.CodeInvalidEscapeSequenceError,
+				return nil, pgerror.New(pgerror.CodeInvalidEscapeSequenceError,
 					"bytea encoded value ends with incomplete escape sequence")
 			}
 			b := byte(0)
 			for j := 1; j <= 3; j++ {
 				octDigit := data[i+j]
 				if octDigit < '0' || octDigit > '7' {
-					return nil, pgerror.NewError(pgerror.CodeInvalidEscapeSequenceError,
+					return nil, pgerror.New(pgerror.CodeInvalidEscapeSequenceError,
 						"invalid bytea escape sequence")
 				}
 				b = (b << 3) | (octDigit - '0')
@@ -322,7 +337,7 @@ func DecodeRawBytesToByteArray(data string, be sessiondata.BytesEncodeFormat) ([
 		return base64.StdEncoding.DecodeString(data)
 
 	default:
-		return nil, pgerror.NewAssertionErrorf("unhandled format: %s", be)
+		return nil, pgerror.AssertionFailedf("unhandled format: %s", be)
 	}
 }
 

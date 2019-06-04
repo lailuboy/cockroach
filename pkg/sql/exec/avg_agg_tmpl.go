@@ -25,6 +25,7 @@ package exec
 
 import (
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/pkg/errors"
@@ -80,7 +81,7 @@ type avg_TYPEAgg struct {
 
 var _ aggregateFunc = &avg_TYPEAgg{}
 
-func (a *avg_TYPEAgg) Init(groups []bool, v ColVec) {
+func (a *avg_TYPEAgg) Init(groups []bool, v coldata.Vec) {
 	a.groups = groups
 	a.scratch.vec = v._TemplateType()
 	a.scratch.groupSums = make([]_GOTYPE, len(a.scratch.vec))
@@ -89,10 +90,11 @@ func (a *avg_TYPEAgg) Init(groups []bool, v ColVec) {
 }
 
 func (a *avg_TYPEAgg) Reset() {
-	copy(a.scratch.groupSums, zero_TYPEBatch)
-	copy(a.scratch.groupCounts, zeroInt64Batch)
-	copy(a.scratch.vec, zero_TYPEBatch)
+	copy(a.scratch.groupSums, zero_TYPEColumn)
+	copy(a.scratch.groupCounts, zeroInt64Column)
+	copy(a.scratch.vec, zero_TYPEColumn)
 	a.scratch.curIdx = -1
+	a.done = false
 }
 
 func (a *avg_TYPEAgg) CurrentOutputIndex() int {
@@ -102,15 +104,15 @@ func (a *avg_TYPEAgg) CurrentOutputIndex() int {
 func (a *avg_TYPEAgg) SetOutputIndex(idx int) {
 	if a.scratch.curIdx != -1 {
 		a.scratch.curIdx = idx
-		copy(a.scratch.groupSums[idx+1:], zero_TYPEBatch)
-		copy(a.scratch.groupCounts[idx+1:], zeroInt64Batch)
+		copy(a.scratch.groupSums[idx+1:], zero_TYPEColumn)
+		copy(a.scratch.groupCounts[idx+1:], zeroInt64Column)
 		// TODO(asubiotto): We might not have to zero a.scratch.vec since we
 		// overwrite with an independent value.
-		copy(a.scratch.vec[idx+1:], zero_TYPEBatch)
+		copy(a.scratch.vec[idx+1:], zero_TYPEColumn)
 	}
 }
 
-func (a *avg_TYPEAgg) Compute(b ColBatch, inputIdxs []uint32) {
+func (a *avg_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	if a.done {
 		return
 	}

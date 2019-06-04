@@ -15,21 +15,40 @@
 package xform
 
 import (
-	"fmt"
 	"math"
 	"math/rand"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"golang.org/x/tools/container/intsets"
 )
 
 // Coster is used by the optimizer to assign a cost to a candidate expression
 // that can provide a set of required physical properties. If a candidate
 // expression has a lower cost than any other expression in the memo group, then
 // it becomes the new best expression for the group.
+//
+// The set of costing formulas maintained by the coster for the set of all
+// operators constitute the "cost model". A given cost model can be designed to
+// maximize any optimization goal, such as:
+//
+//   1. Max aggregate cluster throughput (txns/sec across cluster)
+//   2. Min transaction latency (time to commit txns)
+//   3. Min latency to first row (time to get first row of txns)
+//   4. Min memory usage
+//   5. Some weighted combination of #1 - #4
+//
+// The cost model in this file targets #1 as the optimization goal. However,
+// note that #2 is implicitly important to that goal, since overall cluster
+// throughput will suffer if there are lots of pending transactions waiting on
+// I/O.
 //
 // Coster is an interface so that different costing algorithms can be used by
 // the optimizer. For example, the OptSteps command uses a custom coster that
@@ -51,6 +70,14 @@ type Coster interface {
 // tree.
 type coster struct {
 	mem *memo.Memo
+
+	// locality gives the location of the current node as a set of user-defined
+	// key/value pairs, ordered from most inclusive to least inclusive. If there
+	// are no tiers, then the node's location is not known. Example:
+	//
+	//   [region=us,dc=east]
+	//
+	locality roachpb.Locality
 
 	// perturbation indicates how much to randomly perturb the cost. It is used
 	// to generate alternative plans for testing. For example, if perturbation is
@@ -77,6 +104,25 @@ const (
 	seqIOCostFactor  = 1
 	randIOCostFactor = 4
 
+	// TODO(justin): make this more sophisticated.
+	// lookupJoinRetrieveRowCost is the cost to retrieve a single row during a
+	// lookup join.
+	// See https://github.com/cockroachdb/cockroach/pull/35561 for the initial
+	// justification for this constant.
+	lookupJoinRetrieveRowCost = 2 * seqIOCostFactor
+
+	// latencyCostFactor represents the throughput impact of doing scans on an
+	// index that may be remotely located in a different locality. If latencies
+	// are higher, then overall cluster throughput will suffer somewhat, as there
+	// will be more queries in memory blocking on I/O. The impact on throughput
+	// is expected to be relatively low, so latencyCostFactor is set to a small
+	// value. However, even a low value will cause the optimizer to prefer
+	// indexes that are likely to be geographically closer, if they are otherwise
+	// the same cost to access.
+	// TODO(andyk): Need to do analysis to figure out right value and/or to come
+	// up with better way to incorporate latency into the coster.
+	latencyCostFactor = cpuCostFactor
+
 	// hugeCost is used with expressions we want to avoid; these are expressions
 	// that "violate" a hint like forcing a specific index or join algorithm.
 	// If the final expression has this cost or larger, it means that there was no
@@ -85,8 +131,9 @@ const (
 )
 
 // Init initializes a new coster structure with the given memo.
-func (c *coster) Init(mem *memo.Memo, perturbation float64) {
+func (c *coster) Init(evalCtx *tree.EvalContext, mem *memo.Memo, perturbation float64) {
 	c.mem = mem
+	c.locality = evalCtx.Locality
 	c.perturbation = perturbation
 }
 
@@ -149,8 +196,8 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 	case opt.OffsetOp:
 		cost = c.computeOffsetCost(candidate.(*memo.OffsetExpr))
 
-	case opt.RowNumberOp:
-		cost = c.computeRowNumberCost(candidate.(*memo.RowNumberExpr))
+	case opt.OrdinalityOp:
+		cost = c.computeOrdinalityCost(candidate.(*memo.OrdinalityExpr))
 
 	case opt.ProjectSetOp:
 		cost = c.computeProjectSetCost(candidate.(*memo.ProjectSetExpr))
@@ -171,7 +218,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		// Optsteps uses MaxCost to suppress nodes in the memo. When a node with
 		// MaxCost is added to the memo, it can lead to an obscure crash with an
 		// unknown node. We'd rather detect this early.
-		panic(fmt.Sprintf("node %s with MaxCost added to the memo", candidate.Op()))
+		panic(pgerror.AssertionFailedf("node %s with MaxCost added to the memo", log.Safe(candidate.Op())))
 	}
 
 	if c.perturbation != 0 {
@@ -229,7 +276,15 @@ func (c *coster) computeScanCost(scan *memo.ScanExpr, required *physical.Require
 			perRowCost += memo.Cost(math.Log2(rowCount)) * cpuCostFactor
 		}
 	}
-	return memo.Cost(rowCount) * (seqIOCostFactor + perRowCost)
+
+	// Add a small cost if the scan is unconstrained, so all else being equal, we
+	// will prefer a constrained scan. This is important if our row count
+	// estimate turns out to be smaller than the actual row count.
+	var preferConstrainedScanCost memo.Cost
+	if scan.Constraint == nil || scan.Constraint.IsUnconstrained() {
+		preferConstrainedScanCost = cpuCostFactor
+	}
+	return memo.Cost(rowCount)*(seqIOCostFactor+perRowCost) + preferConstrainedScanCost
 }
 
 func (c *coster) computeVirtualScanCost(scan *memo.VirtualScanExpr) memo.Cost {
@@ -324,7 +379,35 @@ func (c *coster) computeLookupJoinCost(join *memo.LookupJoinExpr) memo.Cost {
 	// rows (relevant when we expect many resulting rows per lookup) and the CPU
 	// cost of emitting the rows.
 	numLookupCols := join.Cols.Difference(join.Input.Relational().OutputCols).Len()
-	perRowCost := seqIOCostFactor + c.rowScanCost(join.Table, join.Index, numLookupCols)
+	perRowCost := lookupJoinRetrieveRowCost +
+		c.rowScanCost(join.Table, join.Index, numLookupCols)
+
+	// Add a cost if we have to evaluate an ON condition on every row. The more
+	// leftover conditions, the more expensive it should be. We want to
+	// differentiate between two lookup joins where one uses only a subset of the
+	// columns. For example:
+	//   abc JOIN xyz ON a=x AND b=y
+	// We could have a lookup join using an index on y (and left-over condition
+	// a=x), and another lookup join on an index on x,y. The latter is definitely
+	// preferable (the former could generate a lot of internal results that are
+	// then discarded).
+	//
+	// TODO(radu): we should take into account that the "internal" row count is
+	// higher, according to the selectivities of the conditions. Unfortunately
+	// this is very tricky, in particular because of left-over conditions that are
+	// not selective.
+	// For example:
+	//   ab JOIN xy ON a=x AND x=10
+	// becomes (during normalization):
+	//   ab JOIN xy ON a=x AND a=10 AND x=10
+	// which can become a lookup join with left-over condition x=10 which doesn't
+	// actually filter anything.
+	//
+	// TODO(radu): this should be extended to all join types. It's tricky for hash
+	// joins where we don't have the equality and leftover filters readily
+	// available.
+	perRowCost += cpuCostFactor * memo.Cost(len(join.On))
+
 	cost += memo.Cost(join.Relational().Stats.RowCount) * perRowCost
 	return cost
 }
@@ -388,7 +471,7 @@ func (c *coster) computeGroupingCost(grouping memo.RelExpr, required *physical.R
 		// The cost is chosen so that it's always less than the cost to sort the
 		// input.
 		hashCost := memo.Cost(inputRowCount) * cpuCostFactor
-		n := ordering.StreamingGroupingCols(private, &required.Ordering).Len()
+		n := len(ordering.StreamingGroupingColOrdering(private, &required.Ordering))
 		// n = 0:                factor = 1
 		// n = groupingColCount: factor = 0
 		hashCost *= 1 - memo.Cost(n)/memo.Cost(groupingColCount)
@@ -410,9 +493,9 @@ func (c *coster) computeOffsetCost(offset *memo.OffsetExpr) memo.Cost {
 	return cost
 }
 
-func (c *coster) computeRowNumberCost(rowNum *memo.RowNumberExpr) memo.Cost {
+func (c *coster) computeOrdinalityCost(ord *memo.OrdinalityExpr) memo.Cost {
 	// Add the CPU cost of emitting the rows.
-	cost := memo.Cost(rowNum.Relational().Stats.RowCount) * cpuCostFactor
+	cost := memo.Cost(ord.Relational().Stats.RowCount) * cpuCostFactor
 	return cost
 }
 
@@ -449,13 +532,179 @@ func (c *coster) rowSortCost(numKeyCols int) memo.Cost {
 // rowScanCost is the CPU cost to scan one row, which depends on the number of
 // columns in the index and (to a lesser extent) on the number of columns we are
 // scanning.
-func (c *coster) rowScanCost(table opt.TableID, index int, numScannedCols int) memo.Cost {
+func (c *coster) rowScanCost(tabID opt.TableID, idxOrd int, numScannedCols int) memo.Cost {
 	md := c.mem.Metadata()
-	numCols := md.Table(table).Index(index).ColumnCount()
+	tab := md.Table(tabID)
+	idx := tab.Index(idxOrd)
+	numCols := idx.ColumnCount()
+
+	// Adjust cost based on how well the current locality matches the index's
+	// zone constraints.
+	var costFactor memo.Cost = cpuCostFactor
+	if len(c.locality.Tiers) != 0 {
+		// If 0% of locality tiers have matching constraints, then add additional
+		// cost. If 100% of locality tiers have matching constraints, then add no
+		// additional cost. Anything in between is proportional to the number of
+		// matches.
+		adjustment := 1.0 - localityMatchScore(idx.Zone(), c.locality)
+		costFactor += latencyCostFactor * memo.Cost(adjustment)
+	}
 
 	// The number of the columns in the index matter because more columns means
 	// more data to scan. The number of columns we actually return also matters
 	// because that is the amount of data that we could potentially transfer over
 	// the network.
-	return memo.Cost(numCols+numScannedCols) * cpuCostFactor
+	return memo.Cost(numCols+numScannedCols) * costFactor
+}
+
+// localityMatchScore returns a number from 0.0 to 1.0 that describes how well
+// the current node's locality matches the given zone constraints and
+// leaseholder preferences, with 0.0 indicating 0% and 1.0 indicating 100%. This
+// is the basic algorithm:
+//
+//   t = total # of locality tiers
+//
+//   Match each locality tier against the constraint set, and compute a value
+//   for each tier:
+//
+//      0 = key not present in constraint set or key matches prohibited
+//          constraint, but value doesn't match
+//     +1 = key matches required constraint, and value does match
+//     -1 = otherwise
+//
+//   m = length of longest locality prefix that ends in a +1 value and doesn't
+//       contain a -1 value.
+//
+//   Compute "m" for both the ReplicaConstraints constraints set, as well as for
+//   the LeasePreferences constraints set:
+//
+//     constraint-score = m / t
+//     lease-pref-score = m / t
+//
+//   if there are no lease preferences, then final-score = lease-pref-score
+//   else final-score = (constraint-score * 2 + lease-pref-score) / 3
+//
+// Here are some scoring examples:
+//
+//   Locality = region=us,dc=east
+//   0.0 = []                     // No constraints to match
+//   0.0 = [+region=eu,+dc=uk]    // None of the tiers match
+//   0.0 = [+region=eu,+dc=east]  // 2nd tier matches, but 1st tier doesn't
+//   0.0 = [-region=us,+dc=east]  // 1st tier matches PROHIBITED constraint
+//   0.0 = [-region=eu]           // 1st tier PROHIBITED and non-matching
+//   0.5 = [+region=us]           // 1st tier matches
+//   0.5 = [+region=us,-dc=east]  // 1st tier matches, 2nd tier PROHIBITED
+//   0.5 = [+region=us,+dc=west]  // 1st tier matches, but 2nd tier doesn't
+//   1.0 = [+region=us,+dc=east]  // Both tiers match
+//   1.0 = [+dc=east]             // 2nd tier matches, no constraints for 1st
+//   1.0 = [+region=us,+dc=east,+rack=1,-ssd]  // Extra constraints ignored
+//
+// Note that constraints need not be specified in any particular order, so all
+// constraints are scanned when matching each locality tier. In cases where
+// there are multiple replica constraint groups (i.e. where a subset of replicas
+// can have different constraints than another subset), the minimum constraint
+// score among the groups is used.
+//
+// While matching leaseholder preferences are considered in the final score,
+// leaseholder preferences are not guaranteed, so its score is weighted at half
+// of the replica constraint score, in order to reflect the possibility that the
+// leaseholder has moved from the preferred location.
+func localityMatchScore(zone cat.Zone, locality roachpb.Locality) float64 {
+	// Fast path: if there are no constraints or leaseholder preferences, then
+	// locality can't match.
+	if zone.ReplicaConstraintsCount() == 0 && zone.LeasePreferenceCount() == 0 {
+		return 0.0
+	}
+
+	// matchTier matches a tier to a set of constraints and returns:
+	//
+	//    0 = key not present in constraint set or key only matches prohibited
+	//        constraints where value doesn't match
+	//   +1 = key matches any required constraint key + value
+	//   -1 = otherwise
+	//
+	matchTier := func(tier roachpb.Tier, set cat.ConstraintSet) int {
+		foundNoMatch := false
+		for j, n := 0, set.ConstraintCount(); j < n; j++ {
+			con := set.Constraint(j)
+			if con.GetKey() != tier.Key {
+				// Ignore constraints that don't have matching key.
+				continue
+			}
+
+			if con.GetValue() == tier.Value {
+				if !con.IsRequired() {
+					// Matching prohibited constraint, so result is -1.
+					return -1
+				}
+
+				// Matching required constraint, so result is +1.
+				return +1
+			}
+
+			if con.IsRequired() {
+				// Remember that non-matching required constraint was found.
+				foundNoMatch = true
+			}
+		}
+
+		if foundNoMatch {
+			// At least one non-matching required constraint was found, and no
+			// matching constraints.
+			return -1
+		}
+
+		// Key not present in constraint set, or key only matches prohibited
+		// constraints where value doesn't match.
+		return 0
+	}
+
+	// matchConstraints returns the number of tiers that match the given
+	// constraint set ("m" in algorithm described above).
+	matchConstraints := func(set cat.ConstraintSet) int {
+		matchCount := 0
+		for i, tier := range locality.Tiers {
+			switch matchTier(tier, set) {
+			case +1:
+				matchCount = i + 1
+			case -1:
+				return matchCount
+			}
+		}
+		return matchCount
+	}
+
+	// Score any replica constraints.
+	var constraintScore float64
+	if zone.ReplicaConstraintsCount() != 0 {
+		// Iterate over the replica constraints and determine the minimum value
+		// returned by matchConstraints for any replica. For example:
+		//
+		//   3: [+region=us,+dc=east]
+		//   2: [+region=us]
+		//
+		// For the [region=us,dc=east] locality, the result is min(2, 1).
+		minCount := intsets.MaxInt
+		for i := 0; i < zone.ReplicaConstraintsCount(); i++ {
+			matchCount := matchConstraints(zone.ReplicaConstraints(i))
+			if matchCount < minCount {
+				minCount = matchCount
+			}
+		}
+
+		constraintScore = float64(minCount) / float64(len(locality.Tiers))
+	}
+
+	// If there are no lease preferences, then use replica constraint score.
+	if zone.LeasePreferenceCount() == 0 {
+		return constraintScore
+	}
+
+	// Score the first lease preference, if one is available. Ignore subsequent
+	// lease preferences, since they only apply in edge cases.
+	matchCount := matchConstraints(zone.LeasePreference(0))
+	leaseScore := float64(matchCount) / float64(len(locality.Tiers))
+
+	// Weight the constraintScore twice as much as the lease score.
+	return (constraintScore*2 + leaseScore) / 3
 }

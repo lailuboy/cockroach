@@ -24,7 +24,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -560,7 +562,7 @@ func TestSyncFlowAfterDrain(t *testing.T) {
 		},
 	}
 
-	types := make([]sqlbase.ColumnType, 0)
+	types := make([]types.T, 0)
 	rb := NewRowBuffer(types, nil /* rows */, RowBufferArgs{})
 	ctx, flow, err := distSQLSrv.SetupSyncFlow(ctx, &distSQLSrv.memMonitor, &req, rb)
 	if err != nil {
@@ -582,7 +584,7 @@ func TestSyncFlowAfterDrain(t *testing.T) {
 
 // TestInboundStreamTimeoutIsRetryable verifies that a failure from an inbound
 // stream to connect in a timeout is considered retryable by
-// testutils.IsSQLRetryableError.
+// pgerror.IsSQLRetryableError.
 // TODO(asubiotto): This error should also be considered retryable by clients.
 func TestInboundStreamTimeoutIsRetryable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -606,7 +608,7 @@ func TestInboundStreamTimeoutIsRetryable(t *testing.T) {
 	wg.Wait()
 	if _, meta := rc.Next(); meta == nil {
 		t.Fatal("expected error but got no meta")
-	} else if !testutils.IsSQLRetryableError(meta.Err) {
+	} else if !pgerror.IsSQLRetryableError(meta.Err) {
 		t.Fatalf("unexpected error: %v", meta.Err)
 	}
 }
@@ -620,12 +622,12 @@ func TestTimeoutPushDoesntBlockRegister(t *testing.T) {
 	fr := makeFlowRegistry(0)
 	// pushChan is used to be able to tell when a Push on the RowBuffer has
 	// occurred.
-	pushChan := make(chan *ProducerMetadata)
+	pushChan := make(chan *distsqlpb.ProducerMetadata)
 	rc := NewRowBuffer(
 		sqlbase.OneIntCol,
 		nil, /* rows */
 		RowBufferArgs{
-			OnPush: func(_ sqlbase.EncDatumRow, meta *ProducerMetadata) {
+			OnPush: func(_ sqlbase.EncDatumRow, meta *distsqlpb.ProducerMetadata) {
 				pushChan <- meta
 				<-pushChan
 			},
@@ -664,4 +666,68 @@ func TestTimeoutPushDoesntBlockRegister(t *testing.T) {
 
 	// Unblock the first RegisterFlow.
 	close(pushChan)
+}
+
+// TestFlowCancelPartiallyBlocked tests that cancellation messages can propagate
+// into a flow even if one of the inbound streams are blocked (#35859).
+func TestFlowCancelPartiallyBlocked(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	fr := makeFlowRegistry(0)
+	left := &RowChannel{}
+	left.initWithBufSizeAndNumSenders(nil /* types */, 1, 1)
+	right := &RowChannel{}
+	right.initWithBufSizeAndNumSenders(nil /* types */, 1, 1)
+
+	wgLeft := sync.WaitGroup{}
+	wgLeft.Add(1)
+	wgRight := sync.WaitGroup{}
+	wgRight.Add(1)
+	inboundStreams := map[distsqlpb.StreamID]*inboundStreamInfo{
+		0: {
+			receiver:  left,
+			waitGroup: &wgLeft,
+		},
+		1: {
+			receiver:  right,
+			waitGroup: &wgRight,
+		},
+	}
+
+	// Fill up the left, so pushes to it block.
+	left.Push(nil, &distsqlpb.ProducerMetadata{})
+
+	// RegisterFlow with an immediate timeout.
+	flow := &Flow{
+		FlowCtx: FlowCtx{
+			id: distsqlpb.FlowID{UUID: uuid.FastMakeV4()},
+		},
+		inboundStreams: inboundStreams,
+		flowRegistry:   fr,
+	}
+	if err := fr.RegisterFlow(
+		ctx, flow.id, flow, inboundStreams, 10*time.Second, /* timeout */
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	flow.cancel()
+
+	// Reading from the right shouldn't block and should immediately return a
+	// flow canceled error.
+
+	_, meta := right.Next()
+	if meta.Err != sqlbase.QueryCanceledError {
+		t.Fatal("expected query canceled, found", meta.Err)
+	}
+
+	// Read from the left to unblock the canceler, assert that the next
+	// message is the query canceled message as well.
+
+	_, _ = left.Next()
+	_, meta = left.Next()
+	if meta.Err != sqlbase.QueryCanceledError {
+		t.Fatal("expected query canceled, found", meta.Err)
+	}
 }

@@ -17,9 +17,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"net/http"
+	"os"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/workload/querybench"
 	"github.com/lib/pq"
 )
 
@@ -30,19 +35,30 @@ type tpchBench int
 //go:generate stringer -type=tpchBench
 
 const (
-	// SQL20 queries: https://github.com/cockroachdb/cockroach/blob/master/pkg/workload/querybench/2.1-sql-20
 	sql20 tpchBench = iota
+	tpch
+	tpchVec
 )
 
-type tpchBenchSpec struct {
-	Nodes       int
-	CPUs        int
-	ScaleFactor int
-	benchType   tpchBench
+var urlMap = map[tpchBench]string{
+	sql20:   `https://raw.githubusercontent.com/cockroachdb/cockroach/master/pkg/workload/querybench/2.1-sql-20`,
+	tpch:    `https://raw.githubusercontent.com/cockroachdb/cockroach/master/pkg/workload/querybench/tpch-queries`,
+	tpchVec: `https://raw.githubusercontent.com/cockroachdb/cockroach/master/pkg/workload/querybench/tpch-queries-vec`,
 }
 
-// sql20bench runs the group of sql20 queries against CockroachDB clusters in
-// different configurations.
+type tpchBenchSpec struct {
+	Nodes           int
+	CPUs            int
+	ScaleFactor     int
+	benchType       tpchBench
+	numRunsPerQuery int
+	// minVersion specifies the minimum version of CRDB nodes. If omitted, it
+	// will default to maybeMinVersionForFixturesImport.
+	minVersion string
+}
+
+// runTPCHBench runs sets of queries against CockroachDB clusters in different
+// configurations.
 //
 // In order to run a benchmark, a TPC-H dataset must first be loaded. To reuse
 // this data across runs, it is recommended to use a combination of
@@ -51,7 +67,7 @@ type tpchBenchSpec struct {
 //
 // This benchmark runs with a single load generator node running a single
 // worker.
-func runSQL20Bench(ctx context.Context, t *test, c *cluster, b tpchBenchSpec) {
+func runTPCHBench(ctx context.Context, t *test, c *cluster, b tpchBenchSpec) {
 	roachNodes := c.Range(1, c.nodes-1)
 	loadNode := c.Node(c.nodes)
 
@@ -59,9 +75,9 @@ func runSQL20Bench(ctx context.Context, t *test, c *cluster, b tpchBenchSpec) {
 	c.Put(ctx, cockroach, "./cockroach", roachNodes)
 	c.Put(ctx, workload, "./workload", loadNode)
 
-	url := `https://raw.githubusercontent.com/cockroachdb/cockroach/master/pkg/workload/querybench/2.1-sql-20`
-	t.Status(fmt.Sprintf("downloading sql20 query file from %s", url))
-	filename := "sql20"
+	url := urlMap[b.benchType]
+	filename := b.benchType.String()
+	t.Status(fmt.Sprintf("downloading %s query file from %s", filename, url))
 	if err := c.RunE(ctx, loadNode, fmt.Sprintf("curl %s > %s", url, filename)); err != nil {
 		t.Fatal(err)
 	}
@@ -77,12 +93,24 @@ func runSQL20Bench(ctx context.Context, t *test, c *cluster, b tpchBenchSpec) {
 			return err
 		}
 
-		t.l.Printf("running sql20 benchmark on tpch scale-factor=%d", b.ScaleFactor)
+		t.l.Printf("running %s benchmark on tpch scale-factor=%d", filename, b.ScaleFactor)
+
+		numQueries, err := getNumQueriesInFile(filename, url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// maxOps flag will allow us to exit the workload once all the queries were
+		// run b.numRunsPerQuery number of times.
+		maxOps := b.numRunsPerQuery * numQueries
 
 		// Run with only one worker to get best-case single-query performance.
 		cmd := fmt.Sprintf(
-			"./workload run querybench --db=tpch --concurrency=1 --query-file=%s --duration=5m {pgurl%s} --histograms=logs/stats.json",
+			"./workload run querybench --db=tpch --concurrency=1 --query-file=%s "+
+				"--num-runs=%d --max-ops=%d --vectorized=%t {pgurl%s} --histograms=logs/stats.json",
 			filename,
+			b.numRunsPerQuery,
+			maxOps,
+			b.benchType == tpchVec,
 			roachNodes,
 		)
 		if err := c.RunE(ctx, loadNode, cmd); err != nil {
@@ -91,7 +119,47 @@ func runSQL20Bench(ctx context.Context, t *test, c *cluster, b tpchBenchSpec) {
 		return nil
 	})
 	m.Wait()
-	c.Stop(ctx, c.All())
+}
+
+// getNumQueriesInFile downloads a file that url points to, stores it at a
+// temporary location, parses it using querybench, and deletes the file. It
+// returns the number of queries in the file.
+func getNumQueriesInFile(filename, url string) (int, error) {
+	tempFile, err := downloadFile(filename, url)
+	if err != nil {
+		return 0, err
+	}
+	// Use closure to make linter happy about unchecked error.
+	defer func() {
+		_ = os.Remove(tempFile.Name())
+	}()
+
+	queries, err := querybench.GetQueries(tempFile.Name())
+	if err != nil {
+		return 0, err
+	}
+	return len(queries), nil
+}
+
+// downloadFile will download a url as a local temporary file.
+func downloadFile(filename string, url string) (*os.File, error) {
+	// Get the data.
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// Create the file.
+	out, err := ioutil.TempFile(`` /* dir */, filename)
+	if err != nil {
+		return nil, err
+	}
+	defer out.Close()
+
+	// Write the body to file.
+	_, err = io.Copy(out, resp.Body)
+	return out, err
 }
 
 // loadTPCHBench loads a TPC-H dataset for the specific benchmark spec. The
@@ -161,29 +229,45 @@ func registerTPCHBenchSpec(r *registry, b tpchBenchSpec) {
 
 	// Add a load generator node.
 	numNodes := b.Nodes + 1
+	minVersion := b.minVersion
+	if minVersion == `` {
+		minVersion = maybeMinVersionForFixturesImport(cloud)
+	}
 
 	r.Add(testSpec{
 		Name:       strings.Join(nameParts, "/"),
 		Cluster:    makeClusterSpec(numNodes),
-		MinVersion: maybeMinVersionForFixturesImport(cloud),
+		MinVersion: minVersion,
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			switch b.benchType {
-			case sql20:
-				runSQL20Bench(ctx, t, c, b)
-			default:
-				t.Fatalf("unsupported benchmark type %d", b.benchType)
-			}
+			runTPCHBench(ctx, t, c, b)
 		},
 	})
 }
 
-func registerSQL20Bench(r *registry) {
+func registerTPCHBench(r *registry) {
 	specs := []tpchBenchSpec{
 		{
-			Nodes:       3,
-			CPUs:        4,
-			ScaleFactor: 1,
-			benchType:   sql20,
+			Nodes:           3,
+			CPUs:            4,
+			ScaleFactor:     1,
+			benchType:       sql20,
+			numRunsPerQuery: 3,
+		},
+		{
+			Nodes:           3,
+			CPUs:            4,
+			ScaleFactor:     1,
+			benchType:       tpch,
+			numRunsPerQuery: 3,
+			minVersion:      `v19.1.0`,
+		},
+		{
+			Nodes:           3,
+			CPUs:            4,
+			ScaleFactor:     1,
+			benchType:       tpchVec,
+			numRunsPerQuery: 3,
+			minVersion:      `v19.1.0`,
 		},
 	}
 

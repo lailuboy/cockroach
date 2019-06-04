@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/petermattis/goid"
+	"github.com/pkg/errors"
 )
 
 var (
@@ -241,7 +242,7 @@ func newRegistry(opts ...registryOpt) *registry {
 	r.config.skipClusterWipeOnAttach = !clusterWipe
 	for _, opt := range opts {
 		if err := opt(r); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to construct registry: %v", err)
+			fmt.Fprintf(os.Stderr, "failed to construct registry: %v\n", err)
 			os.Exit(1)
 		}
 	}
@@ -259,7 +260,8 @@ func (r *registry) loadBuildVersion() error {
 		cmd := exec.Command("git", "describe", "--abbrev=0", "--tags", "--match=v[0-9]*")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			return "", err
+			return "", errors.Wrapf(err, "failed to get version tag from git. Are you running in the "+
+				"cockroach repo directory? err=%s, out=%s", err, out)
 		}
 		return strings.TrimSpace(string(out)), nil
 	}
@@ -272,19 +274,26 @@ func (r *registry) loadBuildVersion() error {
 
 // PredecessorVersion returns a recent predecessor of the build version (i.e.
 // the build tag of the main binary). For example, if the running binary is from
-// the master branch prior to releasing 2.2.0, this will return a recent
-// (ideally though not necessarily the latest) 2.1 patch release.
-func (r *registry) PredecessorVersion() string {
+// the master branch prior to releasing 19.2.0, this will return a recent
+// (ideally though not necessarily the latest) 19.1 patch release.
+func (r *registry) PredecessorVersion() (string, error) {
 	if r.buildVersion == nil {
-		return ""
+		return "", errors.Errorf("buildVersion not set")
 	}
 
 	buildVersionMajorMinor := fmt.Sprintf("%d.%d", r.buildVersion.Major(), r.buildVersion.Minor())
 
-	return map[string]string{
-		"2.2": "2.1.3",
-		"2.1": "2.0.7",
-	}[buildVersionMajorMinor]
+	verMap := map[string]string{
+		"19.2": "19.1.0-rc.4",
+		"19.1": "2.1.6",
+		"2.2":  "2.1.6",
+		"2.1":  "2.0.7",
+	}
+	v, ok := verMap[buildVersionMajorMinor]
+	if !ok {
+		return "", errors.Errorf("prev version not set for version: %s", buildVersionMajorMinor)
+	}
+	return v, nil
 }
 
 // verifyValidClusterName verifies that the test name can be turned into a cluster
@@ -488,6 +497,8 @@ func (r *registry) Run(filters []string, parallelism int, artifactsDir string, u
 	r.status.fail = make(map[*test]struct{})
 	r.status.skip = make(map[*test]struct{})
 
+	cr := newClusterRegistry()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -518,7 +529,7 @@ func (r *registry) Run(filters []string, parallelism int, artifactsDir string, u
 
 				r.runAsync(
 					ctx, tests[i], filter, nil /* parent */, nil, /* cluster */
-					runNum, teeOpt, runDir, user, func(failed bool) {
+					runNum, teeOpt, runDir, user, cr, func(failed bool) {
 						wg.Done()
 						<-sem
 					})
@@ -633,7 +644,10 @@ func (r *registry) Run(filters []string, parallelism int, artifactsDir string, u
 		case <-sig:
 			if !debugEnabled {
 				cancel()
-				destroyAllClusters()
+				// Destroy all clusters. Don't wait more than 5 min for that though.
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				cr.destroyAllClusters(ctx)
+				cancel()
 			}
 		}
 	}
@@ -792,9 +806,12 @@ func (t *test) printAndFail(skip int, args ...interface{}) {
 }
 
 func (t *test) printfAndFail(skip int, format string, args ...interface{}) {
+	msg := t.decorate(skip+1, fmt.Sprintf(format, args...))
+	t.l.Printf("test failure: " + msg)
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.mu.output = append(t.mu.output, t.decorate(skip+1, fmt.Sprintf(format, args...))...)
+	t.mu.output = append(t.mu.output, msg...)
 	t.mu.failed = true
 	if t.mu.cancel != nil {
 		t.mu.cancel()
@@ -902,6 +919,8 @@ func (t *test) IsBuildVersion(minVersion string) bool {
 	return t.registry.buildVersion.AtLeast(vers)
 }
 
+var _ = (*test)(nil).IsBuildVersion // avoid unused lint
+
 // runAsync starts a goroutine that runs a test. If the test has subtests,
 // runAsync will be invoked recursively, but in a blocking manner.
 //
@@ -921,6 +940,7 @@ func (r *registry) runAsync(
 	teeOpt teeOptType,
 	artifactsDir string,
 	user string,
+	cr *clusterRegistry,
 	done func(failed bool),
 ) {
 	t := &test{
@@ -935,6 +955,7 @@ func (r *registry) runAsync(
 	l, err := rootLogger(logPath, teeOpt)
 	FatalIfErr(t, err)
 	t.l = l
+	out := io.MultiWriter(r.out, t.l.file)
 
 	if teamCity {
 		fmt.Printf("##teamcity[testStarted name='%s' flowId='%s']\n", t.Name(), t.Name())
@@ -947,7 +968,7 @@ func (r *registry) runAsync(
 		if len(details) > 0 {
 			detail = fmt.Sprintf(" [%s]", strings.Join(details, ","))
 		}
-		fmt.Fprintf(r.out, "=== RUN   %s%s\n", t.Name(), detail)
+		fmt.Fprintf(out, "=== RUN   %s%s\n", t.Name(), detail)
 	}
 	r.status.Lock()
 	r.status.running[t] = struct{}{}
@@ -998,24 +1019,26 @@ func (r *registry) runAsync(
 					)
 				}
 
-				fmt.Fprintf(r.out, "--- FAIL: %s (%s)\n%s", t.Name(), dstr, output)
+				fmt.Fprintf(out, "--- FAIL: %s (%s)\n%s", t.Name(), dstr, output)
 				if postIssues && issues.CanPost() && t.spec.Run != nil {
 					authorEmail := getAuthorEmail(failLoc.file, failLoc.line)
 					branch := "<unknown branch>"
 					if b := os.Getenv("TC_BUILD_BRANCH"); b != "" {
 						branch = b
 					}
+					msg := fmt.Sprintf("The test failed on branch=%s, cloud=%s:\n%s",
+						branch, cloud, output)
 					if err := issues.Post(
 						context.Background(),
 						fmt.Sprintf("roachtest: %s failed", t.Name()),
-						"roachtest", t.Name(), "The test failed on "+branch+":\n"+string(output), authorEmail,
+						"roachtest", t.Name(), msg, authorEmail,
 						[]string{"O-roachtest"},
 					); err != nil {
-						fmt.Fprintf(r.out, "failed to post issue: %s\n", err)
+						fmt.Fprintf(out, "failed to post issue: %s\n", err)
 					}
 				}
 			} else if t.spec.Skip == "" {
-				fmt.Fprintf(r.out, "--- PASS: %s (%s)\n", t.Name(), dstr)
+				fmt.Fprintf(out, "--- PASS: %s (%s)\n", t.Name(), dstr)
 				// If `##teamcity[testFailed ...]` is not present before `##teamCity[testFinished ...]`,
 				// TeamCity regards the test as successful.
 			} else {
@@ -1023,9 +1046,9 @@ func (r *registry) runAsync(
 					fmt.Fprintf(r.out, "##teamcity[testIgnored name='%s' message='%s']\n",
 						t.Name(), teamCityEscape(t.spec.Skip))
 				}
-				fmt.Fprintf(r.out, "--- SKIP: %s (%s)\n\t%s\n", t.Name(), dstr, t.spec.Skip)
+				fmt.Fprintf(out, "--- SKIP: %s (%s)\n\t%s\n", t.Name(), dstr, t.spec.Skip)
 				if t.spec.SkipDetails != "" {
-					fmt.Fprintf(r.out, "Details: %s\n", t.spec.SkipDetails)
+					fmt.Fprintf(out, "Details: %s\n", t.spec.SkipDetails)
 				}
 			}
 
@@ -1086,7 +1109,7 @@ func (r *registry) runAsync(
 					user:         user,
 				}
 				var err error
-				c, err = newCluster(ctx, t.l, cfg)
+				c, err = newCluster(ctx, t.l, cfg, cr)
 				if err != nil {
 					t.Skip("failed to created cluster", err.Error())
 				}
@@ -1097,13 +1120,13 @@ func (r *registry) runAsync(
 					skipWipe:       r.config.skipClusterWipeOnAttach,
 				}
 				var err error
-				c, err = attachToExistingCluster(ctx, clusterName, t.l, t.spec.Cluster, opt)
+				c, err = attachToExistingCluster(ctx, clusterName, t.l, t.spec.Cluster, opt, cr)
 				FatalIfErr(t, err)
 			}
 			if c != nil {
 				defer func() {
 					if (!debugEnabled && !t.debugEnabled) || !t.Failed() {
-						c.Destroy(ctx)
+						c.Destroy(ctx, closeLogger)
 					} else {
 						c.l.Printf("not destroying cluster to allow debugging\n")
 					}
@@ -1129,7 +1152,7 @@ func (r *registry) runAsync(
 					}
 
 					r.runAsync(ctx, &childSpec, filter, t, c,
-						runNum, teeOpt, childDir, user, func(failed bool) {
+						runNum, teeOpt, childDir, user, cr, func(failed bool) {
 							if failed {
 								// Mark the parent test as failed since one of the subtests
 								// failed.
@@ -1153,26 +1176,7 @@ func (r *registry) runAsync(
 
 		// No subtests, so this is a leaf test.
 
-		timeout := time.Hour
-		defer func() {
-			if t.Failed() {
-				if err := c.FetchDebugZip(ctx); err != nil {
-					c.l.Printf("failed to download debug zip: %s", err)
-				}
-			}
-			if err := c.FetchDmesg(ctx); err != nil {
-				c.l.Printf("failed to fetch dmesg: %s", err)
-			}
-			// NB: fetch the logs even when we have a debug zip because
-			// debug zip can't ever get the logs for down nodes.
-			// We only save artifacts for failed tests in CI, so this
-			// duplication is acceptable.
-			if err := c.FetchLogs(ctx); err != nil {
-				c.l.Printf("failed to download logs: %s", err)
-			}
-		}()
-
-		timeout = c.expiration.Add(-10 * time.Minute).Sub(timeutil.Now())
+		timeout := c.expiration.Add(-10 * time.Minute).Sub(timeutil.Now())
 		if timeout <= 0 {
 			t.spec.Skip = fmt.Sprintf("cluster expired (%s)", timeout)
 			return
@@ -1183,7 +1187,41 @@ func (r *registry) runAsync(
 		}
 
 		done := make(chan struct{})
-		defer close(done)
+		defer close(done) // closed only after we've grabbed the debug info below
+
+		defer func() {
+			if t.Failed() {
+				if err := c.FetchDebugZip(ctx); err != nil {
+					c.l.Printf("failed to download debug zip: %s", err)
+				}
+				if err := c.FetchDmesg(ctx); err != nil {
+					c.l.Printf("failed to fetch dmesg: %s", err)
+				}
+				if err := c.FetchJournalctl(ctx); err != nil {
+					c.l.Printf("failed to fetch journalctl: %s", err)
+				}
+				if err := c.FetchCores(ctx); err != nil {
+					c.l.Printf("failed to fetch cores: %s", err)
+				}
+				if err := c.CopyRoachprodState(ctx); err != nil {
+					c.l.Printf("failed to copy roachprod state: %s", err)
+				}
+			}
+			// NB: fetch the logs even when we have a debug zip because
+			// debug zip can't ever get the logs for down nodes.
+			// We only save artifacts for failed tests in CI, so this
+			// duplication is acceptable.
+			if err := c.FetchLogs(ctx); err != nil {
+				c.l.Printf("failed to download logs: %s", err)
+			}
+		}()
+		// Detect replica divergence (i.e. ranges in which replicas have arrived
+		// at the same log position with different states).
+		defer c.FailOnReplicaDivergence(ctx, t)
+		// Detect dead nodes in an inner defer. Note that this will call t.Fatal
+		// when appropriate, which will cause the closure above to enter the
+		// t.Failed() branch.
+		defer c.FailOnDeadNodes(ctx, t)
 
 		runCtx, cancel := context.WithCancel(ctx)
 		t.mu.Lock()
@@ -1200,9 +1238,11 @@ func (r *registry) runAsync(
 				if err := c.FetchDebugZip(ctx); err != nil {
 					c.l.Printf("failed to download logs: %s", err)
 				}
-				// NB: c.destroyed is nil for cloned clusters (i.e. in subtests).
-				if !debugEnabled && c.destroyed != nil {
-					c.Destroy(ctx)
+				// NB: c.destroyState is nil for cloned clusters (i.e. in subtests).
+				if !debugEnabled && c.destroyState != nil {
+					// We don't close the logger here because the cluster may still be in
+					// use by the test.
+					c.Destroy(ctx, dontCloseLogger)
 				}
 			case <-done:
 			}

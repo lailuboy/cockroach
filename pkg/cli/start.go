@@ -446,7 +446,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	serverCfg.HeapProfileDirName = logOutputDirectory()
+
+	serverCfg.GoroutineDumpDirName = logOutputDirectory()
+
+	heapProfileDir := filepath.Join(logOutputDirectory(), base.HeapProfileDir)
+	serverCfg.HeapProfileDirName = heapProfileDir
 	// We don't care about GRPCs fairly verbose logs in most client commands,
 	// but when actually starting a server, we enable them.
 	grpcutil.SetSeverity(log.Severity_WARNING)
@@ -1101,9 +1105,6 @@ func addrWithDefaultHost(addr string) (string, error) {
 	if host == "" {
 		host = "localhost"
 	}
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
-	}
 	return net.JoinHostPort(host, port), nil
 }
 
@@ -1130,7 +1131,9 @@ func getClientGRPCConn(ctx context.Context) (*grpc.ClientConn, *hlc.Clock, func(
 		stopper.Stop(ctx)
 		return nil, nil, nil, err
 	}
-	conn, err := rpcContext.GRPCDial(addr).Connect(ctx)
+	// We use GRPCUnvalidatedDial() here because it does not matter
+	// to which node we're talking to.
+	conn, err := rpcContext.GRPCUnvalidatedDial(addr).Connect(ctx)
 	if err != nil {
 		stopper.Stop(ctx)
 		return nil, nil, nil, err

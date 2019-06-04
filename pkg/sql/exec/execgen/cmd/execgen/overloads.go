@@ -76,7 +76,8 @@ type overload struct {
 	RGoType string
 	RetTyp  types.T
 
-	AssignFunc assignFunc
+	AssignFunc  assignFunc
+	CompareFunc compareFunc
 
 	// TODO(solon): These would not be necessary if we changed the zero values of
 	// ComparisonOperator and BinaryOperator to be invalid.
@@ -86,6 +87,7 @@ type overload struct {
 }
 
 type assignFunc func(op overload, target, l, r string) string
+type compareFunc func(l, r string) string
 
 var binaryOpOverloads []*overload
 var comparisonOpOverloads []*overload
@@ -115,6 +117,20 @@ func (o overload) Assign(target, l, r string) string {
 	}
 	// Default assign form assumes an infix operator.
 	return fmt.Sprintf("%s = %s %s %s", target, l, o.OpStr, r)
+}
+
+// Compare produces a Go source string that assigns the "target" variable to the
+// result of comparing the two inputs, l and r.
+func (o overload) Compare(target, l, r string) string {
+	if o.CompareFunc != nil {
+		if ret := o.CompareFunc(l, r); ret != "" {
+			return fmt.Sprintf("%s = %s", target, ret)
+		}
+	}
+	// Default compare form assumes an infix operator.
+	return fmt.Sprintf(
+		"if %s < %s { %s = -1 } else if %s > %s { %s = 1 } else { %s = 0 }",
+		l, r, target, l, r, target, target)
 }
 
 func (o overload) UnaryAssign(target, v string) string {
@@ -178,7 +194,14 @@ func init() {
 			}
 			if customizer != nil {
 				if b, ok := customizer.(cmpOpTypeCustomizer); ok {
-					ov.AssignFunc = b.getCmpOpAssignFunc()
+					ov.AssignFunc = func(op overload, target, l, r string) string {
+						c := b.getCmpOpCompareFunc()(l, r)
+						if c == "" {
+							return ""
+						}
+						return fmt.Sprintf("%s = %s %s 0", target, c, op.OpStr)
+					}
+					ov.CompareFunc = b.getCmpOpCompareFunc()
 				}
 			}
 			comparisonOpOverloads = append(comparisonOpOverloads, ov)
@@ -224,7 +247,7 @@ type binOpTypeCustomizer interface {
 // cmpOpTypeCustomizer is a type customizer that changes how the templater
 // produces comparison operator output for a particular type.
 type cmpOpTypeCustomizer interface {
-	getCmpOpAssignFunc() assignFunc
+	getCmpOpCompareFunc() compareFunc
 }
 
 // hashTypeCustomizer is a type customizer that changes how the templater
@@ -245,63 +268,49 @@ type bytesCustomizer struct{}
 // variable-set semantics.
 type decimalCustomizer struct{}
 
-// float32Customizer and float64Customizer are necessary since float32 and
-// float64 require additional logic for hashing.
-type float32Customizer struct{}
-type float64Customizer struct{}
+// floatCustomizers are used for hash functions.
+type floatCustomizer struct{ width int }
 
-func (boolCustomizer) getCmpOpAssignFunc() assignFunc {
-	return func(op overload, target, l, r string) string {
-		switch op.CmpOp {
-		case tree.EQ, tree.NE:
-			return ""
-		}
-		return fmt.Sprintf("%s = tree.CompareBools(%s, %s) %s 0",
-			target, l, r, op.OpStr)
+// intCustomizers are used for hash functions.
+type intCustomizer struct{ width int }
+
+func (boolCustomizer) getCmpOpCompareFunc() compareFunc {
+	return func(l, r string) string {
+		return fmt.Sprintf("tree.CompareBools(%s, %s)", l, r)
 	}
 }
 
 func (boolCustomizer) getHashAssignFunc() assignFunc {
 	return func(op overload, target, v, _ string) string {
 		return fmt.Sprintf(`
-			x := uint64(0)
+			x := 0
 			if %[2]s {
     		x = 1
 			}
-			%[1]s = x
+			%[1]s = %[1]s*31 + uintptr(x)
 		`, target, v)
 	}
 }
 
-func (bytesCustomizer) getCmpOpAssignFunc() assignFunc {
-	return func(op overload, target, l, r string) string {
-		switch op.CmpOp {
-		case tree.EQ:
-			return fmt.Sprintf("%s = bytes.Equal(%s, %s)", target, l, r)
-		case tree.NE:
-			return fmt.Sprintf("%s = !bytes.Equal(%s, %s)", target, l, r)
-		}
-		return fmt.Sprintf("%s = bytes.Compare(%s, %s) %s 0",
-			target, l, r, op.OpStr)
+func (bytesCustomizer) getCmpOpCompareFunc() compareFunc {
+	return func(l, r string) string {
+		return fmt.Sprintf("bytes.Compare(%s, %s)", l, r)
 	}
 }
 
 func (bytesCustomizer) getHashAssignFunc() assignFunc {
 	return func(op overload, target, v, _ string) string {
 		return fmt.Sprintf(`
-			_temp := 1
-			for b := range %s {
-				_temp = _temp*31 + b
-			}
-			%s = uint64(hash)
+			sh := (*reflect.SliceHeader)(unsafe.Pointer(&%[1]s))
+			%[2]s = memhash(unsafe.Pointer(sh.Data), %[2]s, uintptr(len(%[1]s)))
+
 		`, v, target)
 	}
 }
 
-func (decimalCustomizer) getCmpOpAssignFunc() assignFunc {
-	return func(op overload, target, l, r string) string {
-		return fmt.Sprintf("%s = tree.CompareDecimals(&%s, &%s) %s 0",
-			target, l, r, op.OpStr)
+func (decimalCustomizer) getCmpOpCompareFunc() compareFunc {
+	return func(l, r string) string {
+		return fmt.Sprintf("tree.CompareDecimals(&%s, &%s)", l, r)
 	}
 }
 
@@ -319,20 +328,21 @@ func (decimalCustomizer) getHashAssignFunc() assignFunc {
 			if err != nil {
 				panic(fmt.Sprintf("%%v", err))
 			}
-			%[1]s = math.Float64bits(d)
+
+			%[1]s = f64hash(noescape(unsafe.Pointer(&d)), %[1]s)
 		`, target, v)
 	}
 }
 
-func (float32Customizer) getHashAssignFunc() assignFunc {
+func (c floatCustomizer) getHashAssignFunc() assignFunc {
 	return func(op overload, target, v, _ string) string {
-		return fmt.Sprintf("%s = uint64(math.Float32bits(%s))", target, v)
+		return fmt.Sprintf("%[1]s = f%[3]dhash(noescape(unsafe.Pointer(&%[2]s)), %[1]s)", target, v, c.width)
 	}
 }
 
-func (float64Customizer) getHashAssignFunc() assignFunc {
+func (c intCustomizer) getHashAssignFunc() assignFunc {
 	return func(op overload, target, v, _ string) string {
-		return fmt.Sprintf("%s = math.Float64bits(%s)", target, v)
+		return fmt.Sprintf("%[1]s = memhash%[3]d(noescape(unsafe.Pointer(&%[2]s)), %[1]s)", target, v, c.width)
 	}
 }
 
@@ -341,12 +351,17 @@ func registerTypeCustomizers() {
 	registerTypeCustomizer(types.Bool, boolCustomizer{})
 	registerTypeCustomizer(types.Bytes, bytesCustomizer{})
 	registerTypeCustomizer(types.Decimal, decimalCustomizer{})
-	registerTypeCustomizer(types.Float32, float32Customizer{})
-	registerTypeCustomizer(types.Float64, float64Customizer{})
+	registerTypeCustomizer(types.Float32, floatCustomizer{width: 32})
+	registerTypeCustomizer(types.Float64, floatCustomizer{width: 64})
+	registerTypeCustomizer(types.Int8, intCustomizer{width: 8})
+	registerTypeCustomizer(types.Int16, intCustomizer{width: 16})
+	registerTypeCustomizer(types.Int32, intCustomizer{width: 32})
+	registerTypeCustomizer(types.Int64, intCustomizer{width: 64})
 }
 
-// Avoid unused warning for Assign, which is only used in templates.
+// Avoid unused warning for functions which are only used in templates.
 var _ = overload{}.Assign
+var _ = overload{}.Compare
 var _ = overload{}.UnaryAssign
 
 // buildDict is a template function that builds a dictionary out of its

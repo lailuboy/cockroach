@@ -28,6 +28,9 @@ extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fmetadata_2eproto ::google::pr
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fmetadata_2eproto ::google::protobuf::internal::SCCInfo<2> scc_info_LocalityAddress;
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_roachpb_2fmetadata_2eproto ::google::protobuf::internal::SCCInfo<5> scc_info_NodeDescriptor;
 }  // namespace protobuf_roachpb_2fmetadata_2eproto
+namespace protobuf_util_2fhlc_2ftimestamp_2eproto {
+extern PROTOBUF_INTERNAL_EXPORT_protobuf_util_2fhlc_2ftimestamp_2eproto ::google::protobuf::internal::SCCInfo<0> scc_info_Timestamp;
+}  // namespace protobuf_util_2fhlc_2ftimestamp_2eproto
 namespace protobuf_util_2funresolved_5faddr_2eproto {
 extern PROTOBUF_INTERNAL_EXPORT_protobuf_util_2funresolved_5faddr_2eproto ::google::protobuf::internal::SCCInfo<0> scc_info_UnresolvedAddr;
 }  // namespace protobuf_util_2funresolved_5faddr_2eproto
@@ -174,9 +177,10 @@ static void InitDefaultsRangeDescriptor() {
   ::cockroach::roachpb::RangeDescriptor::InitAsDefaultInstance();
 }
 
-::google::protobuf::internal::SCCInfo<1> scc_info_RangeDescriptor =
-    {{ATOMIC_VAR_INIT(::google::protobuf::internal::SCCInfoBase::kUninitialized), 1, InitDefaultsRangeDescriptor}, {
-      &protobuf_roachpb_2fmetadata_2eproto::scc_info_ReplicaDescriptor.base,}};
+::google::protobuf::internal::SCCInfo<2> scc_info_RangeDescriptor =
+    {{ATOMIC_VAR_INIT(::google::protobuf::internal::SCCInfoBase::kUninitialized), 2, InitDefaultsRangeDescriptor}, {
+      &protobuf_roachpb_2fmetadata_2eproto::scc_info_ReplicaDescriptor.base,
+      &protobuf_util_2fhlc_2ftimestamp_2eproto::scc_info_Timestamp.base,}};
 
 static void InitDefaultsPercentiles() {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
@@ -1227,14 +1231,21 @@ void ReplicaIdent::InternalSwap(ReplicaIdent* other) {
 // ===================================================================
 
 void RangeDescriptor::InitAsDefaultInstance() {
+  ::cockroach::roachpb::_RangeDescriptor_default_instance_._instance.get_mutable()->sticky_bit_ = const_cast< ::cockroach::util::hlc::Timestamp*>(
+      ::cockroach::util::hlc::Timestamp::internal_default_instance());
+}
+void RangeDescriptor::clear_sticky_bit() {
+  if (sticky_bit_ != NULL) sticky_bit_->Clear();
+  clear_has_sticky_bit();
 }
 #if !defined(_MSC_VER) || _MSC_VER >= 1900
 const int RangeDescriptor::kRangeIdFieldNumber;
 const int RangeDescriptor::kStartKeyFieldNumber;
 const int RangeDescriptor::kEndKeyFieldNumber;
-const int RangeDescriptor::kReplicasFieldNumber;
+const int RangeDescriptor::kInternalReplicasFieldNumber;
 const int RangeDescriptor::kNextReplicaIdFieldNumber;
 const int RangeDescriptor::kGenerationFieldNumber;
+const int RangeDescriptor::kStickyBitFieldNumber;
 #endif  // !defined(_MSC_VER) || _MSC_VER >= 1900
 
 RangeDescriptor::RangeDescriptor()
@@ -1248,7 +1259,7 @@ RangeDescriptor::RangeDescriptor(const RangeDescriptor& from)
   : ::google::protobuf::MessageLite(),
       _internal_metadata_(NULL),
       _has_bits_(from._has_bits_),
-      replicas_(from.replicas_) {
+      internal_replicas_(from.internal_replicas_) {
   _internal_metadata_.MergeFrom(from._internal_metadata_);
   start_key_.UnsafeSetDefault(&::google::protobuf::internal::GetEmptyStringAlreadyInited());
   if (from.has_start_key()) {
@@ -1257,6 +1268,11 @@ RangeDescriptor::RangeDescriptor(const RangeDescriptor& from)
   end_key_.UnsafeSetDefault(&::google::protobuf::internal::GetEmptyStringAlreadyInited());
   if (from.has_end_key()) {
     end_key_.AssignWithDefault(&::google::protobuf::internal::GetEmptyStringAlreadyInited(), from.end_key_);
+  }
+  if (from.has_sticky_bit()) {
+    sticky_bit_ = new ::cockroach::util::hlc::Timestamp(*from.sticky_bit_);
+  } else {
+    sticky_bit_ = NULL;
   }
   ::memcpy(&range_id_, &from.range_id_,
     static_cast<size_t>(reinterpret_cast<char*>(&next_replica_id_) -
@@ -1267,9 +1283,9 @@ RangeDescriptor::RangeDescriptor(const RangeDescriptor& from)
 void RangeDescriptor::SharedCtor() {
   start_key_.UnsafeSetDefault(&::google::protobuf::internal::GetEmptyStringAlreadyInited());
   end_key_.UnsafeSetDefault(&::google::protobuf::internal::GetEmptyStringAlreadyInited());
-  ::memset(&range_id_, 0, static_cast<size_t>(
+  ::memset(&sticky_bit_, 0, static_cast<size_t>(
       reinterpret_cast<char*>(&next_replica_id_) -
-      reinterpret_cast<char*>(&range_id_)) + sizeof(next_replica_id_));
+      reinterpret_cast<char*>(&sticky_bit_)) + sizeof(next_replica_id_));
 }
 
 RangeDescriptor::~RangeDescriptor() {
@@ -1280,6 +1296,7 @@ RangeDescriptor::~RangeDescriptor() {
 void RangeDescriptor::SharedDtor() {
   start_key_.DestroyNoArena(&::google::protobuf::internal::GetEmptyStringAlreadyInited());
   end_key_.DestroyNoArena(&::google::protobuf::internal::GetEmptyStringAlreadyInited());
+  if (this != internal_default_instance()) delete sticky_bit_;
 }
 
 void RangeDescriptor::SetCachedSize(int size) const {
@@ -1297,17 +1314,21 @@ void RangeDescriptor::Clear() {
   // Prevent compiler warnings about cached_has_bits being unused
   (void) cached_has_bits;
 
-  replicas_.Clear();
+  internal_replicas_.Clear();
   cached_has_bits = _has_bits_[0];
-  if (cached_has_bits & 3u) {
+  if (cached_has_bits & 7u) {
     if (cached_has_bits & 0x00000001u) {
       start_key_.ClearNonDefaultToEmptyNoArena();
     }
     if (cached_has_bits & 0x00000002u) {
       end_key_.ClearNonDefaultToEmptyNoArena();
     }
+    if (cached_has_bits & 0x00000004u) {
+      GOOGLE_DCHECK(sticky_bit_ != NULL);
+      sticky_bit_->Clear();
+    }
   }
-  if (cached_has_bits & 28u) {
+  if (cached_has_bits & 56u) {
     ::memset(&range_id_, 0, static_cast<size_t>(
         reinterpret_cast<char*>(&next_replica_id_) -
         reinterpret_cast<char*>(&range_id_)) + sizeof(next_replica_id_));
@@ -1371,7 +1392,7 @@ bool RangeDescriptor::MergePartialFromCodedStream(
         if (static_cast< ::google::protobuf::uint8>(tag) ==
             static_cast< ::google::protobuf::uint8>(34u /* 34 & 0xFF */)) {
           DO_(::google::protobuf::internal::WireFormatLite::ReadMessage(
-                input, add_replicas()));
+                input, add_internal_replicas()));
         } else {
           goto handle_unusual;
         }
@@ -1405,6 +1426,18 @@ bool RangeDescriptor::MergePartialFromCodedStream(
         break;
       }
 
+      // optional .cockroach.util.hlc.Timestamp sticky_bit = 7;
+      case 7: {
+        if (static_cast< ::google::protobuf::uint8>(tag) ==
+            static_cast< ::google::protobuf::uint8>(58u /* 58 & 0xFF */)) {
+          DO_(::google::protobuf::internal::WireFormatLite::ReadMessage(
+               input, mutable_sticky_bit()));
+        } else {
+          goto handle_unusual;
+        }
+        break;
+      }
+
       default: {
       handle_unusual:
         if (tag == 0) {
@@ -1432,7 +1465,7 @@ void RangeDescriptor::SerializeWithCachedSizes(
   (void) cached_has_bits;
 
   cached_has_bits = _has_bits_[0];
-  if (cached_has_bits & 0x00000004u) {
+  if (cached_has_bits & 0x00000008u) {
     ::google::protobuf::internal::WireFormatLite::WriteInt64(1, this->range_id(), output);
   }
 
@@ -1447,20 +1480,26 @@ void RangeDescriptor::SerializeWithCachedSizes(
   }
 
   for (unsigned int i = 0,
-      n = static_cast<unsigned int>(this->replicas_size()); i < n; i++) {
+      n = static_cast<unsigned int>(this->internal_replicas_size()); i < n; i++) {
     ::google::protobuf::internal::WireFormatLite::WriteMessage(
       4,
-      this->replicas(static_cast<int>(i)),
+      this->internal_replicas(static_cast<int>(i)),
       output);
   }
 
-  if (cached_has_bits & 0x00000010u) {
+  if (cached_has_bits & 0x00000020u) {
     ::google::protobuf::internal::WireFormatLite::WriteInt32(5, this->next_replica_id(), output);
   }
 
   // optional int64 generation = 6;
-  if (cached_has_bits & 0x00000008u) {
+  if (cached_has_bits & 0x00000010u) {
     ::google::protobuf::internal::WireFormatLite::WriteInt64(6, this->generation(), output);
+  }
+
+  // optional .cockroach.util.hlc.Timestamp sticky_bit = 7;
+  if (cached_has_bits & 0x00000004u) {
+    ::google::protobuf::internal::WireFormatLite::WriteMessage(
+      7, this->_internal_sticky_bit(), output);
   }
 
   output->WriteRaw(_internal_metadata_.unknown_fields().data(),
@@ -1475,16 +1514,16 @@ size_t RangeDescriptor::ByteSizeLong() const {
   total_size += _internal_metadata_.unknown_fields().size();
 
   {
-    unsigned int count = static_cast<unsigned int>(this->replicas_size());
+    unsigned int count = static_cast<unsigned int>(this->internal_replicas_size());
     total_size += 1UL * count;
     for (unsigned int i = 0; i < count; i++) {
       total_size +=
         ::google::protobuf::internal::WireFormatLite::MessageSize(
-          this->replicas(static_cast<int>(i)));
+          this->internal_replicas(static_cast<int>(i)));
     }
   }
 
-  if (_has_bits_[0 / 32] & 31u) {
+  if (_has_bits_[0 / 32] & 63u) {
     if (has_start_key()) {
       total_size += 1 +
         ::google::protobuf::internal::WireFormatLite::BytesSize(
@@ -1495,6 +1534,13 @@ size_t RangeDescriptor::ByteSizeLong() const {
       total_size += 1 +
         ::google::protobuf::internal::WireFormatLite::BytesSize(
           this->end_key());
+    }
+
+    // optional .cockroach.util.hlc.Timestamp sticky_bit = 7;
+    if (has_sticky_bit()) {
+      total_size += 1 +
+        ::google::protobuf::internal::WireFormatLite::MessageSize(
+          *sticky_bit_);
     }
 
     if (has_range_id()) {
@@ -1534,9 +1580,9 @@ void RangeDescriptor::MergeFrom(const RangeDescriptor& from) {
   ::google::protobuf::uint32 cached_has_bits = 0;
   (void) cached_has_bits;
 
-  replicas_.MergeFrom(from.replicas_);
+  internal_replicas_.MergeFrom(from.internal_replicas_);
   cached_has_bits = from._has_bits_[0];
-  if (cached_has_bits & 31u) {
+  if (cached_has_bits & 63u) {
     if (cached_has_bits & 0x00000001u) {
       set_has_start_key();
       start_key_.AssignWithDefault(&::google::protobuf::internal::GetEmptyStringAlreadyInited(), from.start_key_);
@@ -1546,12 +1592,15 @@ void RangeDescriptor::MergeFrom(const RangeDescriptor& from) {
       end_key_.AssignWithDefault(&::google::protobuf::internal::GetEmptyStringAlreadyInited(), from.end_key_);
     }
     if (cached_has_bits & 0x00000004u) {
-      range_id_ = from.range_id_;
+      mutable_sticky_bit()->::cockroach::util::hlc::Timestamp::MergeFrom(from.sticky_bit());
     }
     if (cached_has_bits & 0x00000008u) {
-      generation_ = from.generation_;
+      range_id_ = from.range_id_;
     }
     if (cached_has_bits & 0x00000010u) {
+      generation_ = from.generation_;
+    }
+    if (cached_has_bits & 0x00000020u) {
       next_replica_id_ = from.next_replica_id_;
     }
     _has_bits_[0] |= cached_has_bits;
@@ -1575,11 +1624,12 @@ void RangeDescriptor::Swap(RangeDescriptor* other) {
 }
 void RangeDescriptor::InternalSwap(RangeDescriptor* other) {
   using std::swap;
-  CastToBase(&replicas_)->InternalSwap(CastToBase(&other->replicas_));
+  CastToBase(&internal_replicas_)->InternalSwap(CastToBase(&other->internal_replicas_));
   start_key_.Swap(&other->start_key_, &::google::protobuf::internal::GetEmptyStringAlreadyInited(),
     GetArenaNoVirtual());
   end_key_.Swap(&other->end_key_, &::google::protobuf::internal::GetEmptyStringAlreadyInited(),
     GetArenaNoVirtual());
+  swap(sticky_bit_, other->sticky_bit_);
   swap(range_id_, other->range_id_);
   swap(generation_, other->generation_);
   swap(next_replica_id_, other->next_replica_id_);

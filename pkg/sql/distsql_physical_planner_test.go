@@ -27,6 +27,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -233,7 +234,7 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 	}
 
 	// Push some metadata and check that the caches are updated with it.
-	status := r.Push(nil /* row */, &distsqlrun.ProducerMetadata{
+	status := r.Push(nil /* row */, &distsqlpb.ProducerMetadata{
 		Ranges: []roachpb.RangeInfo{
 			{
 				Desc: descs[0],
@@ -249,7 +250,7 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 	if status != distsqlrun.NeedMoreRows {
 		t.Fatalf("expected status NeedMoreRows, got: %d", status)
 	}
-	status = r.Push(nil /* row */, &distsqlrun.ProducerMetadata{
+	status = r.Push(nil /* row */, &distsqlpb.ProducerMetadata{
 		Ranges: []roachpb.RangeInfo{
 			{
 				Desc: descs[2],
@@ -486,7 +487,7 @@ func TestDistSQLDrainingHosts(t *testing.T) {
 		numNodes,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
-			ServerArgs:      base.TestServerArgs{UseDatabase: "test"},
+			ServerArgs:      base.TestServerArgs{Knobs: base.TestingKnobs{DistSQL: &distsqlrun.TestingKnobs{DrainFast: true}}, UseDatabase: "test"},
 		},
 	)
 	ctx := context.TODO()
@@ -543,7 +544,6 @@ func TestDistSQLDrainingHosts(t *testing.T) {
 	// Drain the second node and expect the query to be planned on only the
 	// first node.
 	distServer := tc.Server(1).DistSQLServer().(*distsqlrun.ServerImpl)
-	distServer.ServerConfig.TestingKnobs.DrainFast = true
 	distServer.Drain(ctx, 0 /* flowDrainWait */)
 
 	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html#eJyUkDFLxEAUhHt_xTGVwsolV26lWF2TSO7EQoKs2UcIJPvCextQjvx3SbbQE060fDM78w17QmBPhRtIYV-QozYYhRtSZVmk9GDv32Ezgy6MU1zk2qBhIdgTYhd7gsXRvfVUkfMk2wwGnqLr-rV2lG5w8nEXpkFhcBhdULu5hUE5RbspOBDq2YCn-NWv0bUEm8_m7xvu21aodZFlm59PeCifiuNrVT4frm8usnb_YVWkIwelM86l5myuDci3lP5UeZKGHoWbFZPOcs2tgieNyc3TsQ_JWgZ-D-e_hnc_wvV89RkAAP__weakAA=="}})
@@ -750,7 +750,7 @@ func TestPartitionSpans(t *testing.T) {
 	testStopper := stop.NewStopper()
 	defer testStopper.Stop(context.TODO())
 	mockGossip := gossip.NewTest(roachpb.NodeID(1), nil /* rpcContext */, nil, /* grpcServer */
-		testStopper, metric.NewRegistry())
+		testStopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
 	var nodeDescs []*roachpb.NodeDescriptor
 	for i := 1; i <= 10; i++ {
 		nodeID := roachpb.NodeID(i)
@@ -940,7 +940,7 @@ func TestPartitionSpansSkipsIncompatibleNodes(t *testing.T) {
 			testStopper := stop.NewStopper()
 			defer testStopper.Stop(context.TODO())
 			mockGossip := gossip.NewTest(roachpb.NodeID(1), nil /* rpcContext */, nil, /* grpcServer */
-				testStopper, metric.NewRegistry())
+				testStopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
 			var nodeDescs []*roachpb.NodeDescriptor
 			for i := 1; i <= 2; i++ {
 				nodeID := roachpb.NodeID(i)
@@ -1029,7 +1029,7 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 	defer stopper.Stop(context.TODO())
 
 	mockGossip := gossip.NewTest(roachpb.NodeID(1), nil /* rpcContext */, nil, /* grpcServer */
-		stopper, metric.NewRegistry())
+		stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
 	var nodeDescs []*roachpb.NodeDescriptor
 	for i := 1; i <= 2; i++ {
 		nodeID := roachpb.NodeID(i)
@@ -1119,7 +1119,7 @@ func TestCheckNodeHealth(t *testing.T) {
 	const nodeID = roachpb.NodeID(5)
 
 	mockGossip := gossip.NewTest(nodeID, nil /* rpcContext */, nil, /* grpcServer */
-		stopper, metric.NewRegistry())
+		stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
 
 	desc := &roachpb.NodeDescriptor{
 		NodeID:  nodeID,
@@ -1163,7 +1163,7 @@ func TestCheckNodeHealth(t *testing.T) {
 	}{
 		{live, ""},
 		{errLive, "not using n5 due to liveness: injected liveness error"},
-		{notLive, "not using n5 due to liveness: node is not live"},
+		{notLive, "not using n5 due to liveness: node n5 is not live"},
 	}
 
 	for _, test := range livenessTests {

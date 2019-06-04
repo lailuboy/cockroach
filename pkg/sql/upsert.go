@@ -16,14 +16,13 @@ package sql
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
@@ -61,7 +60,7 @@ func (p *planner) newUpsertNode(
 	computeExprs []tree.TypedExpr,
 	computedCols []sqlbase.ColumnDescriptor,
 	fkTables row.FkTableMetadata,
-	desiredTypes []types.T,
+	desiredTypes []*types.T,
 ) (res batchedPlanNode, err error) {
 	// Extract the index that will detect upsert conflicts
 	// (conflictIndex) and the assignment expressions to use when
@@ -354,7 +353,6 @@ func (n *upsertNode) BatchedNext(params runParams) (bool, error) {
 
 	// Possibly initiate a run of CREATE STATISTICS.
 	params.ExecCfg().StatsRefresher.NotifyMutation(
-		&params.EvalContext().Settings.SV,
 		n.run.tw.tableDesc().ID,
 		n.run.tw.batchedCount(),
 	)
@@ -373,7 +371,7 @@ func (n *upsertNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 		n.run.computeExprs,
 		n.run.insertCols,
 		n.run.computedCols,
-		*params.EvalContext(),
+		params.EvalContext().Copy(),
 		n.run.tw.tableDesc(),
 		sourceVals,
 		&n.run.iVarContainerForComputedCols,
@@ -514,7 +512,7 @@ func (uh *upsertHelper) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Dat
 }
 
 // IndexedVarResolvedType implements the tree.IndexedVarContainer interface.
-func (uh *upsertHelper) IndexedVarResolvedType(idx int) types.T {
+func (uh *upsertHelper) IndexedVarResolvedType(idx int) *types.T {
 	numSourceColumns := len(uh.sourceInfo.SourceColumns)
 	if idx >= numSourceColumns {
 		return uh.excludedSourceInfo.SourceColumns[idx-numSourceColumns].Typ
@@ -586,7 +584,7 @@ func (p *planner) newUpsertHelper(
 					i++
 				}
 			} else {
-				return nil, pgerror.UnimplementedWithIssueErrorf(8330,
+				return nil, pgerror.UnimplementedWithIssuef(8330,
 					"cannot use this type of expression on the right of UPDATE SET: %s", updateExpr.Expr)
 			}
 		} else {
@@ -648,7 +646,7 @@ func (p *planner) newUpsertHelper(
 		// Analyze the expression.
 
 		// We require the type from the column descriptor.
-		desiredType := updateCols[i].Type.ToDatumType()
+		desiredType := &updateCols[i].Type
 
 		// Resolve names, type and normalize.
 		normExpr, err := p.analyzeExpr(
@@ -832,5 +830,6 @@ func upsertExprsAndIndex(
 			return false, onConflict.Exprs, &tableDesc.Indexes[i], nil
 		}
 	}
-	return false, nil, nil, fmt.Errorf("there is no unique or exclusion constraint matching the ON CONFLICT specification")
+	return false, nil, nil, pgerror.Newf(pgerror.CodeInvalidColumnReferenceError,
+		"there is no unique or exclusion constraint matching the ON CONFLICT specification")
 }

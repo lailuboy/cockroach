@@ -18,23 +18,17 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
-
-func checkArrayElementType(t types.T) error {
-	if !types.IsValidArrayElementType(t) {
-		return pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError,
-			"arrays of %s not allowed", t)
-	}
-	return nil
-}
 
 // buildScalar builds a set of memo groups that represent the given scalar
 // expression. If outScope is not nil, then this is a projection context, and
@@ -87,6 +81,9 @@ func (b *Builder) buildScalar(
 	case *aggregateInfo:
 		return b.finishBuildScalarRef(t.col, inScope.groupby.aggOutScope, outScope, outCol, colRefs)
 
+	case *windowInfo:
+		return b.finishBuildScalarRef(t.col, inScope, outScope, outCol, colRefs)
+
 	case *tree.AndExpr:
 		left := b.buildScalar(t.TypedLeft(), inScope, nil, nil, colRefs)
 		right := b.buildScalar(t.TypedRight(), inScope, nil, nil, colRefs)
@@ -95,8 +92,8 @@ func (b *Builder) buildScalar(
 	case *tree.Array:
 		els := make(memo.ScalarListExpr, len(t.Exprs))
 		arrayType := t.ResolvedType()
-		elementType := arrayType.(types.TArray).Typ
-		if err := checkArrayElementType(elementType); err != nil {
+		elementType := arrayType.ArrayContents()
+		if err := types.CheckArrayElementType(elementType); err != nil {
 			panic(builderError{err})
 		}
 		for i := range t.Exprs {
@@ -124,11 +121,11 @@ func (b *Builder) buildScalar(
 		// Thus, we reject a query that is correlated and over a type that we can't array_agg.
 		typ := b.factory.Metadata().ColumnMeta(inCol).Type
 		if !s.outerCols.Empty() && !memo.AggregateOverloadExists(opt.ArrayAggOp, typ) {
-			panic(builderError{fmt.Errorf("can't execute a correlated ARRAY(...) over %s", typ)})
+			panic(unimplementedWithIssueDetailf(35710, "", "can't execute a correlated ARRAY(...) over %s", typ))
 		}
 
-		if !types.IsValidArrayElementType(typ) {
-			panic(builderError{fmt.Errorf("arrays of %s not allowed", typ)})
+		if err := types.CheckArrayElementType(typ); err != nil {
+			panic(builderError{err})
 		}
 
 		// Perform correctness checks on the outer cols, update colRefs and
@@ -146,12 +143,12 @@ func (b *Builder) buildScalar(
 		expr := b.buildScalar(t.Expr.(tree.TypedExpr), inScope, nil, nil, colRefs)
 
 		if len(t.Indirection) != 1 {
-			panic(unimplementedf("multidimensional arrays are not supported"))
+			panic(unimplementedWithIssueDetailf(32552, "ind", "multidimensional indexing is not supported"))
 		}
 
 		subscript := t.Indirection[0]
 		if subscript.Slice {
-			panic(unimplementedf("array slicing is not supported"))
+			panic(unimplementedWithIssueDetailf(32551, "", "array slicing is not supported"))
 		}
 
 		out = b.factory.ConstructIndirection(
@@ -228,7 +225,7 @@ func (b *Builder) buildScalar(
 	case *tree.CastExpr:
 		texpr := t.Expr.(tree.TypedExpr)
 		arg := b.buildScalar(texpr, inScope, nil, nil, colRefs)
-		out = b.factory.ConstructCast(arg, t.Type.(coltypes.T))
+		out = b.factory.ConstructCast(arg, t.Type)
 
 	case *tree.CoalesceExpr:
 		args := make(memo.ScalarListExpr, len(t.Exprs))
@@ -242,14 +239,14 @@ func (b *Builder) buildScalar(
 		out = b.factory.ConstructColumnAccess(input, memo.TupleOrdinal(t.ColIndex))
 
 	case *tree.ComparisonExpr:
-		if sub, ok := t.Right.(*subquery); ok && sub.wrapInTuple {
+		if sub, ok := t.Right.(*subquery); ok && sub.isMultiRow() {
 			out, _ = b.buildMultiRowSubquery(t, inScope, colRefs)
 			// Perform correctness checks on the outer cols, update colRefs and
 			// b.subquery.outerCols.
 			b.checkSubqueryOuterCols(sub.outerCols, inGroupingContext, inScope, colRefs)
 		} else if b.hasSubOperator(t) {
-			// Cases where the RHS is a subquery and not a scalar (of which only an
-			// array or tuple is legal) were handled above.
+			// Cases where the RHS is a multi-row subquery were handled above, so this
+			// only handles explicit tuples and arrays.
 			out = b.buildAnyScalar(t, inScope, colRefs)
 		} else {
 			left := b.buildScalar(t.TypedLeft(), inScope, nil, nil, colRefs)
@@ -276,8 +273,8 @@ func (b *Builder) buildScalar(
 
 	case *tree.IndexedVar:
 		if t.Idx < 0 || t.Idx >= len(inScope.cols) {
-			panic(builderError{pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-				"invalid column ordinal: @%d", t.Idx+1)})
+			panic(pgerror.Newf(pgerror.CodeUndefinedColumnError,
+				"invalid column ordinal: @%d", t.Idx+1))
 		}
 		out = b.factory.ConstructVariable(inScope.cols[t.Idx].id)
 
@@ -359,8 +356,7 @@ func (b *Builder) buildScalar(
 
 		found := false
 		for _, typ := range t.Types {
-			wantTyp := coltypes.CastTargetToDatumType(typ)
-			if actualType.Equivalent(wantTyp) {
+			if actualType.Equivalent(typ) {
 				found = true
 				break
 			}
@@ -382,7 +378,7 @@ func (b *Builder) buildScalar(
 		if b.AllowUnsupportedExpr {
 			out = b.factory.ConstructUnsupportedExpr(scalar)
 		} else {
-			panic(unimplementedf("not yet implemented: scalar expression: %T", scalar))
+			panic(unimplementedWithIssueDetailf(34848, fmt.Sprintf("%T", scalar), "not yet implemented: scalar expression: %T", scalar))
 		}
 	}
 
@@ -430,7 +426,6 @@ func (b *Builder) buildFunction(
 		if inScope.groupby.inAgg {
 			panic(builderError{sqlbase.NewWindowInAggError()})
 		}
-		panic(unimplementedf("window functions are not supported"))
 	}
 
 	def, err := f.Func.Resolve(b.semaCtx.SearchPath)
@@ -439,7 +434,11 @@ func (b *Builder) buildFunction(
 	}
 
 	if isAggregate(def) {
-		panic("aggregate function should have been replaced")
+		panic(pgerror.AssertionFailedf("aggregate function should have been replaced"))
+	}
+
+	if isWindow(def) {
+		panic(pgerror.AssertionFailedf("window function should have been replaced"))
 	}
 
 	args := make(memo.ScalarListExpr, len(f.Exprs))
@@ -513,6 +512,18 @@ func (b *Builder) checkSubqueryOuterCols(
 		return
 	}
 
+	if !b.IsCorrelated {
+		// Remember whether the query was correlated for the heuristic planner,
+		// to enhance error messages.
+		// TODO(knz): this can go away when the HP disappears.
+		b.IsCorrelated = true
+
+		// Register the use of correlation to telemetry.
+		// Note: we don't blindly increment the counter every time this
+		// method is called, to avoid double counting the same query.
+		telemetry.Inc(sqltelemetry.CorrelatedSubqueryUseCounter)
+	}
+
 	var inScopeCols opt.ColSet
 	if b.subquery != nil || inGroupingContext {
 		// Only calculate the set of inScope columns if it will be used below.
@@ -546,10 +557,10 @@ func (b *Builder) checkSubqueryOuterCols(
 			subqueryOuterCols.DifferenceWith(inScope.groupby.aggOutScope.colSet())
 			colID, _ := subqueryOuterCols.Next(0)
 			col := inScope.getColumn(opt.ColumnID(colID))
-			panic(builderError{pgerror.NewErrorf(
+			panic(pgerror.Newf(
 				pgerror.CodeGroupingError,
 				"subquery uses ungrouped column \"%s\" from outer query",
-				tree.ErrString(&col.name))})
+				tree.ErrString(&col.name)))
 		}
 	}
 }
@@ -610,11 +621,11 @@ func (b *Builder) constructComparison(
 	case tree.JSONSomeExists:
 		return b.factory.ConstructJsonSomeExists(left, right)
 	}
-	panic(fmt.Sprintf("unhandled comparison operator: %s", cmp))
+	panic(pgerror.AssertionFailedf("unhandled comparison operator: %s", log.Safe(cmp)))
 }
 
 func (b *Builder) constructBinary(
-	bin tree.BinaryOperator, left, right opt.ScalarExpr, typ types.T,
+	bin tree.BinaryOperator, left, right opt.ScalarExpr, typ *types.T,
 ) opt.ScalarExpr {
 	switch bin {
 	case tree.Bitand:
@@ -652,11 +663,11 @@ func (b *Builder) constructBinary(
 	case tree.JSONFetchTextPath:
 		return b.factory.ConstructFetchTextPath(left, right)
 	}
-	panic(fmt.Sprintf("unhandled binary operator: %s", bin))
+	panic(pgerror.AssertionFailedf("unhandled binary operator: %s", log.Safe(bin)))
 }
 
 func (b *Builder) constructUnary(
-	un tree.UnaryOperator, input opt.ScalarExpr, typ types.T,
+	un tree.UnaryOperator, input opt.ScalarExpr, typ *types.T,
 ) opt.ScalarExpr {
 	switch un {
 	case tree.UnaryMinus:
@@ -664,7 +675,7 @@ func (b *Builder) constructUnary(
 	case tree.UnaryComplement:
 		return b.factory.ConstructUnaryComplement(input)
 	}
-	panic(fmt.Sprintf("unhandled unary operator: %s", un))
+	panic(pgerror.AssertionFailedf("unhandled unary operator: %s", log.Safe(un)))
 }
 
 // ScalarBuilder is a specialized variant of Builder that can be used to create

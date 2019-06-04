@@ -20,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
@@ -63,6 +64,18 @@ func Inc(c Counter) {
 	atomic.AddInt32(c, 1)
 }
 
+// GetCounterOnce returns a counter from the global registry,
+// and asserts it didn't exist previously.
+func GetCounterOnce(feature string) Counter {
+	counters.RLock()
+	_, ok := counters.m[feature]
+	counters.RUnlock()
+	if ok {
+		panic("counter already exists: " + feature)
+	}
+	return GetCounter(feature)
+}
+
 // GetCounter returns a counter from the global registry.
 func GetCounter(feature string) Counter {
 	counters.RLock()
@@ -79,11 +92,68 @@ func GetCounter(feature string) Counter {
 	return i
 }
 
+// CounterWithMetric combines a telemetry and a metrics counter.
+type CounterWithMetric struct {
+	telemetry Counter
+	metric    *metric.Counter
+}
+
+// Necessary for metric metadata registration.
+var _ metric.Iterable = CounterWithMetric{}
+
+// NewCounterWithMetric creates a CounterWithMetric.
+func NewCounterWithMetric(metadata metric.Metadata) CounterWithMetric {
+	return CounterWithMetric{
+		telemetry: GetCounter(metadata.Name),
+		metric:    metric.NewCounter(metadata),
+	}
+}
+
+// Inc increments both counters.
+func (c CounterWithMetric) Inc() {
+	Inc(c.telemetry)
+	c.metric.Inc(1)
+}
+
+// Forward the metric.Iterable interface to the metric counter. We
+// don't just embed the counter because our Inc() interface is a bit
+// different.
+
+// GetName implements metric.Iterable
+func (c CounterWithMetric) GetName() string {
+	return c.metric.GetName()
+}
+
+// GetHelp implements metric.Iterable
+func (c CounterWithMetric) GetHelp() string {
+	return c.metric.GetHelp()
+}
+
+// GetMeasurement implements metric.Iterable
+func (c CounterWithMetric) GetMeasurement() string {
+	return c.metric.GetMeasurement()
+}
+
+// GetUnit implements metric.Iterable
+func (c CounterWithMetric) GetUnit() metric.Unit {
+	return c.metric.GetUnit()
+}
+
+// GetMetadata implements metric.Iterable
+func (c CounterWithMetric) GetMetadata() metric.Metadata {
+	return c.metric.GetMetadata()
+}
+
+// Inspect implements metric.Iterable
+func (c CounterWithMetric) Inspect(f func(interface{})) {
+	c.metric.Inspect(f)
+}
+
 func init() {
 	counters.m = make(map[string]Counter, approxFeatureCount)
 }
 
-var approxFeatureCount = 100
+var approxFeatureCount = 1500
 
 // counters stores the registry of feature-usage counts.
 // TODO(dt): consider a lock-free map.
@@ -92,27 +162,43 @@ var counters struct {
 	m map[string]Counter
 }
 
-// GetFeatureCounts returns the current feature usage counts. Used for
-// inspection via SQL. They are not quantized! Thus not suitable for
-// reporting.
-func GetFeatureCounts() map[string]int32 {
-	counters.RLock()
-	defer counters.RUnlock()
-	m := make(map[string]int32, len(counters.m))
-	for k, cnt := range counters.m {
-		m[k] = atomic.LoadInt32(cnt)
-	}
-	return m
+// QuantizeCounts controls if counts are quantized when fetched.
+type QuantizeCounts bool
+
+// ResetCounters controls if counts are reset when fetched.
+type ResetCounters bool
+
+const (
+	// Quantized returns counts quantized to order of magnitude.
+	Quantized QuantizeCounts = true
+	// Raw returns the raw, unquanitzed counter values.
+	Raw QuantizeCounts = false
+	// ResetCounts resets the counter to zero after fetching its value.
+	ResetCounts ResetCounters = true
+	// ReadOnly leaves the counter value unchanged when reading it.
+	ReadOnly ResetCounters = false
+)
+
+// GetRawFeatureCounts returns current raw, un-quanitzed feature counter values.
+func GetRawFeatureCounts() map[string]int32 {
+	return GetFeatureCounts(Raw, ReadOnly)
 }
 
-// GetAndResetFeatureCounts returns the current feature usage counts and resets
-// the counts for all features back to 0. If `quantize` is true, the returned
-// counts are quantized to just order of magnitude using the `Bucket10` helper.
-func GetAndResetFeatureCounts(quantize bool) map[string]int32 {
+// GetFeatureCounts returns the current feature usage counts.
+//
+// It optionally quantizes quantizes the returned counts to just order of
+// magnitude using the `Bucket10` helper, and optionally resets the counters to
+// zero i.e. if flushing accumulated counts during a report.
+func GetFeatureCounts(quantize QuantizeCounts, reset ResetCounters) map[string]int32 {
 	counters.RLock()
 	m := make(map[string]int32, len(counters.m))
 	for k, cnt := range counters.m {
-		val := atomic.SwapInt32(cnt, 0)
+		var val int32
+		if reset {
+			val = atomic.SwapInt32(cnt, 0)
+		} else {
+			val = atomic.LoadInt32(cnt)
+		}
 		if val != 0 {
 			m[k] = val
 		}
@@ -138,7 +224,7 @@ func RecordError(err error) {
 	if pgErr, ok := pgerror.GetPGCause(err); ok {
 		Count("errorcodes." + pgErr.Code)
 
-		if details := pgErr.InternalCommand; details != "" {
+		if details := pgErr.TelemetryKey; details != "" {
 			var prefix string
 			switch pgErr.Code {
 			case pgerror.CodeFeatureNotSupportedError:

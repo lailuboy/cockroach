@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -30,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -202,6 +204,12 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 		includedInBootstrap: true,
 		newDescriptorIDs:    staticIDs(keys.CommentsTableID),
 	},
+	{
+		// Introduced in v2.2.
+		// TODO(knz): bake this migration into v2.3.
+		name:   "propagate the ts purge interval to the new setting names",
+		workFn: retireOldTsPurgeIntervalSettings,
+	},
 }
 
 func staticIDs(ids ...sqlbase.ID) func(ctx context.Context, db db) ([]sqlbase.ID, error) {
@@ -324,12 +332,17 @@ func NewManager(
 // NOTE: This value may be out-of-date if another node is actively running
 // migrations, and so should only be used in test code where the migration
 // lifecycle is tightly controlled.
-func ExpectedDescriptorIDs(ctx context.Context, db db) (sqlbase.IDs, error) {
+func ExpectedDescriptorIDs(
+	ctx context.Context,
+	db db,
+	defaultZoneConfig *config.ZoneConfig,
+	defaultSystemZoneConfig *config.ZoneConfig,
+) (sqlbase.IDs, error) {
 	completedMigrations, err := getCompletedMigrations(ctx, db)
 	if err != nil {
 		return nil, err
 	}
-	descriptorIDs := sqlbase.MakeMetadataSchema().DescriptorIDs()
+	descriptorIDs := sqlbase.MakeMetadataSchema(defaultZoneConfig, defaultSystemZoneConfig).DescriptorIDs()
 	for _, migration := range backwardCompatibleMigrations {
 		// Is the migration not creating descriptors?
 		if migration.newDescriptorIDs == nil ||
@@ -529,12 +542,10 @@ func createSystemTable(ctx context.Context, r runner, desc sqlbase.TableDescript
 		}
 		return txn.Run(ctx, b)
 	})
-	if err != nil {
-		// CPuts only provide idempotent inserts if we ignore the errors that arise
-		// when the condition isn't met.
-		if _, ok := err.(*roachpb.ConditionFailedError); ok {
-			return nil
-		}
+	// CPuts only provide idempotent inserts if we ignore the errors that arise
+	// when the condition isn't met.
+	if _, ok := err.(*roachpb.ConditionFailedError); ok {
+		return nil
 	}
 	return err
 }
@@ -688,8 +699,8 @@ func upgradeDescsWithFn(
 	// use multiple transactions to prevent blocking reads on the
 	// table descriptors while running this upgrade process.
 	startKey := sqlbase.MakeAllDescsMetadataKey()
-	span := roachpb.Span{Key: startKey, EndKey: startKey.PrefixEnd()}
-	for resumeSpan := (roachpb.Span{}); span.Key != nil; span = resumeSpan {
+	span := &roachpb.Span{Key: startKey, EndKey: startKey.PrefixEnd()}
+	for span != nil {
 		// It's safe to use multiple transactions here because it is assumed
 		// that a new table created will be created upgraded.
 		if err := r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
@@ -703,7 +714,7 @@ func upgradeDescsWithFn(
 			result := b.Results[0]
 			kvs := result.Rows
 			// Store away the span for the next batch.
-			resumeSpan = result.ResumeSpan
+			span = result.ResumeSpan
 
 			var idVersions []sql.IDVersion
 			var now hlc.Timestamp
@@ -861,9 +872,9 @@ func addJobsProgress(ctx context.Context, r runner) error {
 		if _, err := desc.FindActiveColumnByName("progress"); err == nil {
 			return nil
 		}
-		desc.AddColumn(sqlbase.ColumnDescriptor{
+		desc.AddColumn(&sqlbase.ColumnDescriptor{
 			Name:     "progress",
-			Type:     sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BYTES},
+			Type:     *types.Bytes,
 			Nullable: true,
 		})
 		if err := desc.AddColumnToFamilyMaybeCreate("progress", "progress", true, false); err != nil {
@@ -874,4 +885,40 @@ func addJobsProgress(ctx context.Context, r runner) error {
 		}
 		return txn.Put(ctx, sqlbase.MakeDescMetadataKey(desc.ID), sqlbase.WrapDescriptor(desc))
 	})
+}
+
+func retireOldTsPurgeIntervalSettings(ctx context.Context, r runner) error {
+	// We are going to deprecate `timeseries.storage.10s_resolution_ttl`
+	// into `timeseries.storage.resolution_10s.ttl` if the latter is not
+	// defined.
+	//
+	// Ditto for the `30m` resolution.
+
+	// Copy 'timeseries.storage.10s_resolution_ttl' into
+	// 'timeseries.storage.resolution_10s.ttl' if the former is defined
+	// and the latter is not defined yet.
+	//
+	// We rely on the SELECT returning no row if the original setting
+	// was not defined, and INSERT ON CONFLICT DO NOTHING to ignore the
+	// insert if the new name was already set.
+	if _, err := r.sqlExecutor.Exec(ctx, "copy-setting", nil /* txn */, `
+INSERT INTO system.settings (name, value, "lastUpdated", "valueType")
+   SELECT 'timeseries.storage.resolution_10s.ttl', value, "lastUpdated", "valueType"
+     FROM system.settings WHERE name = 'timeseries.storage.10s_resolution_ttl'
+ON CONFLICT (name) DO NOTHING`,
+	); err != nil {
+		return err
+	}
+
+	// Ditto 30m.
+	if _, err := r.sqlExecutor.Exec(ctx, "copy-setting", nil /* txn */, `
+INSERT INTO system.settings (name, value, "lastUpdated", "valueType")
+   SELECT 'timeseries.storage.resolution_30m.ttl', value, "lastUpdated", "valueType"
+     FROM system.settings WHERE name = 'timeseries.storage.30m_resolution_ttl'
+ON CONFLICT (name) DO NOTHING`,
+	); err != nil {
+		return err
+	}
+
+	return nil
 }

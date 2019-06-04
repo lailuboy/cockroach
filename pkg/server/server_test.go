@@ -79,10 +79,13 @@ func TestHealthCheck(t *testing.T) {
 
 	cfg := config.DefaultZoneConfig()
 	cfg.NumReplicas = proto.Int32(1)
-	fnSys := config.TestingSetDefaultSystemZoneConfig(cfg)
-	defer fnSys()
-
-	s, err := serverutils.StartServerRaw(base.TestServerArgs{})
+	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Server: &TestingKnobs{
+				DefaultZoneConfigOverride: &cfg,
+			},
+		},
+	})
 
 	if err != nil {
 		t.Fatal(err)
@@ -311,19 +314,12 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
-	s, _, db := serverutils.StartServer(t, base.TestServerArgs{
-		Knobs: base.TestingKnobs{
-			Store: &storage.StoreTestingKnobs{
-				// Prevent the merge queue from immediately discarding our splits.
-				DisableMergeQueue: true,
-			},
-		},
-	})
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 	ts := s.(*TestServer)
 	tds := db.NonTransactionalSender()
 
-	if err := ts.node.storeCfg.DB.AdminSplit(ctx, "m", "m"); err != nil {
+	if err := ts.node.storeCfg.DB.AdminSplit(ctx, "m", "m", true /* manual */); err != nil {
 		t.Fatal(err)
 	}
 	writes := []roachpb.Key{roachpb.Key("a"), roachpb.Key("z")}
@@ -414,20 +410,13 @@ func TestMultiRangeScanWithMaxResults(t *testing.T) {
 	for i, tc := range testCases {
 		t.Run("", func(t *testing.T) {
 			ctx := context.Background()
-			s, _, db := serverutils.StartServer(t, base.TestServerArgs{
-				Knobs: base.TestingKnobs{
-					Store: &storage.StoreTestingKnobs{
-						// Prevent the merge queue from immediately discarding our splits.
-						DisableMergeQueue: true,
-					},
-				},
-			})
+			s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
 			defer s.Stopper().Stop(ctx)
 			ts := s.(*TestServer)
 			tds := db.NonTransactionalSender()
 
 			for _, sk := range tc.splitKeys {
-				if err := ts.node.storeCfg.DB.AdminSplit(ctx, sk, sk); err != nil {
+				if err := ts.node.storeCfg.DB.AdminSplit(ctx, sk, sk, true /* manual */); err != nil {
 					t.Fatal(err)
 				}
 			}

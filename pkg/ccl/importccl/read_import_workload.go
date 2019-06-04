@@ -10,37 +10,41 @@ package importccl
 
 import (
 	"context"
-	"fmt"
 	"net/url"
+	"runtime"
 	"strings"
-	"time"
+	"sync/atomic"
+	"unsafe"
 
+	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	sqltypes "github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/pkg/errors"
 )
 
 type workloadReader struct {
-	conv *rowConverter
-	kvCh chan kvBatch
+	evalCtx *tree.EvalContext
+	table   *sqlbase.TableDescriptor
+	kvCh    chan []roachpb.KeyValue
 }
 
 var _ inputConverter = &workloadReader{}
 
 func newWorkloadReader(
-	kvCh chan kvBatch, table *sqlbase.TableDescriptor, evalCtx *tree.EvalContext,
-) (*workloadReader, error) {
-	conv, err := newRowConverter(table, evalCtx, kvCh)
-	if err != nil {
-		return nil, err
-	}
-	return &workloadReader{kvCh: kvCh, conv: conv}, nil
+	kvCh chan []roachpb.KeyValue, table *sqlbase.TableDescriptor, evalCtx *tree.EvalContext,
+) *workloadReader {
+	return &workloadReader{evalCtx: evalCtx, table: table, kvCh: kvCh}
 }
 
 func (w *workloadReader) start(ctx ctxgroup.Group) {
@@ -50,46 +54,88 @@ func (w *workloadReader) inputFinished(ctx context.Context) {
 	close(w.kvCh)
 }
 
-// makeDatumFromRaw tries to fast-path a few workload-generated types into
+// makeDatumFromColOffset tries to fast-path a few workload-generated types into
 // directly datums, to dodge making a string and then the parsing it.
-func makeDatumFromRaw(
-	alloc *sqlbase.DatumAlloc, datum interface{}, hint types.T, evalCtx *tree.EvalContext,
+func makeDatumFromColOffset(
+	alloc *sqlbase.DatumAlloc,
+	hint *sqltypes.T,
+	evalCtx *tree.EvalContext,
+	col coldata.Vec,
+	rowIdx int,
 ) (tree.Datum, error) {
-	if datum == nil {
+	if col.Nulls().NullAt64(uint64(rowIdx)) {
 		return tree.DNull, nil
 	}
-	switch t := datum.(type) {
-	case int:
-		return alloc.NewDInt(tree.DInt(t)), nil
-	case int64:
-		return alloc.NewDInt(tree.DInt(t)), nil
-	case []byte:
-		return alloc.NewDBytes(tree.DBytes(t)), nil
-	case time.Time:
-		switch hint {
-		case types.TimestampTZ:
-			return tree.MakeDTimestampTZ(t, time.Microsecond), nil
-		case types.Timestamp:
-			return tree.MakeDTimestamp(t, time.Microsecond), nil
+	switch col.Type() {
+	case types.Bool:
+		return tree.MakeDBool(tree.DBool(col.Bool()[rowIdx])), nil
+	case types.Int64:
+		switch hint.Family() {
+		case sqltypes.IntFamily:
+			return alloc.NewDInt(tree.DInt(col.Int64()[rowIdx])), nil
+		case sqltypes.DecimalFamily:
+			d := *apd.New(col.Int64()[rowIdx], 0)
+			return alloc.NewDDecimal(tree.DDecimal{Decimal: d}), nil
 		}
-	case string:
-		return tree.ParseDatumStringAs(hint, t, evalCtx)
+	case types.Float64:
+		switch hint.Family() {
+		case sqltypes.FloatFamily:
+			return alloc.NewDFloat(tree.DFloat(col.Float64()[rowIdx])), nil
+		case sqltypes.DecimalFamily:
+			var d apd.Decimal
+			if _, err := d.SetFloat64(col.Float64()[rowIdx]); err != nil {
+				return nil, err
+			}
+			return alloc.NewDDecimal(tree.DDecimal{Decimal: d}), nil
+		}
+	case types.Bytes:
+		switch hint.Family() {
+		case sqltypes.BytesFamily:
+			return alloc.NewDBytes(tree.DBytes(col.Bytes()[rowIdx])), nil
+		case sqltypes.StringFamily:
+			data := col.Bytes()[rowIdx]
+			str := *(*string)(unsafe.Pointer(&data))
+			return alloc.NewDString(tree.DString(str)), nil
+		default:
+			data := col.Bytes()[rowIdx]
+			str := *(*string)(unsafe.Pointer(&data))
+			return tree.ParseDatumStringAs(hint, str, evalCtx)
+		}
 	}
-	return tree.ParseDatumStringAs(hint, fmt.Sprint(datum), evalCtx)
+	return nil, errors.Errorf(
+		`don't know how to interpret %s column as %s`, col.Type().GoTypeName(), hint)
 }
 
 func (w *workloadReader) readFiles(
 	ctx context.Context,
 	dataFiles map[int32]string,
-	format roachpb.IOFileFormat,
+	_ roachpb.IOFileFormat,
 	progressFn func(float32) error,
-	settings *cluster.Settings,
+	_ *cluster.Settings,
 ) error {
-	var alloc sqlbase.DatumAlloc
+	progress := jobs.ProgressUpdateBatcher{Report: func(ctx context.Context, pct float32) error {
+		return progressFn(pct)
+	}}
 
-	numFiles := float32(len(dataFiles))
-	var filesCompleted int
-	for inputIdx, fileName := range dataFiles {
+	var numTotalBatches int64
+	var finishedBatchesAtomic int64
+	const batchesPerProgress = 1000
+	finishedBatchFn := func() {
+		finishedBatches := atomic.AddInt64(&finishedBatchesAtomic, 1)
+		if finishedBatches%batchesPerProgress == 0 {
+			progressDelta := float32(batchesPerProgress) / float32(numTotalBatches)
+			// TODO(dan): (*ProgressUpdateBatcher).Add also has logic to only report
+			// job progress periodically. See if we can unify them (potentially by
+			// making Add cheap enough to call every time inside `finishedBatchFn`, if
+			// it's not already). It also seems to me that it would be more natural
+			// for Add to take the overall progress than a delta.
+			if err := progress.Add(ctx, progressDelta); err != nil {
+				log.Warningf(ctx, "failed to update progress: %+v", err)
+			}
+		}
+	}
+
+	for _, fileName := range dataFiles {
 		file, err := url.Parse(fileName)
 		if err != nil {
 			return err
@@ -125,36 +171,101 @@ func (w *workloadReader) readFiles(
 			return errors.Wrapf(err, `unknown table %s for generator %s`, conf.Table, meta.Name)
 		}
 
-		// how is this reader, before starting this file.
-		initialProgress := float32(filesCompleted) / numFiles
-		numBatches := conf.BatchEnd - conf.BatchBegin
-		var rows int64
-		lastProgress := rows
-		for b := conf.BatchBegin; b < conf.BatchEnd; b++ {
-			if rows-lastProgress > 10000 {
-				// how far we are on this file
-				fileProgress := float32(b-conf.BatchBegin) / float32(numBatches)
-				progress := initialProgress + fileProgress/numFiles
-				if err := progressFn(progress); err != nil {
+		wc := NewWorkloadKVConverter(
+			w.table, t.InitialRows, int(conf.BatchBegin), int(conf.BatchEnd), w.kvCh)
+		if err := ctxgroup.GroupWorkers(ctx, runtime.NumCPU(), func(ctx context.Context) error {
+			evalCtx := w.evalCtx.Copy()
+			return wc.Worker(ctx, evalCtx, finishedBatchFn)
+		}); err != nil {
+			return err
+		}
+	}
+	if err := progress.Done(ctx); err != nil {
+		log.Warningf(ctx, "failed to update progress: %+v", err)
+	}
+	return nil
+}
+
+// WorkloadKVConverter converts workload.BatchedTuples to []roachpb.KeyValues.
+type WorkloadKVConverter struct {
+	tableDesc      *sqlbase.TableDescriptor
+	rows           workload.BatchedTuples
+	batchIdxAtomic int64
+	batchEnd       int
+	kvCh           chan []roachpb.KeyValue
+}
+
+// NewWorkloadKVConverter returns a WorkloadKVConverter for the given table and
+// range of batches, emitted converted kvs to the given channel.
+func NewWorkloadKVConverter(
+	tableDesc *sqlbase.TableDescriptor,
+	rows workload.BatchedTuples,
+	batchStart, batchEnd int,
+	kvCh chan []roachpb.KeyValue,
+) *WorkloadKVConverter {
+	return &WorkloadKVConverter{
+		tableDesc:      tableDesc,
+		rows:           rows,
+		batchIdxAtomic: int64(batchStart) - 1,
+		batchEnd:       batchEnd,
+		kvCh:           kvCh,
+	}
+}
+
+// Worker can be called concurrently to create multiple workers to process
+// batches in order. This keeps concurrently running workers ~adjacent batches
+// at any given moment (as opposed to handing large ranges of batches to each
+// worker, e.g. 0-999 to worker 1, 1000-1999 to worker 2, etc). This property is
+// relevant when ordered workload batches produce ordered PK data, since the
+// workers feed into a shared kvCH so then contiguous blocks of PK data will
+// usually be buffered together and thus batched together in the SST builder,
+// minimzing the amount of overlapping SSTs ingested.
+//
+// This worker needs its own EvalContext and DatumAlloc.
+func (w *WorkloadKVConverter) Worker(
+	ctx context.Context, evalCtx *tree.EvalContext, finishedBatchFn func(),
+) error {
+	conv, err := newRowConverter(w.tableDesc, evalCtx, w.kvCh)
+	if err != nil {
+		return err
+	}
+
+	var alloc sqlbase.DatumAlloc
+	var a bufalloc.ByteAllocator
+	cb := coldata.NewMemBatchWithSize(nil, 0)
+
+	for {
+		batchIdx := int(atomic.AddInt64(&w.batchIdxAtomic, 1))
+		if batchIdx >= w.batchEnd {
+			break
+		}
+		a = a[:0]
+		w.rows.FillBatch(batchIdx, cb, &a)
+		for rowIdx, numRows := 0, int(cb.Length()); rowIdx < numRows; rowIdx++ {
+			for colIdx, col := range cb.ColVecs() {
+				// TODO(dan): This does a type switch once per-datum. Reduce this to
+				// a one-time switch per column.
+				converted, err := makeDatumFromColOffset(
+					&alloc, conv.visibleColTypes[colIdx], evalCtx, col, rowIdx)
+				if err != nil {
 					return err
 				}
-				lastProgress = rows
+				conv.datums[colIdx] = converted
 			}
-			for _, row := range t.InitialRows.Batch(int(b)) {
-				rows++
-				for i, value := range row {
-					converted, err := makeDatumFromRaw(&alloc, value, w.conv.visibleColTypes[i], w.conv.evalCtx)
-					if err != nil {
-						return err
-					}
-					w.conv.datums[i] = converted
-				}
-				if err := w.conv.row(ctx, inputIdx, rows); err != nil {
-					return err
-				}
+			// `conv.row` uses these as arguments to GenerateUniqueID to generate
+			// hidden primary keys, when necessary. We want them to be ascending per
+			// batch (to reduce overlap in the resulting kvs) and non-conflicting
+			// (because of primary key uniqueness). The ids that come out of
+			// GenerateUniqueID are sorted by (fileIdx, timestamp) and unique as long
+			// as the two inputs are a unique combo, so using the index of the batch
+			// within the table and the index of the row within the batch should do
+			// what we want.
+			fileIdx, timestamp := int32(batchIdx), int64(rowIdx)
+			if err := conv.row(ctx, fileIdx, timestamp); err != nil {
+				return err
 			}
 		}
-		filesCompleted++
+		finishedBatchFn()
 	}
-	return w.conv.sendBatch(ctx)
+	return conv.sendBatch(ctx)
 }

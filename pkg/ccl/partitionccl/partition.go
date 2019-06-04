@@ -10,7 +10,6 @@ package partitionccl
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
@@ -18,8 +17,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/pkg/errors"
 )
@@ -84,26 +83,27 @@ func valueEncodePartitionTuple(
 			value = encoding.EncodeNonsortingUvarint(value, uint64(sqlbase.PartitionMaxVal))
 			continue
 		case *tree.Placeholder:
-			return nil, pgerror.UnimplementedWithIssueErrorf(
+			return nil, pgerror.UnimplementedWithIssuef(
 				19464, "placeholders are not supported in PARTITION BY")
 		default:
 			// Fall-through.
 		}
 
 		var semaCtx tree.SemaContext
-		typedExpr, err := sqlbase.SanitizeVarFreeExpr(expr, cols[i].Type.ToDatumType(), "partition",
+		typedExpr, err := sqlbase.SanitizeVarFreeExpr(expr, &cols[i].Type, "partition",
 			&semaCtx, false /* allowImpure */)
 		if err != nil {
 			return nil, err
 		}
 		if !tree.IsConst(evalCtx, typedExpr) {
-			return nil, fmt.Errorf("%s: partition values must be constant", typedExpr)
+			return nil, pgerror.Newf(pgerror.CodeSyntaxError,
+				"%s: partition values must be constant", typedExpr)
 		}
 		datum, err := typedExpr.Eval(evalCtx)
 		if err != nil {
-			return nil, errors.Wrap(err, typedExpr.String())
+			return nil, pgerror.Wrap(err, pgerror.CodeDataExceptionError, typedExpr.String())
 		}
-		if err := sqlbase.CheckDatumTypeFitsColumnType(cols[i], datum.ResolvedType(), nil); err != nil {
+		if err := sqlbase.CheckDatumTypeFitsColumnType(&cols[i], datum.ResolvedType()); err != nil {
 			return nil, err
 		}
 		value, err = sqlbase.EncodeTableValue(
@@ -166,7 +166,7 @@ func createPartitioningImpl(
 	var cols []sqlbase.ColumnDescriptor
 	for i := 0; i < len(partBy.Fields); i++ {
 		if colOffset+i >= len(indexDesc.ColumnNames) {
-			return partDesc, fmt.Errorf(
+			return partDesc, pgerror.Newf(pgerror.CodeSyntaxError,
 				"declared partition columns (%s) exceed the number of columns in index being partitioned (%s)",
 				partitioningString(), strings.Join(indexDesc.ColumnNames, ", "))
 		}
@@ -176,10 +176,12 @@ func createPartitioningImpl(
 		if err != nil {
 			return partDesc, err
 		}
-		cols = append(cols, col)
+		cols = append(cols, *col)
 		if string(partBy.Fields[i]) != col.Name {
-			n := colOffset + len(partBy.Fields)
-			return partDesc, fmt.Errorf(
+			// This used to print the first `colOffset + len(partBy.Fields)` fields
+			// but there might not be this many columns in the index. See #37682.
+			n := colOffset + i + 1
+			return partDesc, pgerror.Newf(pgerror.CodeSyntaxError,
 				"declared partition columns (%s) do not match first %d columns in index being partitioned (%s)",
 				partitioningString(), n, strings.Join(indexDesc.ColumnNames[:n], ", "))
 		}
@@ -193,7 +195,8 @@ func createPartitioningImpl(
 			encodedTuple, err := valueEncodePartitionTuple(
 				tree.PartitionByList, evalCtx, expr, cols)
 			if err != nil {
-				return partDesc, errors.Wrapf(err, "PARTITION %s", p.Name)
+				return partDesc, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+					"PARTITION %s", p.Name)
 			}
 			p.Values = append(p.Values, encodedTuple)
 		}
@@ -217,15 +220,18 @@ func createPartitioningImpl(
 		p.FromInclusive, err = valueEncodePartitionTuple(
 			tree.PartitionByRange, evalCtx, &tree.Tuple{Exprs: r.From}, cols)
 		if err != nil {
-			return partDesc, errors.Wrapf(err, "PARTITION %s", p.Name)
+			return partDesc, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+				"PARTITION %s", p.Name)
 		}
 		p.ToExclusive, err = valueEncodePartitionTuple(
 			tree.PartitionByRange, evalCtx, &tree.Tuple{Exprs: r.To}, cols)
 		if err != nil {
-			return partDesc, errors.Wrapf(err, "PARTITION %s", p.Name)
+			return partDesc, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+				"PARTITION %s", p.Name)
 		}
 		if r.Subpartition != nil {
-			return partDesc, errors.Errorf("PARTITION %s: cannot subpartition a range partition", p.Name)
+			return partDesc, pgerror.Newf(pgerror.CodeDataExceptionError,
+				"PARTITION %s: cannot subpartition a range partition", p.Name)
 		}
 		partDesc.Range = append(partDesc.Range, p)
 	}
@@ -293,15 +299,15 @@ func selectPartitionExprs(
 	}
 	// In order to typecheck during simplification and normalization, we used
 	// dummy IndexVars. Swap them out for actual column references.
-	finalExpr, err := tree.SimpleVisit(expr, func(e tree.Expr) (error, bool, tree.Expr) {
+	finalExpr, err := tree.SimpleVisit(expr, func(e tree.Expr) (recurse bool, newExpr tree.Expr, _ error) {
 		if ivar, ok := e.(*tree.IndexedVar); ok {
 			col, err := tableDesc.FindColumnByID(sqlbase.ColumnID(ivar.Idx))
 			if err != nil {
-				return err, false, nil
+				return false, nil, err
 			}
-			return nil, false, &tree.ColumnItem{ColumnName: tree.Name(col.Name)}
+			return false, &tree.ColumnItem{ColumnName: tree.Name(col.Name)}, nil
 		}
-		return nil, true, e
+		return true, e, nil
 	})
 	return finalExpr, err
 }
@@ -362,7 +368,7 @@ func selectPartitionExprsByName(
 			if err != nil {
 				return err
 			}
-			colVars[i] = tree.NewTypedOrdinalReference(int(col.ID), col.Type.ToDatumType())
+			colVars[i] = tree.NewTypedOrdinalReference(int(col.ID), &col.Type)
 		}
 	}
 
@@ -389,9 +395,14 @@ func selectPartitionExprsByName(
 
 				// When len(allDatums) < len(colVars), the missing elements are DEFAULTs, so
 				// we can simply exclude them from the expr.
+				typContents := make([]types.T, len(allDatums))
+				for i, d := range allDatums {
+					typContents[i] = *d.ResolvedType()
+				}
+				tupleTyp := types.MakeTuple(typContents)
 				partValueExpr := tree.NewTypedComparisonExpr(tree.EQ,
-					tree.NewTypedTuple(types.TTuple{}, colVars[:len(allDatums)]),
-					tree.NewDTuple(types.TTuple{}, allDatums...))
+					tree.NewTypedTuple(tupleTyp, colVars[:len(allDatums)]),
+					tree.NewDTuple(tupleTyp, allDatums...))
 				partValueExprs[len(t.Datums)] = append(partValueExprs[len(t.Datums)], exprAndPartName{
 					expr: partValueExpr,
 					name: l.Name,

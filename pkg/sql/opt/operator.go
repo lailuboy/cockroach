@@ -18,7 +18,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // Operator describes the type of operation that a memo expression performs.
@@ -98,7 +98,7 @@ type ScalarExpr interface {
 	ID() ScalarID
 
 	// DataType is the SQL type of the expression.
-	DataType() types.T
+	DataType() *types.T
 }
 
 // MutableExpr is implemented by expressions that allow their children to be
@@ -195,6 +195,22 @@ var AggregateOpReverseMap = map[Operator]string{
 	ConstAggOp:        "any_not_null",
 	ConstNotNullAggOp: "any_not_null",
 	AnyNotNullAggOp:   "any_not_null",
+}
+
+// WindowOpReverseMap maps from an optimizer operator type to the name of a
+// window function.
+var WindowOpReverseMap = map[Operator]string{
+	RankOp:        "rank",
+	RowNumberOp:   "row_number",
+	DenseRankOp:   "dense_rank",
+	PercentRankOp: "percent_rank",
+	CumeDistOp:    "cume_dist",
+	NtileOp:       "ntile",
+	LagOp:         "lag",
+	LeadOp:        "lead",
+	FirstValueOp:  "first_value",
+	LastValueOp:   "last_value",
+	NthValueOp:    "nth_value",
 }
 
 // NegateOpMap maps from a comparison operator type to its negated operator

@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -230,7 +231,7 @@ func (rq *replicateQueue) shouldQueue(
 	if lease, _ := repl.GetLease(); repl.IsLeaseValid(lease, now) {
 		if rq.canTransferLease() &&
 			rq.allocator.ShouldTransferLease(
-				ctx, zone, desc.Replicas, lease.Replica.StoreID, desc.RangeID, repl.leaseholderStats) {
+				ctx, zone, desc.Replicas().Unwrap(), lease.Replica.StoreID, desc.RangeID, repl.leaseholderStats) {
 			log.VEventf(ctx, 2, "lease transfer needed, enqueuing")
 			return true, 0
 		}
@@ -253,7 +254,8 @@ func (rq *replicateQueue) process(
 	// snapshot errors, usually signaling that a rebalancing
 	// reservation could not be made with the selected target.
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
-		if requeue, err := rq.processOneChange(ctx, repl, sysCfg, rq.canTransferLease, false /* dryRun */); err != nil {
+		for {
+			requeue, err := rq.processOneChange(ctx, repl, rq.canTransferLease, false /* dryRun */)
 			if IsSnapshotError(err) {
 				// If ChangeReplicas failed because the preemptive snapshot failed, we
 				// log the error but then return success indicating we should retry the
@@ -262,37 +264,41 @@ func (rq *replicateQueue) process(
 				// case we don't want to wait another scanner cycle before reconsidering
 				// the range.
 				log.Info(ctx, err)
-				continue
+				break
 			}
-			return err
-		} else if requeue {
-			// Enqueue this replica again to see if there are more changes to be made.
-			rq.MaybeAdd(repl, rq.store.Clock().Now())
-		}
-		if testingAggressiveConsistencyChecks {
-			if err := rq.store.consistencyQueue.process(ctx, repl, sysCfg); err != nil {
-				log.Warning(ctx, err)
+
+			if err != nil {
+				return err
 			}
+
+			if testingAggressiveConsistencyChecks {
+				if err := rq.store.consistencyQueue.process(ctx, repl, sysCfg); err != nil {
+					log.Warning(ctx, err)
+				}
+			}
+
+			if !requeue {
+				return nil
+			}
+
+			log.VEventf(ctx, 1, "re-processing")
 		}
-		return nil
 	}
+
 	return errors.Errorf("failed to replicate after %d retries", retryOpts.MaxRetries)
 }
 
 func (rq *replicateQueue) processOneChange(
-	ctx context.Context,
-	repl *Replica,
-	sysCfg *config.SystemConfig,
-	canTransferLease func() bool,
-	dryRun bool,
+	ctx context.Context, repl *Replica, canTransferLease func() bool, dryRun bool,
 ) (requeue bool, _ error) {
 	desc, zone := repl.DescAndZone()
 
 	// Avoid taking action if the range has too many dead replicas to make
 	// quorum.
-	liveReplicas, deadReplicas := rq.allocator.storePool.liveAndDeadReplicas(desc.RangeID, desc.Replicas)
+	liveReplicas, deadReplicas := rq.allocator.storePool.liveAndDeadReplicas(
+		desc.RangeID, desc.Replicas().Unwrap())
 	{
-		quorum := computeQuorum(len(desc.Replicas))
+		quorum := desc.Replicas().QuorumSize()
 		if lr := len(liveReplicas); lr < quorum {
 			return false, newQuorumError(
 				"range requires a replication change, but lacks a quorum of live replicas (%d/%d)", lr, quorum)
@@ -300,11 +306,12 @@ func (rq *replicateQueue) processOneChange(
 	}
 
 	rangeInfo := rangeInfoForRepl(repl, desc)
-	switch action, _ := rq.allocator.ComputeAction(ctx, zone, rangeInfo); action {
+	action, _ := rq.allocator.ComputeAction(ctx, zone, rangeInfo)
+	log.VEventf(ctx, 1, "next replica action: %s", action)
+	switch action {
 	case AllocatorNoop:
 		break
 	case AllocatorAdd:
-		log.VEventf(ctx, 1, "adding a new replica")
 		newStore, details, err := rq.allocator.AllocateTarget(
 			ctx,
 			zone,
@@ -321,7 +328,7 @@ func (rq *replicateQueue) processOneChange(
 
 		clusterNodes := rq.allocator.storePool.ClusterNodeCount()
 		need := GetNeededReplicas(*zone.NumReplicas, clusterNodes)
-		willHave := len(desc.Replicas) + 1
+		willHave := len(desc.Replicas().Unwrap()) + 1
 
 		// Only up-replicate if there are suitable allocation targets such
 		// that, either the replication goal is met, or it is possible to get to the
@@ -335,15 +342,15 @@ func (rq *replicateQueue) processOneChange(
 		if willHave < need && willHave%2 == 0 {
 			// This means we are going to up-replicate to an even replica state.
 			// Check if it is possible to go to an odd replica state beyond it.
-			oldPlusNewReplicas := append([]roachpb.ReplicaDescriptor(nil), desc.Replicas...)
-			oldPlusNewReplicas = append(oldPlusNewReplicas, roachpb.ReplicaDescriptor{
+			oldPlusNewReplicas := desc.Replicas().DeepCopy()
+			oldPlusNewReplicas.AddReplica(roachpb.ReplicaDescriptor{
 				NodeID:  newStore.Node.NodeID,
 				StoreID: newStore.StoreID,
 			})
 			_, _, err := rq.allocator.AllocateTarget(
 				ctx,
 				zone,
-				oldPlusNewReplicas,
+				oldPlusNewReplicas.Unwrap(),
 				rangeInfo,
 			)
 			if err != nil {
@@ -355,7 +362,7 @@ func (rq *replicateQueue) processOneChange(
 		}
 		rq.metrics.AddReplicaCount.Inc(1)
 		log.VEventf(ctx, 1, "adding replica %+v due to under-replication: %s",
-			newReplica, rangeRaftProgress(repl.RaftStatus(), desc.Replicas))
+			newReplica, rangeRaftProgress(repl.RaftStatus(), desc.Replicas().Unwrap()))
 		if err := rq.addReplica(
 			ctx,
 			repl,
@@ -369,20 +376,64 @@ func (rq *replicateQueue) processOneChange(
 			return false, err
 		}
 	case AllocatorRemove:
-		log.VEventf(ctx, 1, "removing a replica")
-		lastReplAdded, lastAddedTime := repl.LastReplicaAdded()
-		if timeutil.Since(lastAddedTime) > newReplicaGracePeriod {
-			lastReplAdded = 0
+		// This retry loop involves quick operations on local state, so a
+		// small MaxBackoff is good (but those local variables change on
+		// network time scales as raft receives responses).
+		//
+		// TODO(bdarnell): There's another retry loop at process(). It
+		// would be nice to combine these, but I'm keeping them separate
+		// for now so we can tune the options separately.
+		retryOpts := retry.Options{
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     200 * time.Millisecond,
+			Multiplier:     2,
 		}
-		candidates := filterUnremovableReplicas(repl.RaftStatus(), desc.Replicas, lastReplAdded)
-		log.VEventf(ctx, 3, "filtered unremovable replicas from %v to get %v as candidates for removal: %s",
-			desc.Replicas, candidates, rangeRaftProgress(repl.RaftStatus(), desc.Replicas))
+
+		var candidates []roachpb.ReplicaDescriptor
+		deadline := timeutil.Now().Add(2 * base.NetworkTimeout)
+		for r := retry.StartWithCtx(ctx, retryOpts); r.Next() && timeutil.Now().Before(deadline); {
+			lastReplAdded, lastAddedTime := repl.LastReplicaAdded()
+			if timeutil.Since(lastAddedTime) > newReplicaGracePeriod {
+				lastReplAdded = 0
+			}
+			raftStatus := repl.RaftStatus()
+			if raftStatus == nil || raftStatus.RaftState != raft.StateLeader {
+				// If we've lost raft leadership, we're unlikely to regain it so give up immediately.
+				return false, &benignError{errors.Errorf("not raft leader while range needs removal")}
+			}
+			candidates = filterUnremovableReplicas(raftStatus, desc.Replicas().Unwrap(), lastReplAdded)
+			log.VEventf(ctx, 3, "filtered unremovable replicas from %v to get %v as candidates for removal: %s",
+				desc.Replicas(), candidates, rangeRaftProgress(raftStatus, desc.Replicas().Unwrap()))
+			if len(candidates) > 0 {
+				break
+			}
+			if len(raftStatus.Progress) <= 2 {
+				// HACK(bdarnell): Downreplicating to a single node from
+				// multiple nodes is not really supported. There are edge
+				// cases in which the two peers stop communicating with each
+				// other too soon and we don't reach a satisfactory
+				// resolution. However, some tests (notably
+				// TestRepartitioning) get into this state, and if the
+				// replication queue spends its entire timeout waiting for the
+				// downreplication to finish the test will time out. As a
+				// hack, just fail-fast when we're trying to go down to a
+				// single replica.
+				break
+			}
+			// After upreplication, the candidates for removal could still
+			// be catching up. The allocator determined that the range was
+			// over-replicated, and it's important to clear that state as
+			// quickly as we can (because over-replicated ranges may be
+			// under-diversified). If we return an error here, this range
+			// probably won't be processed again until the next scanner
+			// cycle, which is too long, so we retry here.
+		}
 		if len(candidates) == 0 {
-			// After rapid upreplication, the candidates for removal could still be catching up.
-			// Mark this error as benign so it doesn't create confusion in the logs.
-			return false, &benignError{errors.Errorf("no removable replicas from range that needs a removal: %s",
-				rangeRaftProgress(repl.RaftStatus(), desc.Replicas))}
+			// If we timed out and still don't have any valid candidates, give up.
+			return false, errors.Errorf("no removable replicas from range that needs a removal: %s",
+				rangeRaftProgress(repl.RaftStatus(), desc.Replicas().Unwrap()))
 		}
+
 		removeReplica, details, err := rq.allocator.RemoveTarget(ctx, zone, candidates, rangeInfo)
 		if err != nil {
 			return false, err
@@ -417,7 +468,7 @@ func (rq *replicateQueue) processOneChange(
 		} else {
 			rq.metrics.RemoveReplicaCount.Inc(1)
 			log.VEventf(ctx, 1, "removing replica %+v due to over-replication: %s",
-				removeReplica, rangeRaftProgress(repl.RaftStatus(), desc.Replicas))
+				removeReplica, rangeRaftProgress(repl.RaftStatus(), desc.Replicas().Unwrap()))
 			target := roachpb.ReplicationTarget{
 				NodeID:  removeReplica.NodeID,
 				StoreID: removeReplica.StoreID,
@@ -429,8 +480,8 @@ func (rq *replicateQueue) processOneChange(
 			}
 		}
 	case AllocatorRemoveDecommissioning:
-		log.VEventf(ctx, 1, "removing a decommissioning replica")
-		decommissioningReplicas := rq.allocator.storePool.decommissioningReplicas(desc.RangeID, desc.Replicas)
+		decommissioningReplicas := rq.allocator.storePool.decommissioningReplicas(
+			desc.RangeID, desc.Replicas().Unwrap())
 		if len(decommissioningReplicas) == 0 {
 			log.VEventf(ctx, 1, "range of replica %s was identified as having decommissioning replicas, "+
 				"but no decommissioning replicas were found", repl)
@@ -473,7 +524,6 @@ func (rq *replicateQueue) processOneChange(
 			}
 		}
 	case AllocatorRemoveDead:
-		log.VEventf(ctx, 1, "removing a dead replica")
 		if len(deadReplicas) == 0 {
 			log.VEventf(ctx, 1, "range of replica %s was identified as having dead replicas, but no dead replicas were found", repl)
 			break
@@ -493,8 +543,6 @@ func (rq *replicateQueue) processOneChange(
 	case AllocatorConsiderRebalance:
 		// The Noop case will result if this replica was queued in order to
 		// rebalance. Attempt to find a rebalancing target.
-		log.VEventf(ctx, 1, "allocator noop - considering a rebalance or lease transfer")
-
 		if !rq.store.TestingKnobs().DisableReplicaRebalancing {
 			rebalanceStore, details := rq.allocator.RebalanceTarget(
 				ctx, zone, repl.RaftStatus(), rangeInfo, storeFilterThrottled)
@@ -507,7 +555,7 @@ func (rq *replicateQueue) processOneChange(
 				}
 				rq.metrics.RebalanceReplicaCount.Inc(1)
 				log.VEventf(ctx, 1, "rebalancing to %+v: %s",
-					rebalanceReplica, rangeRaftProgress(repl.RaftStatus(), desc.Replicas))
+					rebalanceReplica, rangeRaftProgress(repl.RaftStatus(), desc.Replicas().Unwrap()))
 				if err := rq.addReplica(
 					ctx,
 					repl,
@@ -568,7 +616,7 @@ func (rq *replicateQueue) findTargetAndTransferLease(
 	zone *config.ZoneConfig,
 	opts transferLeaseOptions,
 ) (bool, error) {
-	candidates := filterBehindReplicas(repl.RaftStatus(), desc.Replicas)
+	candidates := filterBehindReplicas(repl.RaftStatus(), desc.Replicas().Unwrap())
 	target := rq.allocator.TransferLeaseTarget(
 		ctx,
 		zone,
@@ -624,7 +672,7 @@ func (rq *replicateQueue) addReplica(
 	if dryRun {
 		return nil
 	}
-	if err := repl.changeReplicas(ctx, roachpb.ADD_REPLICA, target, desc, priority, reason, details); err != nil {
+	if _, err := repl.changeReplicas(ctx, roachpb.ADD_REPLICA, target, desc, priority, reason, details); err != nil {
 		return err
 	}
 	rangeInfo := rangeInfoForRepl(repl, desc)
@@ -644,7 +692,7 @@ func (rq *replicateQueue) removeReplica(
 	if dryRun {
 		return nil
 	}
-	if err := repl.ChangeReplicas(ctx, roachpb.REMOVE_REPLICA, target, desc, reason, details); err != nil {
+	if _, err := repl.ChangeReplicas(ctx, roachpb.REMOVE_REPLICA, target, desc, reason, details); err != nil {
 		return err
 	}
 	rangeInfo := rangeInfoForRepl(repl, desc)

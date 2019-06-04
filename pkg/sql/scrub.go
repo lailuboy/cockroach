@@ -23,8 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
@@ -82,14 +82,14 @@ func (p *planner) Scrub(ctx context.Context, n *tree.Scrub) (planNode, error) {
 }
 
 var scrubColumns = sqlbase.ResultColumns{
-	{Name: "job_uuid", Typ: types.UUID},
+	{Name: "job_uuid", Typ: types.Uuid},
 	{Name: "error_type", Typ: types.String},
 	{Name: "database", Typ: types.String},
 	{Name: "table", Typ: types.String},
 	{Name: "primary_key", Typ: types.String},
 	{Name: "timestamp", Typ: types.Timestamp},
 	{Name: "repaired", Typ: types.Bool},
-	{Name: "details", Typ: types.JSON},
+	{Name: "details", Typ: types.Jsonb},
 }
 
 // scrubRun contains the run-time state of scrubNode during local execution.
@@ -103,12 +103,14 @@ func (n *scrubNode) startExec(params runParams) error {
 	case tree.ScrubTable:
 		// If the tableName provided refers to a view and error will be
 		// returned here.
-		tableDesc, err := ResolveExistingObject(
-			params.ctx, params.p, &n.n.Table, true /*required*/, requireTableDesc)
+		tableDesc, err := params.p.ResolveExistingObjectEx(
+			params.ctx, n.n.Table, true /*required*/, ResolveRequireTableDesc)
 		if err != nil {
 			return err
 		}
-		if err := n.startScrubTable(params.ctx, params.p, tableDesc, &n.n.Table); err != nil {
+		if err := n.startScrubTable(
+			params.ctx, params.p, tableDesc, params.p.ResolvedName(n.n.Table),
+		); err != nil {
 			return err
 		}
 	case tree.ScrubDatabase:
@@ -116,7 +118,7 @@ func (n *scrubNode) startExec(params runParams) error {
 			return err
 		}
 	default:
-		return pgerror.NewAssertionErrorf("unexpected SCRUB type received, got: %v", n.n.Typ)
+		return pgerror.AssertionFailedf("unexpected SCRUB type received, got: %v", n.n.Typ)
 	}
 	return nil
 }
@@ -177,7 +179,7 @@ func (n *scrubNode) startScrubDatabase(ctx context.Context, p *planner, name *tr
 
 	for i := range tbNames {
 		tableName := &tbNames[i]
-		objDesc, _, err := p.LogicalSchemaAccessor().GetObjectDesc(ctx, p.txn,
+		objDesc, err := p.LogicalSchemaAccessor().GetObjectDesc(ctx, p.txn,
 			tableName, p.ObjectLookupFlags(true /*required*/, false /*requireMutable*/))
 		if err != nil {
 			return err
@@ -213,7 +215,7 @@ func (n *scrubNode) startScrubTable(
 		switch v := option.(type) {
 		case *tree.ScrubOptionIndex:
 			if indexesSet {
-				return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				return pgerror.Newf(pgerror.CodeSyntaxError,
 					"cannot specify INDEX option more than once")
 			}
 			indexesSet = true
@@ -224,11 +226,11 @@ func (n *scrubNode) startScrubTable(
 			n.run.checkQueue = append(n.run.checkQueue, checks...)
 		case *tree.ScrubOptionPhysical:
 			if physicalCheckSet {
-				return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				return pgerror.Newf(pgerror.CodeSyntaxError,
 					"cannot specify PHYSICAL option more than once")
 			}
 			if hasTS {
-				return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				return pgerror.Newf(pgerror.CodeSyntaxError,
 					"cannot use AS OF SYSTEM TIME with PHYSICAL option")
 			}
 			physicalCheckSet = true
@@ -236,7 +238,7 @@ func (n *scrubNode) startScrubTable(
 			n.run.checkQueue = append(n.run.checkQueue, physicalChecks...)
 		case *tree.ScrubOptionConstraint:
 			if constraintsSet {
-				return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				return pgerror.Newf(pgerror.CodeSyntaxError,
 					"cannot specify CONSTRAINT option more than once")
 			}
 			constraintsSet = true
@@ -277,10 +279,11 @@ func (n *scrubNode) startScrubTable(
 // column names and types are also returned.
 func getColumns(
 	tableDesc *sqlbase.ImmutableTableDescriptor, indexDesc *sqlbase.IndexDescriptor,
-) (columns []*sqlbase.ColumnDescriptor, columnNames []string, columnTypes []sqlbase.ColumnType) {
+) (columns []*sqlbase.ColumnDescriptor, columnNames []string, columnTypes []types.T) {
 	colToIdx := make(map[sqlbase.ColumnID]int)
-	for i, col := range tableDesc.Columns {
-		colToIdx[col.ID] = i
+	for i := range tableDesc.Columns {
+		id := tableDesc.Columns[i].ID
+		colToIdx[id] = i
 	}
 
 	// Collect all of the columns we are fetching from the index. This
@@ -461,7 +464,7 @@ func createIndexCheckOperations(
 				missingIndexNames = append(missingIndexNames, idxName.String())
 			}
 		}
-		return nil, pgerror.NewErrorf(pgerror.CodeUndefinedObjectError,
+		return nil, pgerror.Newf(pgerror.CodeUndefinedObjectError,
 			"specified indexes to check that do not exist on table %q: %v",
 			tableDesc.Name, strings.Join(missingIndexNames, ", "))
 	}
@@ -494,7 +497,7 @@ func createConstraintCheckOperations(
 			if v, ok := constraints[string(constraintName)]; ok {
 				wantedConstraints[string(constraintName)] = v
 			} else {
-				return nil, pgerror.NewErrorf(pgerror.CodeUndefinedObjectError,
+				return nil, pgerror.Newf(pgerror.CodeUndefinedObjectError,
 					"constraint %q of relation %q does not exist", constraintName, tableDesc.Name)
 			}
 		}
@@ -539,11 +542,7 @@ func scrubPlanDistSQL(
 // scrubRunDistSQL run a distSQLPhysicalPlan plan in distSQL. If
 // RowContainer is returned, the caller must close it.
 func scrubRunDistSQL(
-	ctx context.Context,
-	planCtx *PlanningCtx,
-	p *planner,
-	plan *PhysicalPlan,
-	columnTypes []sqlbase.ColumnType,
+	ctx context.Context, planCtx *PlanningCtx, p *planner, plan *PhysicalPlan, columnTypes []types.T,
 ) (*rowcontainer.RowContainer, error) {
 	ci := sqlbase.ColTypeInfoFromColTypes(columnTypes)
 	acc := p.extendedEvalCtx.Mon.MakeBoundAccount()

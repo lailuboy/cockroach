@@ -14,7 +14,10 @@
 
 package cat
 
-import "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+import (
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+)
 
 // PrimaryIndex selects the primary index of a table when calling the
 // Table.Index method. Every table is guaranteed to have a unique primary
@@ -113,10 +116,18 @@ type Index interface {
 	// i < ColumnCount.
 	Column(i int) IndexColumn
 
-	// ForeignKey returns a ForeignKeyReference if this index is part
-	// of an outbound foreign key relation. Returns false for the second
-	// return value if there is no foreign key reference on this index.
-	ForeignKey() (ForeignKeyReference, bool)
+	// Zone returns the zone which constrains placement of the index's range
+	// replicas. If the index was not explicitly assigned to a zone, then it
+	// inherits the zone of its owning table (which in turn inherits from its
+	// owning database or the default zone). In addition, any unspecified zone
+	// information will also be inherited.
+	//
+	// NOTE: This zone always applies to the entire index and never to any
+	// partifular partition of the index.
+	Zone() Zone
+
+	// Span returns the KV span associated with the index.
+	Span() roachpb.Span
 }
 
 // IndexColumn describes a single column that is part of an index definition.

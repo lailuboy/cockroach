@@ -30,11 +30,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
 )
 
 type stmtKey struct {
@@ -325,17 +326,6 @@ func (s *sqlStats) getUnscrubbedStmtStats(
 	return s.getStmtStats(vt, false /* scrub */)
 }
 
-// InternalAppNamePrefix indicates that the application name is internal to
-// CockroachDB and therefore can be reported without scrubbing. (Note this only
-// applies to the application name itself. Query data is still scrubbed as
-// usual.)
-const InternalAppNamePrefix = "$ "
-
-// DelegatedAppNamePrefix is added to a regular client application name
-// for SQL queries that are ran internally on behalf of other SQL queries
-// inside that application. The application name should be scrubbed in reporting.
-const DelegatedAppNamePrefix = "$$ "
-
 func (s *sqlStats) getStmtStats(
 	vt *VirtualSchemaHolder, scrub bool,
 ) []roachpb.CollectedStatementStatistics {
@@ -344,18 +334,18 @@ func (s *sqlStats) getStmtStats(
 	var ret []roachpb.CollectedStatementStatistics
 	salt := ClusterSecret.Get(&s.st.SV)
 	for appName, a := range s.apps {
+		a.Lock()
 		if cap(ret) == 0 {
 			// guesstimate that we'll need apps*(queries-per-app).
 			ret = make([]roachpb.CollectedStatementStatistics, 0, len(a.stmts)*len(s.apps))
 		}
-		a.Lock()
 		for q, stats := range a.stmts {
 			maybeScrubbed := q.stmt
 			maybeHashedAppName := appName
 			ok := true
 			if scrub {
 				maybeScrubbed, ok = scrubStmtStatKey(vt, q.stmt)
-				if !strings.HasPrefix(appName, InternalAppNamePrefix) {
+				if !strings.HasPrefix(appName, sqlbase.ReportableAppNamePrefix) {
 					maybeHashedAppName = HashForReporting(salt, appName)
 				}
 			}
@@ -422,7 +412,8 @@ func HashForReporting(secret, appName string) string {
 	}
 	hash := hmac.New(sha256.New, []byte(secret))
 	if _, err := hash.Write([]byte(appName)); err != nil {
-		panic(errors.Wrap(err, `"It never returns an error." -- https://golang.org/pkg/hash`))
+		panic(pgerror.NewAssertionErrorWithWrappedErrf(err,
+			`"It never returns an error." -- https://golang.org/pkg/hash`))
 	}
 	return hex.EncodeToString(hash.Sum(nil)[:4])
 }

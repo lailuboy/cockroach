@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/pkg/errors"
 )
 
@@ -63,7 +64,7 @@ func (se *StreamEncoder) setHeaderFields(flowID distsqlpb.FlowID, streamID dists
 	se.msgHdr.StreamID = streamID
 }
 
-func (se *StreamEncoder) init(types []sqlbase.ColumnType) {
+func (se *StreamEncoder) init(types []types.T) {
 	se.infos = make([]distsqlpb.DatumInfo, len(types))
 	for i := range types {
 		se.infos[i].Type = types[i]
@@ -78,38 +79,8 @@ func (se *StreamEncoder) init(types []sqlbase.ColumnType) {
 // that the StreamDecoder will return them first, before the data rows, thus
 // ensuring that rows produced _after_ an error are not received _before_ the
 // error.
-func (se *StreamEncoder) AddMetadata(meta ProducerMetadata) {
-	var enc distsqlpb.RemoteProducerMetadata
-	if meta.Ranges != nil {
-		enc.Value = &distsqlpb.RemoteProducerMetadata_RangeInfo{
-			RangeInfo: &distsqlpb.RemoteProducerMetadata_RangeInfos{
-				RangeInfo: meta.Ranges,
-			},
-		}
-	} else if meta.TraceData != nil {
-		enc.Value = &distsqlpb.RemoteProducerMetadata_TraceData_{
-			TraceData: &distsqlpb.RemoteProducerMetadata_TraceData{
-				CollectedSpans: meta.TraceData,
-			},
-		}
-	} else if meta.TxnCoordMeta != nil {
-		enc.Value = &distsqlpb.RemoteProducerMetadata_TxnCoordMeta{
-			TxnCoordMeta: meta.TxnCoordMeta,
-		}
-	} else if meta.RowNum != nil {
-		enc.Value = &distsqlpb.RemoteProducerMetadata_RowNum_{
-			RowNum: meta.RowNum,
-		}
-	} else if meta.Progress != nil {
-		enc.Value = &distsqlpb.RemoteProducerMetadata_Progress{
-			Progress: meta.Progress,
-		}
-	} else {
-		enc.Value = &distsqlpb.RemoteProducerMetadata_Error{
-			Error: distsqlpb.NewError(meta.Err),
-		}
-	}
-	se.metadata = append(se.metadata, enc)
+func (se *StreamEncoder) AddMetadata(meta distsqlpb.ProducerMetadata) {
+	se.metadata = append(se.metadata, distsqlpb.LocalMetaToRemoteProducerMeta(meta))
 }
 
 // AddRow encodes a message.
@@ -127,7 +98,7 @@ func (se *StreamEncoder) AddRow(row sqlbase.EncDatumRow) error {
 			if !ok {
 				enc = preferredEncoding
 			}
-			sType := se.infos[i].Type.SemanticType
+			sType := se.infos[i].Type.Family()
 			if enc != sqlbase.DatumEncoding_VALUE &&
 				(sqlbase.HasCompositeKeyEncoding(sType) || sqlbase.MustBeValueEncoded(sType)) {
 				// Force VALUE encoding for composite types (key encodings may lose data).

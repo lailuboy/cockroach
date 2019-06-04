@@ -42,15 +42,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -78,7 +79,7 @@ var ClusterSecret = func() *settings.StringSetting {
 		"cluster specific secret",
 		"",
 	)
-	s.Hide()
+	s.SetConfidential()
 	return s
 }()
 
@@ -124,6 +125,25 @@ var OptimizerClusterMode = settings.RegisterEnumSetting(
 		int64(sessiondata.OptimizerLocal): "local",
 		int64(sessiondata.OptimizerOff):   "off",
 		int64(sessiondata.OptimizerOn):    "on",
+	},
+)
+
+// ReorderJoinsLimitClusterSettingName is the name of the cluster setting for
+// the maximum number of joins to reorder.
+const ReorderJoinsLimitClusterSettingName = "sql.defaults.reorder_joins_limit"
+
+// ReorderJoinsLimitClusterValue controls the cluster default for the maximum
+// number of joins reordered.
+var ReorderJoinsLimitClusterValue = settings.RegisterValidatedIntSetting(
+	ReorderJoinsLimitClusterSettingName,
+	"default number of joins to reorder",
+	opt.DefaultJoinOrderLimit,
+	func(v int64) error {
+		if v < 0 {
+			return pgerror.Newf(pgerror.CodeInvalidParameterValueError,
+				"cannot set sql.defaults.reorder_joins_limit to a negative value: %d", v)
+		}
+		return nil
 	},
 )
 
@@ -173,36 +193,6 @@ const metricsSampleInterval = 10 * time.Second
 
 // Fully-qualified names for metrics.
 var (
-	MetaTxnBegin = metric.Metadata{
-		Name:        "sql.txn.begin.count",
-		Help:        "Number of SQL transaction BEGIN statements",
-		Measurement: "SQL Statements",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaTxnCommit = metric.Metadata{
-		Name:        "sql.txn.commit.count",
-		Help:        "Number of SQL transaction COMMIT statements",
-		Measurement: "SQL Statements",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaTxnAbort = metric.Metadata{
-		Name:        "sql.txn.abort.count",
-		Help:        "Number of SQL transaction ABORT statements",
-		Measurement: "SQL Statements",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaTxnRollback = metric.Metadata{
-		Name:        "sql.txn.rollback.count",
-		Help:        "Number of SQL transaction ROLLBACK statements",
-		Measurement: "SQL Statements",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaSelect = metric.Metadata{
-		Name:        "sql.select.count",
-		Help:        "Number of SQL SELECT statements",
-		Measurement: "SQL Statements",
-		Unit:        metric.Unit_COUNT,
-	}
 	MetaSQLExecLatency = metric.Metadata{
 		Name:        "sql.exec.latency",
 		Help:        "Latency of SQL statement execution",
@@ -257,45 +247,188 @@ var (
 		Measurement: "Latency",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
-	MetaUpdate = metric.Metadata{
-		Name:        "sql.update.count",
-		Help:        "Number of SQL UPDATE statements",
-		Measurement: "SQL Statements",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaInsert = metric.Metadata{
-		Name:        "sql.insert.count",
-		Help:        "Number of SQL INSERT statements",
-		Measurement: "SQL Statements",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaDelete = metric.Metadata{
-		Name:        "sql.delete.count",
-		Help:        "Number of SQL DELETE statements",
-		Measurement: "SQL Statements",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaDdl = metric.Metadata{
-		Name:        "sql.ddl.count",
-		Help:        "Number of SQL DDL statements",
-		Measurement: "SQL Statements",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaMisc = metric.Metadata{
-		Name:        "sql.misc.count",
-		Help:        "Number of other SQL statements",
-		Measurement: "SQL Statements",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaQuery = metric.Metadata{
-		Name:        "sql.query.count",
-		Help:        "Number of SQL queries",
+	MetaTxnAbort = metric.Metadata{
+		Name:        "sql.txn.abort.count",
+		Help:        "Number of SQL transaction abort errors",
 		Measurement: "SQL Statements",
 		Unit:        metric.Unit_COUNT,
 	}
 	MetaFailure = metric.Metadata{
 		Name:        "sql.failure.count",
 		Help:        "Number of statements resulting in a planning or runtime error",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+
+	// Below are the metadata for the statement started counters.
+
+	MetaQueryStarted = metric.Metadata{
+		Name:        "sql.query.started.count",
+		Help:        "Number of SQL queries started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaTxnBeginStarted = metric.Metadata{
+		Name:        "sql.txn.begin.started.count",
+		Help:        "Number of SQL transaction BEGIN statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaTxnCommitStarted = metric.Metadata{
+		Name:        "sql.txn.commit.started.count",
+		Help:        "Number of SQL transaction COMMIT statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaTxnRollbackStarted = metric.Metadata{
+		Name:        "sql.txn.rollback.started.count",
+		Help:        "Number of SQL transaction ROLLBACK statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaSelectStarted = metric.Metadata{
+		Name:        "sql.select.started.count",
+		Help:        "Number of SQL SELECT statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaUpdateStarted = metric.Metadata{
+		Name:        "sql.update.started.count",
+		Help:        "Number of SQL UPDATE statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaInsertStarted = metric.Metadata{
+		Name:        "sql.insert.started.count",
+		Help:        "Number of SQL INSERT statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaDeleteStarted = metric.Metadata{
+		Name:        "sql.delete.started.count",
+		Help:        "Number of SQL DELETE statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaSavepointStarted = metric.Metadata{
+		Name:        "sql.savepoint.started.count",
+		Help:        "Number of SQL SAVEPOINT statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaRestartSavepointStarted = metric.Metadata{
+		Name:        "sql.restart_savepoint.started.count",
+		Help:        "Number of `SAVEPOINT cockroach_restart` statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaReleaseRestartSavepointStarted = metric.Metadata{
+		Name:        "sql.restart_savepoint.release.started.count",
+		Help:        "Number of `RELEASE SAVEPOINT cockroach_restart` statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaRollbackToRestartSavepointStarted = metric.Metadata{
+		Name:        "sql.restart_savepoint.rollback.started.count",
+		Help:        "Number of `ROLLBACK TO SAVEPOINT cockroach_restart` statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaDdlStarted = metric.Metadata{
+		Name:        "sql.ddl.started.count",
+		Help:        "Number of SQL DDL statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaMiscStarted = metric.Metadata{
+		Name:        "sql.misc.started.count",
+		Help:        "Number of other SQL statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+
+	// Below are the metadata for the statement executed counters.
+	MetaQueryExecuted = metric.Metadata{
+		Name:        "sql.query.count",
+		Help:        "Number of SQL queries executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaTxnBeginExecuted = metric.Metadata{
+		Name:        "sql.txn.begin.count",
+		Help:        "Number of SQL transaction BEGIN statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaTxnCommitExecuted = metric.Metadata{
+		Name:        "sql.txn.commit.count",
+		Help:        "Number of SQL transaction COMMIT statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaTxnRollbackExecuted = metric.Metadata{
+		Name:        "sql.txn.rollback.count",
+		Help:        "Number of SQL transaction ROLLBACK statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaSelectExecuted = metric.Metadata{
+		Name:        "sql.select.count",
+		Help:        "Number of SQL SELECT statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaUpdateExecuted = metric.Metadata{
+		Name:        "sql.update.count",
+		Help:        "Number of SQL UPDATE statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaInsertExecuted = metric.Metadata{
+		Name:        "sql.insert.count",
+		Help:        "Number of SQL INSERT statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaDeleteExecuted = metric.Metadata{
+		Name:        "sql.delete.count",
+		Help:        "Number of SQL DELETE statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaSavepointExecuted = metric.Metadata{
+		Name:        "sql.savepoint.count",
+		Help:        "Number of SQL SAVEPOINT statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaRestartSavepointExecuted = metric.Metadata{
+		Name:        "sql.restart_savepoint.count",
+		Help:        "Number of `SAVEPOINT cockroach_restart` statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaReleaseRestartSavepointExecuted = metric.Metadata{
+		Name:        "sql.restart_savepoint.release.count",
+		Help:        "Number of `RELEASE SAVEPOINT cockroach_restart` statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaRollbackToRestartSavepointExecuted = metric.Metadata{
+		Name:        "sql.restart_savepoint.rollback.count",
+		Help:        "Number of `ROLLBACK TO SAVEPOINT cockroach_restart` statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaDdlExecuted = metric.Metadata{
+		Name:        "sql.ddl.count",
+		Help:        "Number of SQL DDL statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaMiscExecuted = metric.Metadata{
+		Name:        "sql.misc.count",
+		Help:        "Number of other SQL statements successfully executed",
 		Measurement: "SQL Statements",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -331,28 +464,31 @@ type nodeStatusGenerator interface {
 type ExecutorConfig struct {
 	Settings *cluster.Settings
 	NodeInfo
-	AmbientCtx       log.AmbientContext
-	DB               *client.DB
-	Gossip           *gossip.Gossip
-	DistSender       *kv.DistSender
-	RPCContext       *rpc.Context
-	LeaseManager     *LeaseManager
-	Clock            *hlc.Clock
-	DistSQLSrv       *distsqlrun.ServerImpl
-	StatusServer     serverpb.StatusServer
-	MetricsRecorder  nodeStatusGenerator
-	SessionRegistry  *SessionRegistry
-	JobRegistry      *jobs.Registry
-	VirtualSchemas   *VirtualSchemaHolder
-	DistSQLPlanner   *DistSQLPlanner
-	TableStatsCache  *stats.TableStatisticsCache
-	StatsRefresher   *stats.Refresher
-	ExecLogger       *log.SecondaryLogger
-	AuditLogger      *log.SecondaryLogger
-	InternalExecutor *InternalExecutor
-	QueryCache       *querycache.C
+	DefaultZoneConfig *config.ZoneConfig
+	Locality          roachpb.Locality
+	AmbientCtx        log.AmbientContext
+	DB                *client.DB
+	Gossip            *gossip.Gossip
+	DistSender        *kv.DistSender
+	RPCContext        *rpc.Context
+	LeaseManager      *LeaseManager
+	Clock             *hlc.Clock
+	DistSQLSrv        *distsqlrun.ServerImpl
+	StatusServer      serverpb.StatusServer
+	MetricsRecorder   nodeStatusGenerator
+	SessionRegistry   *SessionRegistry
+	JobRegistry       *jobs.Registry
+	VirtualSchemas    *VirtualSchemaHolder
+	DistSQLPlanner    *DistSQLPlanner
+	TableStatsCache   *stats.TableStatisticsCache
+	StatsRefresher    *stats.Refresher
+	ExecLogger        *log.SecondaryLogger
+	AuditLogger       *log.SecondaryLogger
+	InternalExecutor  *InternalExecutor
+	QueryCache        *querycache.C
 
-	TestingKnobs              *ExecutorTestingKnobs
+	TestingKnobs              ExecutorTestingKnobs
+	PGWireTestingKnobs        *PGWireTestingKnobs
 	SchemaChangerTestingKnobs *SchemaChangerTestingKnobs
 	DistSQLRunTestingKnobs    *distsqlrun.TestingKnobs
 	EvalContextTestingKnobs   tree.EvalContextTestingKnobs
@@ -381,18 +517,14 @@ type StatementFilter func(context.Context, string, error)
 // ExecutorTestingKnobs is part of the context used to control parts of the
 // system during testing.
 type ExecutorTestingKnobs struct {
-	// CheckStmtStringChange causes Executor.execStmtGroup to verify that executed
-	// statements are not modified during execution.
-	CheckStmtStringChange bool
-
 	// StatementFilter can be used to trap execution of SQL statements and
 	// optionally change their results. The filter function is invoked after each
 	// statement has been executed.
 	StatementFilter StatementFilter
 
 	// BeforeExecute is called by the Executor before plan execution. It is useful
-	// for synchronizing statement execution, such as with parallel statemets.
-	BeforeExecute func(ctx context.Context, stmt string, isParallel bool)
+	// for synchronizing statement execution.
+	BeforeExecute func(ctx context.Context, stmt string)
 
 	// AfterExecute is like StatementFilter, but it runs in the same goroutine of the
 	// statement.
@@ -419,12 +551,24 @@ type ExecutorTestingKnobs struct {
 	// optimization). This is only called when the Executor is the one doing the
 	// committing.
 	BeforeAutoCommit func(ctx context.Context, stmt string) error
+}
 
-	// CatchPanics causes the connExecutor to recover from panics in its execution
+// PGWireTestingKnobs contains knobs for the pgwire module.
+type PGWireTestingKnobs struct {
+	// CatchPanics causes the pgwire.conn to recover from panics in its execution
 	// thread and return them as errors to the client, closing the connection
 	// afterward.
 	CatchPanics bool
+
+	// AuthHook is used to override the normal authentication handling on new
+	// connections.
+	AuthHook func(context.Context) error
 }
+
+var _ base.ModuleTestingKnobs = &PGWireTestingKnobs{}
+
+// ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
+func (*PGWireTestingKnobs) ModuleTestingKnobs() {}
 
 // databaseCacheHolder is a thread-safe container for a *databaseCache.
 // It also allows clients to block until the cache is updated to a desired
@@ -619,47 +763,45 @@ func golangFillQueryArguments(args ...interface{}) tree.Datums {
 	return res
 }
 
-func checkResultType(typ types.T) error {
+// checkResultType verifies that a table result can be returned to the
+// client.
+func checkResultType(typ *types.T) error {
 	// Compare all types that can rely on == equality.
-	switch types.UnwrapType(typ) {
-	case types.Unknown:
-	case types.BitArray:
-	case types.Bool:
-	case types.Int:
-	case types.Float:
-	case types.Decimal:
-	case types.Bytes:
-	case types.String:
-	case types.Date:
-	case types.Time:
-	case types.Timestamp:
-	case types.TimestampTZ:
-	case types.Interval:
-	case types.JSON:
-	case types.UUID:
-	case types.INet:
-	case types.NameArray:
-	case types.Oid:
-	case types.RegClass:
-	case types.RegNamespace:
-	case types.RegProc:
-	case types.RegProcedure:
-	case types.RegType:
-	default:
-		// Compare all types that cannot rely on == equality.
-		istype := typ.FamilyEqual
-		switch {
-		case istype(types.FamArray):
-			if istype(types.UnwrapType(typ).(types.TArray).Typ) {
-				return pgerror.Unimplemented("nested arrays", "arrays cannot have arrays as element type")
-			}
-		case istype(types.FamCollatedString):
-		case istype(types.FamTuple):
-		case istype(types.FamPlaceholder):
-			return errors.Errorf("could not determine data type of %s", typ)
-		default:
-			return errors.Errorf("unsupported result type: %s", typ)
+	switch typ.Family() {
+	case types.UnknownFamily:
+	case types.BitFamily:
+	case types.BoolFamily:
+	case types.IntFamily:
+	case types.FloatFamily:
+	case types.DecimalFamily:
+	case types.BytesFamily:
+	case types.StringFamily:
+	case types.CollatedStringFamily:
+	case types.DateFamily:
+	case types.TimestampFamily:
+	case types.TimeFamily:
+	case types.TimestampTZFamily:
+	case types.IntervalFamily:
+	case types.JsonFamily:
+	case types.UuidFamily:
+	case types.INetFamily:
+	case types.OidFamily:
+	case types.TupleFamily:
+	case types.ArrayFamily:
+		if typ.ArrayContents().Family() == types.ArrayFamily {
+			// Technically we could probably return arrays of arrays to a
+			// client (the encoding exists) but we don't want to give
+			// mixed signals -- that nested arrays appear to be supported
+			// in this case, and not in other cases (eg. CREATE). So we
+			// reject them in every case instead.
+			return pgerror.UnimplementedWithIssueDetail(32552,
+				"result", "arrays cannot have arrays as element type")
 		}
+	case types.AnyFamily:
+		// Placeholder case.
+		return errors.Errorf("could not determine data type of %s", typ)
+	default:
+		return errors.Errorf("unsupported result type: %s", typ)
 	}
 	return nil
 }
@@ -667,7 +809,15 @@ func checkResultType(typ types.T) error {
 // EvalAsOfTimestamp evaluates and returns the timestamp from an AS OF SYSTEM
 // TIME clause.
 func (p *planner) EvalAsOfTimestamp(asOf tree.AsOfClause) (_ hlc.Timestamp, err error) {
-	return tree.EvalAsOfTimestamp(asOf, &p.semaCtx, p.EvalContext())
+	ts, err := tree.EvalAsOfTimestamp(asOf, &p.semaCtx, p.EvalContext())
+	if err != nil {
+		return hlc.Timestamp{}, err
+	}
+	if now := p.execCfg.Clock.Now(); now.Less(ts) {
+		return hlc.Timestamp{}, errors.Errorf(
+			"AS OF SYSTEM TIME: cannot specify timestamp in the future (%s > %s)", ts, now)
+	}
+	return ts, nil
 }
 
 // ParseHLC parses a string representation of an `hlc.Timestamp`.
@@ -712,10 +862,10 @@ func (p *planner) isAsOf(stmt tree.Statement) (*hlc.Timestamp, error) {
 	case *tree.Export:
 		return p.isAsOf(s.Query)
 	case *tree.CreateStats:
-		if s.AsOf.Expr == nil {
+		if s.Options.AsOf.Expr == nil {
 			return nil, nil
 		}
-		asOf = s.AsOf
+		asOf = s.Options.AsOf
 	default:
 		return nil, nil
 	}
@@ -1119,7 +1269,7 @@ func (st *SessionTracing) StartTracing(
 			}
 			fmt.Fprintf(&desiredOptions, "%s%s", comma, recOption)
 
-			return pgerror.NewErrorf(pgerror.CodeObjectNotInPrerequisiteStateError,
+			return pgerror.Newf(pgerror.CodeObjectNotInPrerequisiteStateError,
 				"tracing is already started with different options").SetHintf(
 				"reset with SET tracing = off; SET tracing = %s", desiredOptions.String())
 		}
@@ -1684,6 +1834,10 @@ func (m *sessionDataMutator) SetStmtTimeout(timeout time.Duration) {
 
 func (m *sessionDataMutator) SetAllowPrepareAsOptPlan(val bool) {
 	m.data.AllowPrepareAsOptPlan = val
+}
+
+func (m *sessionDataMutator) SetSaveTablesPrefix(prefix string) {
+	m.data.SaveTablesPrefix = prefix
 }
 
 // RecordLatestSequenceValue records that value to which the session incremented

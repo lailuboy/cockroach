@@ -19,6 +19,9 @@ import (
 	"math"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -33,14 +36,17 @@ import (
 // only include what the optimizer needs, and certain common lookups are cached
 // for faster performance.
 type optCatalog struct {
-	// resolver needs to be set via a call to init before calling other methods.
-	resolver LogicalSchema
+	// planner needs to be set via a call to init before calling other methods.
+	planner *planner
 
-	statsCache *stats.TableStatisticsCache
+	// cfg is the gossiped and cached system config. It may be nil if the node
+	// does not yet have it available.
+	cfg *config.SystemConfig
 
 	// dataSources is a cache of table and view objects that's used to satisfy
-	// repeated calls for the same data source. The same underlying descriptor
-	// will always return the same data source wrapper object.
+	// repeated calls for the same data source.
+	// Note that the data source object might still need to be recreated if
+	// something outside of the descriptor has changed (e.g. table stats).
 	dataSources map[*sqlbase.ImmutableTableDescriptor]cat.DataSource
 
 	// tn is a temporary name used during resolution to avoid heap allocation.
@@ -49,17 +55,34 @@ type optCatalog struct {
 
 var _ cat.Catalog = &optCatalog{}
 
-// init allows the caller to pre-allocate optCatalog.
-func (oc *optCatalog) init(statsCache *stats.TableStatisticsCache, resolver LogicalSchema) {
-	oc.resolver = resolver
-	oc.statsCache = statsCache
-	oc.dataSources = nil
+// init initializes an optCatalog instance (which the caller can pre-allocate).
+// The instance can be used across multiple queries, but reset() should be
+// called for each query.
+func (oc *optCatalog) init(planner *planner) {
+	oc.planner = planner
+	oc.dataSources = make(map[*sqlbase.ImmutableTableDescriptor]cat.DataSource)
+}
+
+// reset prepares the optCatalog to be used for a new query.
+func (oc *optCatalog) reset() {
+	// If we have accumulated too many tables in our map, throw everything away.
+	// This deals with possible edge cases where we do a lot of DDL in a
+	// long-lived session.
+	if len(oc.dataSources) > 100 {
+		oc.dataSources = make(map[*sqlbase.ImmutableTableDescriptor]cat.DataSource)
+	}
+
+	// Gossip can be nil in testing scenarios.
+	if oc.planner.execCfg.Gossip != nil {
+		oc.cfg = oc.planner.execCfg.Gossip.GetSystemConfig()
+	}
 }
 
 // optSchema is a wrapper around sqlbase.DatabaseDescriptor that implements the
 // cat.Object and cat.Schema interfaces.
 type optSchema struct {
-	desc *sqlbase.DatabaseDescriptor
+	planner *planner
+	desc    *sqlbase.DatabaseDescriptor
 
 	name cat.SchemaName
 }
@@ -80,13 +103,25 @@ func (os *optSchema) Name() *cat.SchemaName {
 	return &os.name
 }
 
+// GetDataSourceNames is part of the cat.Schema interface.
+func (os *optSchema) GetDataSourceNames(ctx context.Context) ([]cat.DataSourceName, error) {
+	return GetObjectNames(
+		ctx, os.planner.Txn(), os.planner, os.desc,
+		os.name.Schema(),
+		true, /* explicitPrefix */
+	)
+}
+
 // ResolveSchema is part of the cat.Catalog interface.
 func (oc *optCatalog) ResolveSchema(
-	ctx context.Context, name *cat.SchemaName,
+	ctx context.Context, flags cat.Flags, name *cat.SchemaName,
 ) (cat.Schema, cat.SchemaName, error) {
-	p := oc.resolver.(*planner)
-	defer func(prev bool) { p.avoidCachedDescriptors = prev }(p.avoidCachedDescriptors)
-	p.avoidCachedDescriptors = true
+	if flags.AvoidDescriptorCaches {
+		defer func(prev bool) {
+			oc.planner.avoidCachedDescriptors = prev
+		}(oc.planner.avoidCachedDescriptors)
+		oc.planner.avoidCachedDescriptors = true
+	}
 
 	// ResolveTargetObject wraps ResolveTarget in order to raise "schema not
 	// found" and "schema cannot be modified" errors. However, ResolveTargetObject
@@ -97,30 +132,47 @@ func (oc *optCatalog) ResolveSchema(
 	oc.tn.TableNamePrefix = *name
 	found, desc, err := oc.tn.ResolveTarget(
 		ctx,
-		oc.resolver,
-		oc.resolver.CurrentDatabase(),
-		oc.resolver.CurrentSearchPath(),
+		oc.planner,
+		oc.planner.CurrentDatabase(),
+		oc.planner.CurrentSearchPath(),
 	)
 	if err != nil {
 		return nil, cat.SchemaName{}, err
 	}
 	if !found {
-		return nil, cat.SchemaName{}, pgerror.NewErrorf(pgerror.CodeInvalidSchemaNameError,
-			"target database or schema does not exist")
+		if !name.ExplicitSchema && !name.ExplicitCatalog {
+			return nil, cat.SchemaName{}, pgerror.New(
+				pgerror.CodeInvalidNameError, "no database specified",
+			)
+		}
+		return nil, cat.SchemaName{}, pgerror.Newf(
+			pgerror.CodeInvalidSchemaNameError, "target database or schema does not exist",
+		)
 	}
-	return &optSchema{desc: desc.(*DatabaseDescriptor)}, oc.tn.TableNamePrefix, nil
+	return &optSchema{
+		planner: oc.planner,
+		desc:    desc.(*DatabaseDescriptor),
+		name:    oc.tn.TableNamePrefix,
+	}, oc.tn.TableNamePrefix, nil
 }
 
 // ResolveDataSource is part of the cat.Catalog interface.
 func (oc *optCatalog) ResolveDataSource(
-	ctx context.Context, name *cat.DataSourceName,
+	ctx context.Context, flags cat.Flags, name *cat.DataSourceName,
 ) (cat.DataSource, cat.DataSourceName, error) {
+	if flags.AvoidDescriptorCaches {
+		defer func(prev bool) {
+			oc.planner.avoidCachedDescriptors = prev
+		}(oc.planner.avoidCachedDescriptors)
+		oc.planner.avoidCachedDescriptors = true
+	}
+
 	oc.tn = *name
-	desc, err := ResolveExistingObject(ctx, oc.resolver, &oc.tn, true /* required */, anyDescType)
+	desc, err := ResolveExistingObject(ctx, oc.planner, &oc.tn, true /* required */, ResolveAnyDescType)
 	if err != nil {
 		return nil, cat.DataSourceName{}, err
 	}
-	ds, err := oc.newDataSource(ctx, desc, &oc.tn)
+	ds, err := oc.dataSourceForDesc(ctx, flags, desc, &oc.tn)
 	if err != nil {
 		return nil, cat.DataSourceName{}, err
 	}
@@ -131,7 +183,7 @@ func (oc *optCatalog) ResolveDataSource(
 func (oc *optCatalog) ResolveDataSourceByID(
 	ctx context.Context, dataSourceID cat.StableID,
 ) (cat.DataSource, error) {
-	tableLookup, err := oc.resolver.LookupTableByID(ctx, sqlbase.ID(dataSourceID))
+	tableLookup, err := oc.planner.LookupTableByID(ctx, sqlbase.ID(dataSourceID))
 
 	if err != nil || tableLookup.IsAdding {
 		if err == sqlbase.ErrDescriptorNotFound || tableLookup.IsAdding {
@@ -141,95 +193,71 @@ func (oc *optCatalog) ResolveDataSourceByID(
 	}
 	desc := tableLookup.Desc
 
-	dbDesc, err := sqlbase.GetDatabaseDescFromID(ctx, oc.resolver.Txn(), desc.ParentID)
+	dbDesc, err := sqlbase.GetDatabaseDescFromID(ctx, oc.planner.Txn(), desc.ParentID)
 	if err != nil {
 		return nil, err
 	}
 
 	name := tree.MakeTableName(tree.Name(dbDesc.Name), tree.Name(desc.Name))
-	return oc.newDataSource(ctx, desc, &name)
+	return oc.dataSourceForDesc(ctx, cat.Flags{}, desc, &name)
 }
 
 // CheckPrivilege is part of the cat.Catalog interface.
 func (oc *optCatalog) CheckPrivilege(ctx context.Context, o cat.Object, priv privilege.Kind) error {
 	switch t := o.(type) {
 	case *optSchema:
-		return oc.resolver.CheckPrivilege(ctx, t.desc, priv)
+		return oc.planner.CheckPrivilege(ctx, t.desc, priv)
 	case *optTable:
-		return oc.resolver.CheckPrivilege(ctx, t.desc, priv)
+		return oc.planner.CheckPrivilege(ctx, t.desc, priv)
 	case *optView:
-		return oc.resolver.CheckPrivilege(ctx, t.desc, priv)
+		return oc.planner.CheckPrivilege(ctx, t.desc, priv)
 	case *optSequence:
-		return oc.resolver.CheckPrivilege(ctx, t.desc, priv)
+		return oc.planner.CheckPrivilege(ctx, t.desc, priv)
 	default:
-		return pgerror.NewAssertionErrorf("invalid object type: %T", o)
+		return pgerror.AssertionFailedf("invalid object type: %T", o)
 	}
 }
 
-// newDataSource returns a data source wrapper for the given table descriptor.
+// CheckAnyPrivilege is part of the cat.Catalog interface.
+func (oc *optCatalog) CheckAnyPrivilege(ctx context.Context, o cat.Object) error {
+	switch t := o.(type) {
+	case *optSchema:
+		return oc.planner.CheckAnyPrivilege(ctx, t.desc)
+	case *optTable:
+		return oc.planner.CheckAnyPrivilege(ctx, t.desc)
+	case *optView:
+		return oc.planner.CheckAnyPrivilege(ctx, t.desc)
+	case *optSequence:
+		return oc.planner.CheckAnyPrivilege(ctx, t.desc)
+	default:
+		return pgerror.AssertionFailedf("invalid object type: %T", o)
+	}
+}
+
+// RequireSuperUser is part of the cat.Catalog interface.
+func (oc *optCatalog) RequireSuperUser(ctx context.Context, action string) error {
+	return oc.planner.RequireSuperUser(ctx, action)
+}
+
+// dataSourceForDesc returns a data source wrapper for the given descriptor.
 // The wrapper might come from the cache, or it may be created now.
-func (oc *optCatalog) newDataSource(
-	ctx context.Context, desc *sqlbase.ImmutableTableDescriptor, name *cat.DataSourceName,
+func (oc *optCatalog) dataSourceForDesc(
+	ctx context.Context,
+	flags cat.Flags,
+	desc *sqlbase.ImmutableTableDescriptor,
+	name *cat.DataSourceName,
 ) (cat.DataSource, error) {
-	// Check to see if there's already a data source wrapper for this descriptor.
-	if oc.dataSources == nil {
-		oc.dataSources = make(map[*sqlbase.ImmutableTableDescriptor]cat.DataSource)
-	} else {
-		if ds, ok := oc.dataSources[desc]; ok {
-			return ds, nil
-		}
+	if desc.IsTable() {
+		// Tables require invalidation logic for cached wrappers.
+		return oc.dataSourceForTable(ctx, flags, desc, name)
 	}
 
-	// Create wrapper for the data source now.
-	var ds cat.DataSource
+	ds, ok := oc.dataSources[desc]
+	if ok {
+		return ds, nil
+	}
+
 	switch {
-	case desc.IsTable():
-		id := cat.StableID(desc.ID)
-		if desc.IsVirtualTable() {
-			// A virtual table can effectively have multiple instances, with different
-			// contents. For example `db1.pg_catalog.pg_sequence` contains info about
-			// sequences in db1, whereas `db2.pg_catalog.pg_sequence` contains info
-			// about sequences in db2.
-			//
-			// These instances should have different stable IDs. To achieve this, we
-			// prepend the database ID.
-			//
-			// Note that some virtual tables have a special instance with empty catalog,
-			// for example "".information_schema.tables contains info about tables in
-			// all databases. We treat the empty catalog as having database ID 0.
-			if name.Catalog() != "" {
-				// TODO(radu): it's unfortunate that we have to lookup the schema again.
-				_, dbDesc, err := oc.resolver.LookupSchema(ctx, name.Catalog(), name.Schema())
-				if err != nil {
-					return nil, err
-				}
-				if dbDesc == nil {
-					// The database was not found. This can happen e.g. when
-					// accessing a virtual schema over a non-existent
-					// database. This is a common scenario when the current db
-					// in the session points to a database that was not created
-					// yet.
-					//
-					// In that case we use an invalid database ID. We
-					// distinguish this from the empty database case because the
-					// virtual tables do not "contain" the same information in
-					// both cases.
-					id |= cat.StableID(math.MaxUint32) << 32
-				} else {
-					id |= cat.StableID(dbDesc.(*DatabaseDescriptor).ID) << 32
-				}
-			}
-		}
-
-		stats, err := oc.statsCache.GetTableStats(context.TODO(), desc.ID)
-		if err != nil {
-			// Ignore any error. We still want to be able to run queries even if we lose
-			// access to the statistics table.
-			// TODO(radu): at least log the error.
-			stats = nil
-		}
-		ds = newOptTable(desc, id, name, stats)
-
 	case desc.IsView():
 		ds = newOptView(desc, name)
 
@@ -237,15 +265,116 @@ func (oc *optCatalog) newDataSource(
 		ds = newOptSequence(desc, name)
 
 	default:
-		return nil, pgerror.NewAssertionErrorf("unexpected table descriptor: %+v", desc)
+		return nil, pgerror.AssertionFailedf("unexpected table descriptor: %+v", desc)
 	}
 
+	oc.dataSources[desc] = ds
+	return ds, nil
+}
+
+// dataSourceForTable returns a table data source wrapper for the given descriptor.
+// The wrapper might come from the cache, or it may be created now.
+func (oc *optCatalog) dataSourceForTable(
+	ctx context.Context,
+	flags cat.Flags,
+	desc *sqlbase.ImmutableTableDescriptor,
+	name *cat.DataSourceName,
+) (cat.DataSource, error) {
+	// Even if we have a cached data source, we still have to cross-check that
+	// statistics and the zone config haven't changed.
+	var tableStats []*stats.TableStatistic
+	if !flags.NoTableStats {
+		var err error
+		tableStats, err = oc.planner.execCfg.TableStatsCache.GetTableStats(context.TODO(), desc.ID)
+		if err != nil {
+			// Ignore any error. We still want to be able to run queries even if we lose
+			// access to the statistics table.
+			// TODO(radu): at least log the error.
+			tableStats = nil
+		}
+	}
+
+	zoneConfig, err := oc.getZoneConfig(desc)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check to see if there's already a data source wrapper for this descriptor,
+	// and it was created with the same stats and zone config.
+	if ds, ok := oc.dataSources[desc]; ok && !ds.(*optTable).isStale(tableStats, zoneConfig) {
+		return ds, nil
+	}
+
+	id := cat.StableID(desc.ID)
+	if desc.IsVirtualTable() {
+		// A virtual table can effectively have multiple instances, with different
+		// contents. For example `db1.pg_catalog.pg_sequence` contains info about
+		// sequences in db1, whereas `db2.pg_catalog.pg_sequence` contains info
+		// about sequences in db2.
+		//
+		// These instances should have different stable IDs. To achieve this, we
+		// prepend the database ID.
+		//
+		// Note that some virtual tables have a special instance with empty catalog,
+		// for example "".information_schema.tables contains info about tables in
+		// all databases. We treat the empty catalog as having database ID 0.
+		if name.Catalog() != "" {
+			// TODO(radu): it's unfortunate that we have to lookup the schema again.
+			_, dbDesc, err := oc.planner.LookupSchema(ctx, name.Catalog(), name.Schema())
+			if err != nil {
+				return nil, err
+			}
+			if dbDesc == nil {
+				// The database was not found. This can happen e.g. when
+				// accessing a virtual schema over a non-existent
+				// database. This is a common scenario when the current db
+				// in the session points to a database that was not created
+				// yet.
+				//
+				// In that case we use an invalid database ID. We
+				// distinguish this from the empty database case because the
+				// virtual tables do not "contain" the same information in
+				// both cases.
+				id |= cat.StableID(math.MaxUint32) << 32
+			} else {
+				id |= cat.StableID(dbDesc.(*DatabaseDescriptor).ID) << 32
+			}
+		}
+	}
+
+	ds := newOptTable(desc, id, name, tableStats, zoneConfig)
 	if !desc.IsVirtualTable() {
 		// Virtual tables can have multiple effective instances that utilize the
 		// same descriptor (see above).
 		oc.dataSources[desc] = ds
 	}
 	return ds, nil
+}
+
+var emptyZoneConfig = &config.ZoneConfig{}
+
+// getZoneConfig returns the ZoneConfig data structure for the given table.
+// ZoneConfigs are stored in protobuf binary format in the SystemConfig, which
+// is gossiped around the cluster. Note that the returned ZoneConfig might be
+// somewhat stale, since it's taken from the gossiped SystemConfig.
+func (oc *optCatalog) getZoneConfig(
+	desc *sqlbase.ImmutableTableDescriptor,
+) (*config.ZoneConfig, error) {
+	// Lookup table's zone if system config is available (it may not be as node
+	// is starting up and before it's received the gossiped config). If it is
+	// not available, use an empty config that has no zone constraints.
+	if oc.cfg == nil || desc.IsVirtualTable() {
+		return emptyZoneConfig, nil
+	}
+	zone, err := oc.cfg.GetZoneConfigForObject(uint32(desc.ID))
+	if err != nil {
+		return nil, err
+	}
+	if zone == nil {
+		// This can happen with tests that override the hook.
+		zone = emptyZoneConfig
+	}
+	return zone, err
 }
 
 // optView is a wrapper around sqlbase.ImmutableTableDescriptor that implements
@@ -367,8 +496,14 @@ type optTable struct {
 	// indexes.
 	indexes []optIndex
 
+	// rawStats stores the original table statistics slice. Used for a fast-path
+	// check that the statistics haven't changed.
+	rawStats []*stats.TableStatistic
+
 	// stats are the inlined wrappers for table statistics.
 	stats []optTableStat
+
+	zone *config.ZoneConfig
 
 	// family is the inlined wrapper for the table's primary family. The primary
 	// family is the first family explicitly specified by the user. If no families
@@ -380,6 +515,9 @@ type optTable struct {
 	// primary family is kept separate since the common case is that there's just
 	// one family.
 	families []optFamily
+
+	outboundFKs []optForeignKeyConstraint
+	inboundFKs  []optForeignKeyConstraint
 
 	// colMap is a mapping from unique ColumnID to column ordinal within the
 	// table. This is a common lookup that needs to be fast.
@@ -393,8 +531,15 @@ func newOptTable(
 	id cat.StableID,
 	name *cat.DataSourceName,
 	stats []*stats.TableStatistic,
+	tblZone *config.ZoneConfig,
 ) *optTable {
-	ot := &optTable{desc: desc, id: id, name: *name}
+	ot := &optTable{
+		desc:     desc,
+		id:       id,
+		name:     *name,
+		rawStats: stats,
+		zone:     tblZone,
+	}
 
 	// The cat.Table interface requires that table names be fully qualified.
 	ot.name.ExplicitSchema = true
@@ -418,7 +563,46 @@ func newOptTable(
 			} else {
 				idxDesc = &ot.desc.DeletableIndexes()[i-1]
 			}
-			ot.indexes[i].init(ot, idxDesc)
+
+			// If there is a subzone that applies to the entire index, use that,
+			// else use the table zone. Skip subzones that apply to partitions,
+			// since they apply only to a subset of the index.
+			idxZone := tblZone
+			for j := range tblZone.Subzones {
+				subzone := &tblZone.Subzones[j]
+				if subzone.IndexID == uint32(idxDesc.ID) && subzone.PartitionName == "" {
+					copyZone := subzone.Config
+					copyZone.InheritFromParent(tblZone)
+					idxZone = &copyZone
+				}
+			}
+
+			ot.indexes[i].init(ot, idxDesc, idxZone)
+			if fk := &idxDesc.ForeignKey; fk.IsSet() {
+				ot.outboundFKs = append(ot.outboundFKs, optForeignKeyConstraint{
+					name:            idxDesc.ForeignKey.Name,
+					originTable:     ot.id,
+					originIndex:     idxDesc.ID,
+					referencedTable: cat.StableID(fk.Table),
+					referencedIndex: fk.Index,
+					numCols:         int(fk.SharedPrefixLen),
+					validity:        fk.Validity,
+					match:           fk.Match,
+				})
+			}
+			for j := range idxDesc.ReferencedBy {
+				fk := &idxDesc.ReferencedBy[j]
+				ot.inboundFKs = append(ot.inboundFKs, optForeignKeyConstraint{
+					name:            idxDesc.ForeignKey.Name,
+					originTable:     cat.StableID(fk.Table),
+					originIndex:     fk.Index,
+					referencedTable: ot.id,
+					referencedIndex: idxDesc.ID,
+					numCols:         int(fk.SharedPrefixLen),
+					validity:        fk.Validity,
+					match:           fk.Match,
+				})
+			}
 		}
 	}
 
@@ -460,15 +644,39 @@ func (ot *optTable) ID() cat.StableID {
 	return ot.id
 }
 
+// isStale checks if the optTable object needs to be refreshed because the stats
+// or zone config have changed. False positives are ok.
+func (ot *optTable) isStale(tableStats []*stats.TableStatistic, zone *config.ZoneConfig) bool {
+	// Fast check to verify that the statistics haven't changed: we check the
+	// length and the address of the underlying array. This is not a perfect
+	// check (in principle, the stats could have left the cache and then gotten
+	// regenerated), but it works in the common case.
+	if len(tableStats) != len(ot.rawStats) {
+		return true
+	}
+	if len(tableStats) > 0 && &tableStats[0] != &ot.rawStats[0] {
+		return true
+	}
+	if !zone.Equal(ot.zone) {
+		return true
+	}
+	return false
+}
+
 // Equals is part of the cat.Object interface.
 func (ot *optTable) Equals(other cat.Object) bool {
 	otherTable, ok := other.(*optTable)
 	if !ok {
 		return false
 	}
+	if ot == otherTable {
+		// Fast path when it is the same object.
+		return true
+	}
 	if ot.id != otherTable.id || ot.desc.Version != otherTable.desc.Version {
 		return false
 	}
+
 	// Verify the stats are identical.
 	if len(ot.stats) != len(otherTable.stats) {
 		return false
@@ -478,6 +686,23 @@ func (ot *optTable) Equals(other cat.Object) bool {
 			return false
 		}
 	}
+
+	// Verify that indexes are in same zones. For performance, skip deep equality
+	// check if it's the same as the previous index (common case).
+	var prevLeftZone, prevRightZone *config.ZoneConfig
+	for i := range ot.indexes {
+		leftZone := ot.indexes[i].zone
+		rightZone := otherTable.indexes[i].zone
+		if leftZone == prevLeftZone && rightZone == prevRightZone {
+			continue
+		}
+		if !leftZone.Equal(rightZone) {
+			return false
+		}
+		prevLeftZone = leftZone
+		prevRightZone = rightZone
+	}
+
 	return true
 }
 
@@ -494,16 +719,6 @@ func (ot *optTable) IsVirtualTable() bool {
 // IsInterleaved is part of the cat.Table interface.
 func (ot *optTable) IsInterleaved() bool {
 	return ot.desc.IsInterleaved()
-}
-
-// IsReferenced is part of the cat.Table interface.
-func (ot *optTable) IsReferenced() bool {
-	for i, n := 0, ot.DeletableIndexCount(); i < n; i++ {
-		if len(ot.Index(i).(*optIndex).desc.ReferencedBy) != 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // ColumnCount is part of the cat.Table interface.
@@ -570,13 +785,16 @@ func (ot *optTable) Statistic(i int) cat.TableStatistic {
 
 // CheckCount is part of the cat.Table interface.
 func (ot *optTable) CheckCount() int {
-	return len(ot.desc.AllChecks())
+	return len(ot.desc.ActiveChecks())
 }
 
 // Check is part of the cat.Table interface.
 func (ot *optTable) Check(i int) cat.CheckConstraint {
-	check := ot.desc.AllChecks()[i]
-	return cat.CheckConstraint(check.Expr)
+	check := ot.desc.ActiveChecks()[i]
+	return cat.CheckConstraint{
+		Constraint: check.Expr,
+		Validated:  check.Validity == sqlbase.ConstraintValidity_Validated,
+	}
 }
 
 // FamilyCount is part of the cat.Table interface.
@@ -592,6 +810,26 @@ func (ot *optTable) Family(i int) cat.Family {
 	return &ot.families[i-1]
 }
 
+// OutboundForeignKeyCount is part of the cat.Table interface.
+func (ot *optTable) OutboundForeignKeyCount() int {
+	return len(ot.outboundFKs)
+}
+
+// OutboundForeignKeyCount is part of the cat.Table interface.
+func (ot *optTable) OutboundForeignKey(i int) cat.ForeignKeyConstraint {
+	return &ot.outboundFKs[i]
+}
+
+// InboundForeignKeyCount is part of the cat.Table interface.
+func (ot *optTable) InboundForeignKeyCount() int {
+	return len(ot.inboundFKs)
+}
+
+// InboundForeignKey is part of the cat.Table interface.
+func (ot *optTable) InboundForeignKey(i int) cat.ForeignKeyConstraint {
+	return &ot.inboundFKs[i]
+}
+
 // lookupColumnOrdinal returns the ordinal of the column with the given ID. A
 // cache makes the lookup O(1).
 func (ot *optTable) lookupColumnOrdinal(colID sqlbase.ColumnID) (int, error) {
@@ -599,7 +837,7 @@ func (ot *optTable) lookupColumnOrdinal(colID sqlbase.ColumnID) (int, error) {
 	if ok {
 		return col, nil
 	}
-	return col, pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
+	return col, pgerror.Newf(pgerror.CodeUndefinedColumnError,
 		"column [%d] does not exist", colID)
 }
 
@@ -608,6 +846,8 @@ func (ot *optTable) lookupColumnOrdinal(colID sqlbase.ColumnID) (int, error) {
 type optIndex struct {
 	tab  *optTable
 	desc *sqlbase.IndexDescriptor
+	zone *config.ZoneConfig
+
 	// storedCols is the set of non-PK columns if this is the primary index,
 	// otherwise it is desc.StoreColumnIDs.
 	storedCols []sqlbase.ColumnID
@@ -615,19 +855,16 @@ type optIndex struct {
 	numCols       int
 	numKeyCols    int
 	numLaxKeyCols int
-
-	// foreignKey stores IDs of another table and one of its indexes,
-	// if this index is part of an outbound foreign key relation.
-	foreignKey cat.ForeignKeyReference
 }
 
 var _ cat.Index = &optIndex{}
 
 // init can be used instead of newOptIndex when we have a pre-allocated instance
 // (e.g. as part of a bigger struct).
-func (oi *optIndex) init(tab *optTable, desc *sqlbase.IndexDescriptor) {
+func (oi *optIndex) init(tab *optTable, desc *sqlbase.IndexDescriptor, zone *config.ZoneConfig) {
 	oi.tab = tab
 	oi.desc = desc
+	oi.zone = zone
 	if desc == &tab.desc.PrimaryIndex {
 		// Although the primary index contains all columns in the table, the index
 		// descriptor does not contain columns that are not explicitly part of the
@@ -677,12 +914,6 @@ func (oi *optIndex) init(tab *optTable, desc *sqlbase.IndexDescriptor) {
 		// key. There is no separate lax key.
 		oi.numLaxKeyCols = len(desc.ColumnIDs) + len(desc.ExtraColumnIDs)
 		oi.numKeyCols = oi.numLaxKeyCols
-	}
-
-	if desc.ForeignKey.IsSet() {
-		oi.foreignKey.TableID = cat.StableID(desc.ForeignKey.Table)
-		oi.foreignKey.IndexID = cat.StableID(desc.ForeignKey.Index)
-		oi.foreignKey.PrefixLen = desc.ForeignKey.SharedPrefixLen
 	}
 }
 
@@ -745,16 +976,20 @@ func (oi *optIndex) Column(i int) cat.IndexColumn {
 	return cat.IndexColumn{Column: oi.tab.Column(ord), Ordinal: ord}
 }
 
-// ForeignKey is part of the cat.Index interface.
-func (oi *optIndex) ForeignKey() (cat.ForeignKeyReference, bool) {
-	desc := oi.desc
-	if desc.ForeignKey.IsSet() {
-		oi.foreignKey.TableID = cat.StableID(desc.ForeignKey.Table)
-		oi.foreignKey.IndexID = cat.StableID(desc.ForeignKey.Index)
-		oi.foreignKey.PrefixLen = desc.ForeignKey.SharedPrefixLen
-		oi.foreignKey.Match = sqlbase.ForeignKeyReferenceMatchValue[desc.ForeignKey.Match]
+// Zone is part of the cat.Index interface.
+func (oi *optIndex) Zone() cat.Zone {
+	return oi.zone
+}
+
+// Span is part of the cat.Index interface.
+func (oi *optIndex) Span() roachpb.Span {
+	desc := oi.tab.desc
+	// Tables up to MaxSystemConfigDescID are grouped in a single system config
+	// span.
+	if desc.ID <= keys.MaxSystemConfigDescID {
+		return keys.SystemConfigSpan
 	}
-	return oi.foreignKey, oi.desc.ForeignKey.IsSet()
+	return desc.IndexSpan(oi.desc.ID)
 }
 
 // Table is part of the cat.Index interface.
@@ -874,4 +1109,91 @@ func (oi *optFamily) Column(i int) cat.FamilyColumn {
 // Table is part of the cat.Family interface.
 func (oi *optFamily) Table() cat.Table {
 	return oi.tab
+}
+
+// optForeignKeyConstraint implements cat.ForeignKeyConstraint and represents a
+// foreign key relationship. Both the origin and the referenced table store the
+// same optForeignKeyConstraint (as an outbound and inbound reference,
+// respectively).
+type optForeignKeyConstraint struct {
+	name string
+
+	originTable cat.StableID
+	originIndex sqlbase.IndexID
+
+	referencedTable cat.StableID
+	referencedIndex sqlbase.IndexID
+
+	numCols  int
+	validity sqlbase.ConstraintValidity
+	match    sqlbase.ForeignKeyReference_Match
+}
+
+var _ cat.ForeignKeyConstraint = &optForeignKeyConstraint{}
+
+// Name is part of the cat.ForeignKeyConstraint interface.
+func (fk *optForeignKeyConstraint) Name() string {
+	return fk.name
+}
+
+// OriginTableID is part of the cat.ForeignKeyConstraint interface.
+func (fk *optForeignKeyConstraint) OriginTableID() cat.StableID {
+	return fk.originTable
+}
+
+// ReferencedTableID is part of the cat.ForeignKeyConstraint interface.
+func (fk *optForeignKeyConstraint) ReferencedTableID() cat.StableID {
+	return fk.referencedTable
+}
+
+// ColumnCount is part of the cat.ForeignKeyConstraint interface.
+func (fk *optForeignKeyConstraint) ColumnCount() int {
+	return fk.numCols
+}
+
+// OriginColumnOrdinal is part of the cat.ForeignKeyConstraint interface.
+func (fk *optForeignKeyConstraint) OriginColumnOrdinal(originTable cat.Table, i int) int {
+	if originTable.ID() != fk.originTable {
+		panic(pgerror.AssertionFailedf(
+			"invalid table %d passed to OriginColumnOrdinal (expected %d)",
+			originTable.ID(), fk.originTable,
+		))
+	}
+
+	tab := originTable.(*optTable)
+	index, err := tab.desc.FindIndexByID(fk.originIndex)
+	if err != nil {
+		panic(pgerror.AssertionFailedf("%v", err))
+	}
+
+	ord, _ := tab.lookupColumnOrdinal(index.ColumnIDs[i])
+	return ord
+}
+
+// ReferencedColumnOrdinal is part of the cat.ForeignKeyConstraint interface.
+func (fk *optForeignKeyConstraint) ReferencedColumnOrdinal(referencedTable cat.Table, i int) int {
+	if referencedTable.ID() != fk.referencedTable {
+		panic(pgerror.AssertionFailedf(
+			"invalid table %d passed to ReferencedColumnOrdinal (expected %d)",
+			referencedTable.ID(), fk.referencedTable,
+		))
+	}
+	tab := referencedTable.(*optTable)
+	index, err := tab.desc.FindIndexByID(fk.referencedIndex)
+	if err != nil {
+		panic(pgerror.AssertionFailedf("%v", err))
+	}
+
+	ord, _ := tab.lookupColumnOrdinal(index.ColumnIDs[i])
+	return ord
+}
+
+// Validated is part of the cat.ForeignKeyConstraint interface.
+func (fk *optForeignKeyConstraint) Validated() bool {
+	return fk.validity == sqlbase.ConstraintValidity_Validated
+}
+
+// MatchMethod is part of the cat.ForeignKeyConstraint interface.
+func (fk *optForeignKeyConstraint) MatchMethod() tree.CompositeKeyMatchMethod {
+	return sqlbase.ForeignKeyReferenceMatchValue[fk.match]
 }

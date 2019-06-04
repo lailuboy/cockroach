@@ -15,379 +15,541 @@
 package sqlsmith
 
 import (
-	"bytes"
-	"math/rand"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
+
+var (
+	scalars, bools             []scalarWeight
+	scalarWeights, boolWeights []int
+)
+
+func init() {
+	scalars = []scalarWeight{
+		{10, scalarNoContext(makeAnd)},
+		{1, scalarNoContext(makeCaseExpr)},
+		{1, scalarNoContext(makeCoalesceExpr)},
+		{20, scalarNoContext(makeColRef)},
+		{10, scalarNoContext(makeBinOp)},
+		{2, scalarNoContext(makeScalarSubquery)},
+		{2, scalarNoContext(makeExists)},
+		{2, scalarNoContext(makeIn)},
+		{2, scalarNoContext(makeStringComparison)},
+		{5, scalarNoContext(makeAnd)},
+		{5, scalarNoContext(makeOr)},
+		{5, scalarNoContext(makeNot)},
+		{10, makeFunc},
+		{10, func(s *scope, ctx Context, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+			return makeConstExpr(s, typ, refs), true
+		}},
+	}
+	scalarWeights = extractWeights(scalars)
+
+	bools = []scalarWeight{
+		{1, scalarNoContext(makeColRef)},
+		{1, scalarNoContext(makeAnd)},
+		{1, scalarNoContext(makeOr)},
+		{1, scalarNoContext(makeNot)},
+		{1, scalarNoContext(makeCompareOp)},
+		{1, scalarNoContext(makeIn)},
+		{1, scalarNoContext(makeStringComparison)},
+		{1, func(s *scope, ctx Context, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+			return makeScalar(s, typ, refs), true
+		}},
+		{1, scalarNoContext(makeExists)},
+		{1, makeFunc},
+	}
+	boolWeights = extractWeights(bools)
+}
+
+// TODO(mjibson): remove this and correctly pass around the Context.
+func scalarNoContext(fn func(*scope, *types.T, colRefs) (tree.TypedExpr, bool)) scalarFn {
+	return func(s *scope, ctx Context, t *types.T, refs colRefs) (tree.TypedExpr, bool) {
+		return fn(s, t, refs)
+	}
+}
+
+type scalarFn func(*scope, Context, *types.T, colRefs) (expr tree.TypedExpr, ok bool)
+
+type scalarWeight struct {
+	weight int
+	fn     scalarFn
+}
+
+func extractWeights(weights []scalarWeight) []int {
+	w := make([]int, len(weights))
+	for i, s := range weights {
+		w[i] = s.weight
+	}
+	return w
+}
 
 // makeScalar attempts to construct a scalar expression of the requested type.
 // If it was unsuccessful, it will return false.
-func (s *scope) makeScalar(typ types.T) (scalarExpr, bool) {
-	pickedType := typ
-	if typ == types.Any {
-		pickedType = getRandType()
-	}
-	s = s.push()
-
-	for i := 0; i < retryCount; i++ {
-		var result scalarExpr
-		var ok bool
-		// TODO(justin): this is how sqlsmith chooses what to do, but it feels
-		// to me like there should be a more clean/principled approach here.
-		if s.level < d6() && d9() == 1 {
-			result, ok = s.makeCaseExpr(pickedType)
-		} else if s.level < d6() && d42() == 1 {
-			result, ok = s.makeCoalesceExpr(pickedType)
-		} else if len(s.refs) > 0 && d20() > 1 {
-			result, ok = s.makeColRef(typ)
-		} else if s.level < d6() && d9() == 1 {
-			result, ok = s.makeBinOp(typ)
-		} else if s.level < d6() && d9() == 1 {
-			result, ok = s.makeFunc(typ)
-		} else if s.level < d6() && d6() == 1 {
-			result, ok = s.makeScalarSubquery(typ)
-		} else {
-			result, ok = s.makeConstExpr(pickedType), true
-		}
-		if ok {
-			return result, ok
-		}
-	}
-
-	// Retried enough times, give up.
-	return nil, false
+func makeScalar(s *scope, typ *types.T, refs colRefs) tree.TypedExpr {
+	return makeScalarContext(s, emptyCtx, typ, refs)
 }
 
-// TODO(justin): sqlsmith separated this out from the general case for
-// some reason - I think there must be a clean way to unify the two.
-func (s *scope) makeBoolExpr() (scalarExpr, bool) {
-	s = s.push()
+func makeScalarContext(s *scope, ctx Context, typ *types.T, refs colRefs) tree.TypedExpr {
+	return makeScalarSample(s.schema.scalars, scalars, s, ctx, typ, refs)
+}
 
-	for i := 0; i < retryCount; i++ {
-		var result scalarExpr
-		var ok bool
+func makeBoolExpr(s *scope, refs colRefs) tree.TypedExpr {
+	return makeBoolExprContext(s, emptyCtx, refs)
+}
 
-		if d6() < 4 {
-			result, ok = s.makeBinOp(types.Bool)
-		} else if d6() < 4 {
-			result, ok = s.makeScalar(types.Bool)
-		} else {
-			result, ok = s.makeExists()
-		}
+func makeBoolExprContext(s *scope, ctx Context, refs colRefs) tree.TypedExpr {
+	return makeScalarSample(s.schema.bools, bools, s, ctx, types.Bool, refs)
+}
 
-		if ok {
-			return result, ok
+func makeScalarSample(
+	sampler *WeightedSampler,
+	weights []scalarWeight,
+	s *scope,
+	ctx Context,
+	typ *types.T,
+	refs colRefs,
+) tree.TypedExpr {
+	// If we are in a GROUP BY, attempt to find an aggregate function.
+	if ctx.fnClass == tree.AggregateClass {
+		if expr, ok := makeFunc(s, ctx, typ, refs); ok {
+			return expr
 		}
 	}
-
-	// Retried enough times, give up.
-	return nil, false
-}
-
-///////
-// CASE
-///////
-
-type caseExpr struct {
-	condition scalarExpr
-	trueExpr  scalarExpr
-	falseExpr scalarExpr
-}
-
-func (c *caseExpr) Type() types.T {
-	return c.trueExpr.Type()
-}
-
-func (c *caseExpr) Format(buf *bytes.Buffer) {
-	buf.WriteString("case when ")
-	c.condition.Format(buf)
-	buf.WriteString(" then ")
-	c.trueExpr.Format(buf)
-	buf.WriteString(" else ")
-	c.falseExpr.Format(buf)
-	buf.WriteString(" end")
-}
-
-func (s *scope) makeCaseExpr(typ types.T) (scalarExpr, bool) {
-	condition, ok := s.makeScalar(types.Bool)
-	if !ok {
-		return nil, false
+	if s.canRecurse() {
+		for {
+			// No need for a retry counter here because makeConstExpr well eventually
+			// be called and it always succeeds.
+			idx := sampler.Next()
+			result, ok := weights[idx].fn(s, ctx, typ, refs)
+			if ok {
+				return result
+			}
+		}
 	}
-
-	trueExpr, ok := s.makeScalar(typ)
-	if !ok {
-		return nil, false
+	// Sometimes try to find a col ref or a const if there's no columns
+	// with a matching type.
+	if coin() {
+		if expr, ok := makeColRef(s, typ, refs); ok {
+			return expr
+		}
 	}
-
-	falseExpr, ok := s.makeScalar(typ)
-	if !ok {
-		return nil, false
-	}
-
-	return &caseExpr{condition, trueExpr, falseExpr}, true
+	return makeConstExpr(s, typ, refs)
 }
 
-///////////
-// COALESCE
-///////////
-
-type coalesceExpr struct {
-	firstExpr  scalarExpr
-	secondExpr scalarExpr
+func makeCaseExpr(s *scope, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+	typ = pickAnyType(s, typ)
+	condition := makeScalar(s, types.Bool, refs)
+	trueExpr := makeScalar(s, typ, refs)
+	falseExpr := makeScalar(s, typ, refs)
+	expr, err := tree.NewTypedCaseExpr(
+		nil,
+		[]*tree.When{{
+			Cond: condition,
+			Val:  trueExpr,
+		}},
+		falseExpr,
+		typ,
+	)
+	return expr, err == nil
 }
 
-func (c *coalesceExpr) Type() types.T {
-	return c.firstExpr.Type()
+func makeCoalesceExpr(s *scope, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+	typ = pickAnyType(s, typ)
+	firstExpr := makeScalar(s, typ, refs)
+	secondExpr := makeScalar(s, typ, refs)
+	return tree.NewTypedCoalesceExpr(
+		tree.TypedExprs{
+			firstExpr,
+			secondExpr,
+		},
+		typ,
+	), true
 }
 
-func (c *coalesceExpr) Format(buf *bytes.Buffer) {
-	buf.WriteString("cast(coalesce(")
-	c.firstExpr.Format(buf)
-	buf.WriteString(", ")
-	c.secondExpr.Format(buf)
-	buf.WriteString(") as ")
-	buf.WriteString(c.firstExpr.Type().SQLName())
-	buf.WriteString(")")
-}
+func makeConstExpr(s *scope, typ *types.T, refs colRefs) tree.TypedExpr {
+	typ = pickAnyType(s, typ)
 
-func (s *scope) makeCoalesceExpr(typ types.T) (scalarExpr, bool) {
-	firstExpr, ok := s.makeScalar(typ)
-	if !ok {
-		return nil, false
-	}
-
-	secondExpr, ok := s.makeScalar(typ)
-	if !ok {
-		return nil, false
-	}
-
-	return &coalesceExpr{firstExpr, secondExpr}, true
-}
-
-////////
-// CONST
-////////
-
-type constExpr struct {
-	typ  types.T
-	expr string
-}
-
-func (c *constExpr) Type() types.T {
-	return c.typ
-}
-
-func (c *constExpr) Format(buf *bytes.Buffer) {
-	buf.WriteString(c.expr)
-}
-
-func (s *scope) makeConstExpr(typ types.T) scalarExpr {
 	var datum tree.Datum
-	col, err := sqlbase.DatumTypeToColumnType(typ)
-	if err != nil {
-		datum = tree.DNull
+	s.schema.lock.Lock()
+	datum = sqlbase.RandDatumWithNullChance(s.schema.rnd, typ, 6)
+	s.schema.lock.Unlock()
+
+	return datum
+}
+
+func makeColRef(s *scope, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+	expr, _, ok := getColRef(s, typ, refs)
+	return expr, ok
+}
+
+func getColRef(s *scope, typ *types.T, refs colRefs) (tree.TypedExpr, *colRef, bool) {
+	// Filter by needed type.
+	cols := make(colRefs, 0, len(refs))
+	for _, c := range refs {
+		if typ.Family() == types.AnyFamily || c.typ.Equivalent(typ) {
+			cols = append(cols, c)
+		}
+	}
+	if len(cols) == 0 {
+		return nil, nil, false
+	}
+	col := cols[s.schema.rnd.Intn(len(cols))]
+	return makeTypedExpr(
+		col.item,
+		col.typ,
+	), col, true
+}
+
+// castType tries to wrap expr in a CastExpr. This can be useful for times
+// when operators or functions have ambiguous implementations (i.e., string
+// or bytes, timestamp or timestamptz) and a cast will inform which one to use.
+func castType(expr tree.TypedExpr, typ *types.T) tree.TypedExpr {
+	// If target type involves ANY, then no cast needed.
+	if typ.IsAmbiguous() {
+		return expr
+	}
+	return makeTypedExpr(&tree.CastExpr{
+		Expr:       expr,
+		Type:       typ,
+		SyntaxMode: tree.CastShort,
+	}, typ)
+}
+
+func typedParen(expr tree.TypedExpr, typ *types.T) tree.TypedExpr {
+	return makeTypedExpr(&tree.ParenExpr{Expr: expr}, typ)
+}
+
+func makeOr(s *scope, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+	switch typ.Family() {
+	case types.BoolFamily, types.AnyFamily:
+	default:
+		return nil, false
+	}
+	left := makeBoolExpr(s, refs)
+	right := makeBoolExpr(s, refs)
+	return typedParen(tree.NewTypedAndExpr(left, right), types.Bool), true
+}
+
+func makeAnd(s *scope, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+	switch typ.Family() {
+	case types.BoolFamily, types.AnyFamily:
+	default:
+		return nil, false
+	}
+	left := makeBoolExpr(s, refs)
+	right := makeBoolExpr(s, refs)
+	return typedParen(tree.NewTypedOrExpr(left, right), types.Bool), true
+}
+
+func makeNot(s *scope, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+	switch typ.Family() {
+	case types.BoolFamily, types.AnyFamily:
+	default:
+		return nil, false
+	}
+	expr := makeBoolExpr(s, refs)
+	return typedParen(tree.NewTypedNotExpr(expr), types.Bool), true
+}
+
+// TODO(mjibson): add the other operators somewhere.
+var compareOps = [...]tree.ComparisonOperator{
+	tree.EQ,
+	tree.LT,
+	tree.GT,
+	tree.LE,
+	tree.GE,
+	tree.NE,
+	tree.IsDistinctFrom,
+	tree.IsNotDistinctFrom,
+}
+
+func makeCompareOp(s *scope, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+	typ = pickAnyType(s, typ)
+	op := compareOps[s.schema.rnd.Intn(len(compareOps))]
+	left := makeScalar(s, typ, refs)
+	right := makeScalar(s, typ, refs)
+	return typedParen(tree.NewTypedComparisonExpr(op, left, right), typ), true
+}
+
+func makeBinOp(s *scope, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+	typ = pickAnyType(s, typ)
+	ops := operators[typ.Oid()]
+	if len(ops) == 0 {
+		return nil, false
+	}
+	n := s.schema.rnd.Intn(len(ops))
+	op := ops[n]
+	left := makeScalar(s, op.LeftType, refs)
+	right := makeScalar(s, op.RightType, refs)
+	return typedParen(
+		&tree.BinaryExpr{
+			Operator: op.Operator,
+			// Cast both of these to prevent ambiguity in execution choice.
+			Left:  castType(left, op.LeftType),
+			Right: castType(right, op.RightType),
+		},
+		typ,
+	), true
+}
+
+func makeFunc(s *scope, ctx Context, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+	typ = pickAnyType(s, typ)
+
+	class := ctx.fnClass
+	// Turn off window functions most of the time because they are
+	// enabled for the entire select exprs instead of on a per-expr
+	// basis.
+	if class == tree.WindowClass && d6() != 1 {
+		class = tree.NormalClass
+	}
+	fns := functions[class][typ.Oid()]
+	if len(fns) == 0 {
+		return nil, false
+	}
+	fn := fns[s.schema.rnd.Intn(len(fns))]
+
+	args := make(tree.TypedExprs, 0)
+	for _, argTyp := range fn.overload.Types.Types() {
+		var arg tree.TypedExpr
+		// If we're a GROUP BY or window function, try to choose a col ref for the arguments.
+		if class == tree.AggregateClass || class == tree.WindowClass {
+			var ok bool
+			arg, ok = makeColRef(s, argTyp, refs)
+			if !ok {
+				// If we can't find a col ref for our
+				// aggregate function, try again with
+				// a non-aggregate.
+				return makeFunc(s, emptyCtx, typ, refs)
+			}
+		}
+		if arg == nil {
+			arg = makeScalar(s, argTyp, refs)
+		}
+		args = append(args, castType(arg, argTyp))
+	}
+
+	var window *tree.WindowDef
+	// Use a window function if:
+	// - we chose an aggregate function, then 1/6 chance, but not if we're in a HAVING (noWindow == true)
+	// - we explicitly chose a window function
+	if fn.def.Class == tree.WindowClass || (!ctx.noWindow && d6() == 1 && fn.def.Class == tree.AggregateClass) {
+		// Pick some random subset of cols for the partition.
+		wrefs := refs.extend()
+		s.schema.rnd.Shuffle(len(wrefs), func(i, j int) {
+			wrefs[i], wrefs[j] = wrefs[j], wrefs[i]
+		})
+		var parts tree.Exprs
+		for coin() && len(wrefs) > 0 {
+			parts = append(parts, wrefs[0].item)
+			wrefs = wrefs[1:]
+		}
+		var order tree.OrderBy
+		for coin() && len(wrefs) > 0 {
+			order = append(order, &tree.Order{
+				Expr:      wrefs[0].item,
+				Direction: s.schema.randDirection(),
+			})
+			wrefs = wrefs[1:]
+		}
+		var frame *tree.WindowFrame
+		if coin() {
+			frame = makeWindowFrame(s, refs)
+		}
+		window = &tree.WindowDef{
+			Partitions: parts,
+			OrderBy:    order,
+			Frame:      frame,
+		}
+	}
+
+	// Cast the return and arguments to prevent ambiguity during function
+	// implementation choosing.
+	return castType(tree.NewTypedFuncExpr(
+		tree.ResolvableFunctionReference{FunctionReference: fn.def},
+		0, /* aggQualifier */
+		args,
+		nil, /* filter */
+		window,
+		typ,
+		&fn.def.FunctionProperties,
+		fn.overload,
+	), typ), true
+}
+
+var windowFrameModes = []tree.WindowFrameMode{
+	tree.RANGE,
+	tree.ROWS,
+	tree.GROUPS,
+}
+
+func randWindowFrameMode(s *scope) tree.WindowFrameMode {
+	return windowFrameModes[s.schema.rnd.Intn(len(windowFrameModes))]
+}
+
+func makeWindowFrame(s *scope, refs colRefs) *tree.WindowFrame {
+	// Window frame mode and start bound must always be present whereas end
+	// bound can be omitted.
+	frameMode := randWindowFrameMode(s)
+	var startBound tree.WindowFrameBound
+	var endBound *tree.WindowFrameBound
+	if frameMode == tree.RANGE {
+		// RANGE mode is special in that if a bound is of type OffsetPreceding or
+		// OffsetFollowing, it requires that ORDER BY clause of the window function
+		// have exactly one column that can be only of the following types:
+		// DInt, DFloat, DDecimal, DInterval; so for now let's avoid this
+		// complication and not choose offset bound types.
+		// TODO(yuzefovich): fix this.
+		if coin() {
+			startBound.BoundType = tree.UnboundedPreceding
+		} else {
+			startBound.BoundType = tree.CurrentRow
+		}
+		if coin() {
+			endBound = new(tree.WindowFrameBound)
+			if coin() {
+				endBound.BoundType = tree.CurrentRow
+			} else {
+				endBound.BoundType = tree.UnboundedFollowing
+			}
+		}
 	} else {
-		s.schema.lock.Lock()
-		datum = sqlbase.RandDatumWithNullChance(s.schema.rnd, col, 6)
-		s.schema.lock.Unlock()
+		// There are 5 bound types, but only 4 can be used for the start bound.
+		startBound.BoundType = tree.WindowFrameBoundType(s.schema.rnd.Intn(4))
+		if startBound.BoundType == tree.OffsetFollowing {
+			// With OffsetFollowing as the start bound, the end bound must be
+			// present and can either be OffsetFollowing or UnboundedFollowing.
+			endBound = new(tree.WindowFrameBound)
+			if coin() {
+				endBound.BoundType = tree.OffsetFollowing
+			} else {
+				endBound.BoundType = tree.UnboundedFollowing
+			}
+		}
+		if endBound == nil && coin() {
+			endBound = new(tree.WindowFrameBound)
+			// endBound cannot be "smaller" than startBound, so we will "prohibit" all
+			// such choices.
+			endBoundProhibitedChoices := int(startBound.BoundType)
+			if startBound.BoundType == tree.UnboundedPreceding {
+				// endBound cannot be UnboundedPreceding, so we always need to skip that
+				// choice.
+				endBoundProhibitedChoices = 1
+			}
+			endBound.BoundType = tree.WindowFrameBoundType(endBoundProhibitedChoices + s.schema.rnd.Intn(5-endBoundProhibitedChoices))
+		}
+		// We will set offsets regardless of the bound type, but they will only be
+		// used when a bound is either OffsetPreceding or OffsetFollowing. Both
+		// ROWS and GROUPS mode need non-negative integers as bounds.
+		startBound.OffsetExpr = makeScalar(s, types.Int, refs)
+		if endBound != nil {
+			endBound.OffsetExpr = makeScalar(s, types.Int, refs)
+		}
 	}
-
-	// TODO(justin): maintain context and see if we're in an INSERT, and maybe use
-	// DEFAULT (which is a legal "value" in such a context).
-
-	return &constExpr{typ, datum.String()}
+	return &tree.WindowFrame{
+		Mode: frameMode,
+		Bounds: tree.WindowFrameBounds{
+			StartBound: &startBound,
+			EndBound:   endBound,
+		},
+	}
 }
 
-/////////
-// COLREF
-/////////
-
-type colRefExpr struct {
-	ref string
-	typ types.T
-}
-
-func (c *colRefExpr) Type() types.T {
-	return c.typ
-}
-
-func (c *colRefExpr) Format(buf *bytes.Buffer) {
-	buf.WriteString(c.ref)
-}
-
-func (s *scope) makeColRef(typ types.T) (scalarExpr, bool) {
-	ref := s.refs[rand.Intn(len(s.refs))]
-	col := ref.Cols()[rand.Intn(len(ref.Cols()))]
-	if typ != types.Any && col.typ != typ {
+func makeExists(s *scope, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+	switch typ.Family() {
+	case types.BoolFamily, types.AnyFamily:
+	default:
 		return nil, false
 	}
 
-	return &colRefExpr{
-		ref: ref.Name() + "." + col.name,
-		typ: col.typ,
-	}, true
-}
-
-/////////
-// BIN OP
-/////////
-
-type opExpr struct {
-	outTyp types.T
-
-	left  scalarExpr
-	right scalarExpr
-	op    string
-}
-
-func (o *opExpr) Type() types.T {
-	return o.outTyp
-}
-
-func (o *opExpr) Format(buf *bytes.Buffer) {
-	buf.WriteByte('(')
-	o.left.Format(buf)
-	buf.WriteByte(' ')
-	buf.WriteString(o.op)
-	buf.WriteByte(' ')
-	o.right.Format(buf)
-	buf.WriteByte(')')
-}
-
-func (s *scope) makeBinOp(typ types.T) (scalarExpr, bool) {
-	if typ == types.Any {
-		typ = getRandType()
-	}
-	ops := s.schema.GetOperatorsByOutputType(typ)
-	if len(ops) == 0 {
-		return nil, false
-	}
-	op := ops[rand.Intn(len(ops))]
-
-	left, ok := s.makeScalar(op.left)
-	if !ok {
-		return nil, false
-	}
-	right, ok := s.makeScalar(op.right)
+	selectStmt, _, ok := s.makeSelect(makeDesiredTypes(s.schema.rnd), refs)
 	if !ok {
 		return nil, false
 	}
 
-	return &opExpr{
-		outTyp: typ,
-		left:   left,
-		right:  right,
-		op:     op.name,
-	}, true
-}
-
-//////////
-// FUNC OP
-//////////
-
-type funcExpr struct {
-	outTyp types.T
-
-	name   string
-	inputs []scalarExpr
-}
-
-func (f *funcExpr) Type() types.T {
-	return f.outTyp
-}
-
-func (f *funcExpr) Format(buf *bytes.Buffer) {
-	buf.WriteString(f.name)
-	buf.WriteByte('(')
-	comma := ""
-	for _, a := range f.inputs {
-		buf.WriteString(comma)
-		a.Format(buf)
-		comma = ", "
+	subq := &tree.Subquery{
+		Select: &tree.ParenSelect{Select: selectStmt},
+		Exists: true,
 	}
-	buf.WriteByte(')')
+	subq.SetType(types.Bool)
+	return subq, true
 }
 
-func (s *scope) makeFunc(typ types.T) (scalarExpr, bool) {
-	if typ == types.Any {
-		typ = getRandType()
-	}
-	ops := s.schema.GetFunctionsByOutputType(typ)
-	if len(ops) == 0 {
+func makeIn(s *scope, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+	switch typ.Family() {
+	case types.BoolFamily, types.AnyFamily:
+	default:
 		return nil, false
 	}
-	op := ops[rand.Intn(len(ops))]
 
-	args := make([]scalarExpr, 0)
-	for i := range op.inputs {
-		in, ok := s.makeScalar(op.inputs[i])
+	t := sqlbase.RandScalarType(s.schema.rnd)
+	var rhs tree.TypedExpr
+	if coin() {
+		rhs = makeTuple(s, t, refs)
+	} else {
+		selectStmt, _, ok := s.makeSelect([]*types.T{t}, refs)
 		if !ok {
 			return nil, false
 		}
-		args = append(args, in)
+		// This sometimes produces `SELECT NULL ...`. Cast the
+		// first expression so IN succeeds.
+		clause := selectStmt.Select.(*tree.SelectClause)
+		clause.Exprs[0].Expr = &tree.CastExpr{
+			Expr:       clause.Exprs[0].Expr,
+			Type:       t,
+			SyntaxMode: tree.CastShort,
+		}
+		subq := &tree.Subquery{
+			Select: &tree.ParenSelect{Select: selectStmt},
+		}
+		subq.SetType(types.MakeTuple([]types.T{*t}))
+		rhs = subq
 	}
-
-	return &funcExpr{
-		outTyp: typ,
-		name:   op.name,
-		inputs: args,
-	}, true
+	op := tree.In
+	if coin() {
+		op = tree.NotIn
+	}
+	return tree.NewTypedComparisonExpr(
+		op,
+		// Cast any NULLs to a concrete type.
+		castType(makeScalar(s, t, refs), t),
+		rhs,
+	), true
 }
 
-/////////
-// EXISTS
-/////////
-
-type exists struct {
-	subquery relExpr
+func makeStringComparison(s *scope, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+	switch typ.Family() {
+	case types.BoolFamily, types.AnyFamily:
+	default:
+		return nil, false
+	}
+	return tree.NewTypedComparisonExpr(
+		s.schema.randStringComparison(),
+		makeScalar(s, types.String, refs),
+		makeScalar(s, types.String, refs),
+	), true
 }
 
-func (e *exists) Format(buf *bytes.Buffer) {
-	buf.WriteString("exists(")
-	e.subquery.Format(buf)
-	buf.WriteString(")")
+func makeTuple(s *scope, typ *types.T, refs colRefs) *tree.Tuple {
+	exprs := make(tree.Exprs, s.schema.rnd.Intn(5))
+	for i := range exprs {
+		exprs[i] = makeScalar(s, typ, refs)
+	}
+	return tree.NewTypedTuple(types.MakeTuple([]types.T{*typ}), exprs)
 }
 
-func (e *exists) Type() types.T {
-	return types.Bool
-}
-
-func (s *scope) makeExists() (scalarExpr, bool) {
-	outScope, ok := s.makeSelect(nil)
+func makeScalarSubquery(s *scope, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
+	selectStmt, _, ok := s.makeSelect([]*types.T{typ}, refs)
 	if !ok {
 		return nil, false
 	}
+	selectStmt.Limit = &tree.Limit{Count: tree.NewDInt(1)}
 
-	return &exists{outScope.expr}, true
-}
-
-//////////////////
-// SCALAR SUBQUERY
-//////////////////
-
-type scalarSubq struct {
-	subquery relExpr
-}
-
-func (s *scalarSubq) Format(buf *bytes.Buffer) {
-	buf.WriteString("(")
-	s.subquery.Format(buf)
-	buf.WriteString(")")
-}
-
-func (s *scalarSubq) Type() types.T {
-	return s.subquery.(*selectExpr).selectList[0].Type()
-}
-
-func (s *scope) makeScalarSubquery(typ types.T) (scalarExpr, bool) {
-	outScope, ok := s.makeSelect([]types.T{typ})
-	if !ok {
-		return nil, false
+	subq := &tree.Subquery{
+		Select: &tree.ParenSelect{Select: selectStmt},
 	}
+	subq.SetType(typ)
 
-	outScope.expr.(*selectExpr).limit = "limit 1"
-	return &scalarSubq{outScope.expr}, true
+	return subq, true
 }

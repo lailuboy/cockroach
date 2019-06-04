@@ -1,4 +1,4 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata fakedist-disk
+# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata fakedist-disk
 
 statement ok
 CREATE TABLE t (
@@ -106,6 +106,54 @@ SELECT now() + '1m'::interval > now(), now() + '1m'::interval >= now()
 ----
 true true
 
+# Date sentinel values.
+
+query TTT
+SELECT 'epoch'::date, 'infinity'::date, '-infinity'::date
+----
+1970-01-01 00:00:00 +0000 +0000  infinity  -infinity
+
+# Date edge cases.
+
+statement error year value 0 is out of range
+SELECT '0000-01-01'::date
+
+query TTTTT
+SELECT '4714-11-24 BC'::date, '5874897-12-31'::date, '2000-01-01'::date, '0001-01-01'::date, '0001-12-13 BC'::date
+----
+-4713-11-24 00:00:00 +0000 +0000  5874897-12-31 00:00:00 +0000 +0000  2000-01-01 00:00:00 +0000 +0000  0001-01-01 00:00:00 +0000 +0000  0000-12-13 00:00:00 +0000 +0000
+
+# Also test as strings because lib/pq marshals the previous results to
+# time.Times, which don't stringify the same.
+query TTTTT
+SELECT '4714-11-24 BC'::date::string, '5874897-12-31'::date::string, '2000-01-01'::date::string, '0001-01-01'::date::string, '0001-12-13 BC'::date::string
+----
+4714-11-24 BC  5874897-12-31  2000-01-01  0001-01-01  0001-12-13 BC
+
+statement error date is out of range
+SELECT '4714-11-24 BC'::date - 1
+
+statement error date is out of range
+SELECT '5874897-12-31'::date + 1
+
+query TT
+SELECT ('4714-11-24 BC'::date + 1)::string, ('5874897-12-31'::date - 1)::string
+----
+4714-11-25 BC  5874897-12-30
+
+query TTTT
+SELECT 'infinity'::date + 1, 'infinity'::date - 1, '-infinity'::date + 1, '-infinity'::date - 1
+----
+infinity  infinity  -infinity  -infinity
+
+statement error cannot subtract infinite dates
+SELECT 'infinity'::date - 'infinity'::date
+
+query I
+SELECT '5874897-12-31'::date - '4714-11-24 BC'::date
+----
+2147483493
+
 # TIMESTAMP/DATE builtins.
 
 query T
@@ -120,11 +168,6 @@ true
 
 query B
 SELECT now() - timestamp '2015-06-13' > interval '100h'
-----
-true
-
-query B
-SELECT now() - current_date()::timestamptz < interval '24h10s'
 ----
 true
 
@@ -202,6 +245,55 @@ a
 
 statement ok
 COMMIT TRANSACTION
+
+# Changing timezones changes the output of current_date().
+
+statement ok
+RESET TIME ZONE
+
+query BBB
+SELECT
+    d = tz, d = t, d = n
+FROM
+    (
+        SELECT
+            current_date()::DATE AS d,
+            current_date()::TIMESTAMPTZ::DATE AS tz,
+            current_date()::TIMESTAMP::DATE AS t,
+            now():::DATE AS n
+    )
+----
+true true true
+
+query B
+SELECT now() - current_date()::timestamptz < interval '24h10s'
+----
+true
+
+statement ok
+SET TIME ZONE 48
+
+query B
+SELECT now() - current_date()::timestamptz < interval '24h10s'
+----
+true
+
+query BBB
+SELECT
+    d = tz, d = t, d = n
+FROM
+    (
+        SELECT
+            current_date()::DATE AS d,
+            current_date()::TIMESTAMPTZ::DATE AS tz,
+            current_date()::TIMESTAMP::DATE AS t,
+            now():::DATE AS n
+    )
+----
+true true true
+
+statement ok
+RESET TIME ZONE
 
 # Check that the current_timestamp, now and transaction_timestamp are the same.
 # Test that the transaction_timestamp can differ from the statement_timestamp.
@@ -438,6 +530,12 @@ SELECT k, extract(element, input::timestamp) = extract_result, extract(element, 
 
 query error extract\(\): unsupported timespan: nansecond
 SELECT extract(nansecond from '2001-04-10 12:04:59.34565423'::timestamp)
+
+query error unknown unit "nanosecond"
+SELECT INTERVAL '1 nanosecond';
+
+query error unknown unit "ns"
+SELECT INTERVAL '1 ns';
 
 query IBI
 SELECT k, extract(element, input::timestamptz) = extract_result, extract(element, input::timestamptz) FROM ex ORDER BY k
@@ -795,7 +893,7 @@ SELECT '2015-08-25 05:45:45-01:00'::timestamptz::timestamp
 2015-08-25 02:45:45 +0000 +0000
 
 
-statement error cannot find time zone "foobar": timezone data cannot be found
+statement error cannot find time zone "foobar"
 SET TIME ZONE 'foobar'
 
 statement ok
@@ -1193,3 +1291,90 @@ query T
 SELECT date_trunc('month', "date") AS date_trunc_month_created_at FROM "topics";
 ----
 2017-12-01 00:00:00 +0000 UTC
+
+
+# Test negative years to ensure they can round-trip through the parser.
+# Also ensure that we don't trigger any of the "convenience" rules.
+# Update: dates now have a much more limited range such that the original
+# dates from this issue are no longer possible to express.
+subtest regression_35255
+
+statement error date is out of range
+SELECT '-56325279622-12-26'::DATE
+
+statement error date is out of range
+SELECT '-5632-12-26'::DATE
+
+query T
+SELECT '-563-12-26'::DATE
+----
+-0563-12-26 00:00:00 +0000 +0000
+
+query T
+SELECT '-56-12-26'::DATE
+----
+-0056-12-26 00:00:00 +0000 +0000
+
+query T
+SELECT '-5-12-26'::DATE
+----
+-0005-12-26 00:00:00 +0000 +0000
+
+# Update: dates now have a much more limited range such that the original
+# dates from this issue are no longer possible to express.
+subtest regression_36146
+
+statement error out of range
+WITH
+    w (c) AS (VALUES (NULL), (NULL))
+SELECT
+    '1971-03-18'::DATE + 300866802885581286
+FROM
+    w
+ORDER BY
+    c
+
+statement error out of range
+SELECT
+    '1971-03-18'::DATE + 300866802885581286
+
+# Update: dates now have a much more limited range such that the original
+# dates from this issue are no longer possible to express.
+subtest regression_36557
+
+statement error out of range
+SELECT 7133080445639580613::INT8 + '1977-11-03'::DATE
+
+statement error out of range
+SELECT '-239852040018-04-28':::DATE
+
+statement error out of range
+SELECT(7133080445639580613::INT8 + '1977-11-03'::DATE) = '-239852040018-04-28':::DATE
+
+subtest interval_math
+
+query TTTTTTT
+SELECT
+    i,
+    i / 2::INT8,
+    i * 2::INT8,
+    i / 2::FLOAT8,
+    i * 2::FLOAT8,
+    i / .2362::FLOAT8,
+    i * .2362::FLOAT8
+FROM
+    (
+        VALUES
+            ('1 day'::INTERVAL),
+            ('1 month'::INTERVAL),
+            ('1 hour'::INTERVAL),
+            ('1 month 2 days 4 hours'::INTERVAL)
+    )
+        AS v (i)
+ORDER BY
+    i
+----
+01:00:00               00:30:00          02:00:00                00:30:00          02:00:00                04:14:01.320914                 00:14:10.32
+1 day                  12:00:00          2 days                  12:00:00          2 days                  4 days 05:36:31.701948          05:40:07.68
+1 mon                  15 days           2 mons                  15 days           2 mons                  4 mons 7 days 00:15:51.058425   7 days 02:03:50.4
+1 mon 2 days 04:00:00  16 days 02:00:00  2 mons 4 days 08:00:00  16 days 02:00:00  2 mons 4 days 08:00:00  4 mons 15 days 28:24:59.745978  7 days 14:20:47.04

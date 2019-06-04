@@ -17,6 +17,7 @@ package distsqlplan
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/big"
 	"testing"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -163,7 +165,7 @@ func checkDistAggregationInfo(
 		distsqlpb.ProcessorSpec{
 			Input: []distsqlpb.InputSyncSpec{{
 				Type:        distsqlpb.InputSyncSpec_UNORDERED,
-				ColumnTypes: []sqlbase.ColumnType{colType},
+				ColumnTypes: []types.T{colType},
 				Streams: []distsqlpb.StreamEndpointSpec{
 					{Type: distsqlpb.StreamEndpointSpec_LOCAL, StreamID: 0},
 				},
@@ -200,13 +202,14 @@ func checkDistAggregationInfo(
 
 	// The type(s) outputted by the local stage can be different than the input type
 	// (e.g. DECIMAL instead of INT).
-	intermediaryTypes := make([]sqlbase.ColumnType, numIntermediary)
+	intermediaryTypes := make([]types.T, numIntermediary)
 	for i, fn := range info.LocalStage {
 		var err error
-		_, intermediaryTypes[i], err = distsqlrun.GetAggregateInfo(fn, colType)
+		_, returnTyp, err := distsqlrun.GetAggregateInfo(fn, colType)
 		if err != nil {
 			t.Fatal(err)
 		}
+		intermediaryTypes[i] = *returnTyp
 	}
 
 	localAggregations := make([]distsqlpb.AggregatorSpec_Aggregation, numIntermediary)
@@ -244,12 +247,12 @@ func checkDistAggregationInfo(
 
 	// The type(s) outputted by the final stage can be different than the
 	// input type (e.g. DECIMAL instead of INT).
-	finalOutputTypes := make([]sqlbase.ColumnType, numFinal)
+	finalOutputTypes := make([]*types.T, numFinal)
 	// Passed into FinalIndexing as the indices for the IndexedVars inputs
 	// to the post processor.
 	varIdxs := make([]int, numFinal)
 	for i, finalInfo := range info.FinalStage {
-		inputTypes := make([]sqlbase.ColumnType, len(finalInfo.LocalIdxs))
+		inputTypes := make([]types.T, len(finalInfo.LocalIdxs))
 		for i, localIdx := range finalInfo.LocalIdxs {
 			inputTypes[i] = intermediaryTypes[localIdx]
 		}
@@ -267,7 +270,7 @@ func checkDistAggregationInfo(
 		agg := distsqlpb.ProcessorSpec{
 			Input: []distsqlpb.InputSyncSpec{{
 				Type:        distsqlpb.InputSyncSpec_UNORDERED,
-				ColumnTypes: []sqlbase.ColumnType{colType},
+				ColumnTypes: []types.T{colType},
 				Streams: []distsqlpb.StreamEndpointSpec{
 					{Type: distsqlpb.StreamEndpointSpec_LOCAL, StreamID: distsqlpb.StreamID(2 * i)},
 				},
@@ -290,7 +293,7 @@ func checkDistAggregationInfo(
 	}
 
 	if info.FinalRendering != nil {
-		h := tree.MakeTypesOnlyIndexedVarHelper(sqlbase.ColumnTypesToDatumTypes(finalOutputTypes))
+		h := tree.MakeTypesOnlyIndexedVarHelper(finalOutputTypes)
 		renderExpr, err := info.FinalRendering(&h, varIdxs)
 		if err != nil {
 			t.Fatal(err)
@@ -313,7 +316,7 @@ func checkDistAggregationInfo(
 		for i := range rowsDist[0] {
 			rowDist := rowsDist[0][i]
 			rowNonDist := rowsNonDist[0][i]
-			if !rowDist.Datum.ResolvedType().FamilyEqual(rowNonDist.Datum.ResolvedType()) {
+			if rowDist.Datum.ResolvedType().Family() != rowNonDist.Datum.ResolvedType().Family() {
 				t.Fatalf("different type for column %d (dist: %s non-dist: %s)", i, rowDist.Datum.ResolvedType(), rowNonDist.Datum.ResolvedType())
 			}
 
@@ -338,16 +341,28 @@ func checkDistAggregationInfo(
 					equiv = decNonDist.Coeff.Cmp(bigOne) == 0
 				}
 			case *tree.DFloat:
-				// Float results are highly variable and
-				// loss of precision between non-local and
-				// local is expected. We reduce the precision
-				// specified by floatPrecFmt and compare
-				// their string representations.
+				// Float results are highly variable and loss
+				// of precision between non-local and local is
+				// expected. We reduce the precision specified
+				// by floatPrecFmt and compare their string
+				// representations.
 				floatDist := float64(*typedDist)
 				floatNonDist := float64(*rowNonDist.Datum.(*tree.DFloat))
 				strDist = fmt.Sprintf(floatPrecFmt, floatDist)
 				strNonDist = fmt.Sprintf(floatPrecFmt, floatNonDist)
-				equiv = strDist == strNonDist
+				// Compare using a relative equality
+				// func that isn't dependent on the scale
+				// of the number. In addition, ignore any
+				// NaNs. Sometimes due to the non-deterministic
+				// ordering of distsql, we get a +Inf and
+				// Nan result. Both of these changes started
+				// happening with the float rand datums
+				// were taught about some more adversarial
+				// inputs. Since floats by nature have equality
+				// problems and I think our algorithms are
+				// correct, we need to be slightly more lenient
+				// in our float comparisons.
+				equiv = almostEqualRelative(floatDist, floatNonDist) || math.IsNaN(floatNonDist) || math.IsNaN(floatDist)
 			default:
 				// For all other types, a simple string
 				// representation comparison will suffice.
@@ -360,6 +375,28 @@ func checkDistAggregationInfo(
 			}
 		}
 	}
+}
+
+// almostEqualRelative returns whether a and b are close-enough to equal. It
+// checks if the two numbers are within a certain relative percentage of
+// each other (maxRelDiff), which avoids problems when using "%.3f" as a
+// comparison string. This is the "Relative epsilon comparisons" method from:
+// https://randomascii.wordpress.com/2012/02/25/comparing-floating-point-numbers-2012-edition/
+func almostEqualRelative(a, b float64) bool {
+	if a == b {
+		return true
+	}
+	// Calculate the difference.
+	diff := math.Abs(a - b)
+	A := math.Abs(a)
+	B := math.Abs(b)
+	// Find the largest
+	largest := A
+	if B > A {
+		largest = B
+	}
+	const maxRelDiff = 1e-10
+	return diff <= largest*maxRelDiff
 }
 
 // Test that distributing agg functions according to DistAggregationTable
@@ -389,13 +426,13 @@ func TestDistAggregationTable(t *testing.T) {
 			return []tree.Datum{
 				tree.NewDInt(tree.DInt(row)),
 				tree.NewDInt(tree.DInt(rng.Intn(numRows))),
-				sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}, true),
+				sqlbase.RandDatum(rng, types.Int, true),
 				tree.MakeDBool(tree.DBool(rng.Intn(10) == 0)),
 				tree.MakeDBool(tree.DBool(rng.Intn(10) != 0)),
-				sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_DECIMAL}, false),
-				sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_DECIMAL}, true),
-				sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_FLOAT}, false),
-				sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_FLOAT}, true),
+				sqlbase.RandDatum(rng, types.Decimal, false),
+				sqlbase.RandDatum(rng, types.Decimal, true),
+				sqlbase.RandDatum(rng, types.Float, false),
+				sqlbase.RandDatum(rng, types.Float, true),
 				tree.NewDBytes(tree.DBytes(randutil.RandBytes(rng, 10))),
 			}
 		},

@@ -17,18 +17,23 @@ package sql
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/pkg/errors"
@@ -290,6 +295,34 @@ func (ef *execFactory) ConstructHashJoin(
 	return p.makeJoinNode(leftSrc, rightSrc, pred), nil
 }
 
+// ConstructApplyJoin is part of the exec.Factory interface.
+func (ef *execFactory) ConstructApplyJoin(
+	joinType sqlbase.JoinType,
+	left exec.Node,
+	leftBoundColMap opt.ColMap,
+	memo *memo.Memo,
+	rightProps *physical.Required,
+	fakeRight exec.Node,
+	right memo.RelExpr,
+	onCond tree.TypedExpr,
+) (exec.Node, error) {
+	leftSrc := asDataSource(left)
+	rightSrc := asDataSource(fakeRight)
+	rightSrc.plan.Close(context.TODO())
+	p := ef.planner
+	pred, _, err := p.makeJoinPredicate(
+		context.TODO(), leftSrc.info, rightSrc.info, joinType, nil, /* cond */
+	)
+	if err != nil {
+		return nil, err
+	}
+	pred.onCond = pred.iVarHelper.Rebind(
+		onCond, false /* alsoReset */, false, /* normalizeToNonNil */
+	)
+	rightCols := rightSrc.info.SourceColumns
+	return newApplyJoinNode(joinType, asDataSource(left), leftBoundColMap, rightProps, rightCols, right, pred, memo)
+}
+
 // ConstructMergeJoin is part of the exec.Factory interface.
 func (ef *execFactory) ConstructMergeJoin(
 	joinType sqlbase.JoinType,
@@ -364,7 +397,7 @@ func (ef *execFactory) ConstructScalarGroupBy(
 func (ef *execFactory) ConstructGroupBy(
 	input exec.Node,
 	groupCols []exec.ColumnOrdinal,
-	orderedGroupCols exec.ColumnOrdinalSet,
+	groupColOrdering sqlbase.ColumnOrdering,
 	aggregations []exec.AggInfo,
 	reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
@@ -373,7 +406,7 @@ func (ef *execFactory) ConstructGroupBy(
 		funcs:            make([]*aggregateFuncHolder, 0, len(groupCols)+len(aggregations)),
 		columns:          make(sqlbase.ResultColumns, 0, len(groupCols)+len(aggregations)),
 		groupCols:        make([]int, len(groupCols)),
-		orderedGroupCols: make([]int, 0, orderedGroupCols.Len()),
+		groupColOrdering: groupColOrdering,
 		isScalar:         false,
 		props: physicalProps{
 			ordering: sqlbase.ColumnOrdering(reqOrdering),
@@ -383,9 +416,6 @@ func (ef *execFactory) ConstructGroupBy(
 	for i := range groupCols {
 		col := int(groupCols[i])
 		n.groupCols[i] = col
-		if orderedGroupCols.Contains(col) {
-			n.orderedGroupCols = append(n.orderedGroupCols, col)
-		}
 
 		// TODO(radu): only generate the grouping columns we actually need.
 		f := n.newAggregateFuncHolder(
@@ -417,17 +447,17 @@ func (ef *execFactory) addAggregations(n *groupNode, aggregations []exec.AggInfo
 		case 0:
 			renderIdx = noRenderIdx
 			aggFn = func(evalCtx *tree.EvalContext, arguments tree.Datums) tree.AggregateFunc {
-				return builtin.AggregateFunc([]types.T{}, evalCtx, arguments)
+				return builtin.AggregateFunc([]*types.T{}, evalCtx, arguments)
 			}
 
 		case 1:
 			renderIdx = int(agg.ArgCols[0])
 			aggFn = func(evalCtx *tree.EvalContext, arguments tree.Datums) tree.AggregateFunc {
-				return builtin.AggregateFunc([]types.T{inputCols[renderIdx].Typ}, evalCtx, arguments)
+				return builtin.AggregateFunc([]*types.T{inputCols[renderIdx].Typ}, evalCtx, arguments)
 			}
 
 		default:
-			return pgerror.UnimplementedWithIssueError(28417,
+			return pgerror.UnimplementedWithIssue(28417,
 				"aggregate functions with multiple non-constant expressions are not supported",
 			)
 		}
@@ -453,7 +483,7 @@ func (ef *execFactory) addAggregations(n *groupNode, aggregations []exec.AggInfo
 
 		n.funcs = append(n.funcs, f)
 		n.columns = append(n.columns, sqlbase.ResultColumn{
-			Name: fmt.Sprintf("agg%d", i),
+			Name: agg.FuncName,
 			Typ:  agg.ResultType,
 		})
 	}
@@ -519,6 +549,12 @@ func (ef *execFactory) ConstructIndexJoin(
 	tabDesc := table.(*optTable).desc
 	colCfg := makeScanColumnsConfig(table, cols)
 	colDescs := makeColDescList(table, cols)
+
+	// TODO(rytaft): saveTableNode is not yet supported as input to an index
+	// join, so discard the saveTableNode.
+	if saveTable, ok := input.(*saveTableNode); ok {
+		input = saveTable.source
+	}
 
 	// TODO(justin): this would be something besides a scanNode in the general
 	// case of a lookup join.
@@ -776,6 +812,44 @@ func (ef *execFactory) ConstructProjectSet(
 	return p, nil
 }
 
+// ConstructWindow is part of the exec.Factory interface.
+func (ef *execFactory) ConstructWindow(root exec.Node, wi exec.WindowInfo) (exec.Node, error) {
+	p := &windowNode{
+		plan:         root.(planNode),
+		columns:      wi.Cols,
+		windowRender: make([]tree.TypedExpr, len(wi.Cols)),
+	}
+
+	partitionIdxs := make([]int, len(wi.Partition))
+	for i, idx := range wi.Partition {
+		partitionIdxs[i] = int(idx)
+	}
+
+	p.funcs = make([]*windowFuncHolder, len(wi.Exprs))
+	for i := range wi.Exprs {
+		argsIdxs := make([]uint32, len(wi.ArgIdxs[i]))
+		for j := range argsIdxs {
+			argsIdxs[j] = uint32(wi.ArgIdxs[i][j])
+		}
+
+		p.funcs[i] = &windowFuncHolder{
+			expr:           wi.Exprs[i],
+			args:           wi.Exprs[i].Exprs,
+			argsIdxs:       argsIdxs,
+			window:         p,
+			filterColIdx:   noFilterIdx,
+			outputColIdx:   wi.OutputIdxs[i],
+			partitionIdxs:  partitionIdxs,
+			columnOrdering: wi.Ordering,
+			frame:          wi.Exprs[i].WindowDef.Frame,
+		}
+
+		p.windowRender[wi.OutputIdxs[i]] = p.funcs[i]
+	}
+
+	return p, nil
+}
+
 // ConstructPlan is part of the exec.Factory interface.
 func (ef *execFactory) ConstructPlan(
 	root exec.Node, subqueries []exec.Subquery,
@@ -819,6 +893,191 @@ func (ef *execFactory) ConstructPlan(
 	return res, nil
 }
 
+// lineOutputter handles writing strings for EXPLAIN (env). It's a layer of
+// indirection to ensure each line gets its own row and there's exactly one
+// blank line between each output.
+type lineOutputter struct {
+	rows [][]tree.TypedExpr
+}
+
+func (e *lineOutputter) write(s string) {
+	if len(e.rows) > 0 {
+		e.rows = append(e.rows, []tree.TypedExpr{tree.NewDString("")})
+	}
+	ss := strings.Split(strings.Trim(s, "\n"), "\n")
+	for _, line := range ss {
+		e.rows = append(e.rows, []tree.TypedExpr{tree.NewDString(line)})
+	}
+}
+
+// environmentQuery is a helper to run a query to build up the output of
+// showEnv. It expects a query that returns a single string column.
+func (ef *execFactory) environmentQuery(query string) (string, error) {
+	r, err := ef.planner.extendedEvalCtx.InternalExecutor.QueryRow(
+		ef.planner.EvalContext().Context,
+		"EXPLAIN (env)",
+		ef.planner.Txn(),
+		query,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	if len(r) != 1 {
+		return "", pgerror.AssertionFailedf(
+			"expected env query %q to return a single column, returned %d",
+			query,
+			len(r),
+		)
+	}
+
+	s, ok := r[0].(*tree.DString)
+	if !ok {
+		return "", pgerror.AssertionFailedf(
+			"expected env query %q to return a DString, returned %T",
+			query,
+			r[0],
+		)
+	}
+
+	return string(*s), nil
+}
+
+// showEnv implements EXPLAIN (opt, env). It returns a node which displays
+// the environment a query was run in.
+func (ef *execFactory) showEnv(plan string, envOpts exec.ExplainEnvData) (exec.Node, error) {
+	var out lineOutputter
+
+	// Show the version of Cockroach running.
+	version, err := ef.environmentQuery("SELECT version()")
+	if err != nil {
+		return nil, err
+	}
+	out.write(fmt.Sprintf("Version: %s", version))
+
+	// Show the definition of each referenced catalog object.
+	for _, tn := range envOpts.Sequences {
+		createStatement, err := ef.environmentQuery(
+			fmt.Sprintf("SELECT create_statement FROM [SHOW CREATE SEQUENCE %s]", tn.String()),
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		out.write(fmt.Sprintf("%s;", createStatement))
+	}
+
+	// TODO(justin): it might also be relevant in some cases to print the create
+	// statements for tables referenced via FKs in these tables.
+	for _, tn := range envOpts.Tables {
+		createStatement, err := ef.environmentQuery(
+			fmt.Sprintf("SELECT create_statement FROM [SHOW CREATE TABLE %s]", tn.String()),
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		out.write(fmt.Sprintf("%s;", createStatement))
+
+		// In addition to the schema, it's important to know what the table
+		// statistics on each table are.
+
+		// NOTE: The histogram buckets take up a ton of vertical space and we
+		// don't use them in planning, so don't include them.
+		// TODO(justin): Revisit this once we use histograms in planning.
+		stats, err := ef.environmentQuery(
+			fmt.Sprintf(
+				`
+SELECT
+	jsonb_pretty(COALESCE(json_agg(stat), '[]'))
+FROM
+	(
+		SELECT
+			json_array_elements(statistics) - 'histo_buckets' AS stat
+		FROM
+			[SHOW STATISTICS USING JSON FOR TABLE %s]
+	)
+`,
+				tn.String(),
+			),
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		out.write(
+			fmt.Sprintf(
+				"ALTER TABLE %s INJECT STATISTICS '%s';", tn.String(), stats,
+			),
+		)
+	}
+
+	for _, tn := range envOpts.Views {
+		createStatement, err := ef.environmentQuery(
+			fmt.Sprintf("SELECT create_statement FROM [SHOW CREATE VIEW %s]", tn.String()),
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		out.write(fmt.Sprintf("%s;", createStatement))
+	}
+
+	// Show the values of any non-default session variables that can impact
+	// planning decisions.
+
+	value, err := ef.environmentQuery(fmt.Sprintf("SHOW reorder_joins_limit"))
+	if err != nil {
+		return nil, err
+	}
+	if value != strconv.FormatInt(opt.DefaultJoinOrderLimit, 10) {
+		out.write(fmt.Sprintf("SET reorder_joins_limit = %s;", value))
+	}
+
+	for _, param := range []string{
+		"experimental_enable_zigzag_join",
+	} {
+		value, err := ef.environmentQuery(fmt.Sprintf("SHOW %s", param))
+		if err != nil {
+			return nil, err
+		}
+		defaultVal := varGen[param].GlobalDefault(nil)
+		if value != defaultVal {
+			out.write(fmt.Sprintf("SET %s = %s;", param, value))
+		}
+	}
+
+	// Show the query running. Note that this is the *entire* query, including
+	// the "EXPLAIN (opt, env)" preamble.
+	out.write(fmt.Sprintf("%s;\n----\n%s", ef.planner.stmt.AST.String(), plan))
+
+	return &valuesNode{
+		columns:          sqlbase.ExplainOptColumns,
+		tuples:           out.rows,
+		specifiedInQuery: true,
+	}, nil
+}
+
+// ConstructExplainOpt is part of the exec.Factory interface.
+func (ef *execFactory) ConstructExplainOpt(
+	planText string, envOpts exec.ExplainEnvData,
+) (exec.Node, error) {
+	// If this was an EXPLAIN (opt, env), we need to run a bunch of auxiliary
+	// queries to fetch the environment info.
+	if envOpts.ShowEnv {
+		return ef.showEnv(planText, envOpts)
+	}
+
+	var out lineOutputter
+	out.write(planText)
+
+	return &valuesNode{
+		columns:          sqlbase.ExplainOptColumns,
+		tuples:           out.rows,
+		specifiedInQuery: true,
+	}, nil
+}
+
 // ConstructExplain is part of the exec.Factory interface.
 func (ef *execFactory) ConstructExplain(
 	options *tree.ExplainOptions, stmtType tree.StatementType, plan exec.Plan,
@@ -826,6 +1085,10 @@ func (ef *execFactory) ConstructExplain(
 	p := plan.(*planTop)
 
 	analyzeSet := options.Flags.Contains(tree.ExplainFlagAnalyze)
+
+	if options.Flags.Contains(tree.ExplainFlagEnv) {
+		return nil, errors.New("ENV only supported with (OPT) option")
+	}
 
 	switch options.Mode {
 	case tree.ExplainDistSQL:
@@ -1017,8 +1280,9 @@ func (ef *execFactory) ConstructUpdate(
 	// updateColsIdx inverts the mapping of UpdateCols to FetchCols. See
 	// the explanatory comments in updateRun.
 	updateColsIdx := make(map[sqlbase.ColumnID]int, len(ru.UpdateCols))
-	for i, col := range ru.UpdateCols {
-		updateColsIdx[col.ID] = i
+	for i := range ru.UpdateCols {
+		id := ru.UpdateCols[i].ID
+		updateColsIdx[id] = i
 	}
 
 	upd := updateNodePool.Get().(*updateNode)
@@ -1136,8 +1400,9 @@ func (ef *execFactory) ConstructUpsert(
 	// updateColsIdx inverts the mapping of UpdateCols to FetchCols. See
 	// the explanatory comments in updateRun.
 	updateColsIdx := make(map[sqlbase.ColumnID]int, len(ru.UpdateCols))
-	for i, col := range ru.UpdateCols {
-		updateColsIdx[col.ID] = i
+	for i := range ru.UpdateCols {
+		id := ru.UpdateCols[i].ID
+		updateColsIdx[id] = i
 	}
 
 	// Instantiate the upsert node.
@@ -1290,6 +1555,13 @@ func (ef *execFactory) ConstructCreateTable(
 // ConstructSequenceSelect is part of the exec.Factory interface.
 func (ef *execFactory) ConstructSequenceSelect(sequence cat.Sequence) (exec.Node, error) {
 	return ef.planner.SequenceSelectNode(sequence.(*optSequence).desc)
+}
+
+// ConstructSaveTable is part of the exec.Factory interface.
+func (ef *execFactory) ConstructSaveTable(
+	input exec.Node, table *cat.DataSourceName, colNames []string,
+) (exec.Node, error) {
+	return ef.planner.makeSaveTable(input.(planNode), table, colNames), nil
 }
 
 // renderBuilder encapsulates the code to build a renderNode.

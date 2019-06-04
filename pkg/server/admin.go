@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -291,7 +292,7 @@ func (s *adminServer) DatabaseDetails(
 		}
 
 		if !zoneExists {
-			zone = config.DefaultZoneConfig()
+			zone = s.server.cfg.DefaultZoneConfig
 		}
 		resp.ZoneConfig = zone
 
@@ -509,7 +510,7 @@ func (s *adminServer) TableDetails(
 		}
 
 		if !zoneExists {
-			zone = config.DefaultZoneConfig()
+			zone = s.server.cfg.DefaultZoneConfig
 		}
 		resp.ZoneConfig = zone
 
@@ -666,7 +667,7 @@ func (s *adminServer) statsForSpan(
 		if err := kv.Value.GetProto(&rng); err != nil {
 			return nil, s.serverError(err)
 		}
-		for _, repl := range rng.Replicas {
+		for _, repl := range rng.Replicas().Unwrap() {
 			nodeIDs[repl.NodeID] = struct{}{}
 		}
 	}
@@ -1170,7 +1171,7 @@ func (s *adminServer) Jobs(
 
 	q := makeSQLQuery()
 	q.Append(`
-      SELECT job_id, job_type, description, user_name, descriptor_ids, status,
+      SELECT job_id, job_type, description, statement, user_name, descriptor_ids, status,
 						 running_status, created, started, finished, modified,
 						 fraction_completed, high_water_timestamp, error
         FROM crdb_internal.jobs
@@ -1181,6 +1182,9 @@ func (s *adminServer) Jobs(
 	}
 	if req.Type != jobspb.TypeUnspecified {
 		q.Append(" AND job_type = $", req.Type.String())
+	} else {
+		// Don't show auto stats jobs in the overview page.
+		q.Append(" AND (job_type != $ OR job_type IS NULL)", jobspb.TypeAutoCreateStats.String())
 	}
 	q.Append("ORDER BY created DESC")
 	if req.Limit > 0 {
@@ -1207,6 +1211,7 @@ func (s *adminServer) Jobs(
 			&job.ID,
 			&job.Type,
 			&job.Description,
+			&job.Statement,
 			&job.Username,
 			&job.DescriptorIDs,
 			&job.Status,
@@ -1349,12 +1354,12 @@ func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_Dr
 		return nil
 	}
 
-	s.server.grpc.Stop()
-
 	go func() {
-		// The explicit closure here allows callers.Lookup() to return something
-		// sensible referring to this file (otherwise it ends up in runtime
-		// internals).
+		// TODO(tbg): why don't we stop the stopper first? Stopping the stopper
+		// first seems more reasonable since grpc.Stop closes the listener right
+		// away (and who knows whether gRPC-goroutines are tied up in some
+		// stopper task somewhere).
+		s.server.grpc.Stop()
 		s.server.stopper.Stop(ctx)
 	}()
 
@@ -1363,6 +1368,23 @@ func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_Dr
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-time.After(10 * time.Second):
+		// This is a hack to work around the problem in
+		// https://github.com/cockroachdb/cockroach/issues/37425#issuecomment-494336131
+		//
+		// There appear to be deadlock scenarios in which we don't manage to
+		// fully stop the grpc server (which implies closing the listener, i.e.
+		// seeming dead to the outside world) or don't manage to shut down the
+		// stopper (the evidence in #37425 is inconclusive which one it is).
+		//
+		// Other problems in this area are known, such as
+		// https://github.com/cockroachdb/cockroach/pull/31692
+		//
+		// The signal-based shutdown path uses a similar time-based escape hatch.
+		// Until we spend (potentially lots of time to) understand and fix this
+		// issue, this will serve us well.
+		os.Exit(1)
+		return errors.New("unreachable")
 	}
 }
 
@@ -1401,7 +1423,7 @@ func (s *adminServer) DecommissionStatus(
 					if err := row.ValueProto(&rangeDesc); err != nil {
 						return errors.Wrapf(err, "%s: unable to unmarshal range descriptor", row.Key)
 					}
-					for _, r := range rangeDesc.Replicas {
+					for _, r := range rangeDesc.Replicas().Unwrap() {
 						if _, ok := replicaCounts[r.NodeID]; ok {
 							replicaCounts[r.NodeID]++
 						}
@@ -1475,7 +1497,7 @@ func (s *adminServer) DataDistribution(
 	// and deleted tables (as opposed to e.g. information_schema) because we are interested
 	// in the data for all ranges, not just ranges for visible tables.
 	userName := s.getUser(req)
-	tablesQuery := `SELECT name, table_id, database_name, drop_time FROM "".crdb_internal.tables`
+	tablesQuery := `SELECT name, table_id, database_name, drop_time FROM "".crdb_internal.tables WHERE schema_name = 'public'`
 	rows1, _ /* cols */, err := s.server.internalExecutor.QueryWithUser(
 		ctx, "admin-replica-matrix", nil /* txn */, userName, tablesQuery,
 	)
@@ -1570,7 +1592,7 @@ func (s *adminServer) DataDistribution(
 				return err
 			}
 
-			for _, replicaDesc := range rangeDesc.Replicas {
+			for _, replicaDesc := range rangeDesc.Replicas().Unwrap() {
 				tableInfo, ok := tableInfosByTableID[tableID]
 				if !ok {
 					// This is a database, skip.
@@ -1587,7 +1609,7 @@ func (s *adminServer) DataDistribution(
 	// Get zone configs.
 	// TODO(vilterp): this can be done in parallel with getting table/db names and replica counts.
 	zoneConfigsQuery := `
-		SELECT zone_name, config_sql, config_protobuf 
+		SELECT zone_name, config_sql, config_protobuf
 		FROM crdb_internal.zones
 		WHERE zone_name IS NOT NULL
 	`
@@ -2088,7 +2110,7 @@ func (s *adminServer) dialNode(
 	if err != nil {
 		return nil, err
 	}
-	conn, err := s.server.rpcContext.GRPCDial(addr.String()).Connect(ctx)
+	conn, err := s.server.rpcContext.GRPCDialNode(addr.String(), nodeID).Connect(ctx)
 	if err != nil {
 		return nil, err
 	}

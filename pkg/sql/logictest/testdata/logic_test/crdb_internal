@@ -36,6 +36,7 @@ node_runtime_info
 node_sessions
 node_statement_statistics
 partitions
+predefined_comments
 ranges
 ranges_no_leases
 schema_changes
@@ -71,11 +72,11 @@ SELECT * FROM crdb_internal.schema_changes
 ----
 table_id parent_id name type target_id target_name state direction
 
-query IITTITRTTTTTT colnames
+query IITTITRTTTTTTT colnames
 SELECT * FROM crdb_internal.tables WHERE NAME = 'namespace'
 ----
-table_id  parent_id  name       database_name  version  mod_time                         mod_time_logical  format_version            state   sc_lease_node_id  sc_lease_expiration_time  drop_time  audit_mode
-2         1          namespace  system         1        1970-01-01 00:00:00 +0000 +0000  0E-10             InterleavedFormatVersion  PUBLIC  NULL              NULL                      NULL       DISABLED
+table_id  parent_id  name       database_name  version  mod_time                         mod_time_logical  format_version            state   sc_lease_node_id  sc_lease_expiration_time  drop_time  audit_mode  schema_name
+2         1          namespace  system         1        1970-01-01 00:00:00 +0000 +0000  0E-10             InterleavedFormatVersion  PUBLIC  NULL              NULL                      NULL       DISABLED    public
 
 # Verify that table names are not double escaped.
 
@@ -106,10 +107,10 @@ Channel
 
 
 # The validity of the rows in this table are tested elsewhere; we merely assert the columns.
-query ITTTTTTTTTTRTTI colnames
+query ITTTTTTTTTTTRTTI colnames
 SELECT * FROM crdb_internal.jobs WHERE false
 ----
-job_id  job_type  description  user_name  descriptor_ids  status  running_status  created  started  finished  modified  fraction_completed  high_water_timestamp  error  coordinator_id
+job_id  job_type  description  statement  user_name  descriptor_ids  status  running_status  created  started  finished  modified  fraction_completed  high_water_timestamp  error  coordinator_id
 
 query IITTITTT colnames
 SELECT * FROM crdb_internal.schema_changes WHERE table_id < 0
@@ -206,6 +207,16 @@ SELECT * FROM crdb_internal.zones WHERE false
 ----
 zone_id  zone_name cli_specifier  config_yaml  config_sql  config_protobuf
 
+query ITTTTTTTTTT colnames
+SELECT * FROM crdb_internal.ranges WHERE range_id < 0
+----
+range_id  start_key  start_pretty  end_key  end_pretty  database_name  table_name  index_name  replicas  manual_split_time  lease_holder
+
+query ITTTTTTTTT colnames
+SELECT * FROM crdb_internal.ranges_no_leases WHERE range_id < 0
+----
+range_id  start_key  start_pretty  end_key  end_pretty  database_name  table_name  index_name  replicas  manual_split_time
+
 statement ok
 INSERT INTO system.zones (id, config) VALUES
   (18, (SELECT config_protobuf FROM crdb_internal.zones WHERE zone_id = 0)),
@@ -266,9 +277,9 @@ select crdb_internal.set_vmodule('')
 0
 
 query T
-select regexp_replace(crdb_internal.node_executable_version()::string, '-\d+', '-x');
+select regexp_replace(crdb_internal.node_executable_version()::string, '(-\d+)?$', '');
 ----
-2.1-x
+19.1
 
 query ITTT colnames
 select node_id, component, field, regexp_replace(regexp_replace(value, '^\d+$', '<port>'), e':\\d+', ':<port>') as value from crdb_internal.node_runtime_info
@@ -290,8 +301,8 @@ node_id  component  field   value
 query ITTTTT colnames
 SELECT node_id, network, regexp_replace(address, '\d+$', '<port>') as address, attrs, locality, regexp_replace(server_version, '^\d+\.\d+(-\d+)?$', '<server_version>') as server_version FROM crdb_internal.gossip_nodes WHERE node_id = 1
 ----
-node_id  network  address           attrs  locality            server_version
-1        tcp      127.0.0.1:<port>  []     {"region": "test"}  <server_version>
+node_id  network  address           attrs  locality                         server_version
+1        tcp      127.0.0.1:<port>  []     {"dc": "dc1", "region": "test"}  <server_version>
 
 query IITBB colnames
 SELECT node_id, epoch, regexp_replace(expiration, '^\d+\.\d+,\d+$', '<timestamp>') as expiration, draining, decommissioning FROM crdb_internal.gossip_liveness WHERE node_id = 1
@@ -303,8 +314,8 @@ query ITTTTTT colnames
 SELECT node_id, network, regexp_replace(address, '\d+$', '<port>') as address, attrs, locality, regexp_replace(server_version, '^\d+\.\d+(-\d+)?$', '<server_version>') as server_version, regexp_replace(go_version, '^go.+$', '<go_version>') as go_version
 FROM crdb_internal.kv_node_status WHERE node_id = 1
 ----
-node_id  network  address           attrs  locality            server_version    go_version
-1        tcp      127.0.0.1:<port>  []     {"region": "test"}  <server_version>  <go_version>
+node_id  network  address           attrs  locality                         server_version    go_version
+1        tcp      127.0.0.1:<port>  []     {"dc": "dc1", "region": "test"}  <server_version>  <go_version>
 
 query IITI colnames
 SELECT node_id, store_id, attrs, used
@@ -315,6 +326,34 @@ node_id  store_id  attrs  used
 
 statement ok
 CREATE TABLE foo (a INT PRIMARY KEY); INSERT INTO foo VALUES(1)
+
+statement ok
+ALTER TABLE foo SPLIT AT VALUES(2)
+
+query TT colnames
+SELECT start_pretty, end_pretty FROM crdb_internal.ranges WHERE manual_split_time IS NOT NULL
+----
+start_pretty   end_pretty
+/Table/56/1/2  /Max
+
+query TT colnames
+SELECT start_pretty, end_pretty FROM crdb_internal.ranges_no_leases WHERE manual_split_time IS NOT NULL
+----
+start_pretty   end_pretty
+/Table/56/1/2  /Max
+
+statement ok
+ALTER TABLE foo UNSPLIT AT VALUES(2)
+
+query TT colnames
+SELECT start_pretty, end_pretty FROM crdb_internal.ranges WHERE manual_split_time IS NOT NULL
+----
+start_pretty   end_pretty
+
+query TT colnames
+SELECT start_pretty, end_pretty FROM crdb_internal.ranges_no_leases WHERE manual_split_time IS NOT NULL
+----
+start_pretty   end_pretty
 
 # Make sure that the cluster id isn't unset.
 query B
@@ -363,9 +402,9 @@ select * from crdb_internal.gossip_alerts
 
 # Anyone can see the executable version.
 query T
-select regexp_replace(crdb_internal.node_executable_version()::string, '-\d+', '-x');
+select regexp_replace(crdb_internal.node_executable_version()::string, '(-\d+)?$', '');
 ----
-2.1-x
+19.1
 
 user root
 

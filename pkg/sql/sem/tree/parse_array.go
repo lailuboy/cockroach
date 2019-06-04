@@ -20,14 +20,14 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
-var enclosingError = pgerror.NewErrorf(pgerror.CodeInvalidTextRepresentationError, "array must be enclosed in { and }")
-var extraTextError = pgerror.NewErrorf(pgerror.CodeInvalidTextRepresentationError, "extra text after closing right brace")
-var nestedArraysNotSupportedError = pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, "nested arrays not supported")
-var malformedError = pgerror.NewErrorf(pgerror.CodeInvalidTextRepresentationError, "malformed array")
+var enclosingError = pgerror.Newf(pgerror.CodeInvalidTextRepresentationError, "array must be enclosed in { and }")
+var extraTextError = pgerror.Newf(pgerror.CodeInvalidTextRepresentationError, "extra text after closing right brace")
+var nestedArraysNotSupportedError = pgerror.UnimplementedWithIssueDetail(32552, "strcast", "nested arrays not supported")
+var malformedError = pgerror.Newf(pgerror.CodeInvalidTextRepresentationError, "malformed array")
 
 var isQuoteChar = func(ch byte) bool {
 	return ch == '"'
@@ -76,7 +76,7 @@ type parseState struct {
 	s       string
 	evalCtx *EvalContext
 	result  *DArray
-	t       coltypes.T
+	t       *types.T
 }
 
 func (p *parseState) advance() {
@@ -147,11 +147,11 @@ func (p *parseState) parseElement() error {
 
 // ParseDArrayFromString parses the string-form of constructing arrays, handling
 // cases such as `'{1,2,3}'::INT[]`.
-func ParseDArrayFromString(evalCtx *EvalContext, s string, t coltypes.T) (*DArray, error) {
+func ParseDArrayFromString(evalCtx *EvalContext, s string, t *types.T) (*DArray, error) {
 	parser := parseState{
 		s:       s,
 		evalCtx: evalCtx,
-		result:  NewDArray(coltypes.CastTargetToDatumType(t)),
+		result:  NewDArray(t),
 		t:       t,
 	}
 

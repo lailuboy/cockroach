@@ -26,8 +26,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -57,8 +59,13 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 		},
 	)
 
-	rpcCtx := newInsecureRPCContext(stopper)
-	rpcSrv := rpc.NewServer(rpcCtx)
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+
+	// We're going to serve multiple node IDs with that one context. Disable node ID checks.
+	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
+
+	rpcSrv := rpc.NewServer(rpcContext)
 	defer rpcSrv.Stop()
 
 	distsqlpb.RegisterDistSQLServer(rpcSrv, srv)
@@ -70,7 +77,7 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	// The outbox uses this stopper to run a goroutine.
 	outboxStopper := stop.NewStopper()
 	flowCtx := FlowCtx{
-		nodeDialer: nodedialer.New(rpcCtx, staticAddressResolver(ln.Addr())),
+		nodeDialer: nodedialer.New(rpcContext, staticAddressResolver(ln.Addr())),
 		stopper:    outboxStopper,
 	}
 
@@ -104,7 +111,7 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	// below.
 	consumer.ConsumerDone()
 
-	row := sqlbase.EncDatumRow{sqlbase.DatumToEncDatum(sqlbase.IntType, tree.NewDInt(tree.DInt(0)))}
+	row := sqlbase.EncDatumRow{sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(0)))}
 
 	// Now push a row to the outbox's RowChannel and expect the consumer status
 	// returned to be DrainRequested. This is wrapped in a SucceedsSoon because

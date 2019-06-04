@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -68,10 +69,10 @@ var testIdent = roachpb.StoreIdent{
 
 func (s *Store) TestSender() client.Sender {
 	return client.Wrap(s, func(ba roachpb.BatchRequest) roachpb.BatchRequest {
-		rangeID := roachpb.RangeID(1)
 		if ba.RangeID != 0 {
 			return ba
 		}
+
 		// If the client hasn't set ba.Range, we do it a favor and figure out the
 		// range to which the request needs to go.
 		//
@@ -83,15 +84,18 @@ func (s *Store) TestSender() client.Sender {
 			log.Fatal(context.TODO(), err)
 		}
 
-		visitor := newStoreReplicaVisitor(s)
-		visitor.Visit(func(repl *Replica) bool {
-			if repl.Desc().ContainsKeyRange(key, key) {
-				rangeID = repl.RangeID
-				return false
+		ba.RangeID = roachpb.RangeID(1)
+		if repl := s.LookupReplica(key); repl != nil {
+			ba.RangeID = repl.RangeID
+
+			// Attempt to assign a Replica descriptor to the batch if
+			// necessary, but don't throw an error if this fails.
+			if ba.Replica == (roachpb.ReplicaDescriptor{}) {
+				if desc, err := repl.GetReplicaDescriptor(); err == nil {
+					ba.Replica = desc
+				}
 			}
-			return true
-		})
-		ba.RangeID = rangeID
+		}
 		return ba
 	})
 }
@@ -197,7 +201,7 @@ func createTestStoreWithoutStart(
 		cfg.AmbientCtx, &base.Config{Insecure: true}, cfg.Clock,
 		stopper, &cfg.Settings.Version)
 	server := rpc.NewServer(rpcContext) // never started
-	cfg.Gossip = gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry())
+	cfg.Gossip = gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), cfg.DefaultZoneConfig)
 	cfg.StorePool = NewTestStorePool(*cfg)
 	// Many tests using this test harness (as opposed to higher-level
 	// ones like multiTestContext or TestServer) want to micro-manage
@@ -215,15 +219,15 @@ func createTestStoreWithoutStart(
 	cfg.Transport = NewDummyRaftTransport(cfg.Settings)
 	factory := &testSenderFactory{}
 	cfg.DB = client.NewDB(cfg.AmbientCtx, factory, cfg.Clock)
-	store := NewStore(*cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
+	store := NewStore(context.TODO(), *cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 	factory.setStore(store)
-	if err := Bootstrap(
+	if err := InitEngine(
 		context.TODO(), eng, roachpb.StoreIdent{NodeID: 1, StoreID: 1}, cfg.Settings.Version.BootstrapVersion(),
 	); err != nil {
 		t.Fatal(err)
 	}
 	var splits []roachpb.RKey
-	kvs, tableSplits := sqlbase.MakeMetadataSchema().GetInitialValues()
+	kvs, tableSplits := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig).GetInitialValues()
 	if opts.createSystemRanges {
 		splits = config.StaticSplits()
 		splits = append(splits, tableSplits...)
@@ -231,9 +235,9 @@ func createTestStoreWithoutStart(
 			return splits[i].Less(splits[j])
 		})
 	}
-	if err := store.WriteInitialData(
-		context.TODO(), kvs /* initialValues */, cfg.Settings.Version.BootstrapVersion().Version,
-		1 /* numStores */, splits,
+	if err := WriteInitialClusterData(
+		context.TODO(), eng, kvs /* initialValues */, cfg.Settings.Version.BootstrapVersion().Version,
+		1 /* numStores */, splits, cfg.Clock.PhysicalNow(),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -414,14 +418,14 @@ func TestStoreInitAndBootstrap(t *testing.T) {
 	factory := &testSenderFactory{}
 	cfg.DB = client.NewDB(cfg.AmbientCtx, factory, cfg.Clock)
 	{
-		store := NewStore(cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
+		store := NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 		// Can't start as haven't bootstrapped.
 		if err := store.Start(ctx, stopper); err == nil {
 			t.Error("expected failure starting un-bootstrapped store")
 		}
 
 		// Bootstrap with a fake ident.
-		if err := Bootstrap(ctx, eng, testIdent, cfg.Settings.Version.BootstrapVersion()); err != nil {
+		if err := InitEngine(ctx, eng, testIdent, cfg.Settings.Version.BootstrapVersion()); err != nil {
 			t.Errorf("error bootstrapping store: %s", err)
 		}
 
@@ -435,23 +439,23 @@ func TestStoreInitAndBootstrap(t *testing.T) {
 
 		// Bootstrap the system ranges.
 		var splits []roachpb.RKey
-		kvs, tableSplits := sqlbase.MakeMetadataSchema().GetInitialValues()
+		kvs, tableSplits := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig).GetInitialValues()
 		splits = config.StaticSplits()
 		splits = append(splits, tableSplits...)
 		sort.Slice(splits, func(i, j int) bool {
 			return splits[i].Less(splits[j])
 		})
 
-		if err := store.WriteInitialData(
-			ctx, kvs /* initialValues */, cfg.Settings.Version.BootstrapVersion().Version,
-			1 /* numStores */, splits,
+		if err := WriteInitialClusterData(
+			ctx, eng, kvs /* initialValues */, cfg.Settings.Version.BootstrapVersion().Version,
+			1 /* numStores */, splits, cfg.Clock.PhysicalNow(),
 		); err != nil {
 			t.Errorf("failure to create first range: %s", err)
 		}
 	}
 
 	// Now, attempt to initialize a store with a now-bootstrapped range.
-	store := NewStore(cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
+	store := NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 	if err := store.Start(ctx, stopper); err != nil {
 		t.Fatalf("failure initializing bootstrapped store: %s", err)
 	}
@@ -489,7 +493,7 @@ func TestBootstrapOfNonEmptyStore(t *testing.T) {
 	}
 	cfg := TestStoreConfig(nil)
 	cfg.Transport = NewDummyRaftTransport(cfg.Settings)
-	store := NewStore(cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
+	store := NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 
 	// Can't init as haven't bootstrapped.
 	switch err := errors.Cause(store.Start(ctx, stopper)); err.(type) {
@@ -499,7 +503,7 @@ func TestBootstrapOfNonEmptyStore(t *testing.T) {
 	}
 
 	// Bootstrap should fail on non-empty engine.
-	switch err := errors.Cause(Bootstrap(ctx, eng, testIdent, cfg.Settings.Version.BootstrapVersion())); err.(type) {
+	switch err := errors.Cause(InitEngine(ctx, eng, testIdent, cfg.Settings.Version.BootstrapVersion())); err.(type) {
 	case *NotBootstrappedError:
 	default:
 		t.Errorf("unexpected error bootstrapping non-empty store: %v", err)
@@ -516,7 +520,7 @@ func createReplica(s *Store, rangeID roachpb.RangeID, start, end roachpb.RKey) *
 		RangeID:  rangeID,
 		StartKey: start,
 		EndKey:   end,
-		Replicas: []roachpb.ReplicaDescriptor{{
+		InternalReplicas: []roachpb.ReplicaDescriptor{{
 			NodeID:    1,
 			StoreID:   1,
 			ReplicaID: 1,
@@ -669,9 +673,9 @@ func TestStoreRemoveReplicaOldDescriptor(t *testing.T) {
 	// First try and fail with a stale descriptor.
 	origDesc := rep.Desc()
 	newDesc := protoutil.Clone(origDesc).(*roachpb.RangeDescriptor)
-	for i := range newDesc.Replicas {
-		if newDesc.Replicas[i].StoreID == store.StoreID() {
-			newDesc.Replicas[i].ReplicaID++
+	for i := range newDesc.InternalReplicas {
+		if newDesc.InternalReplicas[i].StoreID == store.StoreID() {
+			newDesc.InternalReplicas[i].ReplicaID++
 			newDesc.NextReplicaID++
 			break
 		}
@@ -726,7 +730,7 @@ func TestStoreRemoveReplicaDestroy(t *testing.T) {
 		t.Fatal("replica was not marked as destroyed")
 	}
 
-	if _, _, _, pErr := repl1.propose(
+	if _, _, _, pErr := repl1.evalAndPropose(
 		context.Background(), lease, roachpb.BatchRequest{}, nil, &allSpans,
 	); !pErr.Equal(expErr) {
 		t.Fatalf("expected error %s, but got %v", expErr, pErr)
@@ -980,7 +984,7 @@ func TestMaybeMarkReplicaInitialized(t *testing.T) {
 	newRangeID := roachpb.RangeID(3)
 	desc := &roachpb.RangeDescriptor{
 		RangeID: newRangeID,
-		Replicas: []roachpb.ReplicaDescriptor{{
+		InternalReplicas: []roachpb.ReplicaDescriptor{{
 			NodeID:    1,
 			StoreID:   1,
 			ReplicaID: 1,
@@ -1127,6 +1131,7 @@ func TestStoreObservedTimestamp(t *testing.T) {
 // TestStoreAnnotateNow verifies that the Store sets Now on the batch responses.
 func TestStoreAnnotateNow(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 	badKey := []byte("a")
 	goodKey := []byte("b")
 	desc := roachpb.ReplicaDescriptor{
@@ -1160,9 +1165,9 @@ func TestStoreAnnotateNow(t *testing.T) {
 			}},
 	}
 
-	for _, useTxn := range []bool{false, true} {
+	testutils.RunTrueAndFalse(t, "useTxn", func(t *testing.T, useTxn bool) {
 		for _, test := range testCases {
-			func() {
+			t.Run(test.key.String(), func(t *testing.T) {
 				cfg := TestStoreConfig(nil)
 				cfg.TestingKnobs.EvalKnobs.TestingEvalFilter =
 					func(filterArgs storagebase.FilterArgs) *roachpb.Error {
@@ -1172,7 +1177,7 @@ func TestStoreAnnotateNow(t *testing.T) {
 						return nil
 					}
 				stopper := stop.NewStopper()
-				defer stopper.Stop(context.TODO())
+				defer stopper.Stop(ctx)
 				store := createTestStoreWithConfig(t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
 				var txn *roachpb.Transaction
 				pArgs := putArgs(test.key, []byte("value"))
@@ -1189,10 +1194,10 @@ func TestStoreAnnotateNow(t *testing.T) {
 				}
 				ba.Add(&pArgs)
 
-				test.check(store.TestSender().Send(context.Background(), ba))
-			}()
+				test.check(store.TestSender().Send(ctx, ba))
+			})
 		}
-	}
+	})
 }
 
 // TestStoreVerifyKeys checks that key length is enforced and
@@ -1338,7 +1343,7 @@ func splitTestRange(store *Store, key, splitKey roachpb.RKey, t *testing.T) *Rep
 		t.Fatalf("couldn't lookup range for key %q", key)
 	}
 	desc, err := store.NewRangeDescriptor(
-		context.Background(), splitKey, repl.Desc().EndKey, repl.Desc().Replicas)
+		context.Background(), splitKey, repl.Desc().EndKey, repl.Desc().InternalReplicas)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1494,11 +1499,11 @@ func TestStoreSetRangesMaxBytes(t *testing.T) {
 		expMaxBytes int64
 	}{
 		{store.LookupReplica(roachpb.RKeyMin),
-			*config.DefaultZoneConfig().RangeMaxBytes},
+			*store.cfg.DefaultZoneConfig.RangeMaxBytes},
 		{splitTestRange(store, roachpb.RKeyMin, keys.MakeTablePrefix(baseID), t),
 			1 << 20},
 		{splitTestRange(store, keys.MakeTablePrefix(baseID), keys.MakeTablePrefix(baseID+1), t),
-			*config.DefaultZoneConfig().RangeMaxBytes},
+			*store.cfg.DefaultZoneConfig.RangeMaxBytes},
 		{splitTestRange(store, keys.MakeTablePrefix(baseID+1), keys.MakeTablePrefix(baseID+2), t),
 			2 << 20},
 	}
@@ -1543,7 +1548,7 @@ func TestStoreResolveWriteIntent(t *testing.T) {
 				return nil
 			}
 			if exp, act := manual.UnixNano(), pr.PushTo.WallTime; exp > act {
-				return roachpb.NewError(fmt.Errorf("expected PushTo >= WallTime, but got %d < %d:\n%+v", act, exp, pr))
+				return roachpb.NewError(fmt.Errorf("expected PushTo > WallTime, but got %d < %d:\n%+v", act, exp, pr))
 			}
 			return nil
 		}
@@ -1556,11 +1561,11 @@ func TestStoreResolveWriteIntent(t *testing.T) {
 		pusher := newTransaction("test", key, 1, store.cfg.Clock)
 		pushee := newTransaction("test", key, 1, store.cfg.Clock)
 		if resolvable {
-			pushee.Priority = roachpb.MinTxnPriority
-			pusher.Priority = roachpb.MaxTxnPriority // Pusher will win.
+			pushee.Priority = enginepb.MinTxnPriority
+			pusher.Priority = enginepb.MaxTxnPriority // Pusher will win.
 		} else {
-			pushee.Priority = roachpb.MaxTxnPriority
-			pusher.Priority = roachpb.MinTxnPriority // Pusher will lose.
+			pushee.Priority = enginepb.MaxTxnPriority
+			pusher.Priority = enginepb.MinTxnPriority // Pusher will lose.
 		}
 
 		// First lay down intent using the pushee's txn.
@@ -1623,8 +1628,8 @@ func TestStoreResolveWriteIntentRollback(t *testing.T) {
 	key := roachpb.Key("a")
 	pusher := newTransaction("test", key, 1, store.cfg.Clock)
 	pushee := newTransaction("test", key, 1, store.cfg.Clock)
-	pushee.Priority = roachpb.MinTxnPriority
-	pusher.Priority = roachpb.MaxTxnPriority // Pusher will win.
+	pushee.Priority = enginepb.MinTxnPriority
+	pusher.Priority = enginepb.MaxTxnPriority // Pusher will win.
 
 	// First lay down intent using the pushee's txn.
 	args := incrementArgs(key, 1)
@@ -1646,83 +1651,192 @@ func TestStoreResolveWriteIntentRollback(t *testing.T) {
 }
 
 // TestStoreResolveWriteIntentPushOnRead verifies that resolving a write intent
-// for a read will push the timestamp. On failure to push, verify a write
-// intent error is returned with !Resolvable.
+// for a read will push the timestamp. It tests this along a few dimensions:
+// - high-priority pushes       vs. low-priority pushes
+// - already pushed pushee txns vs. not already pushed pushee txns
+// - PENDING pushee txn records vs. STAGING pushee txn records
 func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	storeCfg := TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DontRetryPushTxnFailures = true
+	storeCfg.TestingKnobs.DontRecoverIndeterminateCommits = true
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, testStoreOpts{createSystemRanges: true}, &storeCfg)
 
-	for i, resolvable := range []bool{true, false} {
-		key := roachpb.Key(fmt.Sprintf("key-%d", i))
-		pusher := newTransaction("test", key, 1, store.cfg.Clock)
-		pushee := newTransaction("test", key, 1, store.cfg.Clock)
-
-		if resolvable {
-			pushee.Priority = roachpb.MinTxnPriority
-			pusher.Priority = roachpb.MaxTxnPriority // Pusher will win.
-		} else {
-			pushee.Priority = roachpb.MaxTxnPriority
-			pusher.Priority = roachpb.MinTxnPriority // Pusher will lose.
-		}
-		// First, write original value.
+	testCases := []struct {
+		pusherWillWin       bool   // if true, pusher will have a high enough priority to push the pushee
+		pusheeAlreadyPushed bool   // if true, pushee's timestamp will be set above pusher's target timestamp
+		pusheeStagingRecord bool   // if true, pushee's record is STAGING, otherwise PENDING
+		expPushError        string // regexp pattern to match on run error, if not empty
+		expPusheeRetry      bool   // do we expect the pushee to hit a retry error when committing?
+	}{
 		{
-			args := putArgs(key, []byte("value1"))
-			if _, pErr := client.SendWrapped(context.Background(), store.TestSender(), &args); pErr != nil {
-				t.Fatal(pErr)
-			}
-		}
-
-		// Second, lay down intent using the pushee's txn.
+			// Insufficient priority to push.
+			pusherWillWin:       false,
+			pusheeAlreadyPushed: false,
+			pusheeStagingRecord: false,
+			expPushError:        "failed to push",
+			expPusheeRetry:      false,
+		},
 		{
-			args := putArgs(key, []byte("value2"))
-			assignSeqNumsForReqs(pushee, &args)
-			if _, pErr := client.SendWrappedWith(
-				context.Background(), store.TestSender(), roachpb.Header{Txn: pushee}, &args,
-			); pErr != nil {
-				t.Fatal(pErr)
-			}
-		}
+			// Successful push.
+			pusherWillWin:       true,
+			pusheeAlreadyPushed: false,
+			pusheeStagingRecord: false,
+			expPushError:        "",
+			expPusheeRetry:      true,
+		},
+		{
+			// Already pushed, no-op.
+			pusherWillWin:       false,
+			pusheeAlreadyPushed: true,
+			pusheeStagingRecord: false,
+			expPushError:        "",
+			expPusheeRetry:      false,
+		},
+		{
+			// Already pushed, no-op.
+			pusherWillWin:       true,
+			pusheeAlreadyPushed: true,
+			pusheeStagingRecord: false,
+			expPushError:        "",
+			expPusheeRetry:      false,
+		},
+		{
+			// Insufficient priority to push.
+			pusherWillWin:       false,
+			pusheeAlreadyPushed: false,
+			pusheeStagingRecord: true,
+			expPushError:        "failed to push",
+			expPusheeRetry:      false,
+		},
+		{
+			// Cannot push STAGING txn record.
+			pusherWillWin:       true,
+			pusheeAlreadyPushed: false,
+			pusheeStagingRecord: true,
+			expPushError:        "found txn in indeterminate STAGING state",
+			expPusheeRetry:      false,
+		},
+		{
+			// Already pushed the STAGING record, no-op.
+			pusherWillWin:       false,
+			pusheeAlreadyPushed: true,
+			pusheeStagingRecord: true,
+			expPushError:        "",
+			expPusheeRetry:      false,
+		},
+		{
+			// Already pushed the STAGING record, no-op.
+			pusherWillWin:       true,
+			pusheeAlreadyPushed: true,
+			pusheeStagingRecord: true,
+			expPushError:        "",
+			expPusheeRetry:      false,
+		},
+	}
+	for _, tc := range testCases {
+		name := fmt.Sprintf("pusherWillWin=%t,pusheePushed=%t,pusheeStaging=%t",
+			tc.pusherWillWin, tc.pusheeAlreadyPushed, tc.pusheeStagingRecord)
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			key := roachpb.Key(fmt.Sprintf("key-%s", name))
+			pusher := newTransaction("pusher", key, 1, store.cfg.Clock)
+			pushee := newTransaction("pushee", key, 1, store.cfg.Clock)
 
-		// Now, try to read value using the pusher's txn.
-		now := store.Clock().Now()
-		pusher.OrigTimestamp.Forward(now)
-		pusher.Timestamp.Forward(now)
-		gArgs := getArgs(key)
-		assignSeqNumsForReqs(pusher, &gArgs)
-		firstReply, pErr := client.SendWrappedWith(context.Background(), store.TestSender(), roachpb.Header{Txn: pusher}, &gArgs)
-		if resolvable {
-			if pErr != nil {
-				t.Errorf("%d: expected read to succeed: %s", i, pErr)
-			} else if replyBytes, err := firstReply.(*roachpb.GetResponse).Value.GetBytes(); err != nil {
-				t.Fatal(err)
-			} else if !bytes.Equal(replyBytes, []byte("value1")) {
-				t.Errorf("%d: expected bytes to be %q, got %q", i, "value1", replyBytes)
+			// Set transaction priorities.
+			if tc.pusherWillWin {
+				pushee.Priority = enginepb.MinTxnPriority
+				pusher.Priority = enginepb.MaxTxnPriority // Pusher will win.
+			} else {
+				pushee.Priority = enginepb.MaxTxnPriority
+				pusher.Priority = enginepb.MinTxnPriority // Pusher will lose.
 			}
 
-			// Finally, try to end the pushee's transaction; if we have
-			// SNAPSHOT isolation, the commit should work: verify the txn
-			// commit timestamp is greater than pusher's Timestamp.
-			// Otherwise, verify commit fails with TransactionRetryError.
-			etArgs, h := endTxnArgs(pushee, true)
+			// First, write original value.
+			{
+				args := putArgs(key, []byte("value1"))
+				if _, pErr := client.SendWrapped(ctx, store.TestSender(), &args); pErr != nil {
+					t.Fatal(pErr)
+				}
+			}
+
+			// Second, lay down intent using the pushee's txn.
+			{
+				args := putArgs(key, []byte("value2"))
+				assignSeqNumsForReqs(pushee, &args)
+				if _, pErr := client.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{Txn: pushee}, &args); pErr != nil {
+					t.Fatal(pErr)
+				}
+			}
+
+			// Determine the timestamp to read at.
+			readTs := store.cfg.Clock.Now()
+			// Give the pusher a previous observed timestamp equal to this read
+			// timestamp. This ensures that the pusher doesn't need to push the
+			// intent any higher just to push it out of its uncertainty window.
+			pusher.UpdateObservedTimestamp(store.Ident.NodeID, readTs)
+
+			// If the pushee is already pushed, update the transaction record.
+			if tc.pusheeAlreadyPushed {
+				pushedTs := store.cfg.Clock.Now()
+				pushee.Timestamp.Forward(pushedTs)
+				pushee.RefreshedTimestamp.Forward(pushedTs)
+				hb, hbH := heartbeatArgs(pushee, store.cfg.Clock.Now())
+				if _, pErr := client.SendWrappedWith(ctx, store.TestSender(), hbH, &hb); pErr != nil {
+					t.Fatal(pErr)
+				}
+			}
+
+			// If the pushee is staging, update the transaction record.
+			if tc.pusheeStagingRecord {
+				et, etH := endTxnArgs(pushee, true)
+				et.InFlightWrites = []roachpb.SequencedWrite{{Key: []byte("keyA"), Sequence: 1}}
+				etReply, pErr := client.SendWrappedWith(ctx, store.TestSender(), etH, &et)
+				if pErr != nil {
+					t.Fatal(pErr)
+				}
+				if replyTxn := etReply.Header().Txn; replyTxn.Status != roachpb.STAGING {
+					t.Fatalf("expected STAGING txn, found %v", replyTxn)
+				}
+			}
+
+			// Now, try to read value using the pusher's txn.
+			pusher.OrigTimestamp.Forward(readTs)
+			pusher.Timestamp.Forward(readTs)
+			gArgs := getArgs(key)
+			assignSeqNumsForReqs(pusher, &gArgs)
+			repl, pErr := client.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{Txn: pusher}, &gArgs)
+			if tc.expPushError == "" {
+				if pErr != nil {
+					t.Errorf("expected read to succeed: %s", pErr)
+				} else if replyBytes, err := repl.(*roachpb.GetResponse).Value.GetBytes(); err != nil {
+					t.Fatal(err)
+				} else if !bytes.Equal(replyBytes, []byte("value1")) {
+					t.Errorf("expected bytes to be %q, got %q", "value1", replyBytes)
+				}
+			} else {
+				if !testutils.IsPError(pErr, tc.expPushError) {
+					t.Fatalf("expected error %q, found %v", tc.expPushError, pErr)
+				}
+			}
+
+			// Finally, try to end the pushee's transaction. Check whether
+			// the commit succeeds or fails.
+			etArgs, etH := endTxnArgs(pushee, true)
 			assignSeqNumsForReqs(pushee, &etArgs)
-			_, cErr := client.SendWrappedWith(context.Background(), store.TestSender(), h, &etArgs)
-			if _, ok := cErr.GetDetail().(*roachpb.TransactionRetryError); !ok {
-				t.Errorf("expected transaction retry error; got %s", cErr)
+			_, pErr = client.SendWrappedWith(ctx, store.TestSender(), etH, &etArgs)
+			if tc.expPusheeRetry {
+				if _, ok := pErr.GetDetail().(*roachpb.TransactionRetryError); !ok {
+					t.Errorf("expected transaction retry error; got %s", pErr)
+				}
+			} else {
+				if pErr != nil {
+					t.Fatalf("expected no commit error; got %s", pErr)
+				}
 			}
-		} else {
-			// Verify we receive a transaction retry error (because we max out
-			// retries).
-			if pErr == nil {
-				t.Errorf("expected read to fail")
-			}
-			if _, ok := pErr.GetDetail().(*roachpb.TransactionPushError); !ok {
-				t.Errorf("expected transaction push error; got %T", pErr.GetDetail())
-			}
-		}
+		})
 	}
 }
 
@@ -1797,8 +1911,8 @@ func TestStoreResolveWriteIntentNoTxn(t *testing.T) {
 	}
 	// Similarly, verify that pushee's priority was moved from 0
 	// to MaxTxnPriority-1 during push.
-	if txn.Priority != roachpb.MaxTxnPriority-1 {
-		t.Errorf("expected pushee priority to be pushed to %d; got %d", roachpb.MaxTxnPriority-1, txn.Priority)
+	if txn.Priority != enginepb.MaxTxnPriority-1 {
+		t.Errorf("expected pushee priority to be pushed to %d; got %d", enginepb.MaxTxnPriority-1, txn.Priority)
 	}
 
 	// Finally, try to end the pushee's transaction; it should have
@@ -2322,7 +2436,7 @@ func TestStoreScanIntentsFromTwoTxns(t *testing.T) {
 	// Now, expire the transactions by moving the clock forward. This will
 	// result in the subsequent scan operation pushing both transactions
 	// in a single batch.
-	manualClock.Increment(2*base.DefaultHeartbeatInterval.Nanoseconds() + 1)
+	manualClock.Increment(txnwait.TxnLivenessThreshold.Nanoseconds() + 1)
 
 	// Scan the range and verify empty result (expired txn is aborted,
 	// cleaning up intents).
@@ -2373,7 +2487,7 @@ func TestStoreScanMultipleIntents(t *testing.T) {
 	// Now, expire the transactions by moving the clock forward. This will
 	// result in the subsequent scan operation pushing both transactions
 	// in a single batch.
-	manual.Increment(2*base.DefaultHeartbeatInterval.Nanoseconds() + 1)
+	manual.Increment(txnwait.TxnLivenessThreshold.Nanoseconds() + 1)
 
 	// Query the range with a single INCONSISTENT scan, which should
 	// cause all intents to be resolved.
@@ -2474,7 +2588,7 @@ func (fq *fakeRangeQueue) Start(_ *stop.Stopper) {
 	// Do nothing
 }
 
-func (fq *fakeRangeQueue) MaybeAdd(_ *Replica, _ hlc.Timestamp) {
+func (fq *fakeRangeQueue) MaybeAddAsync(context.Context, replicaInQueue, hlc.Timestamp) {
 	// Do nothing
 }
 
@@ -2965,7 +3079,7 @@ type fakeStorePool struct {
 	failedThrottles   int
 }
 
-func (sp *fakeStorePool) throttle(reason throttleReason, toStoreID roachpb.StoreID) {
+func (sp *fakeStorePool) throttle(reason throttleReason, why string, toStoreID roachpb.StoreID) {
 	switch reason {
 	case throttleDeclined:
 		sp.declinedThrottles++

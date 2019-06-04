@@ -19,7 +19,6 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanlatch"
@@ -27,12 +26,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/storage/txnwait"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/pkg/errors"
 	"go.etcd.io/etcd/raft"
+)
+
+const (
+	splitQueueThrottleDuration = 5 * time.Second
+	mergeQueueThrottleDuration = 5 * time.Second
 )
 
 func newReplica(rangeID roachpb.RangeID, store *Store) *Replica {
@@ -46,7 +51,7 @@ func newReplica(rangeID roachpb.RangeID, store *Store) *Replica {
 	r.mu.pendingLeaseRequest = makePendingLeaseRequest(r)
 	r.mu.stateLoader = stateloader.Make(rangeID)
 	r.mu.quiescent = true
-	r.mu.zone = config.DefaultZoneConfigRef()
+	r.mu.zone = store.cfg.DefaultZoneConfig
 	split.Init(&r.loadBasedSplitter, rand.Intn, func() float64 {
 		return float64(SplitByLoadQPSThreshold.Get(&store.cfg.Settings.SV))
 	})
@@ -67,8 +72,11 @@ func newReplica(rangeID roachpb.RangeID, store *Store) *Replica {
 	r.AmbientContext.AddLogTag("r", &r.rangeStr)
 	// Add replica pointer value. NB: this was historically useful for debugging
 	// replica GC issues, but is a distraction at the moment.
-	// r.AmbientContext.AddLogTagStr("@", fmt.Sprintf("%x", unsafe.Pointer(r)))
+	// r.AmbientContext.AddLogTag("@", fmt.Sprintf("%x", unsafe.Pointer(r)))
 	r.raftMu.stateLoader = stateloader.Make(rangeID)
+
+	r.splitQueueThrottle = util.Every(splitQueueThrottleDuration)
+	r.mergeQueueThrottle = util.Every(mergeQueueThrottleDuration)
 	return r
 }
 

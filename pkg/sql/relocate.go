@@ -21,10 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
@@ -44,7 +45,7 @@ type relocateNode struct {
 // (`ALTER TABLE/INDEX ... EXPERIMENTAL_RELOCATE [LEASE] ...` statement)
 // Privileges: INSERT on table.
 func (p *planner) Relocate(ctx context.Context, n *tree.Relocate) (planNode, error) {
-	tableDesc, index, err := p.getTableAndIndex(ctx, n.Table, n.Index, privilege.INSERT)
+	tableDesc, index, err := p.getTableAndIndex(ctx, &n.TableOrIndex, privilege.INSERT)
 	if err != nil {
 		return nil, err
 	}
@@ -54,18 +55,18 @@ func (p *planner) Relocate(ctx context.Context, n *tree.Relocate) (planNode, err
 	//    storeID) if relocating a lease
 	//  - column values; it is OK if the select statement returns fewer columns
 	//    (the relevant prefix is used).
-	desiredTypes := make([]types.T, len(index.ColumnIDs)+1)
+	desiredTypes := make([]*types.T, len(index.ColumnIDs)+1)
 	if n.RelocateLease {
 		desiredTypes[0] = types.Int
 	} else {
-		desiredTypes[0] = types.TArray{Typ: types.Int}
+		desiredTypes[0] = types.IntArray
 	}
 	for i, colID := range index.ColumnIDs {
 		c, err := tableDesc.FindColumnByID(colID)
 		if err != nil {
 			return nil, err
 		}
-		desiredTypes[i+1] = c.Type.ToDatumType()
+		desiredTypes[i+1] = &c.Type
 	}
 
 	// Create the plan for the split rows source.
@@ -157,7 +158,7 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 			return false, errors.Errorf("invalid target leaseholder store ID %d for EXPERIMENTAL_RELOCATE LEASE", leaseStoreID)
 		}
 	} else {
-		if !data[0].ResolvedType().Equivalent(types.TArray{Typ: types.Int}) {
+		if !data[0].ResolvedType().Equivalent(types.IntArray) {
 			return false, errors.Errorf(
 				"expected int array in the first EXPERIMENTAL_RELOCATE data column; got %s",
 				data[0].ResolvedType(),
@@ -180,7 +181,8 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 				if err := params.extendedEvalCtx.ExecCfg.Gossip.GetInfoProto(
 					gossipStoreKey, &storeDesc,
 				); err != nil {
-					return false, errors.Wrapf(err, "error looking up store %d", storeID)
+					return false, pgerror.NewAssertionErrorWithWrappedErrf(err,
+						"error looking up store %d", log.Safe(storeID))
 				}
 				nodeID = storeDesc.Node.NodeID
 				n.run.storeMap[storeID] = nodeID
@@ -203,7 +205,8 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 
 	rangeDesc, err := lookupRangeDescriptor(params.ctx, params.extendedEvalCtx.ExecCfg.DB, rowKey)
 	if err != nil {
-		return false, errors.Wrap(err, "error looking up range descriptor")
+		return false, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+			"error looking up range descriptor")
 	}
 	n.run.lastRangeStartKey = rangeDesc.StartKey.AsRawKey()
 

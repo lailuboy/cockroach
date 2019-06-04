@@ -16,10 +16,6 @@ CREATE TABLE abc (
   PRIMARY KEY (a, b, c)
 )
 
-# Prevent the merge queue from immediately discarding our splits.
-statement ok
-SET CLUSTER SETTING kv.range_merge.queue_enabled = false;
-
 statement ok
 ALTER TABLE xyz SPLIT AT VALUES (2), (4), (6), (7)
 
@@ -135,7 +131,7 @@ https://cockroachdb.github.io/distsqlplan/decode.html#eJykk01r4zAQhu_7K8x7lvH3Hn
 query TTTTT
 EXPLAIN (VERBOSE) SELECT DISTINCT ON (a, b) a, b FROM abc ORDER BY a, b, c
 ----
-render          ·            ·            (a, b)     ·
+render          ·            ·            (a, b)     +a,+b
  │              render 0     a            ·          ·
  │              render 1     b            ·          ·
  └── distinct   ·            ·            (a, b, c)  weak-key(a,b); +a,+b,+c

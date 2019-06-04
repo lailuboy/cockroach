@@ -31,7 +31,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/cli/debug"
 	"github.com/cockroachdb/cockroach/pkg/cli/syncbench"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
@@ -178,7 +177,7 @@ func runDebugKeys(cmd *cobra.Command, args []string) error {
 	printer := printKey
 	if debugCtx.values {
 		printer = func(kv engine.MVCCKeyValue) (bool, error) {
-			debug.PrintKeyValue(kv, debugCtx.sizes)
+			storage.PrintKeyValue(kv)
 			return false, nil
 		}
 	}
@@ -279,10 +278,10 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 		} else if !ok {
 			break
 		}
-		debug.PrintKeyValue(engine.MVCCKeyValue{
+		storage.PrintKeyValue(engine.MVCCKeyValue{
 			Key:   iter.Key(),
 			Value: iter.Value(),
-		}, debugCtx.sizes)
+		})
 	}
 	return nil
 }
@@ -306,7 +305,7 @@ func loadRangeDescriptor(
 			// We only want values, not MVCCMetadata.
 			return false, nil
 		}
-		if err := debug.IsRangeDescriptorKey(kv.Key); err != nil {
+		if err := storage.IsRangeDescriptorKey(kv.Key); err != nil {
 			// Range descriptor keys are interleaved with others, so if it
 			// doesn't parse as a range descriptor just skip it.
 			return false, nil
@@ -349,10 +348,10 @@ func runDebugRangeDescriptors(cmd *cobra.Command, args []string) error {
 	end := engine.MakeMVCCMetadataKey(keys.LocalRangeMax)
 
 	return db.Iterate(start, end, func(kv engine.MVCCKeyValue) (bool, error) {
-		if debug.IsRangeDescriptorKey(kv.Key) != nil {
+		if storage.IsRangeDescriptorKey(kv.Key) != nil {
 			return false, nil
 		}
-		debug.PrintKeyValue(kv, debugCtx.sizes)
+		storage.PrintKeyValue(kv)
 		return false, nil
 	})
 }
@@ -403,22 +402,25 @@ Decode and print a hexadecimal-encoded key-value pair.
 			bs = append(bs, b)
 		}
 
+		isTS := bytes.HasPrefix(bs[0], keys.TimeseriesPrefix)
 		k, err := engine.DecodeMVCCKey(bs[0])
 		if err != nil {
 			// Older versions of the consistency checker give you diffs with a raw_key that
 			// is already a roachpb.Key, so make a half-assed attempt to support both.
-			fmt.Printf("unable to decode key: %v, assuming it's a roachpb.Key with fake timestamp;\n"+
-				"if the result below looks like garbage, then it likely is:\n\n", err)
+			if !isTS {
+				fmt.Printf("unable to decode key: %v, assuming it's a roachpb.Key with fake timestamp;\n"+
+					"if the result below looks like garbage, then it likely is:\n\n", err)
+			}
 			k = engine.MVCCKey{
 				Key:       bs[0],
 				Timestamp: hlc.Timestamp{WallTime: 987654321},
 			}
 		}
 
-		debug.PrintKeyValue(engine.MVCCKeyValue{
+		storage.PrintKeyValue(engine.MVCCKeyValue{
 			Key:   k,
 			Value: bs[1],
-		}, debugCtx.sizes)
+		})
 		return nil
 	},
 }
@@ -449,9 +451,11 @@ func runDebugRaftLog(cmd *cobra.Command, args []string) error {
 
 	start := engine.MakeMVCCMetadataKey(keys.RaftLogPrefix(rangeID))
 	end := engine.MakeMVCCMetadataKey(keys.RaftLogPrefix(rangeID).PrefixEnd())
+	fmt.Printf("Printing keys %s -> %s (RocksDB keys: %#x - %#x )\n",
+		start, end, string(engine.EncodeKey(start)), string(engine.EncodeKey(end)))
 
 	return db.Iterate(start, end, func(kv engine.MVCCKeyValue) (bool, error) {
-		debug.PrintKeyValue(kv, debugCtx.sizes)
+		storage.PrintKeyValue(kv)
 		return false, nil
 	})
 }
@@ -1164,8 +1168,8 @@ func removeDeadReplicas(
 	err = storage.IterateRangeDescriptors(ctx, db, func(desc roachpb.RangeDescriptor) (bool, error) {
 		hasSelf := false
 		numDeadPeers := 0
-		numReplicas := len(desc.Replicas)
-		for _, rep := range desc.Replicas {
+		numReplicas := len(desc.Replicas().Unwrap())
+		for _, rep := range desc.Replicas().Unwrap() {
 			if rep.StoreID == storeIdent.StoreID {
 				hasSelf = true
 			}
@@ -1178,11 +1182,11 @@ func removeDeadReplicas(
 			// Rewrite the replicas list. Bump the replica ID as an extra
 			// defense against one of the old replicas returning from the
 			// dead.
-			newDesc.Replicas = []roachpb.ReplicaDescriptor{{
+			newDesc.SetReplicas(roachpb.MakeReplicaDescriptors([]roachpb.ReplicaDescriptor{{
 				NodeID:    storeIdent.NodeID,
 				StoreID:   storeIdent.StoreID,
 				ReplicaID: desc.NextReplicaID,
-			}}
+			}}))
 			newDesc.NextReplicaID++
 			fmt.Printf("Replica %s -> %s\n", desc, newDesc)
 			newDescs = append(newDescs, newDesc)
@@ -1237,11 +1241,13 @@ var debugMergeLogsCommand = &cobra.Command{
 	Short: "merge multiple log files from different machines into a single stream",
 	Long: `
 Takes a list of glob patterns (not left exclusively to the shell because of
-MAX_ARG_STRLEN, usually 128kB) pointing to log files and merges them into a 
+MAX_ARG_STRLEN, usually 128kB) pointing to log files and merges them into a
 single stream printed to stdout. Files not matching the log file name pattern
 are ignored. If log lines appear out of order within a file (which happens), the
 timestamp is ratcheted to the highest value seen so far. The command supports
 efficient time filtering as well as multiline regexp pattern matching via flags.
+If the filter regexp contains captures, such as '^abc(hello)def(world)', only
+the captured parts will be printed.
 `,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runDebugMergeLogs,

@@ -42,7 +42,7 @@ namespace protobuf_roachpb_2fdata_2eproto {
 struct TableStruct {
   static const ::google::protobuf::internal::ParseTableField entries[];
   static const ::google::protobuf::internal::AuxillaryParseTableField aux[];
-  static const ::google::protobuf::internal::ParseTable schema[17];
+  static const ::google::protobuf::internal::ParseTable schema[18];
   static const ::google::protobuf::internal::FieldMetadata field_metadata[];
   static const ::google::protobuf::internal::SerializationTable serialization_table[];
   static const ::google::protobuf::uint32 offsets[];
@@ -86,6 +86,9 @@ extern SpanDefaultTypeInternal _Span_default_instance_;
 class SplitTrigger;
 class SplitTriggerDefaultTypeInternal;
 extern SplitTriggerDefaultTypeInternal _SplitTrigger_default_instance_;
+class StickyBitTrigger;
+class StickyBitTriggerDefaultTypeInternal;
+extern StickyBitTriggerDefaultTypeInternal _StickyBitTrigger_default_instance_;
 class StoreIdent;
 class StoreIdentDefaultTypeInternal;
 extern StoreIdentDefaultTypeInternal _StoreIdent_default_instance_;
@@ -117,6 +120,7 @@ template<> ::cockroach::roachpb::ObservedTimestamp* Arena::CreateMaybeMessage<::
 template<> ::cockroach::roachpb::SequencedWrite* Arena::CreateMaybeMessage<::cockroach::roachpb::SequencedWrite>(Arena*);
 template<> ::cockroach::roachpb::Span* Arena::CreateMaybeMessage<::cockroach::roachpb::Span>(Arena*);
 template<> ::cockroach::roachpb::SplitTrigger* Arena::CreateMaybeMessage<::cockroach::roachpb::SplitTrigger>(Arena*);
+template<> ::cockroach::roachpb::StickyBitTrigger* Arena::CreateMaybeMessage<::cockroach::roachpb::StickyBitTrigger>(Arena*);
 template<> ::cockroach::roachpb::StoreIdent* Arena::CreateMaybeMessage<::cockroach::roachpb::StoreIdent>(Arena*);
 template<> ::cockroach::roachpb::Transaction* Arena::CreateMaybeMessage<::cockroach::roachpb::Transaction>(Arena*);
 template<> ::cockroach::roachpb::TransactionRecord* Arena::CreateMaybeMessage<::cockroach::roachpb::TransactionRecord>(Arena*);
@@ -161,6 +165,7 @@ const int ReplicaChangeType_ARRAYSIZE = ReplicaChangeType_MAX + 1;
 
 enum TransactionStatus {
   PENDING = 0,
+  STAGING = 3,
   COMMITTED = 1,
   ABORTED = 2,
   TransactionStatus_INT_MIN_SENTINEL_DO_NOT_USE_ = ::google::protobuf::kint32min,
@@ -168,7 +173,7 @@ enum TransactionStatus {
 };
 bool TransactionStatus_IsValid(int value);
 const TransactionStatus TransactionStatus_MIN = PENDING;
-const TransactionStatus TransactionStatus_MAX = ABORTED;
+const TransactionStatus TransactionStatus_MAX = STAGING;
 const int TransactionStatus_ARRAYSIZE = TransactionStatus_MAX + 1;
 
 // ===================================================================
@@ -1161,6 +1166,113 @@ class ModifiedSpanTrigger : public ::google::protobuf::MessageLite /* @@protoc_i
 };
 // -------------------------------------------------------------------
 
+class StickyBitTrigger : public ::google::protobuf::MessageLite /* @@protoc_insertion_point(class_definition:cockroach.roachpb.StickyBitTrigger) */ {
+ public:
+  StickyBitTrigger();
+  virtual ~StickyBitTrigger();
+
+  StickyBitTrigger(const StickyBitTrigger& from);
+
+  inline StickyBitTrigger& operator=(const StickyBitTrigger& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  #if LANG_CXX11
+  StickyBitTrigger(StickyBitTrigger&& from) noexcept
+    : StickyBitTrigger() {
+    *this = ::std::move(from);
+  }
+
+  inline StickyBitTrigger& operator=(StickyBitTrigger&& from) noexcept {
+    if (GetArenaNoVirtual() == from.GetArenaNoVirtual()) {
+      if (this != &from) InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+  #endif
+  static const StickyBitTrigger& default_instance();
+
+  static void InitAsDefaultInstance();  // FOR INTERNAL USE ONLY
+  static inline const StickyBitTrigger* internal_default_instance() {
+    return reinterpret_cast<const StickyBitTrigger*>(
+               &_StickyBitTrigger_default_instance_);
+  }
+  static constexpr int kIndexInFileMessages =
+    8;
+
+  void Swap(StickyBitTrigger* other);
+  friend void swap(StickyBitTrigger& a, StickyBitTrigger& b) {
+    a.Swap(&b);
+  }
+
+  // implements Message ----------------------------------------------
+
+  inline StickyBitTrigger* New() const final {
+    return CreateMaybeMessage<StickyBitTrigger>(NULL);
+  }
+
+  StickyBitTrigger* New(::google::protobuf::Arena* arena) const final {
+    return CreateMaybeMessage<StickyBitTrigger>(arena);
+  }
+  void CheckTypeAndMergeFrom(const ::google::protobuf::MessageLite& from)
+    final;
+  void CopyFrom(const StickyBitTrigger& from);
+  void MergeFrom(const StickyBitTrigger& from);
+  void Clear() final;
+  bool IsInitialized() const final;
+
+  size_t ByteSizeLong() const final;
+  bool MergePartialFromCodedStream(
+      ::google::protobuf::io::CodedInputStream* input) final;
+  void SerializeWithCachedSizes(
+      ::google::protobuf::io::CodedOutputStream* output) const final;
+  void DiscardUnknownFields();
+  int GetCachedSize() const final { return _cached_size_.Get(); }
+
+  private:
+  void SharedCtor();
+  void SharedDtor();
+  void SetCachedSize(int size) const;
+  void InternalSwap(StickyBitTrigger* other);
+  private:
+  inline ::google::protobuf::Arena* GetArenaNoVirtual() const {
+    return NULL;
+  }
+  inline void* MaybeArenaPtr() const {
+    return NULL;
+  }
+  public:
+
+  ::std::string GetTypeName() const final;
+
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+
+  // .cockroach.util.hlc.Timestamp sticky_bit = 1;
+  bool has_sticky_bit() const;
+  void clear_sticky_bit();
+  static const int kStickyBitFieldNumber = 1;
+  private:
+  const ::cockroach::util::hlc::Timestamp& _internal_sticky_bit() const;
+  public:
+  const ::cockroach::util::hlc::Timestamp& sticky_bit() const;
+  ::cockroach::util::hlc::Timestamp* release_sticky_bit();
+  ::cockroach::util::hlc::Timestamp* mutable_sticky_bit();
+  void set_allocated_sticky_bit(::cockroach::util::hlc::Timestamp* sticky_bit);
+
+  // @@protoc_insertion_point(class_scope:cockroach.roachpb.StickyBitTrigger)
+ private:
+
+  ::google::protobuf::internal::InternalMetadataWithArenaLite _internal_metadata_;
+  ::cockroach::util::hlc::Timestamp* sticky_bit_;
+  mutable ::google::protobuf::internal::CachedSize _cached_size_;
+  friend struct ::protobuf_roachpb_2fdata_2eproto::TableStruct;
+};
+// -------------------------------------------------------------------
+
 class InternalCommitTrigger : public ::google::protobuf::MessageLite /* @@protoc_insertion_point(class_definition:cockroach.roachpb.InternalCommitTrigger) */ {
  public:
   InternalCommitTrigger();
@@ -1195,7 +1307,7 @@ class InternalCommitTrigger : public ::google::protobuf::MessageLite /* @@protoc
                &_InternalCommitTrigger_default_instance_);
   }
   static constexpr int kIndexInFileMessages =
-    8;
+    9;
 
   void Swap(InternalCommitTrigger* other);
   friend void swap(InternalCommitTrigger& a, InternalCommitTrigger& b) {
@@ -1294,6 +1406,18 @@ class InternalCommitTrigger : public ::google::protobuf::MessageLite /* @@protoc
   ::cockroach::roachpb::ModifiedSpanTrigger* mutable_modified_span_trigger();
   void set_allocated_modified_span_trigger(::cockroach::roachpb::ModifiedSpanTrigger* modified_span_trigger);
 
+  // .cockroach.roachpb.StickyBitTrigger sticky_bit_trigger = 5;
+  bool has_sticky_bit_trigger() const;
+  void clear_sticky_bit_trigger();
+  static const int kStickyBitTriggerFieldNumber = 5;
+  private:
+  const ::cockroach::roachpb::StickyBitTrigger& _internal_sticky_bit_trigger() const;
+  public:
+  const ::cockroach::roachpb::StickyBitTrigger& sticky_bit_trigger() const;
+  ::cockroach::roachpb::StickyBitTrigger* release_sticky_bit_trigger();
+  ::cockroach::roachpb::StickyBitTrigger* mutable_sticky_bit_trigger();
+  void set_allocated_sticky_bit_trigger(::cockroach::roachpb::StickyBitTrigger* sticky_bit_trigger);
+
   // @@protoc_insertion_point(class_scope:cockroach.roachpb.InternalCommitTrigger)
  private:
 
@@ -1302,6 +1426,7 @@ class InternalCommitTrigger : public ::google::protobuf::MessageLite /* @@protoc
   ::cockroach::roachpb::MergeTrigger* merge_trigger_;
   ::cockroach::roachpb::ChangeReplicasTrigger* change_replicas_trigger_;
   ::cockroach::roachpb::ModifiedSpanTrigger* modified_span_trigger_;
+  ::cockroach::roachpb::StickyBitTrigger* sticky_bit_trigger_;
   mutable ::google::protobuf::internal::CachedSize _cached_size_;
   friend struct ::protobuf_roachpb_2fdata_2eproto::TableStruct;
 };
@@ -1341,7 +1466,7 @@ class ObservedTimestamp : public ::google::protobuf::MessageLite /* @@protoc_ins
                &_ObservedTimestamp_default_instance_);
   }
   static constexpr int kIndexInFileMessages =
-    9;
+    10;
 
   void Swap(ObservedTimestamp* other);
   friend void swap(ObservedTimestamp& a, ObservedTimestamp& b) {
@@ -1453,7 +1578,7 @@ class Transaction : public ::google::protobuf::MessageLite /* @@protoc_insertion
                &_Transaction_default_instance_);
   }
   static constexpr int kIndexInFileMessages =
-    10;
+    11;
 
   void Swap(Transaction* other);
   friend void swap(Transaction& a, Transaction& b) {
@@ -1515,16 +1640,27 @@ class Transaction : public ::google::protobuf::MessageLite /* @@protoc_insertion
   const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ObservedTimestamp >&
       observed_timestamps() const;
 
-  int intents_size() const;
-  void clear_intents();
-  static const int kIntentsFieldNumber = 11;
-  ::cockroach::roachpb::Span* mutable_intents(int index);
+  int intent_spans_size() const;
+  void clear_intent_spans();
+  static const int kIntentSpansFieldNumber = 11;
+  ::cockroach::roachpb::Span* mutable_intent_spans(int index);
   ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span >*
-      mutable_intents();
-  const ::cockroach::roachpb::Span& intents(int index) const;
-  ::cockroach::roachpb::Span* add_intents();
+      mutable_intent_spans();
+  const ::cockroach::roachpb::Span& intent_spans(int index) const;
+  ::cockroach::roachpb::Span* add_intent_spans();
   const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span >&
-      intents() const;
+      intent_spans() const;
+
+  int in_flight_writes_size() const;
+  void clear_in_flight_writes();
+  static const int kInFlightWritesFieldNumber = 17;
+  ::cockroach::roachpb::SequencedWrite* mutable_in_flight_writes(int index);
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite >*
+      mutable_in_flight_writes();
+  const ::cockroach::roachpb::SequencedWrite& in_flight_writes(int index) const;
+  ::cockroach::roachpb::SequencedWrite* add_in_flight_writes();
+  const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite >&
+      in_flight_writes() const;
 
   // string name = 2;
   void clear_name();
@@ -1635,7 +1771,8 @@ class Transaction : public ::google::protobuf::MessageLite /* @@protoc_insertion
 
   ::google::protobuf::internal::InternalMetadataWithArenaLite _internal_metadata_;
   ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ObservedTimestamp > observed_timestamps_;
-  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span > intents_;
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span > intent_spans_;
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite > in_flight_writes_;
   ::google::protobuf::internal::ArenaStringPtr name_;
   ::cockroach::storage::engine::enginepb::TxnMeta* meta_;
   ::cockroach::util::hlc::Timestamp* last_heartbeat_;
@@ -1686,7 +1823,7 @@ class TransactionRecord : public ::google::protobuf::MessageLite /* @@protoc_ins
                &_TransactionRecord_default_instance_);
   }
   static constexpr int kIndexInFileMessages =
-    11;
+    12;
 
   void Swap(TransactionRecord* other);
   friend void swap(TransactionRecord& a, TransactionRecord& b) {
@@ -1737,16 +1874,27 @@ class TransactionRecord : public ::google::protobuf::MessageLite /* @@protoc_ins
 
   // accessors -------------------------------------------------------
 
-  int intents_size() const;
-  void clear_intents();
-  static const int kIntentsFieldNumber = 11;
-  ::cockroach::roachpb::Span* mutable_intents(int index);
+  int intent_spans_size() const;
+  void clear_intent_spans();
+  static const int kIntentSpansFieldNumber = 11;
+  ::cockroach::roachpb::Span* mutable_intent_spans(int index);
   ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span >*
-      mutable_intents();
-  const ::cockroach::roachpb::Span& intents(int index) const;
-  ::cockroach::roachpb::Span* add_intents();
+      mutable_intent_spans();
+  const ::cockroach::roachpb::Span& intent_spans(int index) const;
+  ::cockroach::roachpb::Span* add_intent_spans();
   const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span >&
-      intents() const;
+      intent_spans() const;
+
+  int in_flight_writes_size() const;
+  void clear_in_flight_writes();
+  static const int kInFlightWritesFieldNumber = 17;
+  ::cockroach::roachpb::SequencedWrite* mutable_in_flight_writes(int index);
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite >*
+      mutable_in_flight_writes();
+  const ::cockroach::roachpb::SequencedWrite& in_flight_writes(int index) const;
+  ::cockroach::roachpb::SequencedWrite* add_in_flight_writes();
+  const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite >&
+      in_flight_writes() const;
 
   bool has_meta() const;
   void clear_meta();
@@ -1791,7 +1939,8 @@ class TransactionRecord : public ::google::protobuf::MessageLite /* @@protoc_ins
  private:
 
   ::google::protobuf::internal::InternalMetadataWithArenaLite _internal_metadata_;
-  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span > intents_;
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span > intent_spans_;
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite > in_flight_writes_;
   ::cockroach::storage::engine::enginepb::TxnMeta* meta_;
   ::cockroach::util::hlc::Timestamp* last_heartbeat_;
   ::cockroach::util::hlc::Timestamp* orig_timestamp_;
@@ -1835,7 +1984,7 @@ class Intent : public ::google::protobuf::MessageLite /* @@protoc_insertion_poin
                &_Intent_default_instance_);
   }
   static constexpr int kIndexInFileMessages =
-    12;
+    13;
 
   void Swap(Intent* other);
   friend void swap(Intent& a, Intent& b) {
@@ -1960,7 +2109,7 @@ class SequencedWrite : public ::google::protobuf::MessageLite /* @@protoc_insert
                &_SequencedWrite_default_instance_);
   }
   static constexpr int kIndexInFileMessages =
-    13;
+    14;
 
   void Swap(SequencedWrite* other);
   friend void swap(SequencedWrite& a, SequencedWrite& b) {
@@ -2024,7 +2173,6 @@ class SequencedWrite : public ::google::protobuf::MessageLite /* @@protoc_insert
   ::std::string* release_key();
   void set_allocated_key(::std::string* key);
 
-  // int32 sequence = 2;
   void clear_sequence();
   static const int kSequenceFieldNumber = 2;
   ::google::protobuf::int32 sequence() const;
@@ -2075,7 +2223,7 @@ class Lease : public ::google::protobuf::MessageLite /* @@protoc_insertion_point
                &_Lease_default_instance_);
   }
   static constexpr int kIndexInFileMessages =
-    14;
+    15;
 
   void Swap(Lease* other);
   friend void swap(Lease& a, Lease& b) {
@@ -2242,7 +2390,7 @@ class AbortSpanEntry : public ::google::protobuf::MessageLite /* @@protoc_insert
                &_AbortSpanEntry_default_instance_);
   }
   static constexpr int kIndexInFileMessages =
-    15;
+    16;
 
   void Swap(AbortSpanEntry* other);
   friend void swap(AbortSpanEntry& a, AbortSpanEntry& b) {
@@ -2317,7 +2465,6 @@ class AbortSpanEntry : public ::google::protobuf::MessageLite /* @@protoc_insert
   ::cockroach::util::hlc::Timestamp* mutable_timestamp();
   void set_allocated_timestamp(::cockroach::util::hlc::Timestamp* timestamp);
 
-  // int32 priority = 3;
   void clear_priority();
   static const int kPriorityFieldNumber = 3;
   ::google::protobuf::int32 priority() const;
@@ -2369,7 +2516,7 @@ class TxnCoordMeta : public ::google::protobuf::MessageLite /* @@protoc_insertio
                &_TxnCoordMeta_default_instance_);
   }
   static constexpr int kIndexInFileMessages =
-    16;
+    17;
 
   void Swap(TxnCoordMeta* other);
   friend void swap(TxnCoordMeta& a, TxnCoordMeta& b) {
@@ -2420,17 +2567,6 @@ class TxnCoordMeta : public ::google::protobuf::MessageLite /* @@protoc_insertio
 
   // accessors -------------------------------------------------------
 
-  int intents_size() const;
-  void clear_intents();
-  static const int kIntentsFieldNumber = 2;
-  ::cockroach::roachpb::Span* mutable_intents(int index);
-  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span >*
-      mutable_intents();
-  const ::cockroach::roachpb::Span& intents(int index) const;
-  ::cockroach::roachpb::Span* add_intents();
-  const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span >&
-      intents() const;
-
   int refresh_reads_size() const;
   void clear_refresh_reads();
   static const int kRefreshReadsFieldNumber = 4;
@@ -2453,16 +2589,16 @@ class TxnCoordMeta : public ::google::protobuf::MessageLite /* @@protoc_insertio
   const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span >&
       refresh_writes() const;
 
-  int outstanding_writes_size() const;
-  void clear_outstanding_writes();
-  static const int kOutstandingWritesFieldNumber = 8;
-  ::cockroach::roachpb::SequencedWrite* mutable_outstanding_writes(int index);
+  int in_flight_writes_size() const;
+  void clear_in_flight_writes();
+  static const int kInFlightWritesFieldNumber = 8;
+  ::cockroach::roachpb::SequencedWrite* mutable_in_flight_writes(int index);
   ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite >*
-      mutable_outstanding_writes();
-  const ::cockroach::roachpb::SequencedWrite& outstanding_writes(int index) const;
-  ::cockroach::roachpb::SequencedWrite* add_outstanding_writes();
+      mutable_in_flight_writes();
+  const ::cockroach::roachpb::SequencedWrite& in_flight_writes(int index) const;
+  ::cockroach::roachpb::SequencedWrite* add_in_flight_writes();
   const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite >&
-      outstanding_writes() const;
+      in_flight_writes() const;
 
   bool has_txn() const;
   void clear_txn();
@@ -2491,10 +2627,9 @@ class TxnCoordMeta : public ::google::protobuf::MessageLite /* @@protoc_insertio
  private:
 
   ::google::protobuf::internal::InternalMetadataWithArenaLite _internal_metadata_;
-  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span > intents_;
   ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span > refresh_reads_;
   ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span > refresh_writes_;
-  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite > outstanding_writes_;
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite > in_flight_writes_;
   ::cockroach::roachpb::Transaction* txn_;
   ::google::protobuf::int32 command_count_;
   bool refresh_invalid_;
@@ -3379,6 +3514,58 @@ inline void ModifiedSpanTrigger::set_allocated_node_liveness_span(::cockroach::r
 
 // -------------------------------------------------------------------
 
+// StickyBitTrigger
+
+// .cockroach.util.hlc.Timestamp sticky_bit = 1;
+inline bool StickyBitTrigger::has_sticky_bit() const {
+  return this != internal_default_instance() && sticky_bit_ != NULL;
+}
+inline const ::cockroach::util::hlc::Timestamp& StickyBitTrigger::_internal_sticky_bit() const {
+  return *sticky_bit_;
+}
+inline const ::cockroach::util::hlc::Timestamp& StickyBitTrigger::sticky_bit() const {
+  const ::cockroach::util::hlc::Timestamp* p = sticky_bit_;
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.StickyBitTrigger.sticky_bit)
+  return p != NULL ? *p : *reinterpret_cast<const ::cockroach::util::hlc::Timestamp*>(
+      &::cockroach::util::hlc::_Timestamp_default_instance_);
+}
+inline ::cockroach::util::hlc::Timestamp* StickyBitTrigger::release_sticky_bit() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.StickyBitTrigger.sticky_bit)
+  
+  ::cockroach::util::hlc::Timestamp* temp = sticky_bit_;
+  sticky_bit_ = NULL;
+  return temp;
+}
+inline ::cockroach::util::hlc::Timestamp* StickyBitTrigger::mutable_sticky_bit() {
+  
+  if (sticky_bit_ == NULL) {
+    auto* p = CreateMaybeMessage<::cockroach::util::hlc::Timestamp>(GetArenaNoVirtual());
+    sticky_bit_ = p;
+  }
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.StickyBitTrigger.sticky_bit)
+  return sticky_bit_;
+}
+inline void StickyBitTrigger::set_allocated_sticky_bit(::cockroach::util::hlc::Timestamp* sticky_bit) {
+  ::google::protobuf::Arena* message_arena = GetArenaNoVirtual();
+  if (message_arena == NULL) {
+    delete reinterpret_cast< ::google::protobuf::MessageLite*>(sticky_bit_);
+  }
+  if (sticky_bit) {
+    ::google::protobuf::Arena* submessage_arena = NULL;
+    if (message_arena != submessage_arena) {
+      sticky_bit = ::google::protobuf::internal::GetOwnedMessage(
+          message_arena, sticky_bit, submessage_arena);
+    }
+    
+  } else {
+    
+  }
+  sticky_bit_ = sticky_bit;
+  // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.StickyBitTrigger.sticky_bit)
+}
+
+// -------------------------------------------------------------------
+
 // InternalCommitTrigger
 
 // .cockroach.roachpb.SplitTrigger split_trigger = 1;
@@ -3595,6 +3782,60 @@ inline void InternalCommitTrigger::set_allocated_modified_span_trigger(::cockroa
   }
   modified_span_trigger_ = modified_span_trigger;
   // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.InternalCommitTrigger.modified_span_trigger)
+}
+
+// .cockroach.roachpb.StickyBitTrigger sticky_bit_trigger = 5;
+inline bool InternalCommitTrigger::has_sticky_bit_trigger() const {
+  return this != internal_default_instance() && sticky_bit_trigger_ != NULL;
+}
+inline void InternalCommitTrigger::clear_sticky_bit_trigger() {
+  if (GetArenaNoVirtual() == NULL && sticky_bit_trigger_ != NULL) {
+    delete sticky_bit_trigger_;
+  }
+  sticky_bit_trigger_ = NULL;
+}
+inline const ::cockroach::roachpb::StickyBitTrigger& InternalCommitTrigger::_internal_sticky_bit_trigger() const {
+  return *sticky_bit_trigger_;
+}
+inline const ::cockroach::roachpb::StickyBitTrigger& InternalCommitTrigger::sticky_bit_trigger() const {
+  const ::cockroach::roachpb::StickyBitTrigger* p = sticky_bit_trigger_;
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.InternalCommitTrigger.sticky_bit_trigger)
+  return p != NULL ? *p : *reinterpret_cast<const ::cockroach::roachpb::StickyBitTrigger*>(
+      &::cockroach::roachpb::_StickyBitTrigger_default_instance_);
+}
+inline ::cockroach::roachpb::StickyBitTrigger* InternalCommitTrigger::release_sticky_bit_trigger() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.InternalCommitTrigger.sticky_bit_trigger)
+  
+  ::cockroach::roachpb::StickyBitTrigger* temp = sticky_bit_trigger_;
+  sticky_bit_trigger_ = NULL;
+  return temp;
+}
+inline ::cockroach::roachpb::StickyBitTrigger* InternalCommitTrigger::mutable_sticky_bit_trigger() {
+  
+  if (sticky_bit_trigger_ == NULL) {
+    auto* p = CreateMaybeMessage<::cockroach::roachpb::StickyBitTrigger>(GetArenaNoVirtual());
+    sticky_bit_trigger_ = p;
+  }
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.InternalCommitTrigger.sticky_bit_trigger)
+  return sticky_bit_trigger_;
+}
+inline void InternalCommitTrigger::set_allocated_sticky_bit_trigger(::cockroach::roachpb::StickyBitTrigger* sticky_bit_trigger) {
+  ::google::protobuf::Arena* message_arena = GetArenaNoVirtual();
+  if (message_arena == NULL) {
+    delete sticky_bit_trigger_;
+  }
+  if (sticky_bit_trigger) {
+    ::google::protobuf::Arena* submessage_arena = NULL;
+    if (message_arena != submessage_arena) {
+      sticky_bit_trigger = ::google::protobuf::internal::GetOwnedMessage(
+          message_arena, sticky_bit_trigger, submessage_arena);
+    }
+    
+  } else {
+    
+  }
+  sticky_bit_trigger_ = sticky_bit_trigger;
+  // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.InternalCommitTrigger.sticky_bit_trigger)
 }
 
 // -------------------------------------------------------------------
@@ -4024,33 +4265,62 @@ inline void Transaction::set_write_too_old(bool value) {
   // @@protoc_insertion_point(field_set:cockroach.roachpb.Transaction.write_too_old)
 }
 
-inline int Transaction::intents_size() const {
-  return intents_.size();
+inline int Transaction::intent_spans_size() const {
+  return intent_spans_.size();
 }
-inline void Transaction::clear_intents() {
-  intents_.Clear();
+inline void Transaction::clear_intent_spans() {
+  intent_spans_.Clear();
 }
-inline ::cockroach::roachpb::Span* Transaction::mutable_intents(int index) {
-  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.Transaction.intents)
-  return intents_.Mutable(index);
+inline ::cockroach::roachpb::Span* Transaction::mutable_intent_spans(int index) {
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.Transaction.intent_spans)
+  return intent_spans_.Mutable(index);
 }
 inline ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span >*
-Transaction::mutable_intents() {
-  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.Transaction.intents)
-  return &intents_;
+Transaction::mutable_intent_spans() {
+  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.Transaction.intent_spans)
+  return &intent_spans_;
 }
-inline const ::cockroach::roachpb::Span& Transaction::intents(int index) const {
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.Transaction.intents)
-  return intents_.Get(index);
+inline const ::cockroach::roachpb::Span& Transaction::intent_spans(int index) const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.Transaction.intent_spans)
+  return intent_spans_.Get(index);
 }
-inline ::cockroach::roachpb::Span* Transaction::add_intents() {
-  // @@protoc_insertion_point(field_add:cockroach.roachpb.Transaction.intents)
-  return intents_.Add();
+inline ::cockroach::roachpb::Span* Transaction::add_intent_spans() {
+  // @@protoc_insertion_point(field_add:cockroach.roachpb.Transaction.intent_spans)
+  return intent_spans_.Add();
 }
 inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span >&
-Transaction::intents() const {
-  // @@protoc_insertion_point(field_list:cockroach.roachpb.Transaction.intents)
-  return intents_;
+Transaction::intent_spans() const {
+  // @@protoc_insertion_point(field_list:cockroach.roachpb.Transaction.intent_spans)
+  return intent_spans_;
+}
+
+inline int Transaction::in_flight_writes_size() const {
+  return in_flight_writes_.size();
+}
+inline void Transaction::clear_in_flight_writes() {
+  in_flight_writes_.Clear();
+}
+inline ::cockroach::roachpb::SequencedWrite* Transaction::mutable_in_flight_writes(int index) {
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.Transaction.in_flight_writes)
+  return in_flight_writes_.Mutable(index);
+}
+inline ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite >*
+Transaction::mutable_in_flight_writes() {
+  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.Transaction.in_flight_writes)
+  return &in_flight_writes_;
+}
+inline const ::cockroach::roachpb::SequencedWrite& Transaction::in_flight_writes(int index) const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.Transaction.in_flight_writes)
+  return in_flight_writes_.Get(index);
+}
+inline ::cockroach::roachpb::SequencedWrite* Transaction::add_in_flight_writes() {
+  // @@protoc_insertion_point(field_add:cockroach.roachpb.Transaction.in_flight_writes)
+  return in_flight_writes_.Add();
+}
+inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite >&
+Transaction::in_flight_writes() const {
+  // @@protoc_insertion_point(field_list:cockroach.roachpb.Transaction.in_flight_writes)
+  return in_flight_writes_;
 }
 
 inline bool Transaction::has_epoch_zero_timestamp() const {
@@ -4273,33 +4543,62 @@ inline void TransactionRecord::set_allocated_orig_timestamp(::cockroach::util::h
   // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.TransactionRecord.orig_timestamp)
 }
 
-inline int TransactionRecord::intents_size() const {
-  return intents_.size();
+inline int TransactionRecord::intent_spans_size() const {
+  return intent_spans_.size();
 }
-inline void TransactionRecord::clear_intents() {
-  intents_.Clear();
+inline void TransactionRecord::clear_intent_spans() {
+  intent_spans_.Clear();
 }
-inline ::cockroach::roachpb::Span* TransactionRecord::mutable_intents(int index) {
-  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.TransactionRecord.intents)
-  return intents_.Mutable(index);
+inline ::cockroach::roachpb::Span* TransactionRecord::mutable_intent_spans(int index) {
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.TransactionRecord.intent_spans)
+  return intent_spans_.Mutable(index);
 }
 inline ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span >*
-TransactionRecord::mutable_intents() {
-  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.TransactionRecord.intents)
-  return &intents_;
+TransactionRecord::mutable_intent_spans() {
+  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.TransactionRecord.intent_spans)
+  return &intent_spans_;
 }
-inline const ::cockroach::roachpb::Span& TransactionRecord::intents(int index) const {
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.TransactionRecord.intents)
-  return intents_.Get(index);
+inline const ::cockroach::roachpb::Span& TransactionRecord::intent_spans(int index) const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.TransactionRecord.intent_spans)
+  return intent_spans_.Get(index);
 }
-inline ::cockroach::roachpb::Span* TransactionRecord::add_intents() {
-  // @@protoc_insertion_point(field_add:cockroach.roachpb.TransactionRecord.intents)
-  return intents_.Add();
+inline ::cockroach::roachpb::Span* TransactionRecord::add_intent_spans() {
+  // @@protoc_insertion_point(field_add:cockroach.roachpb.TransactionRecord.intent_spans)
+  return intent_spans_.Add();
 }
 inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span >&
-TransactionRecord::intents() const {
-  // @@protoc_insertion_point(field_list:cockroach.roachpb.TransactionRecord.intents)
-  return intents_;
+TransactionRecord::intent_spans() const {
+  // @@protoc_insertion_point(field_list:cockroach.roachpb.TransactionRecord.intent_spans)
+  return intent_spans_;
+}
+
+inline int TransactionRecord::in_flight_writes_size() const {
+  return in_flight_writes_.size();
+}
+inline void TransactionRecord::clear_in_flight_writes() {
+  in_flight_writes_.Clear();
+}
+inline ::cockroach::roachpb::SequencedWrite* TransactionRecord::mutable_in_flight_writes(int index) {
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.TransactionRecord.in_flight_writes)
+  return in_flight_writes_.Mutable(index);
+}
+inline ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite >*
+TransactionRecord::mutable_in_flight_writes() {
+  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.TransactionRecord.in_flight_writes)
+  return &in_flight_writes_;
+}
+inline const ::cockroach::roachpb::SequencedWrite& TransactionRecord::in_flight_writes(int index) const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.TransactionRecord.in_flight_writes)
+  return in_flight_writes_.Get(index);
+}
+inline ::cockroach::roachpb::SequencedWrite* TransactionRecord::add_in_flight_writes() {
+  // @@protoc_insertion_point(field_add:cockroach.roachpb.TransactionRecord.in_flight_writes)
+  return in_flight_writes_.Add();
+}
+inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite >&
+TransactionRecord::in_flight_writes() const {
+  // @@protoc_insertion_point(field_list:cockroach.roachpb.TransactionRecord.in_flight_writes)
+  return in_flight_writes_;
 }
 
 // -------------------------------------------------------------------
@@ -4476,7 +4775,6 @@ inline void SequencedWrite::set_allocated_key(::std::string* key) {
   // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.SequencedWrite.key)
 }
 
-// int32 sequence = 2;
 inline void SequencedWrite::clear_sequence() {
   sequence_ = 0;
 }
@@ -4859,7 +5157,6 @@ inline void AbortSpanEntry::set_allocated_timestamp(::cockroach::util::hlc::Time
   // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.AbortSpanEntry.timestamp)
 }
 
-// int32 priority = 3;
 inline void AbortSpanEntry::clear_priority() {
   priority_ = 0;
 }
@@ -4928,35 +5225,6 @@ inline void TxnCoordMeta::set_allocated_txn(::cockroach::roachpb::Transaction* t
   }
   txn_ = txn;
   // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.TxnCoordMeta.txn)
-}
-
-inline int TxnCoordMeta::intents_size() const {
-  return intents_.size();
-}
-inline void TxnCoordMeta::clear_intents() {
-  intents_.Clear();
-}
-inline ::cockroach::roachpb::Span* TxnCoordMeta::mutable_intents(int index) {
-  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.TxnCoordMeta.intents)
-  return intents_.Mutable(index);
-}
-inline ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span >*
-TxnCoordMeta::mutable_intents() {
-  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.TxnCoordMeta.intents)
-  return &intents_;
-}
-inline const ::cockroach::roachpb::Span& TxnCoordMeta::intents(int index) const {
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.TxnCoordMeta.intents)
-  return intents_.Get(index);
-}
-inline ::cockroach::roachpb::Span* TxnCoordMeta::add_intents() {
-  // @@protoc_insertion_point(field_add:cockroach.roachpb.TxnCoordMeta.intents)
-  return intents_.Add();
-}
-inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Span >&
-TxnCoordMeta::intents() const {
-  // @@protoc_insertion_point(field_list:cockroach.roachpb.TxnCoordMeta.intents)
-  return intents_;
 }
 
 // int32 command_count = 3;
@@ -5045,38 +5313,40 @@ inline void TxnCoordMeta::set_refresh_invalid(bool value) {
   // @@protoc_insertion_point(field_set:cockroach.roachpb.TxnCoordMeta.refresh_invalid)
 }
 
-inline int TxnCoordMeta::outstanding_writes_size() const {
-  return outstanding_writes_.size();
+inline int TxnCoordMeta::in_flight_writes_size() const {
+  return in_flight_writes_.size();
 }
-inline void TxnCoordMeta::clear_outstanding_writes() {
-  outstanding_writes_.Clear();
+inline void TxnCoordMeta::clear_in_flight_writes() {
+  in_flight_writes_.Clear();
 }
-inline ::cockroach::roachpb::SequencedWrite* TxnCoordMeta::mutable_outstanding_writes(int index) {
-  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.TxnCoordMeta.outstanding_writes)
-  return outstanding_writes_.Mutable(index);
+inline ::cockroach::roachpb::SequencedWrite* TxnCoordMeta::mutable_in_flight_writes(int index) {
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.TxnCoordMeta.in_flight_writes)
+  return in_flight_writes_.Mutable(index);
 }
 inline ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite >*
-TxnCoordMeta::mutable_outstanding_writes() {
-  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.TxnCoordMeta.outstanding_writes)
-  return &outstanding_writes_;
+TxnCoordMeta::mutable_in_flight_writes() {
+  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.TxnCoordMeta.in_flight_writes)
+  return &in_flight_writes_;
 }
-inline const ::cockroach::roachpb::SequencedWrite& TxnCoordMeta::outstanding_writes(int index) const {
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.TxnCoordMeta.outstanding_writes)
-  return outstanding_writes_.Get(index);
+inline const ::cockroach::roachpb::SequencedWrite& TxnCoordMeta::in_flight_writes(int index) const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.TxnCoordMeta.in_flight_writes)
+  return in_flight_writes_.Get(index);
 }
-inline ::cockroach::roachpb::SequencedWrite* TxnCoordMeta::add_outstanding_writes() {
-  // @@protoc_insertion_point(field_add:cockroach.roachpb.TxnCoordMeta.outstanding_writes)
-  return outstanding_writes_.Add();
+inline ::cockroach::roachpb::SequencedWrite* TxnCoordMeta::add_in_flight_writes() {
+  // @@protoc_insertion_point(field_add:cockroach.roachpb.TxnCoordMeta.in_flight_writes)
+  return in_flight_writes_.Add();
 }
 inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite >&
-TxnCoordMeta::outstanding_writes() const {
-  // @@protoc_insertion_point(field_list:cockroach.roachpb.TxnCoordMeta.outstanding_writes)
-  return outstanding_writes_;
+TxnCoordMeta::in_flight_writes() const {
+  // @@protoc_insertion_point(field_list:cockroach.roachpb.TxnCoordMeta.in_flight_writes)
+  return in_flight_writes_;
 }
 
 #ifdef __GNUC__
   #pragma GCC diagnostic pop
 #endif  // __GNUC__
+// -------------------------------------------------------------------
+
 // -------------------------------------------------------------------
 
 // -------------------------------------------------------------------

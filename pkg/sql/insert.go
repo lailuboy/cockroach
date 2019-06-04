@@ -24,10 +24,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
 )
 
 var insertNodePool = sync.Pool{
@@ -61,7 +60,7 @@ var _ autoCommitNode = &insertNode{}
 //   Notes: postgres requires INSERT. No "on duplicate key update" option.
 //          mysql requires INSERT. Also requires UPDATE on "ON DUPLICATE KEY UPDATE".
 func (p *planner) Insert(
-	ctx context.Context, n *tree.Insert, desiredTypes []types.T,
+	ctx context.Context, n *tree.Insert, desiredTypes []*types.T,
 ) (result planNode, resultErr error) {
 	// CTE analysis.
 	resetter, err := p.initWith(ctx, n.With)
@@ -92,7 +91,7 @@ func (p *planner) Insert(
 	}
 
 	// Find which table we're working on, check the permissions.
-	desc, err := ResolveExistingObject(ctx, p, tn, true /*required*/, requireTableDesc)
+	desc, err := ResolveExistingObject(ctx, p, tn, true /*required*/, ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -196,9 +195,9 @@ func (p *planner) Insert(
 	// required types from the inserted columns.
 
 	// Analyze the expressions for column information and typing.
-	requiredTypesFromSelect := make([]types.T, len(insertCols))
-	for i, col := range insertCols {
-		requiredTypesFromSelect[i] = col.Type.ToDatumType()
+	requiredTypesFromSelect := make([]*types.T, len(insertCols))
+	for i := range insertCols {
+		requiredTypesFromSelect[i] = &insertCols[i].Type
 	}
 
 	// Extract the AST for the data source.
@@ -266,8 +265,7 @@ func (p *planner) Insert(
 	// While this may be OK if the results were geared toward a client,
 	// for INSERT/UPSERT we must have a direct match.
 	for i, srcCol := range srcCols {
-		if err := sqlbase.CheckDatumTypeFitsColumnType(
-			insertCols[i], srcCol.Typ, &p.semaCtx.Placeholders); err != nil {
+		if err := sqlbase.CheckDatumTypeFitsColumnType(&insertCols[i], srcCol.Typ); err != nil {
 			return nil, err
 		}
 	}
@@ -418,8 +416,9 @@ func (n *insertNode) startExec(params runParams) error {
 		}
 
 		colIDToRetIndex := make(map[sqlbase.ColumnID]int)
-		for i, col := range n.run.ti.tableDesc().Columns {
-			colIDToRetIndex[col.ID] = i
+		cols := n.run.ti.tableDesc().Columns
+		for i := range cols {
+			colIDToRetIndex[cols[i].ID] = i
 		}
 
 		n.run.rowIdxToRetIdx = make([]int, len(n.run.insertCols))
@@ -513,11 +512,7 @@ func (n *insertNode) BatchedNext(params runParams) (bool, error) {
 	}
 
 	// Possibly initiate a run of CREATE STATISTICS.
-	params.ExecCfg().StatsRefresher.NotifyMutation(
-		&params.EvalContext().Settings.SV,
-		n.run.ti.tableDesc().ID,
-		n.run.rowCount,
-	)
+	params.ExecCfg().StatsRefresher.NotifyMutation(n.run.ti.tableDesc().ID, n.run.rowCount)
 
 	return n.run.rowCount > 0, nil
 }
@@ -533,7 +528,7 @@ func (n *insertNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 		n.run.computeExprs,
 		n.run.insertCols,
 		n.run.computedCols,
-		*params.EvalContext(),
+		params.EvalContext().Copy(),
 		n.run.ti.tableDesc(),
 		sourceVals,
 		&n.run.iVarContainerForComputedCols,
@@ -628,7 +623,7 @@ func GenerateInsertRow(
 	computeExprs []tree.TypedExpr,
 	insertCols []sqlbase.ColumnDescriptor,
 	computedCols []sqlbase.ColumnDescriptor,
-	evalCtx tree.EvalContext,
+	evalCtx *tree.EvalContext,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	rowVals tree.Datums,
 	rowContainerForComputedVals *sqlbase.RowIndexedVarContainer,
@@ -649,7 +644,7 @@ func GenerateInsertRow(
 				rowVals[i] = tree.DNull
 				continue
 			}
-			d, err := defaultExprs[i].Eval(&evalCtx)
+			d, err := defaultExprs[i].Eval(evalCtx)
 			if err != nil {
 				return nil, err
 			}
@@ -666,15 +661,30 @@ func GenerateInsertRow(
 			// since we disallow computed columns from referencing other computed
 			// columns, all the columns which could possibly be referenced *are*
 			// available.
-			d, err := computeExprs[i].Eval(&evalCtx)
+			d, err := computeExprs[i].Eval(evalCtx)
 			if err != nil {
-				return nil, errors.Wrapf(err,
+				return nil, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
 					"computed column %s", tree.ErrString((*tree.Name)(&computedCols[i].Name)))
 			}
 			rowVals[rowContainerForComputedVals.Mapping[computedCols[i].ID]] = d
 		}
 		evalCtx.PopIVarContainer()
 	}
+
+	// Verify the column constraints.
+	//
+	// We would really like to use enforceLocalColumnConstraints() here,
+	// but this is not possible because of some brain damage in the
+	// Insert() constructor, which causes insertCols to contain
+	// duplicate columns descriptors: computed columns are listed twice,
+	// one will receive a NULL value and one will receive a comptued
+	// value during execution. It "works out in the end" because the
+	// latter (non-NULL) value overwrites the earlier, but
+	// enforceLocalColumnConstraints() does not know how to reason about
+	// this.
+	//
+	// In the end it does not matter much, this code is going away in
+	// favor of the (simpler, correct) code in the CBO.
 
 	// Check to see if NULL is being inserted into any non-nullable column.
 	for _, col := range tableDesc.WritableColumns() {
@@ -687,12 +697,13 @@ func GenerateInsertRow(
 
 	// Ensure that the values honor the specified column widths.
 	for i := 0; i < len(insertCols); i++ {
-		outVal, err := sqlbase.LimitValueWidth(insertCols[i].Type, rowVals[i], &insertCols[i].Name)
+		outVal, err := sqlbase.LimitValueWidth(&insertCols[i].Type, rowVals[i], &insertCols[i].Name)
 		if err != nil {
 			return nil, err
 		}
 		rowVals[i] = outVal
 	}
+
 	return rowVals, nil
 }
 
@@ -721,7 +732,7 @@ func (p *planner) processColumns(
 	cols := make([]sqlbase.ColumnDescriptor, len(nameList))
 	colIDSet := make(map[sqlbase.ColumnID]struct{}, len(nameList))
 	for i, colName := range nameList {
-		var col sqlbase.ColumnDescriptor
+		var col *sqlbase.ColumnDescriptor
 		var err error
 		if allowMutations {
 			col, _, err = tableDesc.FindColumnByName(colName)
@@ -733,10 +744,11 @@ func (p *planner) processColumns(
 		}
 
 		if _, ok := colIDSet[col.ID]; ok {
-			return nil, fmt.Errorf("multiple assignments to the same column %q", &nameList[i])
+			return nil, pgerror.Newf(pgerror.CodeSyntaxError,
+				"multiple assignments to the same column %q", &nameList[i])
 		}
 		colIDSet[col.ID] = struct{}{}
-		cols[i] = col
+		cols[i] = *col
 	}
 
 	return cols, nil
@@ -761,7 +773,7 @@ func extractInsertSource(
 				// (WITH ... (WITH ...))
 				// Currently we are unable to nest the scopes inside ParenSelect so we
 				// must refuse the syntax so that the query does not get invalid results.
-				return nil, nil, pgerror.UnimplementedWithIssueError(24303,
+				return nil, nil, pgerror.UnimplementedWithIssue(24303,
 					"multiple WITH clauses in parentheses")
 			}
 			with = s.Select.With
@@ -896,7 +908,7 @@ func checkNumExprs(isUpsert bool, numExprs, numCols int, specifiedTargets bool) 
 		if isUpsert {
 			kw = "UPSERT"
 		}
-		return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+		return pgerror.Newf(pgerror.CodeSyntaxError,
 			"%s has more %s than %s, %d expressions for %d targets",
 			kw, more, less, numExprs, numCols)
 	}

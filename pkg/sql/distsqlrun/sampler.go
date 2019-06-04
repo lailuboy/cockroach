@@ -16,14 +16,17 @@ package distsqlrun
 
 import (
 	"context"
+	"encoding/binary"
 	"time"
 
 	"github.com/axiomhq/hyperloglog"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -44,12 +47,12 @@ type sketchInfo struct {
 type samplerProcessor struct {
 	ProcessorBase
 
-	flowCtx      *FlowCtx
-	input        RowSource
-	sr           stats.SampleReservoir
-	sketches     []sketchInfo
-	outTypes     []sqlbase.ColumnType
-	fractionIdle float64
+	flowCtx         *FlowCtx
+	input           RowSource
+	sr              stats.SampleReservoir
+	sketches        []sketchInfo
+	outTypes        []types.T
+	maxFractionIdle float64
 	// Output column indices for special columns.
 	rankCol      int
 	sketchIdxCol int
@@ -63,8 +66,8 @@ var _ Processor = &samplerProcessor{}
 const samplerProcName = "sampler"
 
 // SamplerProgressInterval corresponds to the number of input rows after which
-// point the sampler will report progress by pushing a metadata record.
-// It is mutable for testing.
+// the sampler will report progress by pushing a metadata record.  It is mutable
+// for testing.
 var SamplerProgressInterval = 10000
 
 var supportedSketchTypes = map[distsqlpb.SketchType]struct{}{
@@ -72,6 +75,16 @@ var supportedSketchTypes = map[distsqlpb.SketchType]struct{}{
 	// (which avoids the extra complexity until we actually have multiple types).
 	distsqlpb.SketchType_HLL_PLUS_PLUS_V1: {},
 }
+
+// maxIdleSleepTime is the maximum amount of time we sleep for throttling
+// (we sleep once every SamplerProgressInterval rows).
+const maxIdleSleepTime = 10 * time.Second
+
+// At 25% average CPU usage we start throttling automatic stats.
+const cpuUsageMinThrottle = 0.25
+
+// At 75% average CPU usage we reach maximum throttling of automatic stats.
+const cpuUsageMaxThrottle = 0.75
 
 func newSamplerProcessor(
 	flowCtx *FlowCtx,
@@ -86,15 +99,15 @@ func newSamplerProcessor(
 			return nil, errors.Errorf("unsupported sketch type %s", s.SketchType)
 		}
 		if len(s.Columns) != 1 {
-			return nil, errors.Errorf("multi-column sketches not supported yet")
+			return nil, pgerror.UnimplementedWithIssue(34422, "multi-column statistics are not supported yet.")
 		}
 	}
 
 	s := &samplerProcessor{
-		flowCtx:      flowCtx,
-		input:        input,
-		sketches:     make([]sketchInfo, len(spec.Sketches)),
-		fractionIdle: spec.FractionIdle,
+		flowCtx:         flowCtx,
+		input:           input,
+		sketches:        make([]sketchInfo, len(spec.Sketches)),
+		maxFractionIdle: spec.MaxFractionIdle,
 	}
 	for i := range spec.Sketches {
 		s.sketches[i] = sketchInfo{
@@ -108,31 +121,31 @@ func newSamplerProcessor(
 	s.sr.Init(int(spec.SampleSize), input.OutputTypes())
 
 	inTypes := input.OutputTypes()
-	outTypes := make([]sqlbase.ColumnType, 0, len(inTypes)+5)
+	outTypes := make([]types.T, 0, len(inTypes)+5)
 
 	// First columns are the same as the input.
 	outTypes = append(outTypes, inTypes...)
 
 	// An INT column for the rank of each row.
 	s.rankCol = len(outTypes)
-	outTypes = append(outTypes, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT})
+	outTypes = append(outTypes, *types.Int)
 
 	// An INT column indicating the sketch index.
 	s.sketchIdxCol = len(outTypes)
-	outTypes = append(outTypes, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT})
+	outTypes = append(outTypes, *types.Int)
 
 	// An INT column indicating the number of rows processed.
 	s.numRowsCol = len(outTypes)
-	outTypes = append(outTypes, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT})
+	outTypes = append(outTypes, *types.Int)
 
 	// An INT column indicating the number of rows that have a NULL in any sketch
 	// column.
 	s.numNullsCol = len(outTypes)
-	outTypes = append(outTypes, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT})
+	outTypes = append(outTypes, *types.Int)
 
 	// A BYTES column with the sketch data.
 	s.sketchCol = len(outTypes)
-	outTypes = append(outTypes, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BYTES})
+	outTypes = append(outTypes, *types.Bytes)
 	s.outTypes = outTypes
 
 	if err := s.Init(
@@ -165,6 +178,11 @@ func (s *samplerProcessor) Run(ctx context.Context) {
 	}
 }
 
+// TestingSamplerSleep introduces a sleep inside the sampler, every
+// <samplerProgressInterval>. Used to simulate a heavily throttled
+// run for testing.
+var TestingSamplerSleep time.Duration
+
 func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err error) {
 	rng, _ := randutil.NewPseudoRand()
 	var da sqlbase.DatumAlloc
@@ -186,44 +204,63 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 
 		rowCount++
 		if rowCount%SamplerProgressInterval == 0 {
-			// Send a metadata record to check that the consumer is still alive.
-			// We perform this check periodically in case the CREATE STATISTICS job
-			// was paused or canceled.
-			// TODO(rytaft): We could have more intermediate measures of progress if
-			// we were to run this at the kv layer where we know how many spans have
-			// been processed out of the total. For now, report 0 progress until all
-			// rows have been processed.
-			meta := &ProducerMetadata{
-				Progress: &jobspb.Progress{Progress: &jobspb.Progress_FractionCompleted{
-					FractionCompleted: 0,
-				}},
-			}
+			// Send a metadata record to check that the consumer is still alive and
+			// report number of rows processed since the last update.
+			meta := &distsqlpb.ProducerMetadata{SamplerProgress: &distsqlpb.RemoteProducerMetadata_SamplerProgress{
+				RowsProcessed: uint64(SamplerProgressInterval),
+			}}
 			if !emitHelper(ctx, &s.out, nil /* row */, meta, s.pushTrailingMeta, s.input) {
 				return true, nil
 			}
 
-			if s.fractionIdle > 0 {
-				elapsed := timeutil.Now().Sub(lastWakeupTime)
-				// Throttle the processor according to s.fractionIdle.
-				// Wait time is calculated as follows:
-				//
-				//       fraction_idle = t_wait / (t_run + t_wait)
-				//  ==>  t_wait = t_run * fraction_idle / (1 - fraction_idle)
-				//
-				timer := time.NewTimer(
-					time.Duration(float64(elapsed) * s.fractionIdle / (1 - s.fractionIdle)),
-				)
-				defer timer.Stop()
-				select {
-				case <-timer.C:
-					break
-				case <-s.flowCtx.Stopper().ShouldStop():
-					break
+			if s.maxFractionIdle > 0 {
+				// Look at CRDB's average CPU usage in the last 10 seconds:
+				//  - if it is lower than cpuUsageMinThrottle, we do not throttle;
+				//  - if it is higher than cpuUsageMaxThrottle, we throttle all the way;
+				//  - in-between, we scale the idle time proportionally.
+				usage := s.flowCtx.RuntimeStats.GetCPUCombinedPercentNorm()
+
+				if usage > cpuUsageMinThrottle {
+					fractionIdle := s.maxFractionIdle
+					if usage < cpuUsageMaxThrottle {
+						fractionIdle *= (usage - cpuUsageMinThrottle) /
+							(cpuUsageMaxThrottle - cpuUsageMinThrottle)
+					}
+					if log.V(1) {
+						log.Infof(
+							ctx, "throttling to fraction idle %.2f (based on usage %.2f)", fractionIdle, usage,
+						)
+					}
+
+					elapsed := timeutil.Now().Sub(lastWakeupTime)
+					// Throttle the processor according to fractionIdle.
+					// Wait time is calculated as follows:
+					//
+					//       fraction_idle = t_wait / (t_run + t_wait)
+					//  ==>  t_wait = t_run * fraction_idle / (1 - fraction_idle)
+					//
+					wait := time.Duration(float64(elapsed) * fractionIdle / (1 - fractionIdle))
+					if wait > maxIdleSleepTime {
+						wait = maxIdleSleepTime
+					}
+					timer := time.NewTimer(wait)
+					defer timer.Stop()
+					select {
+					case <-timer.C:
+						break
+					case <-s.flowCtx.Stopper().ShouldStop():
+						break
+					}
 				}
 				lastWakeupTime = timeutil.Now()
 			}
+
+			if TestingSamplerSleep != 0 {
+				time.Sleep(TestingSamplerSleep)
+			}
 		}
 
+		var intbuf [8]byte
 		for i := range s.sketches {
 			// TODO(radu): for multi-column sketches, we will need to do this for all
 			// columns.
@@ -233,14 +270,35 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 				s.sketches[i].numNulls++
 				continue
 			}
-			// We need to use a KEY encoding because equal values should have the same
-			// encoding.
-			// TODO(radu): a fast path for simple columns (like integer)?
-			buf, err = row[col].Encode(&s.outTypes[col], &da, sqlbase.DatumEncoding_ASCENDING_KEY, buf[:0])
-			if err != nil {
-				return false, err
+			if s.outTypes[col].Family() == types.IntFamily {
+				// Fast path for integers.
+				// TODO(radu): make this more general.
+				val, err := row[col].GetInt()
+				if err != nil {
+					return false, err
+				}
+
+				// Note: this encoding is not identical with the one in the general path
+				// below, but it achieves the same thing (we want equal integers to
+				// encode to equal []bytes). The only caveat is that all samplers must
+				// use the same encodings, so changes will require a new SketchType to
+				// avoid problems during upgrade.
+				//
+				// We could use a more efficient hash function and use InsertHash, but
+				// it must be a very good hash function (HLL expects the hash values to
+				// be uniformly distributed in the 2^64 range). Experiments (on tpcc
+				// order_line) with simplistic functions yielded bad results.
+				binary.LittleEndian.PutUint64(intbuf[:], uint64(val))
+				s.sketches[i].sketch.Insert(intbuf[:])
+			} else {
+				// We need to use a KEY encoding because equal values should have the same
+				// encoding.
+				buf, err = row[col].Encode(&s.outTypes[col], &da, sqlbase.DatumEncoding_ASCENDING_KEY, buf[:0])
+				if err != nil {
+					return false, err
+				}
+				s.sketches[i].sketch.Insert(buf)
 			}
-			s.sketches[i].sketch.Insert(buf)
 		}
 
 		// Use Int63 so we don't have headaches converting to DInt.
@@ -252,7 +310,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 
 	outRow := make(sqlbase.EncDatumRow, len(s.outTypes))
 	for i := range outRow {
-		outRow[i] = sqlbase.DatumToEncDatum(s.outTypes[i], tree.DNull)
+		outRow[i] = sqlbase.DatumToEncDatum(&s.outTypes[i], tree.DNull)
 	}
 	// Emit the sampled rows.
 	for _, sample := range s.sr.Get() {
@@ -267,7 +325,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 
 	// Emit the sketch rows.
 	for i := range outRow {
-		outRow[i] = sqlbase.DatumToEncDatum(s.outTypes[i], tree.DNull)
+		outRow[i] = sqlbase.DatumToEncDatum(&s.outTypes[i], tree.DNull)
 	}
 
 	for i, si := range s.sketches {
@@ -285,11 +343,9 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 	}
 
 	// Send one last progress update to the consumer.
-	meta := &ProducerMetadata{
-		Progress: &jobspb.Progress{Progress: &jobspb.Progress_FractionCompleted{
-			FractionCompleted: 1,
-		}},
-	}
+	meta := &distsqlpb.ProducerMetadata{SamplerProgress: &distsqlpb.RemoteProducerMetadata_SamplerProgress{
+		RowsProcessed: uint64(rowCount % SamplerProgressInterval),
+	}}
 	if !emitHelper(ctx, &s.out, nil /* row */, meta, s.pushTrailingMeta, s.input) {
 		return true, nil
 	}

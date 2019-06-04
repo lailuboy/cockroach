@@ -14,12 +14,12 @@
 
 package tree
 
-import "github.com/cockroachdb/cockroach/pkg/sql/coltypes"
+import "github.com/cockroachdb/cockroach/pkg/sql/types"
 
 // AlterTable represents an ALTER TABLE statement.
 type AlterTable struct {
 	IfExists bool
-	Table    TableName
+	Table    *UnresolvedObjectName
 	Cmds     AlterTableCmds
 }
 
@@ -29,7 +29,7 @@ func (node *AlterTable) Format(ctx *FmtCtx) {
 	if node.IfExists {
 		ctx.WriteString("IF EXISTS ")
 	}
-	ctx.FormatNode(&node.Table)
+	ctx.FormatNode(node.Table)
 	ctx.FormatNode(&node.Cmds)
 }
 
@@ -61,6 +61,9 @@ func (*AlterTableDropColumn) alterTableCmd()         {}
 func (*AlterTableDropConstraint) alterTableCmd()     {}
 func (*AlterTableDropNotNull) alterTableCmd()        {}
 func (*AlterTableDropStored) alterTableCmd()         {}
+func (*AlterTableRenameColumn) alterTableCmd()       {}
+func (*AlterTableRenameConstraint) alterTableCmd()   {}
+func (*AlterTableRenameTable) alterTableCmd()        {}
 func (*AlterTableSetAudit) alterTableCmd()           {}
 func (*AlterTableSetDefault) alterTableCmd()         {}
 func (*AlterTableValidateConstraint) alterTableCmd() {}
@@ -74,6 +77,9 @@ var _ AlterTableCmd = &AlterTableDropColumn{}
 var _ AlterTableCmd = &AlterTableDropConstraint{}
 var _ AlterTableCmd = &AlterTableDropNotNull{}
 var _ AlterTableCmd = &AlterTableDropStored{}
+var _ AlterTableCmd = &AlterTableRenameColumn{}
+var _ AlterTableCmd = &AlterTableRenameConstraint{}
+var _ AlterTableCmd = &AlterTableRenameTable{}
 var _ AlterTableCmd = &AlterTableSetAudit{}
 var _ AlterTableCmd = &AlterTableSetDefault{}
 var _ AlterTableCmd = &AlterTableValidateConstraint{}
@@ -176,7 +182,7 @@ func (node *AlterTableAddConstraint) Format(ctx *FmtCtx) {
 type AlterTableAlterColumnType struct {
 	Collation string
 	Column    Name
-	ToType    coltypes.T
+	ToType    *types.T
 	Using     Expr
 }
 
@@ -185,7 +191,7 @@ func (node *AlterTableAlterColumnType) Format(ctx *FmtCtx) {
 	ctx.WriteString(" ALTER COLUMN ")
 	ctx.FormatNode(&node.Column)
 	ctx.WriteString(" SET DATA TYPE ")
-	node.ToType.Format(&ctx.Buffer, ctx.flags.EncodeFlags())
+	ctx.WriteString(node.ToType.SQLString())
 	if len(node.Collation) > 0 {
 		ctx.WriteString(" COLLATE ")
 		ctx.WriteString(node.Collation)
@@ -248,6 +254,45 @@ type AlterTableValidateConstraint struct {
 func (node *AlterTableValidateConstraint) Format(ctx *FmtCtx) {
 	ctx.WriteString(" VALIDATE CONSTRAINT ")
 	ctx.FormatNode(&node.Constraint)
+}
+
+// AlterTableRenameTable represents an ALTE RTABLE RENAME TO command.
+type AlterTableRenameTable struct {
+	NewName TableName
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterTableRenameTable) Format(ctx *FmtCtx) {
+	ctx.WriteString(" RENAME TO ")
+	ctx.FormatNode(&node.NewName)
+}
+
+// AlterTableRenameColumn represents an ALTER TABLE RENAME [COLUMN] command.
+type AlterTableRenameColumn struct {
+	Column  Name
+	NewName Name
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterTableRenameColumn) Format(ctx *FmtCtx) {
+	ctx.WriteString(" RENAME COLUMN ")
+	ctx.FormatNode(&node.Column)
+	ctx.WriteString(" TO ")
+	ctx.FormatNode(&node.NewName)
+}
+
+// AlterTableRenameConstraint represents an ALTER TABLE RENAME CONSTRAINT command.
+type AlterTableRenameConstraint struct {
+	Constraint Name
+	NewName    Name
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterTableRenameConstraint) Format(ctx *FmtCtx) {
+	ctx.WriteString(" RENAME CONSTRAINT ")
+	ctx.FormatNode(&node.Constraint)
+	ctx.WriteString(" TO ")
+	ctx.FormatNode(&node.NewName)
 }
 
 // AlterTableSetDefault represents an ALTER COLUMN SET DEFAULT

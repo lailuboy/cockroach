@@ -21,10 +21,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 )
@@ -212,7 +212,7 @@ func ResolveZoneSpecifier(
 
 	tn := &zs.TableOrIndex.Table
 	if tn.SchemaName != tree.PublicSchemaName {
-		return 0, pgerror.NewErrorf(pgerror.CodeReservedNameError,
+		return 0, pgerror.Newf(pgerror.CodeReservedNameError,
 			"only schema \"public\" is supported: %q", tree.ErrString(tn))
 	}
 	databaseID, err := resolveName(keys.RootNamespaceID, tn.Catalog())
@@ -267,44 +267,6 @@ func (c *Constraint) FromString(short string) error {
 // minRangeMaxBytes is the minimum value for range max bytes.
 const minRangeMaxBytes = 64 << 10 // 64 KB
 
-// defaultZoneConfig is the default zone configuration used when no custom
-// config has been specified.
-var defaultZoneConfig = &ZoneConfig{
-	NumReplicas:   proto.Int32(3),
-	RangeMinBytes: proto.Int64(16 << 20), // 16 MB
-	RangeMaxBytes: proto.Int64(64 << 20), // 64 MB
-	GC: &GCPolicy{
-		// Use 25 hours instead of the previous 24 to make users successful by
-		// default. Users desiring to take incremental backups every 24h may
-		// incorrectly assume that the previous default 24h was sufficient to do
-		// that. But the equation for incremental backups is:
-		// 	GC TTLSeconds >= (desired backup interval) + (time to perform incremental backup)
-		// We think most new users' incremental backups will complete within an
-		// hour, and larger clusters will have more experienced operators and will
-		// understand how to change these settings if needed.
-		TTLSeconds: 25 * 60 * 60,
-	},
-}
-
-// defaultSystemZoneConfig is the default zone configuration used when no custom
-// config has been specified for system ranges.
-var defaultSystemZoneConfig = &ZoneConfig{
-	NumReplicas:   proto.Int32(5),
-	RangeMinBytes: proto.Int64(16 << 20), // 16 MB
-	RangeMaxBytes: proto.Int64(64 << 20), // 64 MB
-	GC: &GCPolicy{
-		// Use 25 hours instead of the previous 24 to make users successful by
-		// default. Users desiring to take incremental backups every 24h may
-		// incorrectly assume that the previous default 24h was sufficient to do
-		// that. But the equation for incremental backups is:
-		// 	GC TTLSeconds >= (desired backup interval) + (time to perform incremental backup)
-		// We think most new users' incremental backups will complete within an
-		// hour, and larger clusters will have more experienced operators and will
-		// understand how to change these settings if needed.
-		TTLSeconds: 25 * 60 * 60,
-	},
-}
-
 // NewZoneConfig is the zone configuration used when no custom
 // config has been specified.
 func NewZoneConfig() *ZoneConfig {
@@ -330,54 +292,57 @@ func EmptyCompleteZoneConfig() *ZoneConfig {
 // DefaultZoneConfig is the default zone configuration used when no custom
 // config has been specified.
 func DefaultZoneConfig() ZoneConfig {
-	testingLock.Lock()
-	defer testingLock.Unlock()
-	return *protoutil.Clone(defaultZoneConfig).(*ZoneConfig)
+	return ZoneConfig{
+		NumReplicas:   proto.Int32(3),
+		RangeMinBytes: proto.Int64(16 << 20), // 16 MB
+		RangeMaxBytes: proto.Int64(64 << 20), // 64 MB
+		GC: &GCPolicy{
+			// Use 25 hours instead of the previous 24 to make users successful by
+			// default. Users desiring to take incremental backups every 24h may
+			// incorrectly assume that the previous default 24h was sufficient to do
+			// that. But the equation for incremental backups is:
+			// 	GC TTLSeconds >= (desired backup interval) + (time to perform incremental backup)
+			// We think most new users' incremental backups will complete within an
+			// hour, and larger clusters will have more experienced operators and will
+			// understand how to change these settings if needed.
+			TTLSeconds: 25 * 60 * 60,
+		},
+	}
 }
 
-// DefaultZoneConfigRef returns a reference to the default zone config.
+// DefaultZoneConfigRef is the default zone configuration used when no custom
+// config has been specified.
 func DefaultZoneConfigRef() *ZoneConfig {
-	testingLock.Lock()
-	defer testingLock.Unlock()
-	return defaultZoneConfig
+	zoneConfig := DefaultZoneConfig()
+	return &zoneConfig
 }
 
 // DefaultSystemZoneConfig is the default zone configuration used when no custom
 // config has been specified.
 func DefaultSystemZoneConfig() ZoneConfig {
-	testingLock.Lock()
-	defer testingLock.Unlock()
-	return *protoutil.Clone(defaultSystemZoneConfig).(*ZoneConfig)
-}
-
-// TestingSetDefaultZoneConfig is a testing-only function that changes the
-// default zone config and returns a function that reverts the change.
-func TestingSetDefaultZoneConfig(cfg ZoneConfig) func() {
-	testingLock.Lock()
-	oldConfig := defaultZoneConfig
-	defaultZoneConfig = &cfg
-	testingLock.Unlock()
-
-	return func() {
-		testingLock.Lock()
-		defaultZoneConfig = oldConfig
-		testingLock.Unlock()
+	return ZoneConfig{
+		NumReplicas:   proto.Int32(5),
+		RangeMinBytes: proto.Int64(16 << 20), // 16 MB
+		RangeMaxBytes: proto.Int64(64 << 20), // 64 MB
+		GC: &GCPolicy{
+			// Use 25 hours instead of the previous 24 to make users successful by
+			// default. Users desiring to take incremental backups every 24h may
+			// incorrectly assume that the previous default 24h was sufficient to do
+			// that. But the equation for incremental backups is:
+			// 	GC TTLSeconds >= (desired backup interval) + (time to perform incremental backup)
+			// We think most new users' incremental backups will complete within an
+			// hour, and larger clusters will have more experienced operators and will
+			// understand how to change these settings if needed.
+			TTLSeconds: 25 * 60 * 60,
+		},
 	}
 }
 
-// TestingSetDefaultSystemZoneConfig is a testing-only function that changes the
-// default zone config and returns a function that reverts the change.
-func TestingSetDefaultSystemZoneConfig(cfg ZoneConfig) func() {
-	testingLock.Lock()
-	oldConfig := defaultSystemZoneConfig
-	defaultSystemZoneConfig = &cfg
-	testingLock.Unlock()
-
-	return func() {
-		testingLock.Lock()
-		defaultSystemZoneConfig = oldConfig
-		testingLock.Unlock()
-	}
+// DefaultSystemZoneConfigRef is the default zone configuration used when no custom
+// config has been specified.
+func DefaultSystemZoneConfigRef() *ZoneConfig {
+	systemZoneConfig := DefaultSystemZoneConfig()
+	return &systemZoneConfig
 }
 
 // IsComplete returns whether all the fields are set.
@@ -504,7 +469,7 @@ func (z *ZoneConfig) Validate() error {
 }
 
 // InheritFromParent hydrates a zones missing fields from its parent.
-func (z *ZoneConfig) InheritFromParent(parent ZoneConfig) {
+func (z *ZoneConfig) InheritFromParent(parent *ZoneConfig) {
 	if z.NumReplicas == nil {
 		if parent.NumReplicas != nil {
 			z.NumReplicas = proto.Int32(*parent.NumReplicas)
@@ -725,4 +690,64 @@ func (z ZoneConfig) subzoneSplits() []roachpb.RKey {
 		// the maximum possible value.
 	}
 	return out
+}
+
+// ReplicaConstraintsCount is part of the cat.Zone interface.
+func (z *ZoneConfig) ReplicaConstraintsCount() int {
+	return len(z.Constraints)
+}
+
+// ReplicaConstraints is part of the cat.Zone interface.
+func (z *ZoneConfig) ReplicaConstraints(i int) cat.ReplicaConstraints {
+	return &z.Constraints[i]
+}
+
+// LeasePreferenceCount is part of the cat.Zone interface.
+func (z *ZoneConfig) LeasePreferenceCount() int {
+	return len(z.LeasePreferences)
+}
+
+// LeasePreference is part of the cat.Zone interface.
+func (z *ZoneConfig) LeasePreference(i int) cat.ConstraintSet {
+	return &z.LeasePreferences[i]
+}
+
+// ConstraintCount is part of the cat.LeasePreference interface.
+func (l *LeasePreference) ConstraintCount() int {
+	return len(l.Constraints)
+}
+
+// Constraint is part of the cat.LeasePreference interface.
+func (l *LeasePreference) Constraint(i int) cat.Constraint {
+	return &l.Constraints[i]
+}
+
+// ReplicaCount is part of the cat.ReplicaConstraints interface.
+func (c *Constraints) ReplicaCount() int32 {
+	return c.NumReplicas
+}
+
+// ConstraintCount is part of the cat.ReplicaConstraints interface.
+func (c *Constraints) ConstraintCount() int {
+	return len(c.Constraints)
+}
+
+// Constraint is part of the cat.ReplicaConstraints interface.
+func (c *Constraints) Constraint(i int) cat.Constraint {
+	return &c.Constraints[i]
+}
+
+// IsRequired is part of the cat.Constraint interface.
+func (c *Constraint) IsRequired() bool {
+	return c.Type == Constraint_REQUIRED
+}
+
+// GetKey is part of the cat.Constraint interface.
+func (c *Constraint) GetKey() string {
+	return c.Key
+}
+
+// GetValue is part of the cat.Constraint interface.
+func (c *Constraint) GetValue() string {
+	return c.Value
 }
