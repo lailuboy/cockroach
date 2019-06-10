@@ -1,16 +1,14 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package sqlsmith
 
@@ -151,13 +149,13 @@ func makeAddColumn(s *scope) (tree.Statement, bool) {
 		return nil, false
 	}
 	col.Nullable.Nullability = s.schema.randNullability()
-	if coin() {
+	if s.coin() {
 		col.DefaultExpr.Expr = &tree.ParenExpr{Expr: makeScalar(s, t, nil)}
-	} else if coin() {
+	} else if s.coin() {
 		col.Computed.Computed = true
 		col.Computed.Expr = &tree.ParenExpr{Expr: makeScalar(s, t, colRefs)}
 	}
-	for coin() {
+	for s.coin() {
 		col.CheckExprs = append(col.CheckExprs, tree.ColumnTableDefCheckExpr{
 			Expr: makeBoolExpr(s, colRefs),
 		})
@@ -198,7 +196,7 @@ func makeCreateIndex(s *scope) (tree.Statement, bool) {
 	}
 	var cols tree.IndexElemList
 	seen := map[tree.Name]bool{}
-	for len(cols) < 1 || coin() {
+	for len(cols) < 1 || s.coin() {
 		col := tableRef.Columns[s.schema.rnd.Intn(len(tableRef.Columns))]
 		if seen[col.Name] {
 			continue
@@ -210,7 +208,7 @@ func makeCreateIndex(s *scope) (tree.Statement, bool) {
 		})
 	}
 	var storing tree.NameList
-	for coin() {
+	for s.coin() {
 		col := tableRef.Columns[s.schema.rnd.Intn(len(tableRef.Columns))]
 		if seen[col.Name] {
 			continue
@@ -222,7 +220,7 @@ func makeCreateIndex(s *scope) (tree.Statement, bool) {
 	return &tree.CreateIndex{
 		Name:    s.schema.name("idx"),
 		Table:   *tableRef.TableName,
-		Unique:  coin(),
+		Unique:  s.coin(),
 		Columns: cols,
 		Storing: storing,
 	}, true

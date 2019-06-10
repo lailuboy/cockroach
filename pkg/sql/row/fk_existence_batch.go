@@ -1,16 +1,14 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package row
 
@@ -102,16 +100,13 @@ func (f *fkExistenceBatchChecker) runCheck(
 		case CheckInserts:
 			// If we're inserting, then there's a violation if the scan found nothing.
 			if fk.rf.kvEnd {
-				// TODO(knz): re-allocating a datum slice in every check
-				// is super inefficient and expensive. Factor this.
-				fkValues := make(tree.Datums, fk.prefixLen)
-
 				for valueIdx, colID := range fk.searchIdx.ColumnIDs[:fk.prefixLen] {
-					fkValues[valueIdx] = newRow[fk.ids[colID]]
+					fk.valuesScratch[valueIdx] = newRow[fk.ids[colID]]
 				}
 				return pgerror.Newf(pgerror.CodeForeignKeyViolationError,
 					"foreign key violation: value %s not found in %s@%s %s (txn=%s)",
-					fkValues, fk.searchTable.Name, fk.searchIdx.Name, fk.searchIdx.ColumnNames[:fk.prefixLen], f.txn.ID())
+					fk.valuesScratch, fk.searchTable.Name, fk.searchIdx.Name,
+					fk.searchIdx.ColumnNames[:fk.prefixLen], f.txn.ID())
 			}
 
 		case CheckDeletes:
@@ -123,16 +118,12 @@ func (f *fkExistenceBatchChecker) runCheck(
 						fk.mutatedIdx.ColumnNames[:fk.prefixLen], fk.searchTable.Name)
 				}
 
-				// TODO(knz): re-allocating a datum slice in every check
-				// is super inefficient and expensive. Factor this.
-				fkValues := make(tree.Datums, fk.prefixLen)
-
 				for valueIdx, colID := range fk.searchIdx.ColumnIDs[:fk.prefixLen] {
-					fkValues[valueIdx] = oldRow[fk.ids[colID]]
+					fk.valuesScratch[valueIdx] = oldRow[fk.ids[colID]]
 				}
 				return pgerror.Newf(pgerror.CodeForeignKeyViolationError,
 					"foreign key violation: values %v in columns %s referenced in table %q",
-					fkValues, fk.mutatedIdx.ColumnNames[:fk.prefixLen], fk.searchTable.Name)
+					fk.valuesScratch, fk.mutatedIdx.ColumnNames[:fk.prefixLen], fk.searchTable.Name)
 			}
 
 		default:

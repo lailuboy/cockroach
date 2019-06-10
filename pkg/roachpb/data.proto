@@ -1,16 +1,14 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 syntax = "proto3";
 package cockroach.roachpb;
@@ -196,11 +194,11 @@ message ModifiedSpanTrigger {
 // StickyBitTrigger indicates that the sticky bit of a range should be changed.
 // This trigger is used in two cases:
 // 1. Unsplitting a range. Note that unsplitting and merging are different
-//    operations. Unsplitting a range will only remove the sticky bit
-//    associated with the range.
+//    operations. Unsplitting a range will only update the expiration time
+//    associated with the range to hlc.Timestamp{}.
 // 2. Splitting at the start key of a range. In this case, no range is split but
-//    the sticky bit is still set, so we need to use this trigger instead of
-//    SplitTrigger.
+//    the sticky bit is might be updated, so we need to use this trigger instead
+//    of SplitTrigger.
 //
 // Note that the sticky_bit should always be set to the same timestamp used to
 // update the range descriptor and it's the client's responsibility that the
@@ -209,7 +207,7 @@ message StickyBitTrigger {
   option (gogoproto.equal) = true;
 
   // Set to nil to remove a RangeDescriptor's sticky bit.
-  util.hlc.Timestamp sticky_bit = 1;
+  util.hlc.Timestamp sticky_bit = 1 [(gogoproto.nullable) = false];
 }
 
 // InternalCommitTrigger encapsulates all of the internal-only commit triggers.

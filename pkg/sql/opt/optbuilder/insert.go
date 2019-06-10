@@ -1,16 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package optbuilder
 
@@ -90,11 +88,24 @@ func init() {
 //   3. Computed columns which will be updated when a conflict is detected and
 //      that are dependent on one or more updated columns.
 //
-// In addition, the insert and update column expressions are merged into a
-// single set of upsert column expressions that toggle between the insert and
-// update values depending on whether the canary column is null.
+// A LEFT OUTER JOIN associates each row to insert with the corresponding
+// existing row (#1 above). If the row does not exist, then the existing columns
+// will be null-extended, per the semantics of LEFT OUTER JOIN. This behavior
+// allows the execution engine to test whether a given insert row conflicts with
+// an existing row in the table. One of the existing columns that is declared as
+// NOT NULL in the table schema is designated as a "canary column". When the
+// canary column is null after the join step, then it must have been null-
+// extended by the LEFT OUTER JOIN. Therefore, there is no existing row, and no
+// conflict. If the canary column is not null, then there is an existing row,
+// and a conflict.
 //
-// For example, if this is the schema and INSERT..ON CONFLICT statement:
+// The canary column is used in CASE statements to toggle between the insert and
+// update values for each row. If there is no conflict, the insert value is
+// used. Otherwise, the update value is used (or the existing value if there is
+// no update value for that column).
+//
+// Putting it all together, if this is the schema and INSERT..ON CONFLICT
+// statement:
 //
 //   CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
 //   INSERT INTO abc VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b=10
@@ -111,6 +122,10 @@ func init() {
 //   FROM (VALUES (1, 2, NULL)) AS ins(ins_a, ins_b, ins_c)
 //   LEFT OUTER JOIN abc AS fetch(fetch_a, fetch_b, fetch_c)
 //   ON ins_a = fetch_a
+//
+// Here, the fetch_a column has been designated as the canary column, since it
+// is NOT NULL in the schema. It is used as the CASE condition to decide between
+// the insert and update values for each row.
 //
 // The CASE expressions will often prevent the unnecessary evaluation of the
 // update expression in the case where an insertion needs to occur. In addition,

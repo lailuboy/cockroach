@@ -465,7 +465,7 @@ show_csettings_stmt ::=
 	| 'SHOW' 'ALL' 'CLUSTER' 'SETTINGS'
 
 show_databases_stmt ::=
-	'SHOW' 'DATABASES'
+	'SHOW' 'DATABASES' with_comment
 
 show_grants_stmt ::=
 	'SHOW' 'GRANTS' opt_on_targets_roles for_grantee_clause
@@ -620,6 +620,7 @@ unreserved_keyword ::=
 	| 'EXPERIMENTAL_RANGES'
 	| 'EXPERIMENTAL_RELOCATE'
 	| 'EXPERIMENTAL_REPLICA'
+	| 'EXPIRATION'
 	| 'EXPLAIN'
 	| 'EXPORT'
 	| 'EXTENSION'
@@ -1228,9 +1229,11 @@ alter_onetable_stmt ::=
 
 alter_split_stmt ::=
 	'ALTER' 'TABLE' table_name 'SPLIT' 'AT' select_stmt
+	| 'ALTER' 'TABLE' table_name 'SPLIT' 'AT' select_stmt 'WITH' 'EXPIRATION' a_expr
 
 alter_unsplit_stmt ::=
 	'ALTER' 'TABLE' table_name 'UNSPLIT' 'AT' select_stmt
+	| 'ALTER' 'TABLE' table_name 'UNSPLIT' 'ALL'
 
 alter_scatter_stmt ::=
 	'ALTER' 'TABLE' table_name 'SCATTER'
@@ -1250,9 +1253,11 @@ alter_oneindex_stmt ::=
 
 alter_split_index_stmt ::=
 	'ALTER' 'INDEX' table_index_name 'SPLIT' 'AT' select_stmt
+	| 'ALTER' 'INDEX' table_index_name 'SPLIT' 'AT' select_stmt 'WITH' 'EXPIRATION' a_expr
 
 alter_unsplit_index_stmt ::=
 	'ALTER' 'INDEX' table_index_name 'UNSPLIT' 'AT' select_stmt
+	| 'ALTER' 'INDEX' table_index_name 'UNSPLIT' 'ALL'
 
 alter_scatter_index_stmt ::=
 	'ALTER' 'INDEX' table_index_name 'SCATTER'

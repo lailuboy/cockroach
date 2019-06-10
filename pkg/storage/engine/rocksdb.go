@@ -1,16 +1,14 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package engine
 
@@ -3188,6 +3186,49 @@ func unlockFile(lock C.DBFileLock) error {
 func MVCCScanDecodeKeyValue(repr []byte) (key MVCCKey, value []byte, orepr []byte, err error) {
 	k, ts, value, orepr, err := enginepb.ScanDecodeKeyValue(repr)
 	return MVCCKey{k, ts}, value, orepr, err
+}
+
+// ExportToSst exports changes to the keyrange [start.Key, end.Key) over the
+// interval (start.Timestamp, end.Timestamp]. Passing exportAllRevisions exports
+// every revision of a key for the interval, otherwise only the latest value
+// within the interval is exported. Deletions are included if all revisions are
+// requested or if the start.Timestamp is non-zero. Returns the bytes of an
+// SSTable containing the exported keys, the size of exported data, or an error.
+func ExportToSst(
+	ctx context.Context, e Reader, start, end MVCCKey, exportAllRevisions bool, io IterOptions,
+) ([]byte, int64, error) {
+
+	var cdbEngine *C.DBEngine
+	switch v := e.(type) {
+	case *RocksDB:
+		cdbEngine = v.rdb
+	case *rocksDBReadOnly:
+		cdbEngine = v.parent.rdb
+	default:
+		panic(errors.Errorf("Not a rocksdb or rocksdbReadOnly engine but a %T", e))
+	}
+
+	var data C.DBString
+	var entries C.int64_t
+	var dataSize C.int64_t
+	var intentErr C.DBString
+
+	err := statusToError(C.DBExportToSst(goToCKey(start), goToCKey(end), C.bool(exportAllRevisions),
+		goToCIterOptions(io), cdbEngine, &data, &entries, &dataSize, &intentErr))
+
+	if err != nil {
+		if err.Error() == "WriteIntentError" {
+			var e roachpb.WriteIntentError
+			if err := protoutil.Unmarshal(cStringToGoBytes(intentErr), &e); err != nil {
+				return nil, 0, errors.Wrap(err, "failed to decode write intent error")
+			}
+
+			return nil, 0, &e
+		}
+		return nil, 0, err
+	}
+
+	return cStringToGoBytes(data), int64(dataSize), nil
 }
 
 func notFoundErrOrDefault(err error) error {

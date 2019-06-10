@@ -1,16 +1,14 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package client
 
@@ -477,14 +475,18 @@ func (db *DB) AdminMerge(ctx context.Context, key interface{}) error {
 // #16008 for details, and #16344 for the tracking issue to clean this mess up
 // properly.
 //
-// When manual is true, the sticky bit associated with the split range is set.
-// Any ranges with the sticky bit set will be skipped by the merge queue when
-// scanning for potential ranges to merge.
+// expirationTime is the timestamp when the split expires and is eligible for
+// automatic merging by the merge queue. To specify that a split should
+// immediately be eligible for automatic merging, set expirationTime to
+// hlc.Timestamp{} (I.E. the zero timestamp). To specify that a split should
+// never be eligible, set expirationTime to hlc.MaxTimestamp.
 //
 // The keys can be either byte slices or a strings.
-func (db *DB) AdminSplit(ctx context.Context, spanKey, splitKey interface{}, manual bool) error {
+func (db *DB) AdminSplit(
+	ctx context.Context, spanKey, splitKey interface{}, expirationTime hlc.Timestamp,
+) error {
 	b := &Batch{}
-	b.adminSplit(spanKey, splitKey, manual)
+	b.adminSplit(spanKey, splitKey, expirationTime)
 	return getOneErr(db.Run(ctx, b), b)
 }
 

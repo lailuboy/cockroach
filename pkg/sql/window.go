@@ -1,16 +1,14 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package sql
 
@@ -295,12 +293,13 @@ func constructWindowDef(
 	var refName string
 	switch {
 	case def.RefName != "":
-		// SELECT rank() OVER (w) FROM t WINDOW w as (...)
+		// SELECT rank() OVER (w) FROM t WINDOW w AS (...)
 		// We copy the referenced window specification, and modify it if necessary.
 		refName = string(def.RefName)
 		modifyRef = true
 	case def.Name != "":
-		// SELECT rank() OVER w FROM t WINDOW w as (...)
+		// SELECT rank() OVER w FROM t WINDOW w AS (...)
+		// Note the lack of parens around w, compared to the first case.
 		// We use the referenced window specification directly, without modification.
 		refName = string(def.Name)
 	}
@@ -316,25 +315,7 @@ func constructWindowDef(
 		return *referencedSpec, nil
 	}
 
-	// referencedSpec.Partitions is always used.
-	if len(def.Partitions) > 0 {
-		return def, pgerror.Newf(pgerror.CodeWindowingError, "cannot override PARTITION BY clause of window %q", refName)
-	}
-	def.Partitions = referencedSpec.Partitions
-
-	// referencedSpec.OrderBy is used if set.
-	if len(referencedSpec.OrderBy) > 0 {
-		if len(def.OrderBy) > 0 {
-			return def, pgerror.Newf(pgerror.CodeWindowingError, "cannot override ORDER BY clause of window %q", refName)
-		}
-		def.OrderBy = referencedSpec.OrderBy
-	}
-
-	if referencedSpec.Frame != nil {
-		return def, pgerror.Newf(pgerror.CodeWindowingError, "cannot copy window %q because it has a frame clause", refName)
-	}
-
-	return def, nil
+	return tree.OverrideWindowDef(referencedSpec, def)
 }
 
 // Once the extractWindowFunctions has been run over each render, the remaining

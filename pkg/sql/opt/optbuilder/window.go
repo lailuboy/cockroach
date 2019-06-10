@@ -1,16 +1,14 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package optbuilder
 
@@ -31,17 +29,8 @@ type windowInfo struct {
 
 	def memo.FunctionPrivate
 
-	// partition is the set of expressions used in the PARTITION BY clause.
-	partition []tree.TypedExpr
-
-	// orderBy is the set of expressions used in the ORDER BY clause.
-	orderBy tree.OrderBy
-
 	// col is the output column of the aggregation.
 	col *scopeColumn
-
-	// frame is the window frame this window function is computed relative to.
-	frame *tree.WindowFrame
 }
 
 // Walk is part of the tree.Expr interface.
@@ -73,9 +62,12 @@ func (b *Builder) buildWindow(outScope *scope, inScope *scope) {
 	if len(inScope.windows) == 0 {
 		return
 	}
+
 	argLists := make([][]opt.ScalarExpr, len(inScope.windows))
 	partitions := make([]opt.ColSet, len(inScope.windows))
 	orderings := make([]physical.OrderingChoice, len(inScope.windows))
+	filterCols := make([]opt.ColumnID, len(inScope.windows))
+	defs := make([]*tree.WindowDef, len(inScope.windows))
 	windowFrames := make([]tree.WindowFrame, len(inScope.windows))
 	argScope := outScope.push()
 	argScope.appendColumnsFromScope(outScope)
@@ -88,6 +80,10 @@ func (b *Builder) buildWindow(outScope *scope, inScope *scope) {
 	// values.
 	for i := range inScope.windows {
 		w := inScope.windows[i].expr.(*windowInfo)
+
+		def := w.WindowDef
+		defs[i] = def
+
 		argExprs := b.getTypedWindowArgs(w)
 
 		argLists[i] = make(memo.ScalarListExpr, len(argExprs))
@@ -105,8 +101,13 @@ func (b *Builder) buildWindow(outScope *scope, inScope *scope) {
 			argLists[i][j] = b.factory.ConstructVariable(col.id)
 		}
 
+		partition := make([]tree.TypedExpr, len(def.Partitions))
+		for i := range partition {
+			partition[i] = def.Partitions[i].(tree.TypedExpr)
+		}
+
 		// PARTITION BY (a, b) => PARTITION BY a, b
-		cols := flattenTuples(w.partition)
+		cols := flattenTuples(partition)
 		for j, e := range cols {
 			col := argScope.findExistingCol(e)
 			if col == nil {
@@ -121,8 +122,8 @@ func (b *Builder) buildWindow(outScope *scope, inScope *scope) {
 			partitions[i].Add(int(col.id))
 		}
 
-		ord := make(opt.Ordering, 0, len(w.orderBy))
-		for j, t := range w.orderBy {
+		ord := make(opt.Ordering, 0, len(def.OrderBy))
+		for j, t := range def.OrderBy {
 			// ORDER BY (a, b) => ORDER BY a, b
 			cols := flattenTuples([]tree.TypedExpr{t.Expr.(tree.TypedExpr)})
 
@@ -142,8 +143,27 @@ func (b *Builder) buildWindow(outScope *scope, inScope *scope) {
 		}
 		orderings[i].FromOrdering(ord)
 
-		if w.frame != nil {
-			windowFrames[i] = *w.frame
+		if def.Frame != nil {
+			windowFrames[i] = *def.Frame
+		}
+
+		if w.Filter != nil {
+			defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
+			b.semaCtx.Properties.Require("FILTER", tree.RejectSpecial)
+
+			te := inScope.resolveAndRequireType(w.Filter, types.Bool)
+
+			col := argScope.findExistingCol(te)
+			if col == nil {
+				col = b.synthesizeColumn(
+					argScope,
+					fmt.Sprintf("%s_%d_filter", w.def.Name, i+1),
+					te.ResolvedType(),
+					te,
+					b.buildScalar(te, inScope, nil, nil, nil),
+				)
+			}
+			filterCols[i] = col.id
 		}
 
 		// Fill this in with the default so that we don't need nil checks
@@ -198,11 +218,46 @@ func (b *Builder) buildWindow(outScope *scope, inScope *scope) {
 			frameIdx = len(frames) - 1
 		}
 
+		fn := b.constructWindowFn(w.def.Name, argLists[i])
+
+		if windowFrames[i].Bounds.StartBound.OffsetExpr != nil {
+			fn = b.factory.ConstructWindowFromOffset(
+				fn,
+				b.buildScalar(
+					w.WindowDef.Frame.Bounds.StartBound.OffsetExpr.(tree.TypedExpr),
+					inScope,
+					nil, nil, nil,
+				),
+			)
+		}
+
+		if windowFrames[i].Bounds.EndBound.OffsetExpr != nil {
+			fn = b.factory.ConstructWindowToOffset(
+				fn,
+				b.buildScalar(
+					w.WindowDef.Frame.Bounds.EndBound.OffsetExpr.(tree.TypedExpr),
+					inScope,
+					nil, nil, nil,
+				),
+			)
+		}
+
+		if filterCols[i] != 0 {
+			fn = b.factory.ConstructAggFilter(
+				fn,
+				b.factory.ConstructVariable(filterCols[i]),
+			)
+		}
+
 		frames[frameIdx].Windows = append(frames[frameIdx].Windows,
 			memo.WindowsItem{
-				Function: b.constructWindowFn(w.def.Name, argLists[i]),
+				Function: fn,
 				WindowsItemPrivate: memo.WindowsItemPrivate{
-					Frame:      &windowFrames[i],
+					Frame: memo.WindowFrame{
+						Mode:           windowFrames[i].Mode,
+						StartBoundType: windowFrames[i].Bounds.StartBound.BoundType,
+						EndBoundType:   windowFrames[i].Bounds.EndBound.BoundType,
+					},
 					ColPrivate: memo.ColPrivate{Col: w.col.id},
 				},
 			},

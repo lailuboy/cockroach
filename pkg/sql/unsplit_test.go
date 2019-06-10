@@ -1,21 +1,20 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package sql_test
 
 import (
 	"context"
+	gosql "database/sql"
 	"strings"
 	"testing"
 
@@ -24,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
@@ -56,7 +56,8 @@ func TestUnsplitAt(t *testing.T) {
 	for _, splitStmt := range splitStmts {
 		var key roachpb.Key
 		var pretty string
-		if err := db.QueryRow(splitStmt).Scan(&key, &pretty); err != nil {
+		var expirationTimestamp gosql.NullString
+		if err := db.QueryRow(splitStmt).Scan(&key, &pretty, &expirationTimestamp); err != nil {
 			t.Fatalf("unexpected error setting up test: %s", err)
 		}
 	}
@@ -145,8 +146,8 @@ func TestUnsplitAt(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if rng.StickyBit != nil {
-				t.Fatalf("%s: expected range sticky bit to be nil, got %s", tt.in, pretty)
+			if (rng.StickyBit != hlc.Timestamp{}) {
+				t.Fatalf("%s: expected range sticky bit to be hlc.MinTimestamp, got %s", tt.in, pretty)
 			}
 		}
 	}

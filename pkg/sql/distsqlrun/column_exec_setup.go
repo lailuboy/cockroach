@@ -1,22 +1,21 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package distsqlrun
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"reflect"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
@@ -112,6 +111,7 @@ func newColOperator(
 			return nil, err
 		}
 		op = exec.NewNoop(inputs[0])
+		columnTypes = spec.Input[0].ColumnTypes
 	case core.TableReader != nil:
 		if err := checkNumIn(inputs, 0); err != nil {
 			return nil, err
@@ -377,15 +377,23 @@ func newColOperator(
 		if err := checkNumIn(inputs, 1); err != nil {
 			return nil, err
 		}
-		if core.Sorter.OrderingMatchLen > 0 {
-			op, err = exec.NewSortChunks(inputs[0],
-				conv.FromColumnTypes(spec.Input[0].ColumnTypes),
-				core.Sorter.OutputOrdering.Columns,
-				int(core.Sorter.OrderingMatchLen))
+		input := inputs[0]
+		inputTypes := conv.FromColumnTypes(spec.Input[0].ColumnTypes)
+		orderingCols := core.Sorter.OutputOrdering.Columns
+		matchLen := core.Sorter.OrderingMatchLen
+		if matchLen > 0 {
+			// The input is already partially ordered. Use a chunks sorter to avoid
+			// loading all the rows into memory.
+			op, err = exec.NewSortChunks(input, inputTypes, orderingCols, int(matchLen))
+		} else if post.Limit != 0 && post.Filter.Empty() && post.Limit+post.Offset < math.MaxUint16 {
+			// There is a limit specified with no post-process filter, so we know
+			// exactly how many rows the sorter should output. Choose a top K sorter,
+			// which uses a heap to avoid storing more rows than necessary.
+			k := uint16(post.Limit + post.Offset)
+			op = exec.NewTopKSorter(input, inputTypes, orderingCols, k)
 		} else {
-			op, err = exec.NewSorter(inputs[0],
-				conv.FromColumnTypes(spec.Input[0].ColumnTypes),
-				core.Sorter.OutputOrdering.Columns)
+			// No optimizations possible. Default to the standard sort operator.
+			op, err = exec.NewSorter(input, inputTypes, orderingCols)
 		}
 		columnTypes = spec.Input[0].ColumnTypes
 

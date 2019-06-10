@@ -1,16 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-/// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package bulk_test
 
@@ -107,10 +105,10 @@ func runTestImport(t *testing.T, batchSize int64) {
 				return encoding.EncodeStringAscending(append([]byte{}, prefix...), fmt.Sprintf("k%d", i))
 			}
 
-			if err := kvDB.AdminSplit(ctx, key(split1), key(split1), true /* manual */); err != nil {
+			if err := kvDB.AdminSplit(ctx, key(split1), key(split1), hlc.MaxTimestamp /* expirationTime */); err != nil {
 				t.Fatal(err)
 			}
-			if err := kvDB.AdminSplit(ctx, key(split2), key(split2), true /* manual */); err != nil {
+			if err := kvDB.AdminSplit(ctx, key(split2), key(split2), hlc.MaxTimestamp /* expirationTime */); err != nil {
 				t.Fatal(err)
 			}
 

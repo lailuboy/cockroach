@@ -1,16 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package memo
 
@@ -388,6 +386,8 @@ func (sb *statisticsBuilder) colStatLeaf(
 				colStat.NullCount = s.RowCount * unknownNullCountRatio
 			} else {
 				colStatLeaf := sb.colStatLeaf(nullableCols, s, fd, notNullCols)
+				// Fetch the colStat again since it may now have a different address.
+				colStat, _ = s.ColStats.Lookup(colSet)
 				colStat.NullCount = colStatLeaf.NullCount
 			}
 		}
@@ -416,6 +416,8 @@ func (sb *statisticsBuilder) colStatLeaf(
 				nullCount += colStatLeaf.NullCount * (1 - nullCount/s.RowCount)
 			}
 		})
+		// Fetch the colStat again since it may now have a different address.
+		colStat, _ = s.ColStats.Lookup(colSet)
 		colStat.DistinctCount = min(distinctCount, s.RowCount)
 		colStat.NullCount = min(nullCount, s.RowCount)
 	}
@@ -2519,25 +2521,35 @@ func (sb *statisticsBuilder) updateDistinctCountsFromConstraint(
 			startVal := sp.StartKey().Value(col)
 			endVal := sp.EndKey().Value(col)
 			if startVal.Compare(sb.evalCtx, endVal) != 0 {
-				// TODO(rytaft): are there other types we should handle here
-				// besides int?
+				var start, end float64
 				if startVal.ResolvedType().Family() == types.IntFamily &&
 					endVal.ResolvedType().Family() == types.IntFamily {
-					start := int(*startVal.(*tree.DInt))
-					end := int(*endVal.(*tree.DInt))
-					// We assume that both start and end boundaries are inclusive. This
-					// should be the case for integer valued columns (due to normalization
-					// by constraint.PreferInclusive).
-					if c.Columns.Get(col).Ascending() {
-						distinctCount += float64(end - start)
-					} else {
-						distinctCount += float64(start - end)
+					start = float64(*startVal.(*tree.DInt))
+					end = float64(*endVal.(*tree.DInt))
+				} else if startVal.ResolvedType().Family() == types.DateFamily &&
+					endVal.ResolvedType().Family() == types.DateFamily {
+					startDate := startVal.(*tree.DDate)
+					endDate := endVal.(*tree.DDate)
+					if !startDate.IsFinite() || !endDate.IsFinite() {
+						// One of the boundaries is not finite, so we can't determine the
+						// distinct count for this column.
+						return applied
 					}
+					start = float64(startDate.PGEpochDays())
+					end = float64(endDate.PGEpochDays())
 				} else {
 					// We can't determine the distinct count for this column. For example,
 					// the number of distinct values in the constraint
 					// /a: [/'cherry' - /'mango'] cannot be determined.
 					return applied
+				}
+				// We assume that both start and end boundaries are inclusive. This
+				// should be the case for integer and date columns (due to
+				// normalization by constraint.PreferInclusive).
+				if c.Columns.Get(col).Ascending() {
+					distinctCount += end - start
+				} else {
+					distinctCount += start - end
 				}
 			}
 			if i != 0 {

@@ -1,16 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package memo
 
@@ -564,8 +562,9 @@ func (f *ExprFmtCtx) formatScalar(scalar opt.ScalarExpr, tp treeprinter.Node) {
 		case opt.WindowsItemOp:
 			// Only show this if the frame differs from the default.
 			frame := scalar.Private().(*WindowsItemPrivate).Frame
-			if frame.Bounds.StartBound.BoundType == tree.UnboundedPreceding &&
-				frame.Bounds.EndBound.BoundType == tree.CurrentRow {
+			if frame.Mode == tree.RANGE &&
+				frame.StartBoundType == tree.UnboundedPreceding &&
+				frame.EndBoundType == tree.CurrentRow {
 				scalar = scalar.Child(0).(opt.ScalarExpr)
 			}
 		}
@@ -902,13 +901,18 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 		fmt.Fprintf(f.Buffer, " %s", t.Name)
 
 	case *WindowsItemPrivate:
-		if t.Frame.Bounds.StartBound.BoundType != tree.UnboundedPreceding ||
-			t.Frame.Bounds.EndBound.BoundType != tree.CurrentRow {
-			fmt.Fprintf(f.Buffer, " from %s to %s",
-				frameBoundName(t.Frame.Bounds.StartBound.BoundType),
-				frameBoundName(t.Frame.Bounds.EndBound.BoundType),
-			)
+		switch t.Frame.Mode {
+		case tree.GROUPS:
+			fmt.Fprintf(f.Buffer, " groups")
+		case tree.ROWS:
+			fmt.Fprintf(f.Buffer, " rows")
+		case tree.RANGE:
+			fmt.Fprintf(f.Buffer, " range")
 		}
+		fmt.Fprintf(f.Buffer, " from %s to %s",
+			frameBoundName(t.Frame.StartBoundType),
+			frameBoundName(t.Frame.EndBoundType),
+		)
 
 	case *WindowPrivate:
 		fmt.Fprintf(f.Buffer, " partition=%s", t.Partition)

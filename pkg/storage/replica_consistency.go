@@ -1,16 +1,14 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package storage
 
@@ -29,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
@@ -176,10 +173,8 @@ func (r *Replica) CheckConsistency(
 		// is through this mechanism that existing ranges are updated. Hence, the
 		// logging below is relatively timid.
 
-		// If there's no delta (or some nodes in the cluster may not know
-		// RecomputeStats, in which case sending it to them could crash them),
-		// there's nothing else to do.
-		if delta == (enginepb.MVCCStats{}) || !r.ClusterSettings().Version.IsActive(cluster.VersionRecomputeStats) {
+		// If there's no delta, there's nothing else to do.
+		if delta == (enginepb.MVCCStats{}) {
 			return resp, nil
 		}
 

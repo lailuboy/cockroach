@@ -1,16 +1,14 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package distsqlrun
 
@@ -425,6 +423,7 @@ func (jr *joinReader) performLookup() (joinReaderState, *distsqlpb.ProducerMetad
 
 	// Iterate over the lookup results, map them to the input rows, and emit the
 	// rendered rows.
+	isJoinTypeLeftSemiJoin := jr.joinType == sqlbase.LeftSemiJoin
 	for _, lookupRow := range jr.lookupRows {
 		if jr.indexFilter.expr != nil {
 			// Apply index filter.
@@ -438,15 +437,18 @@ func (jr *joinReader) performLookup() (joinReaderState, *distsqlpb.ProducerMetad
 			}
 		}
 		for _, inputRowIdx := range jr.keyToInputRowIndices[lookupRow.key] {
-			renderedRow, err := jr.render(jr.inputRows[inputRowIdx], lookupRow.row)
-			if err != nil {
-				jr.MoveToDraining(err)
-				return jrStateUnknown, jr.DrainHelper()
-			}
-			if renderedRow != nil {
-				rowCopy := jr.out.rowAlloc.CopyRow(renderedRow)
-				jr.inputRowIdxToOutputRows[inputRowIdx] = append(
-					jr.inputRowIdxToOutputRows[inputRowIdx], rowCopy)
+			// Only add to output if joinType is not LeftSemiJoin or if we have not gotten the match
+			if !isJoinTypeLeftSemiJoin || len(jr.inputRowIdxToOutputRows[inputRowIdx]) == 0 {
+				renderedRow, err := jr.render(jr.inputRows[inputRowIdx], lookupRow.row)
+				if err != nil {
+					jr.MoveToDraining(err)
+					return jrStateUnknown, jr.DrainHelper()
+				}
+				if renderedRow != nil {
+					rowCopy := jr.out.rowAlloc.CopyRow(renderedRow)
+					jr.inputRowIdxToOutputRows[inputRowIdx] = append(
+						jr.inputRowIdxToOutputRows[inputRowIdx], rowCopy)
+				}
 			}
 		}
 	}
@@ -460,17 +462,19 @@ func (jr *joinReader) performLookup() (joinReaderState, *distsqlpb.ProducerMetad
 
 // collectOutputRows iterates over jr.inputRowIdxToOutputRows and adds output
 // rows to jr.Emit, rendering rows for unmatched inputs if the join is a left
-// outer join, while preserving the input order.
+// outer join or left anti join, while preserving the input order.
 func (jr *joinReader) collectOutputRows() joinReaderState {
 	for i, outputRows := range jr.inputRowIdxToOutputRows {
 		if len(outputRows) == 0 {
-			if jr.joinType == sqlbase.LeftOuterJoin {
+			if jr.joinType == sqlbase.LeftOuterJoin || jr.joinType == sqlbase.LeftAntiJoin {
 				if row := jr.renderUnmatchedRow(jr.inputRows[i], leftSide); row != nil {
 					jr.toEmit = append(jr.toEmit, jr.out.rowAlloc.CopyRow(row))
 				}
 			}
 		} else {
-			jr.toEmit = append(jr.toEmit, outputRows...)
+			if jr.joinType != sqlbase.LeftAntiJoin {
+				jr.toEmit = append(jr.toEmit, outputRows...)
+			}
 		}
 	}
 	return jrEmittingRows

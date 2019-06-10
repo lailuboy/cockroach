@@ -1,16 +1,14 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package types
 
@@ -223,17 +221,15 @@ func TestTypes(t *testing.T) {
 		{MakeTime(6), MakeScalar(TimeFamily, oid.T_time, 6, 0, emptyLocale)},
 
 		// TIMESTAMP
-		{MakeTimestamp(0), Timestamp},
 		{MakeTimestamp(0), &T{InternalType: InternalType{
-			Family: TimestampFamily, Oid: oid.T_timestamp, Locale: &emptyLocale}}},
+			Family: TimestampFamily, Precision: 0, Oid: oid.T_timestamp, Locale: &emptyLocale}}},
 		{MakeTimestamp(6), &T{InternalType: InternalType{
 			Family: TimestampFamily, Oid: oid.T_timestamp, Precision: 6, Locale: &emptyLocale}}},
 		{MakeTimestamp(6), MakeScalar(TimestampFamily, oid.T_timestamp, 6, 0, emptyLocale)},
 
 		// TIMESTAMPTZ
-		{MakeTimestampTZ(0), TimestampTZ},
 		{MakeTimestampTZ(0), &T{InternalType: InternalType{
-			Family: TimestampTZFamily, Oid: oid.T_timestamptz, Locale: &emptyLocale}}},
+			Family: TimestampTZFamily, Precision: 0, Oid: oid.T_timestamptz, Locale: &emptyLocale}}},
 		{MakeTimestampTZ(6), &T{InternalType: InternalType{
 			Family: TimestampTZFamily, Oid: oid.T_timestamptz, Precision: 6, Locale: &emptyLocale}}},
 		{MakeTimestampTZ(6), MakeScalar(TimestampTZFamily, oid.T_timestamptz, 6, 0, emptyLocale)},

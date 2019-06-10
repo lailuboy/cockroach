@@ -1,16 +1,14 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package sqlmigrations
 
@@ -611,9 +609,9 @@ func populateVersionSetting(ctx context.Context, r runner) error {
 		return err
 	}
 	if v == (roachpb.Version{}) {
-		// The cluster was bootstrapped at v1.0 (or even earlier), so make that
-		// the version.
-		v = cluster.VersionByKey(cluster.VersionBase)
+		// The cluster was bootstrapped at v1.0 (or even earlier), so just use
+		// the MinSupportedVersion of the binary.
+		v = cluster.BinaryMinimumSupportedVersion
 	}
 
 	b, err := protoutil.Marshal(&cluster.ClusterVersion{Version: v})

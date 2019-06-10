@@ -1,4 +1,4 @@
-// Copyright 2018 The Cockroach Authors.
+// Copyright 2019 The Cockroach Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,29 +12,26 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-package datadriven
+package delegate
 
 import (
-	"bufio"
-	"io"
+	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
-type lineScanner struct {
-	*bufio.Scanner
-	line int
-}
-
-func newLineScanner(r io.Reader) *lineScanner {
-	return &lineScanner{
-		Scanner: bufio.NewScanner(r),
-		line:    0,
-	}
-}
-
-func (l *lineScanner) Scan() bool {
-	ok := l.Scanner.Scan()
-	if ok {
-		l.line++
-	}
-	return ok
+func (d *delegator) delegateShowDatabaseIndexes(
+	n *tree.ShowDatabaseIndexes,
+) (tree.Statement, error) {
+	const getAllIndexesQuery = `
+    SELECT table_name,
+           index_name,
+           non_unique::BOOL,
+           seq_in_index,
+           column_name,
+           direction,
+           storing::BOOL,
+           implicit::BOOL
+      FROM %s.information_schema.statistics`
+	return parse(fmt.Sprintf(getAllIndexesQuery, n.Database.String()))
 }

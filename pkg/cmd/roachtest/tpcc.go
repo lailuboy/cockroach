@@ -1,17 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package main
 
@@ -63,13 +60,13 @@ type tpccOptions struct {
 // specified warehouse count into a cluster using either `fixtures import`
 // or `fixtures load` depending on the cloud.
 func tpccFixturesCmd(t *test, cloud string, warehouses int, extraArgs string) string {
-	var action string
+	var command string
 	switch cloud {
 	case "gce":
 		// TODO(nvanbenschoten): We could switch to import for both clouds.
 		// At the moment, import is still a little unstable and load is still
 		// marginally faster.
-		action = "load"
+		command = "./workload fixtures load"
 		fixtureWarehouses := -1
 		for _, w := range []int{1, 10, 100, 1000, 2000, 5000, 10000} {
 			if w >= warehouses {
@@ -82,12 +79,14 @@ func tpccFixturesCmd(t *test, cloud string, warehouses int, extraArgs string) st
 		}
 		warehouses = fixtureWarehouses
 	case "aws":
-		action = "import"
+		// For fixtures import, use the version built into the cockroach binary
+		// so the tpcc workload-versions match on release branches.
+		command = "./cockroach workload fixtures import"
 	default:
 		t.Fatalf("unknown cloud: %q", cloud)
 	}
-	return fmt.Sprintf("./workload fixtures %s tpcc --warehouses=%d %s {pgurl:1}",
-		action, warehouses, extraArgs)
+	return fmt.Sprintf("%s tpcc --warehouses=%d %s {pgurl:1}",
+		command, warehouses, extraArgs)
 }
 
 func runTPCC(ctx context.Context, t *test, c *cluster, opts tpccOptions) {
@@ -128,6 +127,8 @@ func runTPCC(ctx context.Context, t *test, c *cluster, opts tpccOptions) {
 		c.Put(ctx, cockroach, "./cockroach", regularNodes...)
 	}
 
+	// Fixture import needs ./cockroach workload on workloadNode.
+	c.Put(ctx, cockroach, "./cockroach", workloadNode)
 	c.Put(ctx, workload, "./workload", workloadNode)
 
 	t.Status("loading fixture")
@@ -671,6 +672,10 @@ func runTPCCBench(ctx context.Context, t *test, c *cluster, b tpccBenchSpec) {
 	roachNodes := loadGroups.roachNodes()
 	loadNodes := loadGroups.loadNodes()
 	c.Put(ctx, cockroach, "./cockroach", roachNodes)
+	// Fixture import needs ./cockroach workload on loadNodes[0],
+	// and if we use haproxy (see below) we need it on the others
+	// as well.
+	c.Put(ctx, cockroach, "./cockroach", loadNodes)
 	c.Put(ctx, workload, "./workload", loadNodes)
 	c.Start(ctx, t, append(b.startOpts(), roachNodes)...)
 
@@ -681,7 +686,6 @@ func runTPCCBench(ctx context.Context, t *test, c *cluster, b tpccBenchSpec) {
 		}
 		t.Status("installing haproxy")
 		c.Install(ctx, loadNodes, "haproxy")
-		c.Put(ctx, cockroach, "./cockroach", loadNodes)
 		c.Run(ctx, loadNodes, "./cockroach gen haproxy --insecure --url {pgurl:1}")
 		c.Run(ctx, loadNodes, "haproxy -f haproxy.cfg -D")
 	}

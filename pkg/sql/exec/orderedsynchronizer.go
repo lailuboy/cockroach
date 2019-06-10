@@ -1,16 +1,14 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package exec
 
@@ -126,7 +124,7 @@ func (o *orderedSynchronizer) compareRow(batchIdx1 int, batchIdx2 int) int {
 			case encoding.Ascending:
 				return res
 			case encoding.Descending:
-				return res * -1
+				return -res
 			default:
 				panic(fmt.Sprintf("unexpected direction value %d", d))
 			}
@@ -139,7 +137,11 @@ func (o *orderedSynchronizer) compareRow(batchIdx1 int, batchIdx2 int) int {
 // all the relevant vectors in o.comparators.
 func (o *orderedSynchronizer) updateComparators(batchIdx int) {
 	batch := o.inputBatches[batchIdx]
+	if batch.Length() == 0 {
+		return
+	}
 	for i := range o.ordering {
-		o.comparators[i].setVec(batchIdx, batch.ColVecs()[o.ordering[i].ColIdx])
+		vec := batch.ColVec(o.ordering[i].ColIdx)
+		o.comparators[i].setVec(batchIdx, vec)
 	}
 }

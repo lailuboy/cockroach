@@ -1,16 +1,14 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package engine
 
@@ -45,25 +43,6 @@ var (
 	// NilKey is the nil MVCCKey.
 	NilKey = MVCCKey{}
 )
-
-// AccountForLegacyMVCCStats adjusts ms to account for the predicted impact it
-// will have on the values that it records when the structure is initially stored.
-// Specifically, MVCCStats is stored on the RangeStats legacy key, which means
-// that its creation will have an impact on system-local data size and key count.
-func AccountForLegacyMVCCStats(ms *enginepb.MVCCStats, rangeID roachpb.RangeID) error {
-	key := keys.RangeStatsLegacyKey(rangeID)
-	metaKey := MakeMVCCMetadataKey(key)
-
-	// MVCCStats is stored inline, so compute MVCCMetadata accordingly.
-	value := roachpb.Value{}
-	if err := value.SetProto(ms); err != nil {
-		return err
-	}
-	meta := enginepb.MVCCMetadata{RawBytes: value.RawBytes}
-
-	updateStatsForInline(ms, key, 0, 0, int64(metaKey.EncodedSize()), int64(meta.Size()))
-	return nil
-}
 
 // MakeValue returns the inline value.
 func MakeValue(meta enginepb.MVCCMetadata) roachpb.Value {

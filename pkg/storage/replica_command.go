@@ -1,16 +1,14 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package storage
 
@@ -223,11 +221,11 @@ func (r *Replica) adminSplitWithDescriptor(
 			log.Fatal(ctx, "MVCCFindSplitKey returned start key of range")
 		}
 		log.Event(ctx, "range already split")
-		// Even if the range is already split, we should still set the sticky bit
-		if args.Manual {
-			nowTs := r.store.Clock().Now()
+		// Even if the range is already split, we should still update the sticky
+		// bit if it has a later expiration time.
+		if desc.StickyBit.Less(args.ExpirationTime) {
 			newDesc := *desc
-			newDesc.StickyBit = &nowTs
+			newDesc.StickyBit = args.ExpirationTime
 			err := r.store.DB().Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 				b := txn.NewBatch()
 				descKey := keys.RangeDescriptorKey(desc.StartKey)
@@ -243,7 +241,7 @@ func (r *Replica) adminSplitWithDescriptor(
 					Commit: true,
 					InternalCommitTrigger: &roachpb.InternalCommitTrigger{
 						StickyBitTrigger: &roachpb.StickyBitTrigger{
-							StickyBit: &nowTs,
+							StickyBit: args.ExpirationTime,
 						},
 					},
 				})
@@ -270,11 +268,8 @@ func (r *Replica) adminSplitWithDescriptor(
 		return reply, errors.Errorf("unable to allocate right hand side range descriptor: %s", err)
 	}
 
-	// Add sticky bit.
-	if args.Manual {
-		nowTs := r.store.Clock().Now()
-		rightDesc.StickyBit = &nowTs
-	}
+	// Set the range descriptor's sticky bit.
+	rightDesc.StickyBit = args.ExpirationTime
 
 	// Init updated version of existing range descriptor.
 	leftDesc := *desc
@@ -394,16 +389,17 @@ func (r *Replica) AdminUnsplit(
 		return reply, roachpb.NewErrorf("key %s is not the start of a range", args.Header().Key)
 	}
 
-	// If the range's sticky bit is not set, we treat the unsplit command
-	// as a no-op and return success instead of throwing an error.
-	if desc.StickyBit == nil {
+	// If the range's sticky bit is already hlc.Timestamp{}, we treat the
+	// unsplit command as a no-op and return success instead of throwing an
+	// error.
+	if (desc.StickyBit == hlc.Timestamp{}) {
 		return reply, nil
 	}
 
 	if err := r.store.DB().Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		b := txn.NewBatch()
 		newDesc := desc
-		newDesc.StickyBit = nil
+		newDesc.StickyBit = hlc.Timestamp{}
 		descKey := keys.RangeDescriptorKey(newDesc.StartKey)
 
 		if err := updateRangeDescriptor(b, descKey, &desc, &newDesc); err != nil {
@@ -417,8 +413,9 @@ func (r *Replica) AdminUnsplit(
 			Commit: true,
 			InternalCommitTrigger: &roachpb.InternalCommitTrigger{
 				StickyBitTrigger: &roachpb.StickyBitTrigger{
-					// Setting StickyBit to nil unsets the sticky bit.
-					StickyBit: nil,
+					// Setting StickyBit to the zero timestamp ensures that it is always
+					// eligible for automatic merging.
+					StickyBit: hlc.Timestamp{},
 				},
 			},
 		})

@@ -1,16 +1,14 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package sql
 
@@ -41,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -1675,7 +1674,7 @@ CREATE VIEW crdb_internal.ranges AS SELECT
 	table_name,
 	index_name,
 	replicas,
-	manual_split_time,
+	split_enforced_until,
 	crdb_internal.lease_holder(start_key) AS lease_holder
 FROM crdb_internal.ranges_no_leases
 `,
@@ -1689,7 +1688,7 @@ FROM crdb_internal.ranges_no_leases
 		{Name: "table_name", Typ: types.String},
 		{Name: "index_name", Typ: types.String},
 		{Name: "replicas", Typ: types.Int2Vector},
-		{Name: "manual_split_time", Typ: types.Timestamp},
+		{Name: "split_enforced_until", Typ: types.Timestamp},
 		{Name: "lease_holder", Typ: types.Int},
 	},
 }
@@ -1702,16 +1701,16 @@ var crdbInternalRangesNoLeasesTable = virtualSchemaTable{
 	comment: `range metadata without leaseholder details (KV join; expensive!)`,
 	schema: `
 CREATE TABLE crdb_internal.ranges_no_leases (
-  range_id          INT NOT NULL,
-  start_key         BYTES NOT NULL,
-  start_pretty      STRING NOT NULL,
-  end_key           BYTES NOT NULL,
-  end_pretty        STRING NOT NULL,
-  database_name     STRING NOT NULL,
-  table_name        STRING NOT NULL,
-  index_name        STRING NOT NULL,
-  replicas          INT[] NOT NULL,
-  manual_split_time TIMESTAMP
+  range_id             INT NOT NULL,
+  start_key            BYTES NOT NULL,
+  start_pretty         STRING NOT NULL,
+  end_key              BYTES NOT NULL,
+  end_pretty           STRING NOT NULL,
+  database_name        STRING NOT NULL,
+  table_name           STRING NOT NULL,
+  index_name           STRING NOT NULL,
+  replicas             INT[] NOT NULL,
+  split_enforced_until TIMESTAMP
 )
 `,
 	generator: func(ctx context.Context, p *planner, _ *DatabaseDescriptor) (virtualTableGenerator, error) {
@@ -1790,9 +1789,9 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				}
 			}
 
-			manualSplitTime := tree.DNull
-			if desc.StickyBit != nil {
-				manualSplitTime = tree.TimestampToInexactDTimestamp(*desc.StickyBit)
+			splitEnforcedUntil := tree.DNull
+			if (desc.StickyBit != hlc.Timestamp{}) {
+				splitEnforcedUntil = tree.TimestampToInexactDTimestamp(desc.StickyBit)
 			}
 
 			return tree.Datums{
@@ -1805,7 +1804,7 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				tree.NewDString(tableName),
 				tree.NewDString(indexName),
 				arr,
-				manualSplitTime,
+				splitEnforcedUntil,
 			}, nil
 		}, nil
 	},

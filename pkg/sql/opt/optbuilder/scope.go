@@ -1,16 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package optbuilder
 
@@ -46,6 +44,10 @@ type scope struct {
 	// windows contains the set of window functions encountered while building
 	// the current SELECT statement.
 	windows []scopeColumn
+
+	// windowDefs is the set of named window definitions present in the nearest
+	// SELECT.
+	windowDefs []*tree.WindowDef
 
 	// ordering records the ORDER BY columns associated with this scope. Each
 	// column is either in cols or in extraCols.
@@ -1011,39 +1013,36 @@ func (s *scope) replaceAggregate(f *tree.FuncExpr, def *tree.FunctionDefinition)
 	return s.builder.buildAggregateFunction(f, &private, s)
 }
 
-func isSupportedFrame(f *tree.WindowDef) bool {
-	if f == nil {
-		return true
+func (s *scope) lookupWindowDef(name tree.Name) *tree.WindowDef {
+	for i := range s.windowDefs {
+		if s.windowDefs[i].Name == name {
+			return s.windowDefs[i]
+		}
 	}
+	panic(builderError{pgerror.Newf(pgerror.CodeUndefinedObjectError, "window %q does not exist", name)})
+}
 
-	if f.Frame == nil {
-		return true
+func (s *scope) constructWindowDef(def tree.WindowDef) *tree.WindowDef {
+	switch {
+	case def.RefName != "":
+		// SELECT rank() OVER (w) FROM t WINDOW w AS (...)
+		// We copy the referenced window specification, and modify it if necessary.
+		result, err := tree.OverrideWindowDef(s.lookupWindowDef(def.RefName), def)
+		if err != nil {
+			panic(builderError{err})
+		}
+		return &result
+	case def.Name != "":
+		// SELECT rank() OVER w FROM t WINDOW w AS (...)
+		// Note the lack of parens around w, compared to the first case.
+		// We use the referenced window specification directly, without modification.
+		return s.lookupWindowDef(def.Name)
+	default:
+		return &def
 	}
-
-	if f.Frame.Mode != tree.RANGE {
-		return false
-	}
-	if f.Frame.Bounds.StartBound != nil &&
-		(f.Frame.Bounds.StartBound.BoundType == tree.OffsetPreceding ||
-			f.Frame.Bounds.StartBound.BoundType == tree.OffsetFollowing) {
-		return false
-	}
-	if f.Frame.Bounds.EndBound != nil &&
-		(f.Frame.Bounds.EndBound.BoundType == tree.OffsetFollowing ||
-			f.Frame.Bounds.EndBound.BoundType == tree.OffsetPreceding) {
-		return false
-	}
-	return true
 }
 
 func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) tree.Expr {
-	if f.Filter != nil ||
-		f.Type == tree.DistinctFuncType ||
-		f.WindowDef.RefName != "" ||
-		!isSupportedFrame(f.WindowDef) {
-		panic(unimplementedWithIssueDetailf(34251, "", "unsupported window function"))
-	}
-
 	f, def = s.replaceCount(f, def)
 
 	if err := tree.CheckIsWindowOrAgg(def); err != nil {
@@ -1058,6 +1057,8 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 	s.builder.semaCtx.Properties.Require("window",
 		tree.RejectNestedWindowFunctions)
 
+	f.WindowDef = s.constructWindowDef(*f.WindowDef)
+
 	expr := f.Walk(s)
 
 	typedFunc, err := tree.TypeCheck(expr, s.builder.semaCtx, types.Any)
@@ -1070,11 +1071,6 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 
 	f = typedFunc.(*tree.FuncExpr)
 
-	partition := make([]tree.TypedExpr, len(f.WindowDef.Partitions))
-	for i, e := range f.WindowDef.Partitions {
-		partition[i] = e.(tree.TypedExpr)
-	}
-
 	info := windowInfo{
 		FuncExpr: f,
 		def: memo.FunctionPrivate{
@@ -1082,9 +1078,6 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 			Properties: &def.FunctionProperties,
 			Overload:   f.ResolvedOverload(),
 		},
-		partition: partition,
-		orderBy:   f.WindowDef.OrderBy,
-		frame:     f.WindowDef.Frame,
 	}
 
 	if col := s.findExistingColInList(&info, s.windows); col != nil {

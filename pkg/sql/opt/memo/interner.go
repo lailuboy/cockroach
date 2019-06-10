@@ -1,16 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package memo
 
@@ -483,15 +481,9 @@ func (h *hasher) HashShowTraceType(val tree.ShowTraceType) {
 	h.HashString(string(val))
 }
 
-func (h *hasher) HashWindowFrame(val *tree.WindowFrame) {
-	// TODO(justin): remove when we support OFFSET.
-	if val.Bounds.StartBound.BoundType == tree.OffsetPreceding ||
-		val.Bounds.EndBound.BoundType == tree.OffsetFollowing {
-		panic(pgerror.AssertionFailedf("expected to have rejected offset"))
-	}
-
-	h.HashInt(int(val.Bounds.StartBound.BoundType))
-	h.HashInt(int(val.Bounds.EndBound.BoundType))
+func (h *hasher) HashWindowFrame(val WindowFrame) {
+	h.HashInt(int(val.StartBoundType))
+	h.HashInt(int(val.EndBoundType))
 	h.HashInt(int(val.Mode))
 }
 
@@ -549,6 +541,7 @@ func (h *hasher) HashWindowsExpr(val WindowsExpr) {
 		item := &val[i]
 		h.HashColumnID(item.Col)
 		h.HashScalarExpr(item.Function)
+		h.HashWindowFrame(item.Frame)
 	}
 }
 
@@ -765,17 +758,9 @@ func (h *hasher) IsShowTraceTypeEqual(l, r tree.ShowTraceType) bool {
 	return l == r
 }
 
-func (h *hasher) IsWindowFrameEqual(l, r *tree.WindowFrame) bool {
-	// TODO(justin): remove when we support OFFSET.
-	if l.Bounds.StartBound.BoundType == tree.OffsetPreceding ||
-		l.Bounds.EndBound.BoundType == tree.OffsetFollowing ||
-		r.Bounds.StartBound.BoundType == tree.OffsetPreceding ||
-		r.Bounds.EndBound.BoundType == tree.OffsetFollowing {
-		panic(pgerror.AssertionFailedf("expected to have rejected offset"))
-	}
-
-	return l.Bounds.StartBound.BoundType == r.Bounds.StartBound.BoundType &&
-		l.Bounds.EndBound.BoundType == r.Bounds.EndBound.BoundType &&
+func (h *hasher) IsWindowFrameEqual(l, r WindowFrame) bool {
+	return l.StartBoundType == r.StartBoundType &&
+		l.EndBoundType == r.EndBoundType &&
 		l.Mode == r.Mode
 }
 
@@ -852,7 +837,9 @@ func (h *hasher) IsWindowsExprEqual(l, r WindowsExpr) bool {
 		return false
 	}
 	for i := range l {
-		if l[i].Col != r[i].Col || l[i].Function != r[i].Function {
+		if l[i].Col != r[i].Col ||
+			l[i].Function != r[i].Function ||
+			l[i].Frame != r[i].Frame {
 			return false
 		}
 	}

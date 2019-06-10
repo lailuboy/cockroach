@@ -1,16 +1,14 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package tree
 
@@ -3363,14 +3361,18 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 
 	case types.TimestampFamily:
 		// TODO(knz): Timestamp from float, decimal.
+		prec := time.Microsecond
+		if t.Precision() == 0 {
+			prec = time.Second
+		}
 		switch d := d.(type) {
 		case *DString:
-			return ParseDTimestamp(ctx, string(*d), time.Microsecond)
+			return ParseDTimestamp(ctx, string(*d), prec)
 		case *DCollatedString:
-			return ParseDTimestamp(ctx, d.Contents, time.Microsecond)
+			return ParseDTimestamp(ctx, d.Contents, prec)
 		case *DDate:
 			t, err := d.ToTime()
-			return MakeDTimestamp(t, time.Microsecond), err
+			return MakeDTimestamp(t, prec), err
 		case *DInt:
 			return MakeDTimestamp(timeutil.Unix(int64(*d), 0), time.Second), nil
 		case *DTimestamp:
@@ -3382,20 +3384,24 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 
 	case types.TimestampTZFamily:
 		// TODO(knz): TimestampTZ from float, decimal.
+		prec := time.Microsecond
+		if t.Precision() == 0 {
+			prec = time.Second
+		}
 		switch d := d.(type) {
 		case *DString:
-			return ParseDTimestampTZ(ctx, string(*d), time.Microsecond)
+			return ParseDTimestampTZ(ctx, string(*d), prec)
 		case *DCollatedString:
-			return ParseDTimestampTZ(ctx, d.Contents, time.Microsecond)
+			return ParseDTimestampTZ(ctx, d.Contents, prec)
 		case *DDate:
 			t, err := d.ToTime()
 			_, before := t.Zone()
 			_, after := t.In(ctx.GetLocation()).Zone()
-			return MakeDTimestampTZ(t.Add(time.Duration(before-after)*time.Second), time.Microsecond), err
+			return MakeDTimestampTZ(t.Add(time.Duration(before-after)*time.Second), prec), err
 		case *DTimestamp:
 			_, before := d.Time.Zone()
 			_, after := d.Time.In(ctx.GetLocation()).Zone()
-			return MakeDTimestampTZ(d.Time.Add(time.Duration(before-after)*time.Second), time.Microsecond), nil
+			return MakeDTimestampTZ(d.Time.Add(time.Duration(before-after)*time.Second), prec), nil
 		case *DInt:
 			return MakeDTimestampTZ(timeutil.Unix(int64(*d), 0), time.Second), nil
 		case *DTimestampTZ:

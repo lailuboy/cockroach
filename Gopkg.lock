@@ -368,6 +368,14 @@
   revision = "3c56c65c97a11c610354ce15b9939c0d0aff5d7a"
 
 [[projects]]
+  branch = "master"
+  digest = "1:85071046e2bc80625cbd99ee5584a675f2dd8a4c56872f04a5d8b913e1c11d0d"
+  name = "github.com/cockroachdb/datadriven"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "edce558372380347c6fef147e62f5559a9f8413d"
+
+[[projects]]
   digest = "1:cd936a7edd1897083994b6d397f9c975a5a8dc58e845f0cf3d1e5cf4717b918b"
   name = "github.com/cockroachdb/gostdlib"
   packages = [
@@ -788,6 +796,21 @@
   pruneopts = "UT"
   revision = "c0698cc33f1e534bb59c455909b88cc2726089af"
   version = "v1.10.0"
+
+[[projects]]
+  digest = "1:010d46ea3c1e730897e53058d1013a963f3f987675dda87df64f891b945281db"
+  name = "github.com/google/go-cmp"
+  packages = [
+    "cmp",
+    "cmp/cmpopts",
+    "cmp/internal/diff",
+    "cmp/internal/flags",
+    "cmp/internal/function",
+    "cmp/internal/value",
+  ]
+  pruneopts = "UT"
+  revision = "6f77996f0c42f7b84e5a2b252227263f93432e9b"
+  version = "v0.3.0"
 
 [[projects]]
   digest = "1:63ede27834b468648817fb80cfb95d40abfc61341f89cb7a0d6779b6aa955425"
@@ -1780,7 +1803,7 @@
     "version",
   ]
   pruneopts = "UT"
-  revision = "4187a5ff696fcfe80ef2204f78a3ae8262b2d54d"
+  revision = "1f0868a609b73436e79b066f93c7f1a28c5dbae2"
 
 [[projects]]
   branch = "no-flag-names-parens"
@@ -1807,6 +1830,7 @@
   input-imports = [
     "cloud.google.com/go/storage",
     "github.com/Azure/azure-storage-blob-go/azblob",
+    "github.com/BurntSushi/toml",
     "github.com/MichaelTJones/walk",
     "github.com/PuerkitoBio/goquery",
     "github.com/Shopify/sarama",
@@ -1835,6 +1859,7 @@
     "github.com/cockroachdb/cmux",
     "github.com/cockroachdb/cockroach-go/crdb",
     "github.com/cockroachdb/crlfmt",
+    "github.com/cockroachdb/datadriven",
     "github.com/cockroachdb/gostdlib/cmd/gofmt",
     "github.com/cockroachdb/gostdlib/x/tools/cmd/goimports",
     "github.com/cockroachdb/returncheck",
@@ -1874,6 +1899,8 @@
     "github.com/golang/snappy",
     "github.com/google/btree",
     "github.com/google/flatbuffers/go",
+    "github.com/google/go-cmp/cmp",
+    "github.com/google/go-cmp/cmp/cmpopts",
     "github.com/google/go-github/github",
     "github.com/google/pprof/driver",
     "github.com/google/pprof/profile",

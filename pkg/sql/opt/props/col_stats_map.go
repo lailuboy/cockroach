@@ -1,16 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package props
 
@@ -100,6 +98,10 @@ func (m *ColStatsMap) Count() int {
 
 // Get returns the nth statistic in the map, by its ordinal position. This
 // position is stable across calls to Get or Add (but not RemoveIntersecting).
+// NOTE: The returned *ColumnStatistic is only valid until this ColStatsMap is
+//       updated via a call to Add() or RemoveIntersecting(). At that point,
+//       the address of the statistic may have changed, so it must be fetched
+//       again using another call to Get() or Lookup().
 func (m *ColStatsMap) Get(nth int) *ColumnStatistic {
 	if nth < initialColStatsCap {
 		return &m.initial[nth]
@@ -109,6 +111,10 @@ func (m *ColStatsMap) Get(nth int) *ColumnStatistic {
 
 // Lookup returns the column statistic indexed by the given column set. If no
 // such statistic exists in the map, then ok=false.
+// NOTE: The returned *ColumnStatistic is only valid until this ColStatsMap is
+//       updated via a call to Add() or RemoveIntersecting(). At that point,
+//       the address of the statistic may have changed, so it must be fetched
+//       again using another call to Lookup() or Get().
 func (m *ColStatsMap) Lookup(cols opt.ColSet) (colStat *ColumnStatistic, ok bool) {
 	// Scan the inlined statistics if there are only a few statistics in the map.
 	if m.count <= initialColStatsCap {
@@ -152,6 +158,10 @@ func (m *ColStatsMap) Lookup(cols opt.ColSet) (colStat *ColumnStatistic, ok bool
 // it does not yet exist in the map, then Add adds a new blank ColumnStatistic
 // and returns it, along with added=true. Otherwise, Add returns the existing
 // ColumnStatistic with added=false.
+// NOTE: The returned *ColumnStatistic is only valid until this ColStatsMap is
+//       updated via another call to Add() or RemoveIntersecting(). At that
+//       point, the address of the statistic may have changed, so it must be
+//       fetched again using Lookup() or Get().
 func (m *ColStatsMap) Add(cols opt.ColSet) (_ *ColumnStatistic, added bool) {
 	// Only add column set if it is not already present in the map.
 	colStat, ok := m.Lookup(cols)

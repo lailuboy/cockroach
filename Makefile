@@ -762,6 +762,11 @@ EXECGEN_TARGETS = \
   pkg/sql/exec/vecbuiltins/row_number.eg.go \
   pkg/sql/exec/zerocolumns.eg.go
 
+EXECGEN_EXCLUSION_STRING = $(shell echo ${EXECGEN_TARGETS} | sed 's/ / -e /g')
+
+$(info Cleaning old generated files.)
+$(shell find ./pkg/sql/exec -type f -name '*.eg.go' | grep -v -e ${EXECGEN_EXCLUSION_STRING} | xargs rm)
+
 OPTGEN_TARGETS = \
 	pkg/sql/opt/memo/expr.og.go \
 	pkg/sql/opt/operator.og.go \
@@ -1117,7 +1122,7 @@ UI_JS_OSS := pkg/ui/src/js/protos.js
 UI_TS_OSS := pkg/ui/src/js/protos.d.ts
 UI_PROTOS_OSS := $(UI_JS_OSS) $(UI_TS_OSS)
 
-CPP_PROTOS := $(filter %/roachpb/metadata.proto %/roachpb/data.proto %/roachpb/internal.proto %/engine/enginepb/mvcc.proto %/engine/enginepb/mvcc3.proto %/engine/enginepb/file_registry.proto %/engine/enginepb/rocksdb.proto %/hlc/legacy_timestamp.proto %/hlc/timestamp.proto %/log/log.proto %/unresolved_addr.proto,$(GO_PROTOS))
+CPP_PROTOS := $(filter %/roachpb/metadata.proto %/roachpb/data.proto %/roachpb/internal.proto %/roachpb/errors.proto %/engine/enginepb/mvcc.proto %/engine/enginepb/mvcc3.proto %/engine/enginepb/file_registry.proto %/engine/enginepb/rocksdb.proto %/hlc/legacy_timestamp.proto %/hlc/timestamp.proto %/log/log.proto %/unresolved_addr.proto,$(GO_PROTOS))
 CPP_HEADERS := $(subst ./pkg,$(CPP_PROTO_ROOT),$(CPP_PROTOS:%.proto=%.pb.h))
 CPP_SOURCES := $(subst ./pkg,$(CPP_PROTO_ROOT),$(CPP_PROTOS:%.proto=%.pb.cc))
 
@@ -1475,9 +1480,13 @@ unsafe-clean-c-deps:
 	git -C $(LIBROACH_SRC_DIR) clean -dxf
 	git -C $(KRB5_SRC_DIR)     clean -dxf
 
+.PHONY: clean-execgen-files
+clean-execgen-files:
+	find ./pkg/sql/exec -type f -name '*.eg.go' -exec rm {} +
+
 .PHONY: clean
 clean: ## Remove build artifacts.
-clean: clean-c-deps
+clean: clean-c-deps clean-execgen-files
 	rm -rf bin/.go_protobuf_sources bin/.gw_protobuf_sources bin/.cpp_protobuf_sources build/defs.mk*
 	$(GO) clean $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -i -cache github.com/cockroachdb/cockroach...
 	$(FIND_RELEVANT) -type f \( -name 'zcgo_flags*.go' -o -name '*.test' \) -exec rm {} +

@@ -1,16 +1,14 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License included
+// in the file licenses/BSL.txt and at www.mariadb.com/bsl11.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Change Date: 2022-10-01
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// On the date above, in accordance with the Business Source License, use
+// of this software will be governed by the Apache License, Version 2.0,
+// included in the file licenses/APL.txt and at
+// https://www.apache.org/licenses/LICENSE-2.0
 
 package storage
 
@@ -961,11 +959,8 @@ func (r *Replica) evaluateProposal(
 		// side-effects that are to be replicated to all replicas.
 		res.Replicated.IsLeaseRequest = ba.IsLeaseRequest()
 		res.Replicated.Timestamp = ba.Timestamp
-		if r.store.cfg.Settings.Version.IsActive(cluster.VersionMVCCNetworkStats) {
-			res.Replicated.Delta = ms.ToStatsDelta()
-		} else {
-			res.Replicated.DeprecatedDelta = &ms
-		}
+		res.Replicated.Delta = ms.ToStatsDelta()
+
 		// If the RangeAppliedState key is not being used and the cluster version is
 		// high enough to guarantee that all current and future binaries will
 		// understand the key, we send the migration flag through Raft. Because
@@ -977,8 +972,13 @@ func (r *Replica) evaluateProposal(
 		r.mu.RLock()
 		usingAppliedStateKey := r.mu.state.UsingAppliedStateKey
 		r.mu.RUnlock()
-		if !usingAppliedStateKey &&
-			r.ClusterSettings().Version.IsActive(cluster.VersionRangeAppliedStateKey) {
+		if !usingAppliedStateKey {
+			// The range applied state was introduced in v2.1. It's possible to
+			// still find ranges that haven't activated it. If so, activate it.
+			// We can remove this code if we introduce a boot-time check that
+			// fails the startup process when any legacy replicas are found. The
+			// operator can then run the old binary for a while to upgrade the
+			// stragglers.
 			if res.Replicated.State == nil {
 				res.Replicated.State = &storagepb.ReplicaState{}
 			}
